@@ -1,0 +1,9 @@
+{
+  "name": "taskspindle-claude-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pinned Claude ACP adapter runtime installed by `taskspindle setup`.",
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.70.0"
+  }
+}
