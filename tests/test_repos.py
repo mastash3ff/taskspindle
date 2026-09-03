@@ -124,3 +124,15 @@ def test_overlapping_dirty_paths_filters_to_scope(make_repo) -> None:
     snapshot = snapshot_root(root)
     assert overlapping_dirty_paths(snapshot, ["src"]) == ["src/a.py"]
     assert overlapping_dirty_paths(snapshot, ["."]) == ["file.txt", "src/a.py", "srcfoo/b.py"]
+
+
+def test_a_renamed_tracked_file_reports_both_paths(make_repo) -> None:
+    root = make_repo()
+    before = snapshot_root(root)
+
+    run_git(["mv", "file.txt", "renamed.txt"], cwd=root)
+    after = snapshot_root(root)
+
+    assert set(after.dirty) == {"file.txt", "renamed.txt"}
+    assert after.dirty["file.txt"] == "deleted"
+    assert compare_snapshots(before, after) == ["file.txt", "renamed.txt"]

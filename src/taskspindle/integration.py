@@ -260,9 +260,9 @@ def abort_staged(identity: RepositoryIdentity, *, journal: Journal) -> None:
 
 def recover_journal(identity: RepositoryIdentity, journal: Journal) -> str:
     """Bring a journal recovered from disk back to a settled state."""
-    if journal.phase == "committed":
+    if journal.phase == PHASES[-1]:
         return "committed"
-    if journal.phase in {"probing", "staged", "verified"}:
+    if journal.phase in PHASES:
         abort_staged(identity, journal=journal)
         return "aborted"
     raise ValueError(f"unknown journal phase: {journal.phase!r}")
