@@ -10,6 +10,7 @@ Script keys::
      "session_id": "fake-session-1",
      "response": "text emitted as two agent message chunks",
      "write": {"path": "rel/path", "content": "..."},   # asks permission (kind "edit") first
+     "write_abs": {"path": "/abs/path", "content": "..."},  # writes with no permission prompt
      "delegate": true,                     # asks permission for an "Agent: spawn subagent" call
      "block_seconds": 30,                  # sleep before responding; cancel -> "cancelled"
      "fail": true,                         # raise a RequestError from prompt
@@ -130,6 +131,9 @@ class FakeAgent:
         if block_seconds and await self._blocked(session_id, float(block_seconds)):
             return PromptResponse(stop_reason="cancelled")
 
+        write_abs = script.get("write_abs")
+        if write_abs:
+            self._write_absolute(write_abs)
         write = script.get("write")
         if write:
             await self._maybe_write(session_id, write)
@@ -178,6 +182,13 @@ class FakeAgent:
         if not await self._ask(session_id, "tc-write", "Write file", "edit"):
             return
         target = self._cwds.get(session_id, Path.cwd()) / str(write["path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(write.get("content", "")), encoding="utf-8")
+
+    @staticmethod
+    def _write_absolute(write: dict[str, Any]) -> None:
+        """Write straight to an absolute path, asking nobody: an agent that ignores the gate."""
+        target = Path(str(write["path"]))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(str(write.get("content", "")), encoding="utf-8")
 

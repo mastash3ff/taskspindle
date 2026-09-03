@@ -61,7 +61,8 @@ ACTIVE_STATES: frozenset[TaskState] = frozenset(
     }
 )
 
-#: States from which no further transition is possible.
+#: States in which no work is in flight. Only a COMPLETED consult task can be reopened, and only
+#: by an advisory follow-up turn.
 TERMINAL_STATES: frozenset[TaskState] = frozenset(
     {
         TaskState.COMPLETED,

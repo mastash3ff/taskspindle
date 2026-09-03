@@ -1,0 +1,243 @@
+"""Reconciling tasks that claim to be active against what systemd still knows."""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from taskspindle import service
+from taskspindle.models import AuthMode, EventKind, Mode, StartTaskRequest, TaskRecord, TaskState
+from taskspindle.recovery import ReconcileAction, reconcile
+from taskspindle.store import Store
+from taskspindle.units import UnitState, accept_unit_name, worker_unit_name
+from tests.fakes.units import ACTIVE, EXITED, NOT_FOUND, OOM, SIGNALLED, SUCCESS, FakeUnitBackend
+
+BOOT = "boot-now"
+PROVIDER = "claude"
+NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> Iterator[Store]:
+    store = Store.open(tmp_path / "taskspindle.sqlite3")
+    yield store
+    store.close()
+
+
+def stamp(offset_s: float) -> str:
+    return (NOW + timedelta(seconds=offset_s)).isoformat().replace("+00:00", "Z")
+
+
+def make_task(
+    store: Store,
+    *,
+    state: TaskState,
+    mode: Mode = Mode.IMPLEMENT,
+    unit: str | None = "worker",
+    boot_id: str | None = BOOT,
+    heartbeat_offset_s: float = -1,
+    created_offset_s: float = -60,
+    lease: bool = True,
+) -> TaskRecord:
+    """A task sitting in an active state, with the lease a live worker would be holding."""
+    fields: dict[str, object] = {"provider": PROVIDER, "mode": mode, "prompt": "do the thing"}
+    if mode is Mode.IMPLEMENT:
+        fields.update(
+            repository="/repo",
+            acceptance_criteria="it works",
+            path_prefixes=["src"],
+            verification_commands=[],
+            candidate_message="Add the thing",
+        )
+    record = service.create_task(
+        store, StartTaskRequest(**fields), repository_id=None, auth_mode=AuthMode.OAUTH
+    )
+    names = {"worker": worker_unit_name(record.id), "accept": accept_unit_name(record.id)}
+    unit_name = names.get(unit or "")
+    task = store.update_task(
+        record.id,
+        None,
+        state=state,
+        unit_name=unit_name,
+        boot_id=boot_id,
+        heartbeat_at=stamp(heartbeat_offset_s),
+        created_at=stamp(created_offset_s),
+        candidate_sha="c0ffeeba" if state is TaskState.ACCEPTING else None,
+    )
+    if lease:
+        store.acquire_lease(PROVIDER, record.id, unit_name or "", 4242, BOOT)
+    return task
+
+
+def run(store: Store, backend: FakeUnitBackend, **kwargs: object) -> list[ReconcileAction]:
+    return reconcile(store, backend, boot=BOOT, now=NOW, **kwargs)
+
+
+def recovery_reasons(store: Store, task_id: str) -> list[str]:
+    return [
+        event["payload"]["reason"]
+        for event in store.list_events(task_id)
+        if event["kind"] == EventKind.RECOVERY.value
+    ]
+
+
+def assert_settled(
+    store: Store, task: TaskRecord, actions: list[ReconcileAction], state: TaskState, reason: str
+) -> None:
+    assert [(action.to_state, action.reason) for action in actions] == [(state.value, reason)]
+    assert store.get_task(task.id).state is state
+    assert recovery_reasons(store, task.id) == [reason]
+    assert store.get_lease(PROVIDER) is None
+
+
+def test_a_live_unit_is_left_alone(store: Store) -> None:
+    task = make_task(store, state=TaskState.RUNNING)
+    backend = FakeUnitBackend({worker_unit_name(task.id): ACTIVE})
+
+    assert run(store, backend) == []
+    assert store.get_task(task.id).state is TaskState.RUNNING
+    assert store.get_lease(PROVIDER) is not None
+
+
+def test_a_task_from_an_earlier_boot_is_interrupted(store: Store) -> None:
+    task = make_task(store, state=TaskState.RUNNING, boot_id="boot-before")
+    backend = FakeUnitBackend({worker_unit_name(task.id): ACTIVE})
+
+    actions = run(store, backend)
+
+    assert_settled(store, task, actions, TaskState.INTERRUPTED, "boot_changed")
+    # The unit was never consulted: a reboot settles the question on its own.
+    assert backend.reset == []
+
+
+def test_a_worker_that_exited_without_recording_anything_is_interrupted(store: Store) -> None:
+    task = make_task(store, state=TaskState.RUNNING)
+    backend = FakeUnitBackend({worker_unit_name(task.id): SUCCESS})
+
+    actions = run(store, backend)
+
+    assert_settled(
+        store, task, actions, TaskState.INTERRUPTED, "worker_exited_without_record"
+    )
+    assert backend.reset == [worker_unit_name(task.id)]
+
+
+@pytest.mark.parametrize(
+    ("unit_state", "reason"),
+    [(OOM, "oom_killed"), (SIGNALLED, "signalled")],
+)
+def test_a_killed_worker_is_interrupted(
+    store: Store, unit_state: UnitState, reason: str
+) -> None:
+    task = make_task(store, state=TaskState.RUNNING)
+    backend = FakeUnitBackend({worker_unit_name(task.id): unit_state})
+
+    actions = run(store, backend)
+
+    assert_settled(store, task, actions, TaskState.INTERRUPTED, reason)
+    assert backend.reset == [worker_unit_name(task.id)]
+    # An interruption never touches what the worker left behind.
+    assert store.get_task(task.id).finished_at is None
+
+
+def test_a_worker_that_exited_nonzero_fails_with_its_status(store: Store) -> None:
+    task = make_task(store, state=TaskState.RUNNING)
+    backend = FakeUnitBackend({worker_unit_name(task.id): EXITED})
+
+    actions = run(store, backend)
+
+    assert_settled(store, task, actions, TaskState.FAILED, "worker_exited")
+    assert store.get_task(task.id).error == {
+        "code": "WORKER_EXITED",
+        "message": "exit status 2",
+        "retryable": True,
+        "details": {},
+    }
+
+
+def test_a_missing_unit_with_a_stale_heartbeat_is_interrupted(store: Store) -> None:
+    task = make_task(store, state=TaskState.RUNNING, heartbeat_offset_s=-120)
+    backend = FakeUnitBackend({worker_unit_name(task.id): NOT_FOUND})
+
+    actions = run(store, backend)
+
+    assert_settled(store, task, actions, TaskState.INTERRUPTED, "unit_missing_stale_heartbeat")
+
+
+def test_a_missing_unit_with_a_fresh_heartbeat_is_ambiguous_and_settled_once(
+    store: Store,
+) -> None:
+    task = make_task(store, state=TaskState.RUNNING, heartbeat_offset_s=-2)
+    backend = FakeUnitBackend({worker_unit_name(task.id): NOT_FOUND})
+
+    actions = run(store, backend)
+
+    assert_settled(
+        store, task, actions, TaskState.RECOVERY_AMBIGUOUS, "unit_missing_fresh_heartbeat"
+    )
+    # RECOVERY_AMBIGUOUS waits for a person; a second pass must not pile on.
+    assert run(store, backend) == []
+
+
+def test_a_cancelling_task_whose_unit_is_gone_is_cancelled(store: Store) -> None:
+    task = make_task(store, state=TaskState.CANCELLING)
+    backend = FakeUnitBackend({worker_unit_name(task.id): SIGNALLED})
+
+    actions = run(store, backend)
+
+    assert_settled(store, task, actions, TaskState.CANCELLED, "signalled")
+    assert store.get_task(task.id).finished_at is not None
+
+
+def test_a_queued_task_that_was_never_started_fails_after_the_grace_period(
+    store: Store,
+) -> None:
+    fresh = make_task(store, state=TaskState.QUEUED, unit=None, boot_id=None, lease=False)
+    stale = make_task(
+        store,
+        state=TaskState.QUEUED,
+        unit=None,
+        boot_id=None,
+        created_offset_s=-3600,
+    )
+    backend = FakeUnitBackend()
+
+    actions = run(store, backend)
+
+    assert [action.task_id for action in actions] == [stale.id]
+    assert store.get_task(fresh.id).state is TaskState.QUEUED
+    assert store.get_task(stale.id).state is TaskState.FAILED
+    assert store.get_task(stale.id).error["code"] == "NEVER_STARTED"
+    assert store.get_lease(PROVIDER) is None
+
+
+def test_an_interrupted_accept_that_committed_is_accepted(store: Store) -> None:
+    task = make_task(store, state=TaskState.ACCEPTING, unit="accept")
+    backend = FakeUnitBackend({accept_unit_name(task.id): SUCCESS})
+
+    actions = run(store, backend, accept_recover=lambda _task: "committed")
+
+    assert [(action.to_state, action.reason) for action in actions] == [
+        (TaskState.ACCEPTED.value, "accept_committed:worker_exited_without_record")
+    ]
+    assert store.get_task(task.id).state is TaskState.ACCEPTED
+    assert store.get_lease(PROVIDER) is None
+
+
+def test_an_interrupted_accept_that_was_aborted_returns_to_result_ready(store: Store) -> None:
+    task = make_task(store, state=TaskState.ACCEPTING, unit="accept")
+    backend = FakeUnitBackend({accept_unit_name(task.id): OOM})
+
+    actions = run(store, backend, accept_recover=lambda _task: "aborted")
+
+    assert [action.to_state for action in actions] == [TaskState.RESULT_READY.value]
+    settled = store.get_task(task.id)
+    assert settled.state is TaskState.RESULT_READY
+    assert settled.warnings == ["ACCEPT_FAILED:oom_killed"]
+    assert settled.candidate_sha == "c0ffeeba"
+    kinds = [event["kind"] for event in store.list_events(task.id)]
+    assert EventKind.ACCEPT_FAILED.value in kinds
+    assert EventKind.RECOVERY.value in kinds

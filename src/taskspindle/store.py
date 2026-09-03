@@ -581,6 +581,32 @@ class Store:
             )
             return int(cur.lastrowid or 0)
 
+    def complete_turn(
+        self,
+        turn_id: int,
+        ended_at: str | None = None,
+        stop_reason: str | None = None,
+        response: str | None = None,
+        session_id: str | None = None,
+        attribution: dict[str, Any] | None = None,
+    ) -> None:
+        """Close the open turn row a worker was given, recording what the turn produced."""
+        with self._guard(), self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE turns SET ended_at = ?, stop_reason = ?, response = ?, "
+                "session_id = COALESCE(?, session_id), attribution = ? WHERE id = ?",
+                (
+                    ended_at or now(),
+                    stop_reason,
+                    response,
+                    session_id,
+                    _json_or_none(attribution),
+                    turn_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise NotFoundError(f"no such turn: {turn_id}")
+
     def list_turns(self, task_id: str) -> list[dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM turns WHERE task_id = ? ORDER BY id", (task_id,)
@@ -717,6 +743,29 @@ class Store:
             "SELECT * FROM leases WHERE provider = ?", (provider,)
         ).fetchone()
         return dict(row) if row else None
+
+    def bind_lease(
+        self,
+        provider: str,
+        task_id: str,
+        *,
+        unit_name: str | None = None,
+        pid: int | None = None,
+        boot_id: str | None = None,
+    ) -> bool:
+        """Record the running worker's identity on a lease the task already holds.
+
+        The server acquires the lease before it starts the unit, so it cannot know the worker's
+        pid or boot; the worker fills those in once it is running.
+        """
+        with self._guard(), self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE leases SET unit_name = COALESCE(?, unit_name), pid = COALESCE(?, pid), "
+                "boot_id = COALESCE(?, boot_id), heartbeat_at = ? "
+                "WHERE provider = ? AND task_id = ?",
+                (unit_name, pid, boot_id, now(), provider, task_id),
+            )
+            return cur.rowcount == 1
 
     def touch_lease(self, task_id: str, at: str | None = None) -> bool:
         """Refresh the lease heartbeat of whichever provider lease this task holds."""

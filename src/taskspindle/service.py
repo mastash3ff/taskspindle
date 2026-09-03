@@ -103,6 +103,7 @@ LEGAL_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
             TaskState.RECOVERY_AMBIGUOUS,
         }
     ),
+    TaskState.COMPLETED: frozenset({TaskState.RESUMING}),
     TaskState.RESULT_READY: frozenset(
         {TaskState.ACCEPTING, TaskState.REJECTED, TaskState.REPAIRING}
     ),
@@ -155,6 +156,14 @@ MODE_FORBIDS_STATES: dict[Mode, frozenset[TaskState]] = {
     Mode.IMPLEMENT: frozenset(),
 }
 
+#: Transitions restricted to particular modes, beyond what :data:`MODE_FORBIDS_STATES` says.
+#: Reopening a finished task is only ever an advisory follow-up: a consult can be asked one more
+#: question in its own session, while an implement task that is done is done and any further work
+#: goes through REPAIRING on its candidate.
+MODE_ONLY_TRANSITIONS: dict[tuple[TaskState, TaskState], frozenset[Mode]] = {
+    (TaskState.COMPLETED, TaskState.RESUMING): frozenset({Mode.CONSULT}),
+}
+
 
 def new_task_id() -> str:
     """Return a fresh task id: ``ts_`` plus 12 lowercase hex characters."""
@@ -196,13 +205,18 @@ def transition(
                     "allowed": sorted(state.value for state in allowed),
                 },
             )
-        if to_state in MODE_FORBIDS_STATES[record.mode]:
+        modes = MODE_ONLY_TRANSITIONS.get((record.state, to_state))
+        if to_state in MODE_FORBIDS_STATES[record.mode] or (
+            modes is not None and record.mode not in modes
+        ):
             raise TaskSpindleError(
                 MODE_FORBIDS_STATE,
-                f"a {record.mode.value} task may not enter {to_state.value}",
+                f"a {record.mode.value} task may not move from {record.state.value} "
+                f"to {to_state.value}",
                 details={
                     "task_id": task_id,
                     "mode": record.mode.value,
+                    "from": record.state.value,
                     "to": to_state.value,
                 },
             )

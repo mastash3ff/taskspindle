@@ -87,10 +87,30 @@ def test_create_task_starts_in_preparing_with_an_event(store: Store) -> None:
 def test_every_legal_transition_is_allowed(
     store: Store, from_state: TaskState, to_state: TaskState
 ) -> None:
-    record = new_task(store)
+    modes = service.MODE_ONLY_TRANSITIONS.get((from_state, to_state))
+    request = None
+    if modes is not None and Mode.IMPLEMENT not in modes:
+        request = StartTaskRequest(provider="grok", mode=sorted(modes)[0], prompt="what shape?")
+    record = new_task(store, request)
     force_state(store, record.id, from_state)
     updated = transition(store, record.id, to_state, reason="test")
     assert updated.state is to_state
+
+
+def test_only_a_consult_task_can_be_reopened_for_a_follow_up(store: Store) -> None:
+    consult = new_task(
+        store, StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="what shape?")
+    )
+    force_state(store, consult.id, TaskState.COMPLETED)
+    assert transition(store, consult.id, TaskState.RESUMING, reason="follow-up").state is (
+        TaskState.RESUMING
+    )
+
+    built = new_task(store)
+    force_state(store, built.id, TaskState.COMPLETED)
+    with pytest.raises(TaskSpindleError) as excinfo:
+        transition(store, built.id, TaskState.RESUMING, reason="follow-up")
+    assert excinfo.value.code == service.MODE_FORBIDS_STATE
 
 
 @pytest.mark.parametrize(
