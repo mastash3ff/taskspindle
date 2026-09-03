@@ -1,0 +1,452 @@
+"""The thin ACP client a TaskSpindle worker drives one agent process with.
+
+One :class:`AcpWorker` owns one subprocess for its lifetime: spawn, initialize, create or resume a
+session, prompt, cancel, tear down. It is deliberately thin -- no retries, no policy beyond the
+permission gate, no knowledge of tasks or the store -- because the worker composes it.
+
+Two decisions are load-bearing:
+
+* **Capture runs on the synchronous stream observer**, not on the async ``session/update``
+  handler. ``acp.Connection`` resolves a response future inline in its receive loop but publishes
+  notifications to a queue that a dispatcher drains into separate tasks, so a ``session/update``
+  sent immediately before the prompt response can be *handled* after ``prompt()`` has already
+  returned. The observer is called inline in receive order, before the message is processed at
+  all, so every update belonging to a turn is captured before that turn's response resolves.
+* **The client advertises no filesystem and no terminal capability.** The agent must use its own
+  tools, which run inside the task worktree and go through :class:`PermissionPolicy`, rather than
+  asking TaskSpindle to write files on its behalf.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from acp import (
+    PROTOCOL_VERSION,
+    RequestError,
+    spawn_agent_process,
+    text_block,
+)
+from acp.connection import StreamDirection, StreamEvent
+from acp.schema import (
+    AllowedOutcome,
+    ClientCapabilities,
+    DeniedOutcome,
+    FileSystemCapabilities,
+    Implementation,
+    PermissionOption,
+    RequestPermissionResponse,
+    ToolCallUpdate,
+)
+from acp.transports import DEFAULT_INHERITED_ENV_VARS
+
+import taskspindle
+
+__all__ = [
+    "AcpError",
+    "AcpWorker",
+    "InitInfo",
+    "PermissionPolicy",
+    "TurnCapture",
+    "TurnResult",
+    "sealed_env",
+]
+
+_CLIENT_INFO = Implementation(name="taskspindle", version=taskspindle.__version__)
+_STREAM_LIMIT = 16 * 1024 * 1024
+_CANCEL_TIMEOUT = 2.0
+
+#: Tool-call words that mean the agent is trying to spawn helpers of its own.
+_DELEGATION_WORDS = ("agent", "subagent", "task", "team")
+_DELEGATION_EXEMPT_KINDS = ("read", "fetch")
+_WRITE_KINDS = ("edit", "delete", "move", "execute")
+
+READ_ONLY_VIOLATION = "READ_ONLY_VIOLATION"
+DELEGATION_ATTEMPT = "DELEGATION_ATTEMPT"
+
+
+class AcpError(Exception):
+    """An ACP-level failure.
+
+    ``code`` is one of ``ACP_SPAWN_FAILED``, ``ACP_HANDSHAKE_FAILED``, ``RESUME_UNAVAILABLE``,
+    ``TURN_TIMEOUT``, ``ACP_TURN_ERROR``.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def sealed_env(env: Mapping[str, str]) -> dict[str, str]:
+    """Close the hole ``acp``'s ``default_environment()`` would otherwise open.
+
+    ``spawn_stdio_transport`` merges a small set of parent variables (``HOME``, ``PATH``,
+    ``SHELL``, ``TERM``, ``USER``, ``LOGNAME`` on POSIX) *under* the environment we hand it, so a
+    name we deliberately left out would still be inherited from the TaskSpindle process. Pinning
+    each such name to the empty string when we did not set it keeps the allowlist authoritative.
+    """
+    sealed = dict(env)
+    for name in DEFAULT_INHERITED_ENV_VARS:
+        sealed.setdefault(name, "")
+    return sealed
+
+
+class PermissionPolicy:
+    """TaskSpindle's answer to ``session/request_permission``.
+
+    Delegation is refused unconditionally: a worker agent may not spawn agents of its own,
+    whatever the task mode. Writes are refused unless the task was started with write intent.
+    """
+
+    def __init__(self, *, allow_writes: bool) -> None:
+        self.allow_writes = allow_writes
+
+    def select(
+        self,
+        tool_call: ToolCallUpdate,
+        options: Sequence[PermissionOption],
+    ) -> tuple[str | None, str | None]:
+        """Return ``(option_id, violation)``; ``option_id`` of ``None`` cancels the request."""
+        kind = getattr(tool_call, "kind", None) or ""
+        title = getattr(tool_call, "title", None) or ""
+        haystack = f"{title} {kind}".lower()
+
+        if kind not in _DELEGATION_EXEMPT_KINDS and any(word in haystack for word in _DELEGATION_WORDS):
+            return self._deny(options), DELEGATION_ATTEMPT
+        if not self.allow_writes and kind in _WRITE_KINDS:
+            return self._deny(options), READ_ONLY_VIOLATION
+
+        allowed = self._pick(options, "allow")
+        if allowed is not None:
+            return allowed, None
+        return self._deny(options), None
+
+    def _deny(self, options: Sequence[PermissionOption]) -> str | None:
+        return self._pick(options, "reject")
+
+    @staticmethod
+    def _pick(options: Sequence[PermissionOption], prefix: str) -> str | None:
+        candidates = [option for option in options if str(option.kind).startswith(prefix)]
+        for option in candidates:
+            if str(option.kind).endswith("_once"):
+                return option.option_id
+        return candidates[0].option_id if candidates else None
+
+
+@dataclass
+class TurnCapture:
+    """Everything one turn produced, in receive order."""
+
+    text: list[str] = field(default_factory=list)
+    thoughts: int = 0
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    permission_events: list[dict[str, Any]] = field(default_factory=list)
+    violations: list[str] = field(default_factory=list)
+    raw_update_count: int = 0
+
+
+@dataclass(frozen=True)
+class InitInfo:
+    """What the agent said about itself at ``initialize``."""
+
+    load_session: bool | None
+    auth_method_ids: tuple[str, ...]
+    agent_info: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TurnResult:
+    """The outcome of one ``session/prompt``."""
+
+    stop_reason: str
+    text: str
+    capture: TurnCapture
+
+
+class _WorkerClient:
+    """The ACP ``Client`` half: permission decisions, and nothing else.
+
+    ``session/update`` is *not* handled here -- it is captured by the stream observer -- but the
+    method must exist so the agent's notifications are not rejected. Filesystem and terminal
+    methods refuse: the client advertises neither capability, so a well-behaved agent never calls
+    them, and a misbehaving one gets a method-not-found rather than a service.
+    """
+
+    def __init__(self, worker: AcpWorker) -> None:
+        self._worker = worker
+
+    def on_connect(self, conn: Any) -> None:
+        return None
+
+    async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+        return None
+
+    async def request_permission(
+        self,
+        session_id: str,
+        tool_call: ToolCallUpdate,
+        options: list[PermissionOption],
+        **kwargs: Any,
+    ) -> RequestPermissionResponse:
+        option_id, violation = self._worker.policy.select(tool_call, options)
+        self._worker._record_permission(tool_call, option_id, violation)
+        if option_id is None:
+            return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
+        return RequestPermissionResponse(outcome=AllowedOutcome(outcome="selected", option_id=option_id))
+
+    async def read_text_file(self, session_id: str, path: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("fs/read_text_file")
+
+    async def write_text_file(self, session_id: str, path: str, content: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("fs/write_text_file")
+
+    async def create_terminal(self, session_id: str, command: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("terminal/create")
+
+    async def terminal_output(self, session_id: str, terminal_id: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("terminal/output")
+
+    async def release_terminal(self, session_id: str, terminal_id: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("terminal/release")
+
+    async def wait_for_terminal_exit(self, session_id: str, terminal_id: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("terminal/wait_for_exit")
+
+    async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs: Any) -> Any:
+        raise RequestError.method_not_found("terminal/kill")
+
+
+class AcpWorker:
+    """One agent subprocess, from spawn to teardown."""
+
+    def __init__(
+        self,
+        *,
+        command: Sequence[str],
+        env: Mapping[str, str],
+        cwd: Path,
+        stderr_path: Path,
+        policy: PermissionPolicy,
+        handshake_timeout: float = 60.0,
+    ) -> None:
+        if not command:
+            raise AcpError("ACP_SPAWN_FAILED", "empty command")
+        self._command = tuple(command)
+        self._env = sealed_env(env)
+        self._cwd = cwd
+        self._stderr_path = stderr_path
+        self.policy = policy
+        self._handshake_timeout = handshake_timeout
+
+        self._stack = contextlib.AsyncExitStack()
+        self._conn: Any = None
+        self._process: Any = None
+        self._capture: TurnCapture | None = None
+        self._sessions: list[str] = []
+        self.init: InitInfo | None = None
+        #: How many ``session/update`` notifications the last ``load_session`` replayed.
+        self.replay_update_count = 0
+
+    # -- lifecycle ---------------------------------------------------------------------------
+
+    async def __aenter__(self) -> AcpWorker:
+        stderr = self._stack.enter_context(self._stderr_path.open("ab"))
+        command, *args = self._command
+        try:
+            conn, process = await self._stack.enter_async_context(
+                spawn_agent_process(
+                    _WorkerClient(self),
+                    command,
+                    *args,
+                    env=self._env,
+                    cwd=self._cwd,
+                    transport_kwargs={"limit": _STREAM_LIMIT, "stderr": stderr},
+                    observers=[self._observe],
+                )
+            )
+        except OSError as exc:
+            await self._stack.aclose()
+            raise AcpError("ACP_SPAWN_FAILED", f"could not launch {command!r}: {exc}") from exc
+        except BaseException:
+            await self._stack.aclose()
+            raise
+
+        self._conn = conn
+        self._process = process
+        try:
+            response = await asyncio.wait_for(
+                conn.initialize(
+                    protocol_version=PROTOCOL_VERSION,
+                    client_capabilities=_capabilities(),
+                    client_info=_CLIENT_INFO,
+                ),
+                timeout=self._handshake_timeout,
+            )
+        except BaseException as exc:
+            await self._stack.aclose()
+            if isinstance(exc, Exception):
+                raise AcpError("ACP_HANDSHAKE_FAILED", f"initialize failed: {exc}") from exc
+            raise
+        self.init = _init_info(response)
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        for session_id in list(self._sessions):
+            await self.cancel(session_id)
+        self._capture = None
+        # The exit stack tears the agent down in order: close the connection, EOF its stdin,
+        # wait, terminate, wait, kill -- then close the stderr file.
+        await self._stack.aclose()
+        self._conn = None
+        self._process = None
+
+    # -- capture -----------------------------------------------------------------------------
+
+    def _observe(self, event: StreamEvent) -> None:
+        """Synchronous, inline in receive order: see the module docstring."""
+        if event.direction is not StreamDirection.INCOMING:
+            return
+        if event.message.get("method") != "session/update":
+            return
+        capture = self._capture
+        if capture is None:
+            return
+        capture.raw_update_count += 1
+        params = event.message.get("params")
+        update = params.get("update") if isinstance(params, dict) else None
+        if not isinstance(update, dict):
+            return
+        kind = update.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            content = update.get("content")
+            text = content.get("text") if isinstance(content, dict) else None
+            if isinstance(text, str):
+                capture.text.append(text)
+        elif kind == "agent_thought_chunk":
+            capture.thoughts += 1
+        elif kind in ("tool_call", "tool_call_update"):
+            capture.tool_calls.append(
+                {
+                    "update": kind,
+                    "tool_call_id": update.get("toolCallId"),
+                    "title": update.get("title"),
+                    "kind": update.get("kind"),
+                    "status": update.get("status"),
+                }
+            )
+
+    def _record_permission(
+        self,
+        tool_call: ToolCallUpdate,
+        option_id: str | None,
+        violation: str | None,
+    ) -> None:
+        capture = self._capture
+        if capture is None:
+            return
+        capture.permission_events.append(
+            {
+                "tool_call_id": getattr(tool_call, "tool_call_id", None),
+                "title": getattr(tool_call, "title", None),
+                "kind": getattr(tool_call, "kind", None),
+                "option_id": option_id,
+                "violation": violation,
+            }
+        )
+        if violation is not None:
+            capture.violations.append(violation)
+
+    # -- sessions ----------------------------------------------------------------------------
+
+    async def new_session(self, **session_kwargs: Any) -> str:
+        """Create a session in the worker's cwd. Extra kwargs travel as the request's ``_meta``."""
+        response = await self._connection().new_session(cwd=str(self._cwd), **session_kwargs)
+        self._sessions.append(response.session_id)
+        return response.session_id
+
+    async def load_session(self, session_id: str, **session_kwargs: Any) -> None:
+        """Resume a prior session, discarding whatever the agent replays.
+
+        The replay is history the caller already has; counting it is enough to prove the resume
+        landed. Because capture is synchronous, every replayed update is seen before this returns.
+        """
+        if self.init is None or self.init.load_session is not True:
+            raise AcpError("RESUME_UNAVAILABLE", "agent does not support session/load")
+        replay = TurnCapture()
+        self._capture = replay
+        try:
+            await self._connection().load_session(
+                cwd=str(self._cwd), session_id=session_id, **session_kwargs
+            )
+        finally:
+            self._capture = None
+        self.replay_update_count = replay.raw_update_count
+        self._sessions.append(session_id)
+
+    async def prompt(self, session_id: str, text: str, *, timeout: float) -> TurnResult:
+        """Send one turn and capture everything it produced."""
+        capture = TurnCapture()
+        self._capture = capture
+        try:
+            response = await asyncio.wait_for(
+                self._connection().prompt(session_id=session_id, prompt=[text_block(text)]),
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            await self.cancel(session_id)
+            raise AcpError("TURN_TIMEOUT", f"turn exceeded {timeout}s") from exc
+        except Exception as exc:
+            raise AcpError("ACP_TURN_ERROR", f"session/prompt failed: {exc}") from exc
+        finally:
+            self._capture = None
+        return TurnResult(stop_reason=response.stop_reason, text="".join(capture.text), capture=capture)
+
+    async def cancel(self, session_id: str) -> None:
+        """Ask the agent to stop the current turn. Bounded, and never raises."""
+        conn = self._conn
+        if conn is None:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(conn.cancel(session_id=session_id), timeout=_CANCEL_TIMEOUT)
+
+    def _connection(self) -> Any:
+        if self._conn is None:
+            raise AcpError("ACP_TURN_ERROR", "worker is not running")
+        return self._conn
+
+
+def _capabilities() -> ClientCapabilities:
+    return ClientCapabilities(
+        fs=FileSystemCapabilities(read_text_file=False, write_text_file=False),
+        terminal=False,
+    )
+
+
+def _init_info(response: Any) -> InitInfo:
+    """Read the initialize response defensively: the SDK salvages bad payloads into raw dicts."""
+    capabilities = getattr(response, "agent_capabilities", None)
+    if isinstance(capabilities, dict):
+        raw_load = capabilities.get("loadSession", capabilities.get("load_session"))
+    else:
+        raw_load = getattr(capabilities, "load_session", None)
+    load_session = raw_load if isinstance(raw_load, bool) else None
+
+    method_ids: list[str] = []
+    for method in getattr(response, "auth_methods", None) or []:
+        raw_id = method.get("id") if isinstance(method, dict) else getattr(method, "id", None)
+        if isinstance(raw_id, str):
+            method_ids.append(raw_id)
+
+    info = getattr(response, "agent_info", None)
+    if isinstance(info, dict):
+        agent_info = dict(info)
+    elif info is not None and hasattr(info, "model_dump"):
+        agent_info = info.model_dump(mode="json", by_alias=True, exclude_none=True)
+    else:
+        agent_info = {}
+    return InitInfo(load_session=load_session, auth_method_ids=tuple(method_ids), agent_info=agent_info)

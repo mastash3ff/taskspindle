@@ -58,3 +58,4 @@ ignore = ["RUF012"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-ra"
+filterwarnings = ["error"]
