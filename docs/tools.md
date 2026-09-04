@@ -110,6 +110,9 @@ No parameters. Returns `{"repositories": [{"repository_id", "display_path", "com
 
 ### `start_task`
 
+Verification commands should leave no untracked files; ignore generated files such as
+`__pycache__/` in the repository's `.gitignore` to avoid `DIRTY_OVERLAP` on later tasks.
+
 Takes one object parameter, `request`; the fields below go inside it.
 
 | Fields of `request` | Type | Default | Meaning |
