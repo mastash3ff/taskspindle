@@ -145,3 +145,47 @@ def test_the_cli_prints_proposals_and_json(tmp_path: Path, monkeypatch: pytest.M
 
     assert cli.main(["discover", "--registry", str(tmp_path / "missing.json")]) == 1
     assert "could not read" in capsys.readouterr().err
+
+
+async def test_probe_initializes_agents_and_continues_after_timeout(tmp_path: Path) -> None:
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    stalled = tmp_path / "stall.py"
+    stalled.write_text("import time; time.sleep(30)\n")
+    items = [
+        discover.DiscoveredAgent(
+            discover.RegistryAgent("stall", "Stall", "", ()), sys.executable, (str(stalled),)),
+        discover.DiscoveredAgent(
+            discover.RegistryAgent("fake", "Fake", "", ()), sys.executable, ()),
+    ]
+    # The fake agent is installed for this test through a Python launcher in the temporary path.
+    launcher = tmp_path / "fake.py"
+    launcher.write_text(f"import sys; sys.path.insert(0, {str(root)!r})\n"
+                        "from tests.fakes.fake_agent import main; main()\n")
+    items[1] = discover.DiscoveredAgent(items[1].agent, sys.executable, (str(launcher),))
+    results = await discover.probe(items, timeout=1)
+    assert results["stall"]["ok"] is False
+    assert results["stall"]["error"]["code"] == "ACP_HANDSHAKE_FAILED"
+    assert results["stall"]["error"]["message"] == "initialize timed out after 1s"
+    assert results["stall"]["agent_info"] is None
+    assert results["fake"]["ok"] is True
+    assert results["fake"]["agent_info"]["name"] == "taskspindle-fake-agent"
+    assert results["fake"]["load_session"] is False
+
+
+def test_cli_probe_is_opt_in_and_reports_failure(monkeypatch, capsys) -> None:
+    agent = discover.DiscoveredAgent(discover.RegistryAgent("fake", "Fake", "", ()), "/fake", ())
+    monkeypatch.setattr(discover, "fetch_registry", lambda **kw: ([agent.agent], "file"))
+    monkeypatch.setattr(discover, "detect", lambda agents: [agent])
+    calls = []
+    async def probe(found):
+        calls.append(found)
+        return {"fake": {"ok": False, "error": {"code": "ACP_HANDSHAKE_FAILED", "message": "timeout"}}}
+    monkeypatch.setattr(discover, "probe", probe)
+    assert cli.main(["discover", "--json"]) == 0
+    assert "probe" not in json.loads(capsys.readouterr().out)["installed"][0]
+    assert calls == []
+    assert cli.main(["discover", "--probe", "--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["installed"][0]["probe"]["ok"] is False
+    assert len(calls) == 1

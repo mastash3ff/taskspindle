@@ -144,3 +144,13 @@ that the environment it would be given contains no credential-shaped name it did
 `api_key` profiles it additionally reports each `secret_env` name as set or unset — advisory, so a
 key you have not exported yet does not fail the run. A `config.toml` that is not valid TOML is
 reported as a single failed `config` check rather than a traceback.
+
+### Probe discovered agents
+
+`taskspindle discover --probe` starts each installed registry launch form and performs only ACP
+`initialize`, with a 30-second handshake limit per agent. It does not authenticate, create a
+session, send a model prompt, install software or write profiles. Results include the advertised
+agent identity, session-loading support and authentication methods; they do not prove a working
+login or model call. `--json` adds a `probe` object to each installed entry. Failures do not stop
+other probes, but any failed probe makes the command exit 1. Without `--probe`, discovery starts
+no agent processes.

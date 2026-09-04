@@ -349,8 +349,13 @@ class AcpWorker:
         except BaseException as exc:
             await self._stack.aclose()
             if isinstance(exc, Exception):
+                detail = (
+                    f"initialize timed out after {self._handshake_timeout:g}s"
+                    if isinstance(exc, TimeoutError)
+                    else f"initialize failed: {exc or type(exc).__name__}"
+                )
                 raise AcpError(
-                    "ACP_HANDSHAKE_FAILED", f"initialize failed: {exc}", cause=error_cause(exc)
+                    "ACP_HANDSHAKE_FAILED", detail, cause=error_cause(exc)
                 ) from exc
             raise
         self.init = _init_info(response)

@@ -3,8 +3,9 @@
 The registry is the published list at ``cdn.agentclientprotocol.com``. For every entry it names
 the launch form -- a platform binary, an npm package, or both -- and from those this module works
 out which binary names to look for on this machine. An agent that is found gets a proposed
-``[providers.<id>]`` block for ``config.toml``. Nothing is downloaded, nothing is run, and the
-configuration file is never written: the proposal is printed for a person to read and paste.
+``[providers.<id>]`` block for ``config.toml``, printed for a person to read and paste. No agent is
+installed and the configuration file is never written. Agents run only when the caller explicitly
+requests an initialize probe.
 
 First-class providers are recognized separately, since they are not configured this way.
 """
@@ -15,6 +16,7 @@ import json
 import os
 import platform
 import shutil
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
@@ -34,6 +36,7 @@ __all__ = [
     "detect",
     "fetch_registry",
     "parse_registry",
+    "probe",
     "proposal",
     "read_registry",
 ]
@@ -307,3 +310,39 @@ def proposal(found: DiscoveredAgent) -> str:
         f'modes = ["consult", "review"]\n'
         f'# secret_env = ["EXAMPLE_API_KEY"]   # names only; required for api_key profiles\n'
     )
+
+
+async def probe(
+    found: Sequence[DiscoveredAgent], *, env: Mapping[str, str] | None = None, timeout: float = 30.0,
+) -> dict[str, dict[str, Any]]:
+    """Probe installed launch forms independently; never sign in or request generation."""
+    from .acp_client import AcpError
+    from .doctor import probe_initialize
+    from .providers import Profile
+
+    results: dict[str, dict[str, Any]] = {}
+    for item in found:
+        # This transient profile only builds a credential-free child environment.
+        profile = Profile(id=profile_id(item.agent), auth="oauth", command=item.command)
+        info = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="taskspindle-discover-") as directory:
+                info = await probe_initialize(
+                    profile, os.environ if env is None else env, Path(directory), timeout=timeout,
+                )
+            if info is None:
+                raise AcpError("ACP_HANDSHAKE_FAILED", "initialize returned no capabilities")
+            results[item.agent.id] = {
+                "ok": True, "agent_info": info.agent_info, "load_session": info.load_session,
+                "auth_method_ids": list(info.auth_method_ids), "error": None,
+            }
+        except (AcpError, OSError) as exc:
+            results[item.agent.id] = {
+                "ok": False, "agent_info": None, "load_session": None, "auth_method_ids": [],
+                "error": {
+                    "code": "PROBE_CLEANUP_FAILED" if info is not None
+                    else getattr(exc, "code", "ACP_SPAWN_FAILED"),
+                    "message": str(exc),
+                },
+            }
+    return results

@@ -42,6 +42,7 @@ __all__ = [
     "MIN_GIT",
     "MIN_NODE",
     "Check",
+    "probe_initialize",
     "run_doctor",
     "run_doctor_async",
 ]
@@ -94,6 +95,27 @@ def _version(text: str) -> tuple[int, ...]:
             if numbers:
                 return tuple(numbers)
     raise ValueError(f"no version number in {text.strip()!r}")
+
+
+async def probe_initialize(
+    profile: Profile, parent_env: Mapping[str, str], workspace: Path, *, timeout: float = 30.0,
+) -> InitInfo | None:
+    """Initialize an installed agent, without authentication, sessions or prompts."""
+    env = providers.build_child_env(profile, parent_env, task_tmp=workspace / "tmp")
+    (workspace / "tmp").mkdir(parents=True, exist_ok=True)
+    worker = AcpWorker(
+        command=profile.command,
+        env=env,
+        cwd=workspace,
+        stderr_path=workspace / "agent.stderr",
+        policy=(
+            AgyPermissionPolicy(allow_writes=False, workspace=workspace)
+            if profile.family == "agy" else PermissionPolicy(allow_writes=False)
+        ),
+        handshake_timeout=timeout,
+    )
+    async with worker as agent:
+        return agent.init
 
 
 class _Doctor:
@@ -429,21 +451,7 @@ class _Doctor:
 
     async def _init_probe(self, profile: Profile, workspace: Path) -> InitInfo | None:
         """Start the agent, keep what it said about itself at ``initialize``, and stop it."""
-        env = providers.build_child_env(profile, self.parent_env, task_tmp=workspace / "tmp")
-        (workspace / "tmp").mkdir(parents=True, exist_ok=True)
-        worker = AcpWorker(
-            command=profile.command,
-            env=env,
-            cwd=workspace,
-            stderr_path=workspace / "agent.stderr",
-            policy=(
-                AgyPermissionPolicy(allow_writes=False, workspace=workspace)
-                if profile.family == "agy" else PermissionPolicy(allow_writes=False)
-            ),
-            handshake_timeout=_TIMEOUT,
-        )
-        async with worker as agent:
-            return agent.init
+        return await probe_initialize(profile, self.parent_env, workspace, timeout=_TIMEOUT)
 
     def child_envs(self) -> None:
         for profile_id, profile in sorted(self.profiles.items()):

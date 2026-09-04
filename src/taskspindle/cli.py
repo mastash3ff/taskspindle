@@ -104,6 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     discover.add_argument(
         "--all", action="store_true", help="also list registry agents that are not installed"
     )
+    discover.add_argument(
+        "--probe", action="store_true", help="initialize installed agents without sending prompts"
+    )
     discover.add_argument("--json", action="store_true", help="print the findings as JSON")
 
     web = sub.add_parser("web", help="serve the read-only dashboard on localhost")
@@ -144,7 +147,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "usage":
         return _usage(args.since, args.provider, args.group_by, as_json=args.json)
     if args.command == "discover":
-        return _discover(args.registry, refresh=args.refresh, show_all=args.all, as_json=args.json)
+        return _discover(args.registry, refresh=args.refresh, show_all=args.all, as_json=args.json,
+                         probe=args.probe)
     if args.command == "web":
         return _web(args.host, args.port, open_browser=args.open)
     return _accept(args.task)
@@ -381,7 +385,9 @@ def _table(columns: list[str], rows: list[list[str]]) -> None:
 # -- discover ------------------------------------------------------------------------
 
 
-def _discover(registry: str | None, *, refresh: bool, show_all: bool, as_json: bool) -> int:
+def _discover(
+    registry: str | None, *, refresh: bool, show_all: bool, as_json: bool, probe: bool = False,
+) -> int:
     from . import discover as discover_module
 
     paths = resolve_paths()
@@ -395,6 +401,12 @@ def _discover(registry: str | None, *, refresh: bool, show_all: bool, as_json: b
         return 1
     found = discover_module.detect(agents)
     found_ids = {item.agent.id for item in found}
+    probes: dict[str, dict[str, Any]] = {}
+    if probe:
+        import asyncio
+
+        probes = asyncio.run(discover_module.probe(found))
+    exit_code = int(any(not result["ok"] for result in probes.values()))
     if as_json:
         print(
             json.dumps(
@@ -409,6 +421,7 @@ def _discover(registry: str | None, *, refresh: bool, show_all: bool, as_json: b
                             "command": list(item.command),
                             "first_class": discover_module.first_class_match(item.agent),
                             "profile_id": discover_module.profile_id(item.agent),
+                            **({"probe": probes[item.agent.id]} if probe else {}),
                         }
                         for item in found
                     ],
@@ -417,8 +430,13 @@ def _discover(registry: str | None, *, refresh: bool, show_all: bool, as_json: b
                 indent=2,
             )
         )
-        return 0
+        return exit_code
     print(f"registry: {source} ({origin}, {len(agents)} agents with a local launch form)")
+    for agent_id, result in probes.items():
+        if result["ok"]:
+            print(f"{agent_id}: ACP initialize passed ({json.dumps(result['agent_info'])})")
+        else:
+            print(f"{agent_id}: ACP initialize failed: {result['error']['message']}")
     proposals = [item for item in found if discover_module.first_class_match(item.agent) is None]
     for item in found:
         first = discover_module.first_class_match(item.agent)
@@ -435,7 +453,7 @@ def _discover(registry: str | None, *, refresh: bool, show_all: bool, as_json: b
         missing = [agent.id for agent in agents if agent.id not in found_ids]
         print()
         print(f"not installed: {', '.join(missing) or 'none'}")
-    return 0
+    return exit_code
 
 
 # -- web -----------------------------------------------------------------------------
