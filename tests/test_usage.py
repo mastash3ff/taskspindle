@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from taskspindle import usage
+from taskspindle.acp_client import TurnCapture, TurnResult
 from taskspindle.models import AuthMode, CheckRecord, Mode, StartTaskRequest, TaskState
 from taskspindle.providers import Profile
 from taskspindle.service import create_task
@@ -117,6 +118,28 @@ def test_parse_since_accepts_shorthand_and_iso() -> None:
     assert usage.parse_since("2030-01-01T00:00:00Z", NOW) == "2030-01-01T00:00:00.000000Z"
     with pytest.raises(ValueError, match="since"):
         usage.parse_since("yesterday", NOW)
+
+
+@pytest.mark.parametrize("session_model", ["claude-opus-5", None])
+def test_claude_configuration_model_precedes_the_session_file(
+    tmp_path: Path, monkeypatch, session_model: str | None
+) -> None:
+    reads = []
+
+    def file_model(path: Path) -> str:
+        reads.append(path)
+        return "claude-sonnet-5"
+
+    monkeypatch.setattr(usage, "claude_session_model", file_model)
+    collected = usage.collect(
+        TurnResult("end_turn", "OK", TurnCapture(), usage={"input_tokens": 100}),
+        profile=Profile(id="claude", auth="oauth", command=("claude",), first_class=True),
+        cwd=tmp_path, session_id="session-1", home=tmp_path, duration_ms=10,
+        session_model=session_model,
+    )
+    assert collected.model == (session_model or "claude-sonnet-5")
+    assert collected.usage.model == collected.model
+    assert bool(reads) is (session_model is None)
 
 
 def _seed(store: Store, provider: str, mode: Mode, *, state: TaskState, ms: int, tokens: int) -> str:

@@ -135,13 +135,13 @@ class FakeAgent:
                 if name not in ("additional_directories", "mcp_servers")
             }
             Path(capture_meta_to).write_text(json.dumps(meta), encoding="utf-8")
-        return NewSessionResponse(session_id=session_id)
+        return NewSessionResponse(session_id=session_id, config_options=self.script.get("config_options"))
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> LoadSessionResponse:
         self._cwds[session_id] = Path(cwd)
         for index in range(int(self.script.get("replay_count", 0))):
             await self._emit(session_id, f"replayed {index}")
-        return LoadSessionResponse()
+        return LoadSessionResponse(config_options=self.script.get("config_options"))
 
     async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> SetSessionModeResponse:
         if self.script.get("refuse_mode"):

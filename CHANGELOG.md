@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Claude model metadata.** Canonical model ids returned by ACP session creation or loading
+  are preferred over the session file. Aliases and display names retain the existing file fallback.
 - **Provider availability, reported rather than acted on.** A turn a provider refuses for a
   usage, rate, credit or login reason is classified (`PROVIDER_THROTTLED`, `PROVIDER_AUTH_EXPIRED`)
   with the window and reset time the provider gave, recorded on the task, as a `PROVIDER_LIMIT`

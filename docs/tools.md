@@ -198,7 +198,9 @@ you.
 `attribution` is how metered work stays visible: an `api_key` profile shows `auth_mode: "api_key"`
 and the gateway's host — never its URL path, never the token. `reported_model` is the model that
 actually answered, when the agent said (Grok says so on the wire; for Claude it is read from the
-adapter's own session record), and `agent` is the adapter's name and version.
+adapter's own session record), and `agent` is the adapter's name and version. Claude's canonical
+model id from ACP session configuration is preferred over that file; unresolved aliases or
+display names such as a `default` description still use the bounded file-read fallback.
 
 `warnings` is the task's warning list, as `task_status` shows it. `quota_warnings` is every
 usage, rate, credit or login refusal a turn of this task ran into, each as

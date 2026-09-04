@@ -95,6 +95,32 @@ async def test_meta_reaches_the_agent_through_new_session(tmp_path: Path) -> Non
     assert json.loads(meta_file.read_text(encoding="utf-8")) == session_options(profile)
 
 
+@pytest.mark.parametrize(
+    ("selected", "description", "expected"),
+    [
+        ("claude-opus-5", "Opus 5", "claude-opus-5"),
+        ("default", "claude-opus-5", "claude-opus-5"),
+        ("default", "Opus 5", None),
+    ],
+)
+async def test_session_model_comes_from_configuration_on_create_and_load(
+    tmp_path: Path, selected: str, description: str, expected: str | None
+) -> None:
+    script = {
+        "load_session": True,
+        "config_options": [{
+            "id": "model", "name": "Model", "type": "select", "currentValue": selected,
+            "options": [{"value": selected, "name": "Selected model", "description": description}],
+        }],
+    }
+    async with running_agent(tmp_path, script) as worker:
+        session_id = await worker.new_session()
+        assert worker.session_model == expected
+        worker.session_model = "stale-model"
+        await worker.load_session(session_id)
+        assert worker.session_model == expected
+
+
 # -- permission gate -----------------------------------------------------------------------------
 
 

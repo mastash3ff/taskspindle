@@ -729,6 +729,24 @@ async def test_a_grok_style_turn_completed_update_is_recorded_with_its_model(
     assert recorded["cost_estimate_usd"] is None
 
 
+async def test_session_configuration_model_reaches_turn_attribution(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    script_path = script({
+        "usage": {"total_tokens": 110, "input_tokens": 100, "output_tokens": 10},
+        "config_options": [{
+            "id": "model", "name": "Model", "type": "select", "currentValue": "claude-opus-5",
+            "options": [{"value": "claude-opus-5", "name": "Opus 5"}],
+        }],
+    })
+    assert await run_task(store, paths, task, script_path) is TaskState.COMPLETED
+    assert store.get_task(task.id).reported_model == "claude-opus-5"
+    turn = store.list_turns(task.id)[-1]
+    assert turn["attribution"]["reported_model"] == "claude-opus-5"
+    assert store.get_turn_usage(turn["id"])["model"] == "claude-opus-5"
+
+
 # -- entry conditions --------------------------------------------------------------------------
 
 

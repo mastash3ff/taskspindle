@@ -256,6 +256,7 @@ class _Run:
     agent_info: dict[str, Any] = field(default_factory=dict)
     #: The model that actually answered, when the wire or the session file said.
     reported_model: str | None = None
+    session_model: str | None = None
     usage: usage.TurnUsage | None = None
     prompt_started_at: str | None = None
     prompt_ended_at: str | None = None
@@ -615,6 +616,9 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
         await agent.load_session(run.task.session_id, **options)
         run.session_id = run.task.session_id
     await _apply_session_mode(run, agent)
+    run.session_model = agent.session_model
+    if run.session_model is not None:
+        run.log.write(f"session model from ACP: {run.session_model}")
 
 
 async def _apply_session_mode(run: _Run, agent: AcpWorker) -> None:
@@ -754,6 +758,7 @@ async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: Tu
         home=home,
         duration_ms=duration_ms,
         started_at=run.prompt_started_at,
+        session_model=run.session_model,
     )
     model = collected.model
     session_path = usage.claude_session_path(profile, workspace, run.session_id, home)

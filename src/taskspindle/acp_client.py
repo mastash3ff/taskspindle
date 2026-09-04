@@ -62,6 +62,7 @@ __all__ = [
 _CLIENT_INFO = Implementation(name="taskspindle", version=taskspindle.__version__)
 _STREAM_LIMIT = 16 * 1024 * 1024
 _CANCEL_TIMEOUT = 2.0
+_CLAUDE_MODEL_ID = re.compile(r"claude-[A-Za-z0-9][A-Za-z0-9._:\[\]-]*")
 
 #: Whole words in a tool-call title that mean the agent is trying to spawn helpers of its own.
 #: Whole words only: ``Edit src/tasks.py`` and ``Run pytest tests/test_task.py`` are ordinary work.
@@ -297,6 +298,8 @@ class AcpWorker:
         self.replay_update_count = 0
         #: The session mode last set through :meth:`set_mode`, if any.
         self.mode: str | None = None
+        #: A canonical Claude model from the session configuration, when the adapter supplies one.
+        self.session_model: str | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------
 
@@ -425,6 +428,7 @@ class AcpWorker:
     async def new_session(self, **session_kwargs: Any) -> str:
         """Create a session in the worker's cwd. Extra kwargs travel as the request's ``_meta``."""
         response = await self._connection().new_session(cwd=str(self._cwd), **session_kwargs)
+        self.session_model = _claude_config_model(response)
         self._sessions.append(response.session_id)
         return response.session_id
 
@@ -439,9 +443,10 @@ class AcpWorker:
         replay = TurnCapture()
         self._capture = replay
         try:
-            await self._connection().load_session(
+            response = await self._connection().load_session(
                 cwd=str(self._cwd), session_id=session_id, **session_kwargs
             )
+            self.session_model = _claude_config_model(response)
         finally:
             self._capture = None
         self.replay_update_count = replay.raw_update_count
@@ -540,6 +545,26 @@ def _note_model_id(capture: TurnCapture, update: Mapping[str, Any], params: Any)
         model_id = meta.get("modelId") if isinstance(meta, dict) else None
         if isinstance(model_id, str) and model_id and model_id not in capture.model_ids:
             capture.model_ids.append(model_id)
+
+
+def _claude_config_model(response: Any) -> str | None:
+    """Read canonical ids only: the adapter may describe ``default`` with a display name."""
+    for option in getattr(response, "config_options", None) or []:
+        if getattr(option, "id", None) != "model":
+            continue
+        selected = getattr(option, "current_value", None)
+        if isinstance(selected, str) and _CLAUDE_MODEL_ID.fullmatch(selected):
+            return selected
+        if selected == "default":
+            for choice in getattr(option, "options", []):
+                description = getattr(choice, "description", None)
+                if (
+                    getattr(choice, "value", None) == selected
+                    and isinstance(description, str)
+                    and _CLAUDE_MODEL_ID.fullmatch(description)
+                ):
+                    return description
+    return None
 
 
 def _usage_data(usage: Any) -> dict[str, Any] | None:

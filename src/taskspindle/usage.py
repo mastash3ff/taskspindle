@@ -357,10 +357,12 @@ def collect(
     home: Path,
     duration_ms: int | None,
     started_at: str | None = None,
+    session_model: str | None = None,
 ) -> Collected:
     """What this turn cost and which model answered, from the wire first and a file last."""
     capture = result.capture
-    model: str | None = capture.model_ids[0] if capture.model_ids else None
+    # Session configuration is a snapshot; per-turn wire IDs override it if the model changes.
+    model: str | None = capture.model_ids[0] if capture.model_ids else session_model
     session_path = claude_session_path(profile, cwd, session_id, home)
     if session_path is not None and model is None:
         model = claude_session_model(session_path)
