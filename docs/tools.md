@@ -43,7 +43,7 @@ No parameters. What you need to compose a valid request, and nothing about any t
                 "windows": [{"window": "five_hour", "status": "rejected", "used_percent": 100.0,
                              "resets_at": "2026-09-04T21:00:00Z", "source": "throttle_error"}]}],
  "modes": ["consult", "review", "implement"],
- "versions": {"taskspindle": "0.1.0", "api": 1, "schema": 2,
+ "versions": {"taskspindle": "0.2.0", "api": 1, "schema": 2,
               "adapter_package": "@agentclientprotocol/claude-agent-acp",
               "adapter_version": "0.70.0", "acp": "0.12.0"},
  "limits": {"timeout_s": [60, 14400], "diff_page_bytes": 16384, "diff_page_max_bytes": 262144,
@@ -379,8 +379,10 @@ can use any more — is deleted outright and the cleanup completes.
 | `group_by` | `provider`\|`day`\|`provider_day`\|`model`\|`mode`\|`repository_id` | `provider` | how the token counts are rolled up |
 
 `repository_id` combines providers within each repository; repository-free turns share a `null`
-group, displayed as `-` in tables. Tables show stable repository IDs, not paths. Individual
-`task_result.usage` entries also include `repository_id`. Existing provider and time filters apply.
+group. Buckets retain that stable ID and add `repository_path` (the registered display path or
+null). Tables display the path when available, otherwise the ID, and use "No repository" for
+the null group. Labels never change grouping identity. Individual `task_result.usage` entries
+also include `repository_id`. Existing provider and time filters apply.
 
 Returns:
 

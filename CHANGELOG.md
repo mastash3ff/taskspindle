@@ -1,6 +1,21 @@
 # Changelog
 
 ## 0.2.0
+## v0.2.0
+
+Prepared release candidate, not published. Publication and activation remain on hold.
+
+- **Search and compare.** Dashboard search matches literal task ID/prompt text, including
+  Unicode case folding. Candidate diffs sit alongside their reviews, finding links retain focus
+  through polling, and stale candidate requests are rejected rather than paired with a new diff.
+- **Repository labels.** Usage summaries display registered paths while retaining stable IDs
+  in JSON and using an ID fallback when a path is unavailable.
+- **Discovery probes.** `discover --probe` optionally initializes installed ACP agents without
+  authenticating or generating a turn. Per-agent results include useful timeout errors; a failed
+  probe does not prevent the remaining probes from running.
+- **Known limitation.** Grok continuation succeeded with per-turn usage in the recorded
+  three-turn verification, but an intermittent direct ACP reload timeout remains unexplained.
+  Publication and activation are held until that reliability issue is resolved.
 
 - **Grok read-only turns use the `read-only` sandbox.** `strict` allowed writes inside the
   worktree and, on WSL, denied the `/etc/resolv.conf` symlink target so the sandboxed agent's
