@@ -179,3 +179,25 @@ def test_worker_and_accept_delegate_to_the_unit_entry_points(
     assert cli.main(["worker", "--task", "ts_abc"]) == 0
     assert cli.main(["accept", "--task", "ts_abc"]) == 3
     assert seen == [("worker", ["--task", "ts_abc"]), ("accept", ["--task", "ts_abc"])]
+
+
+def test_web_parses_defaults_and_calls_serve(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from taskspindle import web
+
+    seen: dict[str, Any] = {}
+
+    def fake_serve(paths: Any, profiles: Any, *, host: str, port: int, open_browser: bool) -> int:
+        seen["host"] = host
+        seen["port"] = port
+        seen["open_browser"] = open_browser
+        seen["profiles"] = sorted(profiles)
+        return 0
+
+    monkeypatch.setattr(web, "serve", fake_serve)
+
+    assert cli.main(["web"]) == 0
+
+    assert seen["host"] == "127.0.0.1"
+    assert seen["port"] == 8765
+    assert seen["open_browser"] is False
+    assert seen["profiles"] == ["claude", "grok"]
