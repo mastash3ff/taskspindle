@@ -73,26 +73,23 @@ FORBIDDEN_ENV_PATTERNS: tuple[str, ...] = (
     *_FORBIDDEN_EXACT,
 )
 
-#: Written next to the state dir and pointed at by ``GROK_CONFIG``. Keys verified against the
-#: embedded docs of the Grok 1.0.13 binary.
-GROK_OVERLAY_TOML = """[compat.claude]
-hooks = false
-skills = false
-mcps = false
-
-[compat.cursor]
-hooks = false
-skills = false
-mcps = false
-
-[compat.codex]
-hooks = false
-skills = false
-mcps = false
-
+#: Written next to the state dir and pointed at by ``GROK_CONFIG``. Grok 1.0.13 does not apply
+#: ``[compat.*]`` keys from a ``GROK_CONFIG`` overlay (verified with ``grok inspect``), so the
+#: compatibility sources are switched off through :data:`GROK_COMPAT_ENV` instead; the overlay only
+#: backs up the ``--no-subagents`` launch flag.
+GROK_OVERLAY_TOML = """# Written by TaskSpindle. Compatibility sources are disabled through the
+# GROK_*_ENABLED environment variables; this overlay only backs up --no-subagents.
 [subagents]
 enabled = false
 """
+
+#: One switch per vendor source Grok would otherwise import (verified with ``grok inspect`` on
+#: Grok 1.0.13: every one of these reports ``OFF (env)``).
+GROK_COMPAT_ENV: dict[str, str] = {
+    f"GROK_{vendor}_{source}_ENABLED": "false"
+    for vendor in ("CLAUDE", "CURSOR", "CODEX")
+    for source in ("SKILLS", "RULES", "AGENTS", "MCPS", "HOOKS", "SESSIONS")
+}
 
 _GROK_DEFAULT_MODEL = "grok-4.6"
 _GROK_DEFAULT_EFFORT = "medium"
@@ -192,15 +189,17 @@ def write_grok_overlay(state_dir: Path) -> Path:
 
 
 def _grok_command(model: str, effort: str) -> tuple[str, ...]:
+    # ``--no-subagents`` is a top-level ``grok`` flag; ``grok agent`` itself only accepts
+    # ``--model``, ``--reasoning-effort`` and ``--no-leader`` (Grok 1.0.13 rejects it after ``agent``).
     return (
         "grok",
+        "--no-subagents",
         "agent",
         "--model",
         model,
         "--reasoning-effort",
         effort,
         "--no-leader",
-        "--no-subagents",
         "stdio",
     )
 
@@ -215,8 +214,7 @@ def builtin_profiles(runtime_dir: Path, *, home: Path, state_dir: Path) -> dict[
     claude_env = {"CLAUDE_CONFIG_DIR": str(home / ".claude")}
     grok_env = {
         "GROK_DISABLE_API_KEY_AUTH": "true",
-        "GROK_CLAUDE_SKILLS_ENABLED": "false",
-        "GROK_CLAUDE_MCPS_ENABLED": "false",
+        **GROK_COMPAT_ENV,
         "GROK_CONFIG": str(grok_overlay_path(state_dir)),
     }
     return {

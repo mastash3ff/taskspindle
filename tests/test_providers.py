@@ -61,16 +61,30 @@ def _builtins(tmp_path: Path) -> dict[str, Profile]:
 def test_grok_argv_denies_leaders_and_subagents(tmp_path: Path) -> None:
     grok = _builtins(tmp_path)["grok"]
 
-    assert grok.command[:2] == ("grok", "agent")
+    # ``--no-subagents`` is a top-level flag and must precede the ``agent`` subcommand: Grok 1.0.13
+    # rejects it after ``agent``.
+    assert grok.command[:3] == ("grok", "--no-subagents", "agent")
     assert grok.command[-1] == "stdio"
-    assert "--no-subagents" in grok.command
     assert "--no-leader" in grok.command
     assert "--model" in grok.command
     assert grok.model == "grok-4.6"
     assert grok.effort == "medium"
 
 
-def test_grok_overlay_is_private_and_disables_extensions(tmp_path: Path) -> None:
+def test_grok_env_switches_off_every_vendor_compatibility_source(tmp_path: Path) -> None:
+    grok = _builtins(tmp_path)["grok"]
+
+    expected = {
+        f"GROK_{vendor}_{source}_ENABLED"
+        for vendor in ("CLAUDE", "CURSOR", "CODEX")
+        for source in ("SKILLS", "RULES", "AGENTS", "MCPS", "HOOKS", "SESSIONS")
+    }
+    assert expected <= set(grok.env)
+    assert all(grok.env[name] == "false" for name in expected)
+    assert grok.env["GROK_DISABLE_API_KEY_AUTH"] == "true"
+
+
+def test_grok_overlay_is_private_and_backs_up_the_subagent_flag(tmp_path: Path) -> None:
     path = write_grok_overlay(tmp_path / "state")
     first = path.read_text(encoding="utf-8")
     # A rewrite is a no-op in effect.
@@ -78,8 +92,8 @@ def test_grok_overlay_is_private_and_disables_extensions(tmp_path: Path) -> None
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert "[subagents]\nenabled = false" in first
-    assert first.count("hooks = false") == 3
-    assert first.count("mcps = false") == 3
+    # Grok ignores [compat.*] keys in a GROK_CONFIG overlay; they live in the environment instead.
+    assert "[compat." not in first
 
 
 def test_claude_profile_points_at_the_pinned_adapter(tmp_path: Path) -> None:
@@ -215,13 +229,13 @@ def test_grok_based_profile_substitutes_model_and_effort(tmp_path: Path) -> None
 
     assert profile.command == (
         "grok",
+        "--no-subagents",
         "agent",
         "--model",
         "grok-4.6-fast",
         "--reasoning-effort",
         "low",
         "--no-leader",
-        "--no-subagents",
         "stdio",
     )
     assert profile.env["GROK_DISABLE_API_KEY_AUTH"] == "true"

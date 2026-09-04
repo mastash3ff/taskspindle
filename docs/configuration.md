@@ -14,9 +14,12 @@ Two profiles ship built in, live-tested, and OAuth-only:
   installs, launched with `CLAUDE_CONFIG_DIR` pointed at `~/.claude`. Its session options deny the
   adapter every settings source, every MCP server and its own delegation tools (`Agent`, `Task`,
   `TeamCreate`, `SendMessage`): a TaskSpindle worker is a leaf, never a parent.
-- **`grok`** — `grok agent --model … --reasoning-effort … --no-leader --no-subagents stdio`, with
-  `GROK_CONFIG` pointed at an overlay TaskSpindle writes that turns off hooks, skills, MCP servers
-  and subagents, and `GROK_DISABLE_API_KEY_AUTH=true`.
+- **`grok`** — `grok --no-subagents agent --model … --reasoning-effort … --no-leader stdio`
+  (`--no-subagents` is a top-level flag and must come before `agent`). Every vendor
+  compatibility source Grok would import (Claude, Cursor and Codex skills, rules, agents, MCP
+  servers, hooks and sessions) is switched off through the `GROK_<VENDOR>_<SOURCE>_ENABLED=false`
+  environment variables, `GROK_DISABLE_API_KEY_AUTH=true` is set, and `GROK_CONFIG` points at a small
+  overlay TaskSpindle writes that backs up the subagent denial.
 
 Their ids are reserved. You cannot redefine them in `config.toml`.
 
