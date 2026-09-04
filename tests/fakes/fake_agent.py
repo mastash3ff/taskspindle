@@ -11,6 +11,7 @@ Script keys::
      "response": "text emitted as two agent message chunks",
      "write": {"path": "rel/path", "content": "..."},   # asks permission (kind "edit") first
      "write_abs": {"path": "/abs/path", "content": "..."},  # writes with no permission prompt
+     "tool_updates": [],                  # raw session updates without permission callbacks
      "delegate": true,                     # asks permission for an "Agent: spawn subagent" call
      "block_seconds": 30,                  # sleep before responding; cancel -> "cancelled"
      "fail_on_cancel": true,               # ... unless this is set: cancel -> RequestError
@@ -218,6 +219,10 @@ class FakeAgent:
         write = script.get("write")
         if write:
             await self._maybe_write(session_id, write)
+        for update in script.get("tool_updates", []):
+            await self.conn._conn.send_notification(
+                "session/update", {"sessionId": session_id, "update": update}
+            )
         if script.get("delegate"):
             await self._attempt_delegation(session_id)
         if script.get("ask_switch_mode"):

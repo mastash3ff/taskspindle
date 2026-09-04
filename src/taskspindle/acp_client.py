@@ -177,6 +177,7 @@ class TurnCapture:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     permission_events: list[dict[str, Any]] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
+    observed_delegation_ids: set[str] = field(default_factory=set)
     raw_update_count: int = 0
     #: Every ``usage_update`` the agent sent: context occupancy, and whatever it put in ``_meta``.
     usage_updates: list[dict[str, Any]] = field(default_factory=list)
@@ -393,6 +394,17 @@ class AcpWorker:
         elif kind == "agent_thought_chunk":
             capture.thoughts += 1
         elif kind in ("tool_call", "tool_call_update"):
+            # An adapter can deny a disabled tool before requesting client permission.
+            # Its initial tool_call still names the attempted tool; later titles are prose.
+            if (
+                kind == "tool_call"
+                and update.get("kind") not in _DELEGATION_EXEMPT_KINDS
+                and _DELEGATION_TOOLS.fullmatch(str(update.get("title") or "").strip())
+                and isinstance(update.get("toolCallId"), str)
+                and update["toolCallId"] not in capture.observed_delegation_ids
+            ):
+                capture.observed_delegation_ids.add(update["toolCallId"])
+                capture.violations.append(DELEGATION_ATTEMPT)
             capture.tool_calls.append(
                 {
                     "update": kind,
@@ -470,7 +482,11 @@ class AcpWorker:
                 "violation": violation,
             }
         )
-        if violation is not None:
+        already_observed = (
+            violation == DELEGATION_ATTEMPT
+            and getattr(tool_call, "tool_call_id", None) in capture.observed_delegation_ids
+        )
+        if violation is not None and not already_observed:
             capture.violations.append(violation)
 
     # -- sessions ----------------------------------------------------------------------------

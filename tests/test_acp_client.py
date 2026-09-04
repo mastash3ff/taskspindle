@@ -386,3 +386,25 @@ async def test_spawning_a_missing_binary_fails_cleanly(tmp_path: Path) -> None:
             pass
 
     assert excinfo.value.code == "ACP_SPAWN_FAILED"
+
+
+@pytest.mark.parametrize(("title", "kind", "expected"), [
+    ("Task", "think", ["DELEGATION_ATTEMPT"]),
+    ("Read agent configuration", "read", []),
+    ("Task queue smoke check", "execute", []),
+])
+async def test_adapter_tool_denial_without_permission_callback(
+    tmp_path: Path, title: str, kind: str, expected: list[str],
+) -> None:
+    updates = [
+        {"sessionUpdate": "tool_call", "toolCallId": "denied", "title": title,
+         "kind": kind, "status": "pending"},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "denied",
+         "title": "Inspect sample.py", "kind": kind},
+        {"sessionUpdate": "tool_call_update", "toolCallId": "denied", "status": "failed"},
+    ]
+    async with running_agent(tmp_path, {"tool_updates": updates}, allow_writes=True) as worker:
+        session = await worker.new_session()
+        result = await worker.prompt(session, "attempt", timeout=10)
+    assert result.capture.permission_events == []
+    assert result.capture.violations == expected

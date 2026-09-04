@@ -29,6 +29,12 @@
   responses, usage and session identifiers. A failed continuation never creates a replacement
   conversation. Database schema 3 adds resolved model, effort and provider family; retain a
   consistent schema-2 backup before activating this code for rollback to an older runtime.
+- **Adapter-side delegation denial.** Initial canonical delegation tool calls now produce
+  `DELEGATION_ATTEMPT` even when the Claude adapter refuses them before requesting client
+  permission. A live Claude implement on adapter 0.70.0 attempted the disabled `Task` tool,
+  received its denial, and recorded the warning without creating a subagent; its small candidate
+  passed an independent Grok review and was accepted in a throwaway repository.
+
 - **Grok model attribution.** New turns prefer the wire model ID, then the backend `modelUsage`
   key, then the profile model; attribution and usage agree while raw telemetry stays intact.
 - **Usage by repository.** `repository_id` grouping is available in MCP, the CLI and dashboard,
