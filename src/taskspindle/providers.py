@@ -35,11 +35,13 @@ __all__ = [
     "env_violations",
     "grok_oauth_evidence",
     "grok_overlay_path",
+    "launch_command",
     "load_profiles",
     "opposite_provider",
     "pinned_node",
     "profile_for_task",
     "reviewer_independent",
+    "session_mode",
     "session_options",
     "write_grok_overlay",
 ]
@@ -94,6 +96,16 @@ GROK_COMPAT_ENV: dict[str, str] = {
 
 _GROK_DEFAULT_MODEL = "grok-4.6"
 _GROK_DEFAULT_EFFORT = "medium"
+
+#: Top-level Grok flags added for a turn that must not write. Verified against Grok 1.0.13's ACP
+#: endpoint: ``--sandbox strict`` is the one that makes a write go through ``session/request_permission``
+#: (where TaskSpindle refuses it); ``--permission-mode plan`` and ``--deny`` had no effect there.
+GROK_READ_ONLY_FLAGS: tuple[str, ...] = ("--sandbox", "strict")
+
+#: The ACP session mode a Claude-family worker is put in, per task mode. ``plan`` refuses every
+#: write and execution; ``default`` sends each one through ``session/request_permission`` so the
+#: permission gate -- not the user's own ``permissions.defaultMode`` -- decides.
+CLAUDE_SESSION_MODES: dict[str, str] = {"consult": "plan", "review": "plan", "implement": "default"}
 
 
 class ProfileError(Exception):
@@ -380,6 +392,30 @@ def profile_for_task(
             f"provider {provider_id!r} bills per token; allow_metered was not set",
         )
     return profile
+
+
+def launch_command(profile: Profile, mode: str) -> tuple[str, ...]:
+    """The argv a worker launches ``profile`` with for a task in ``mode``.
+
+    A Grok-family profile that must not write is launched inside Grok's strict sandbox, which is
+    what turns its file writes into permission requests. Every other case is the profile's own
+    command, unchanged.
+    """
+    command = profile.command
+    if profile.family != "grok" or mode == "implement" or not command:
+        return command
+    try:
+        index = command.index("agent")
+    except ValueError:
+        return command
+    return (*command[:index], *GROK_READ_ONLY_FLAGS, *command[index:])
+
+
+def session_mode(profile: Profile, mode: str) -> str | None:
+    """The ACP session mode to set for ``profile`` in task ``mode``, or None to leave it alone."""
+    if profile.family != "claude":
+        return None
+    return CLAUDE_SESSION_MODES.get(mode)
 
 
 def opposite_provider(profile_id: str) -> str | None:

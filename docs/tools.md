@@ -407,6 +407,13 @@ A `review` task is asked for exactly one JSON object, and `REVIEW_MALFORMED` is 
 not produce one. Fenced or surrounded by prose is fine; the parser takes the innermost JSON object
 it can find.
 
+The reviewer is given the change itself: a candidate review's prompt carries the subject's
+recorded diff, and a snapshot review's carries `git diff <expected_head> <snapshot>`, cut at 96 KiB
+with a note when it is longer. The worktree is checked out at the subject as well, so files can be
+read in full, but a reviewer never needs to run git — which matters, because it cannot: a Claude
+review runs in the adapter's `plan` session mode and a Grok review inside Grok's strict sandbox,
+where a write or a shell command becomes a permission request TaskSpindle refuses.
+
 ```json
 {"verdict": "PASS",
  "summary": "one paragraph, in your own words",
@@ -463,6 +470,7 @@ invalidates the review: get a new one.
 | `MANUAL_RECOVERY_REQUIRED` | recovery will not guess; see [recovery.md](recovery.md) |
 | `UNIT_START_FAILED` | systemd would not start the unit (retryable) |
 | `DIRTY_OVERLAP` | in `details.code`: the repository is dirty inside the task's own prefixes |
+| `MODE_UNAVAILABLE` | on a FAILED task: the agent refused the session mode its task needs, so the turn did not run |
 | `PROVIDER_THROTTLED` | on a FAILED task: the provider refused the turn for a usage, rate or credit limit |
 | `PROVIDER_AUTH_EXPIRED` | on a FAILED task: the provider refused the turn because the seat is logged out or not allowed |
 | `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and the reset has not passed |

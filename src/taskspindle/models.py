@@ -143,6 +143,7 @@ class EventKind(StrEnum):
     SCOPE_VIOLATION = "SCOPE_VIOLATION"
     READ_ONLY_VIOLATION = "READ_ONLY_VIOLATION"
     DELEGATION_ATTEMPT = "DELEGATION_ATTEMPT"
+    MODE_SWITCH_ATTEMPT = "MODE_SWITCH_ATTEMPT"
     RECOVERY = "RECOVERY"
     WARNING = "WARNING"
     #: A provider refused a turn because of a quota, rate or subscription limit.

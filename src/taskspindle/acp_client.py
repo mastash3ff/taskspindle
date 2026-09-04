@@ -76,6 +76,8 @@ _WRITE_KINDS = ("edit", "delete", "move", "execute")
 
 READ_ONLY_VIOLATION = "READ_ONLY_VIOLATION"
 DELEGATION_ATTEMPT = "DELEGATION_ATTEMPT"
+#: The agent asked to leave the session mode it was put in (Claude's "Ready to code?" prompt).
+MODE_SWITCH_ATTEMPT = "MODE_SWITCH_ATTEMPT"
 
 
 class AcpError(Exception):
@@ -140,6 +142,9 @@ class PermissionPolicy:
         kind = getattr(tool_call, "kind", None) or ""
         title = (getattr(tool_call, "title", None) or "").strip()
 
+        if kind == "switch_mode":
+            # The mode was chosen for the task; a worker does not renegotiate it.
+            return self._deny(options), MODE_SWITCH_ATTEMPT
         if kind not in _DELEGATION_EXEMPT_KINDS and _is_delegation(title):
             return self._deny(options), DELEGATION_ATTEMPT
         if not self.allow_writes and kind in _WRITE_KINDS:
@@ -290,6 +295,8 @@ class AcpWorker:
         self.init: InitInfo | None = None
         #: How many ``session/update`` notifications the last ``load_session`` replayed.
         self.replay_update_count = 0
+        #: The session mode last set through :meth:`set_mode`, if any.
+        self.mode: str | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------
 
@@ -439,6 +446,18 @@ class AcpWorker:
             self._capture = None
         self.replay_update_count = replay.raw_update_count
         self._sessions.append(session_id)
+
+    async def set_mode(self, session_id: str, mode_id: str) -> None:
+        """Put the session in ``mode_id`` (ACP ``session/set_mode``); the agent must offer it."""
+        try:
+            await self._connection().set_session_mode(session_id=session_id, mode_id=mode_id)
+        except Exception as exc:
+            raise AcpError(
+                "MODE_UNAVAILABLE",
+                f"the agent refused session mode {mode_id!r}: {exc}",
+                cause=error_cause(exc),
+            ) from exc
+        self.mode = mode_id
 
     async def prompt(self, session_id: str, text: str, *, timeout: float) -> TurnResult:
         """Send one turn and capture everything it produced."""

@@ -20,6 +20,10 @@ produced.
 - **Recovery that does not guess.** A worker that vanished leaves an `INTERRUPTED` task with its
   worktree and session intact. A situation TaskSpindle cannot settle becomes
   `RECOVERY_AMBIGUOUS` and waits for you.
+- **Read-only means read-only.** A consult or review runs a Claude worker in the adapter's `plan`
+  session mode and a Grok worker in its strict sandbox, so a write or a shell command becomes a
+  permission request TaskSpindle refuses; an implement runs Claude in `default` mode so every
+  write and command is decided by TaskSpindle's own gate, not by your Claude settings.
 - **Credentials stay where they are.** The environment each agent sees is built by allowlist, not
   by filtering yours. TaskSpindle never logs in, never copies a credential and never edits your
   Codex configuration.
@@ -78,7 +82,7 @@ moved underneath you is refused rather than clobbered.
 | [install.md](docs/install.md) | requirements, installing, XDG locations, uninstalling |
 | [codex-registration.md](docs/codex-registration.md) | registering the server, the timeouts, granting a repository |
 | [tools.md](docs/tools.md) | all seventeen tools, the envelope, the acceptance and review rules |
-| [configuration.md](docs/configuration.md) | `config.toml`, and what second-class providers may not do |
+| [configuration.md](docs/configuration.md) | `config.toml`, `taskspindle discover`, and what second-class providers may not do |
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |

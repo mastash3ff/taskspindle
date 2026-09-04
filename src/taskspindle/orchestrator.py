@@ -652,9 +652,42 @@ class Orchestrator:
             task.id,
             task.candidate_revision + 1,
             TurnKind.INITIAL.value,
-            prompt=compose_prompt(task, TurnKind.INITIAL),
+            prompt=compose_prompt(
+                task, TurnKind.INITIAL, review_diff=self._review_diff(task, placement)
+            ),
         )
         transition(self.store, task.id, TaskState.QUEUED, reason="prepared")
+
+    def _review_diff(self, task: TaskRecord, placement: _Placement) -> bytes | None:
+        """The change a review task looks at, so a reviewer that cannot run git still sees it.
+
+        A candidate review reads the subject's recorded diff artifact; a snapshot review diffs the
+        expected head against the snapshot commit in the root repository, with read-only plumbing.
+        """
+        if task.mode is not Mode.REVIEW or not task.review_target:
+            return None
+        target = task.review_target
+        try:
+            if target.get("kind") == "candidate":
+                subject = self.store.get_task(str(target.get("task_id") or ""))
+                if subject is None:
+                    return None
+                artifact = self.store.get_artifact(
+                    subject.id, subject.candidate_revision, "candidate_diff"
+                )
+                if artifact is None or not artifact["path"]:
+                    return None
+                return Path(str(artifact["path"])).read_bytes()
+            if placement.identity is not None and placement.base and target.get("expected_head"):
+                proc = repos.run_git(
+                    ["diff", str(target["expected_head"]), placement.base],
+                    cwd=placement.identity.toplevel,
+                    check=False,
+                )
+                return proc.stdout if proc.returncode == 0 else None
+        except (OSError, GitError):
+            return None
+        return None
 
     def _make_workspace(
         self,

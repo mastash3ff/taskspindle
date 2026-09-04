@@ -1,9 +1,9 @@
 """The ``taskspindle`` command line.
 
-Seven subcommands, and none of them is the interesting part: the MCP server is what a Codex
+Eight subcommands, and none of them is the interesting part: the MCP server is what a Codex
 session talks to, and ``worker`` and ``accept`` exist so that the two detached entry points the
 systemd units run can also be run by hand when something has gone wrong. ``setup``, ``doctor``,
-``usage`` and ``web`` are the ones a person actually types.
+``discover``, ``usage`` and ``web`` are the ones a person actually types.
 
 Nothing here decides anything. Each subcommand resolves the paths, hands off to the module that
 owns the work, and turns whatever comes back into an exit code and a line of output. Failures are
@@ -88,6 +88,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     usage.add_argument("--json", action="store_true", help="print the report as JSON")
 
+    discover = sub.add_parser(
+        "discover", help="list installed ACP agents from the community registry as config proposals"
+    )
+    discover.add_argument(
+        "--registry", help="a registry URL or local file instead of the published one"
+    )
+    discover.add_argument("--refresh", action="store_true", help="ignore the cached registry")
+    discover.add_argument(
+        "--all", action="store_true", help="also list registry agents that are not installed"
+    )
+    discover.add_argument("--json", action="store_true", help="print the findings as JSON")
+
     web = sub.add_parser("web", help="serve the read-only dashboard on localhost")
     web.add_argument("--host", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
     web.add_argument("--port", type=int, default=8765, help="port to bind (default: 8765)")
@@ -117,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         return _worker(args.task)
     if args.command == "usage":
         return _usage(args.since, args.provider, args.group_by, as_json=args.json)
+    if args.command == "discover":
+        return _discover(args.registry, refresh=args.refresh, show_all=args.all, as_json=args.json)
     if args.command == "web":
         return _web(args.host, args.port, open_browser=args.open)
     return _accept(args.task)
@@ -294,6 +308,66 @@ def _table(columns: list[str], rows: list[list[str]]) -> None:
         print("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
     if not rows:
         print("(nothing recorded)")
+
+
+# -- discover ------------------------------------------------------------------------
+
+
+def _discover(registry: str | None, *, refresh: bool, show_all: bool, as_json: bool) -> int:
+    from . import discover as discover_module
+
+    paths = resolve_paths()
+    source = registry or os.environ.get("TASKSPINDLE_ACP_REGISTRY") or discover_module.DEFAULT_REGISTRY_URL
+    try:
+        agents, origin = discover_module.fetch_registry(
+            source=source, cache_path=paths.data_dir / "acp-registry.json", refresh=refresh
+        )
+    except discover_module.RegistryError as exc:
+        print(f"taskspindle discover: {exc}", file=sys.stderr)
+        return 1
+    found = discover_module.detect(agents)
+    found_ids = {item.agent.id for item in found}
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "registry": source,
+                    "origin": origin,
+                    "installed": [
+                        {
+                            "id": item.agent.id,
+                            "name": item.agent.name,
+                            "path": item.path,
+                            "command": list(item.command),
+                            "first_class": discover_module.first_class_match(item.agent),
+                            "profile_id": discover_module.profile_id(item.agent),
+                        }
+                        for item in found
+                    ],
+                    "not_installed": [agent.id for agent in agents if agent.id not in found_ids],
+                },
+                indent=2,
+            )
+        )
+        return 0
+    print(f"registry: {source} ({origin}, {len(agents)} agents with a local launch form)")
+    proposals = [item for item in found if discover_module.first_class_match(item.agent) is None]
+    for item in found:
+        first = discover_module.first_class_match(item.agent)
+        if first is not None:
+            print(f"{item.agent.id}: {item.path} -- TaskSpindle's first-class {first!r} provider")
+    if not proposals:
+        print("no other registry agent is installed on this machine")
+    else:
+        print(f"{len(proposals)} installed; proposed blocks for {paths.config_file} (nothing written):")
+        for item in proposals:
+            print()
+            print(discover_module.proposal(item), end="")
+    if show_all:
+        missing = [agent.id for agent in agents if agent.id not in found_ids]
+        print()
+        print(f"not installed: {', '.join(missing) or 'none'}")
+    return 0
 
 
 # -- web -----------------------------------------------------------------------------

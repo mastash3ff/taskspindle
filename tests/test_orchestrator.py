@@ -388,6 +388,19 @@ def test_a_review_of_the_candidate_unblocks_acceptance(harness: Harness, make_re
     assert argv == (sys.executable, "-m", "taskspindle.accept", "--task", task_id)
 
 
+def test_the_review_turn_is_given_the_candidate_diff(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+
+    review_id = review_candidate(harness, repo, task_id)
+
+    prompt = harness.orchestrator.store.list_turns(review_id)[0]["prompt"]
+    assert "```diff" in prompt
+    assert "src/new.txt" in prompt
+    assert "+hello" in prompt
+
+
 def test_a_reviewer_that_is_not_independent_is_refused(harness: Harness, make_repo) -> None:
     repo = make_repo()
     task_id = build_candidate(harness, repo)

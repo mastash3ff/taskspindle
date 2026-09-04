@@ -25,6 +25,9 @@ Script keys::
      "turn_completed": {"usage": {...}},   # send Grok's non-standard turn_completed update
      "model_id": "fake-model-1",           # stamp _meta.modelId on every message chunk
      "late_turn_completed": true,          # ... sent shortly *after* the prompt response
+     "capture_mode_to": "/path/mode.txt",  # write the mode id session/set_mode received
+     "refuse_mode": true,                  # ... or refuse session/set_mode with an error
+     "ask_switch_mode": true,              # ask permission for a "switch_mode" tool call
      "fail_kind": "auth" | "rate_limit" | "usage_limit" | "usage_limit_prefix" | "overloaded"}
                                            # raise a shaped RequestError from prompt
 """
@@ -51,6 +54,7 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
+    SetSessionModeResponse,
     ToolCallUpdate,
     Usage,
     UsageUpdate,
@@ -139,6 +143,14 @@ class FakeAgent:
             await self._emit(session_id, f"replayed {index}")
         return LoadSessionResponse()
 
+    async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> SetSessionModeResponse:
+        if self.script.get("refuse_mode"):
+            raise RequestError.invalid_params({"modeId": mode_id, "reason": "no such mode"})
+        capture_mode_to = self.script.get("capture_mode_to")
+        if capture_mode_to:
+            Path(capture_mode_to).write_text(mode_id, encoding="utf-8")
+        return SetSessionModeResponse()
+
     # -- turns -------------------------------------------------------------------------------
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> PromptResponse:
@@ -167,6 +179,8 @@ class FakeAgent:
             await self._maybe_write(session_id, write)
         if script.get("delegate"):
             await self._attempt_delegation(session_id)
+        if script.get("ask_switch_mode"):
+            await self._ask(session_id, "tc-mode", "Ready to code?", "switch_mode")
 
         rate_limit = script.get("rate_limit")
         if rate_limit:

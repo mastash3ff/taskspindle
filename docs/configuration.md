@@ -119,6 +119,18 @@ agent that speaks ACP 0.12 over stdio can be configured this way; whether it hon
 denial or a cancel is between you and that agent. Harnesses with no ACP stdio endpoint are out of
 scope: there is no other transport.
 
+## Finding agents to configure
+
+`taskspindle discover` reads the ACP community registry — the published list at
+`cdn.agentclientprotocol.com`, cached under the data directory after the first fetch — works out
+which of its agents are installed on this machine, and prints a `[providers.<id>]` block for each
+one. Nothing is downloaded, nothing is run, and `config.toml` is never written: the block is a
+proposal to read, edit and paste, with `auth` and `secret_env` left for you to decide. A registry
+entry that resolves to an interpreter or a shim rather than an agent is not proposed. `--all` also
+lists the registry agents that are not installed; `--registry` points at another URL or a local
+file; `--refresh` ignores the cache. The two first-class providers are reported as such and never
+proposed, since they are not configured this way.
+
 ## Checking a configuration
 
 `taskspindle doctor` resolves every profile and, for each one, checks that its command exists and

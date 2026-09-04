@@ -165,6 +165,9 @@ Four things a task can do that TaskSpindle records rather than hides.
 - **`DELEGATION_ATTEMPT`** — the agent asked for a subagent, team or delegation tool. The request
   is denied and recorded. Both first-class profiles are launched with those tools disabled in the
   first place; this catches the case where they are asked for anyway.
+- **`MODE_SWITCH_ATTEMPT`** — the agent asked to leave the session mode it was put in (Claude's
+  "Ready to code?" prompt on its way out of plan mode). Denied and recorded; the mode was chosen
+  for the task, not by it.
 
 ## Provider availability
 
@@ -204,6 +207,21 @@ repository's HEAD, never checked out on a branch you use. The agent process is a
 user unit with a memory ceiling, and its environment is built by allowlist — a name reaches it only
 because TaskSpindle put it there, so it inherits no credentials, no proxy settings and no agent
 configuration beyond what its profile declares.
+
+Two things make the permission gate real rather than advisory, one per first-class provider:
+
+- **Claude sessions are put in a mode.** The adapter starts every session in whatever
+  `permissions.defaultMode` the operator's own Claude settings name — `bypassPermissions` on a
+  machine that runs Claude Code that way — and in that mode `session/request_permission` is never
+  sent. So after `session/new` or `session/load`, a worker calls `session/set_mode`: `plan` for a
+  consult or a review, where every write and every shell command is refused by the agent itself,
+  and `default` for an implement, where each one is sent to TaskSpindle's permission policy to
+  decide. An agent that refuses the mode fails the turn with `MODE_UNAVAILABLE` rather than running
+  unguarded.
+- **Grok read-only turns run in its strict sandbox.** `grok --sandbox strict` is what turns a file
+  write into a permission request on Grok's ACP endpoint (its `--permission-mode` and `--deny` flags
+  did nothing there, verified on 1.0.13); a consult or review is launched with it, an implement is
+  not.
 
 **That is containment by construction, not an OS security sandbox.** The agent runs as your user
 with your filesystem permissions. It can read anything you can read, and it can write outside its

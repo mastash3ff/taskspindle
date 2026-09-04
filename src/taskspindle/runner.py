@@ -104,7 +104,8 @@ Finish with a short summary of what changed.
 
 _REVIEW_RULES = """
 You are reviewing code. This is a read-only task: do not edit, create or delete any file, and do
-not run anything that changes the working tree. Do not spawn subagents.
+not run anything that changes the working tree. Do not spawn subagents. The working directory is
+checked out at the subject, so you can read any file; the change under review is given below.
 Subject: {subject}
 Output only the JSON object below, matching this schema exactly:
 {{"verdict": "PASS" | "CONCERN" | "BLOCK",
@@ -133,11 +134,31 @@ def _review_subject(task: TaskRecord) -> str:
     return f"working-tree snapshot {target.expected_head} of {target.repository} (paths: {paths})"
 
 
+#: How much of a candidate diff is put into a review prompt before it is cut and said so.
+MAX_REVIEW_DIFF_BYTES = 96 * 1024
+
+
+def review_diff_section(diff: bytes | None) -> str:
+    """The diff a reviewer is shown, capped so the prompt stays bounded."""
+    if not diff:
+        return ""
+    cut = len(diff) > MAX_REVIEW_DIFF_BYTES
+    body = diff[:MAX_REVIEW_DIFF_BYTES].decode("utf-8", "replace")
+    note = (
+        f"\n[diff truncated at {MAX_REVIEW_DIFF_BYTES} bytes of {len(diff)}; the full change is "
+        "checked out in the working directory]"
+        if cut
+        else ""
+    )
+    return f"\n\nThe change under review, as a unified diff:\n```diff\n{body}\n```{note}"
+
+
 def compose_prompt(
     task: TaskRecord,
     kind: TurnKind,
     *,
     continuation: str | None = None,
+    review_diff: bytes | None = None,
 ) -> str:
     """Build the text of one turn.
 
@@ -158,7 +179,8 @@ def compose_prompt(
         )
         return f"{task.prompt}\n\n{rules}"
     if task.mode is Mode.REVIEW:
-        return f"{_REVIEW_RULES.format(subject=_review_subject(task))}\n\n{task.prompt}"
+        rules = _REVIEW_RULES.format(subject=_review_subject(task))
+        return f"{rules}\n\n{task.prompt}{review_diff_section(review_diff)}"
     return task.prompt
 
 
@@ -257,6 +279,7 @@ _PER_TURN_WARNINGS = (
     "ROOT_MUTATION:",
     "READ_ONLY_VIOLATION",
     "DELEGATION_ATTEMPT",
+    "MODE_SWITCH_ATTEMPT",
     ROOT_CHECK_SKIPPED,
 )
 
@@ -452,7 +475,7 @@ async def _run_turn(
 
     stderr_path = run.dir / f"agent-{run.revision}.stderr"
     worker = AcpWorker(
-        command=profile.command,
+        command=providers.launch_command(profile, task.mode.value),
         env=run.child_env,
         cwd=workspace,
         stderr_path=stderr_path,
@@ -586,11 +609,26 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
         session_id = await agent.new_session(**options)
         run.session_id = session_id
         run.task = run.store.update_task(run.task_id, None, session_id=session_id)
+    else:
+        if not run.task.session_id:
+            raise _Interrupted("RESUME_UNAVAILABLE", "the task has no session to resume")
+        await agent.load_session(run.task.session_id, **options)
+        run.session_id = run.task.session_id
+    await _apply_session_mode(run, agent)
+
+
+async def _apply_session_mode(run: _Run, agent: AcpWorker) -> None:
+    """Put a Claude-family session in the mode its task needs, and say so in the log.
+
+    Without this the adapter starts in whatever ``permissions.defaultMode`` the operator's own
+    Claude settings name -- ``bypassPermissions`` on a machine that runs Claude Code that way --
+    and the permission gate is never consulted.
+    """
+    mode = providers.session_mode(run.profile, run.task.mode.value) if run.profile else None
+    if mode is None or not run.session_id:
         return
-    if not run.task.session_id:
-        raise _Interrupted("RESUME_UNAVAILABLE", "the task has no session to resume")
-    await agent.load_session(run.task.session_id, **options)
-    run.session_id = run.task.session_id
+    await agent.set_mode(run.session_id, mode)
+    run.log.write(f"session mode {mode}")
 
 
 async def _prompt(run: _Run, agent: AcpWorker, cancel_event: asyncio.Event) -> TurnResult:

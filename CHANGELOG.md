@@ -25,6 +25,16 @@
 - **Orphans can be cleaned.** `cleanup_task` with `force` removes the worktree of a task whose
   repository no longer exists, and `revoke_repository` accepts a `repository_id` for a repository
   that no longer has a path.
+- **Read-only turns are enforced by the agents themselves.** A Claude worker is put in the
+  adapter's `plan` session mode for a consult or a review and in `default` mode for an implement,
+  so the permission gate is consulted instead of the operator's own `bypassPermissions` setting; a
+  Grok consult or review runs inside `--sandbox strict`, the one flag that makes its writes ask.
+  A request to switch mode is refused and recorded as `MODE_SWITCH_ATTEMPT`; an agent that refuses
+  the mode fails the turn with `MODE_UNAVAILABLE`.
+- **Reviewers are shown the diff.** A review prompt carries the candidate's recorded diff (or the
+  snapshot's `git diff`), cut at 96 KiB, so a reviewer that cannot run git still sees the change.
+- **`taskspindle discover`** lists the ACP community registry's agents that are installed here and
+  prints a `[providers.<id>]` proposal for each; nothing is downloaded, run or written.
 - Schema version 2. The migration is applied on the next open.
 
 ## v0.1.0
