@@ -198,12 +198,14 @@ you.
 "requested_model", "reported_model", "gateway_host", "agent"}, "warnings", "quota_warnings",
 "usage", "transcript_locator"}`.
 
-`attribution` is how metered work stays visible: an `api_key` profile shows `auth_mode: "api_key"`
-and the gateway's host — never its URL path, never the token. `reported_model` is the model that
-actually answered, when the agent said (Grok says so on the wire; for Claude it is read from the
-adapter's own session record), and `agent` is the adapter's name and version. Claude's canonical
-model id from ACP session configuration is preferred over that file; unresolved aliases or
-display names such as a `default` description still use the bounded file-read fallback.
+`attribution` makes metered work visible: an `api_key` profile shows `auth_mode: "api_key"`
+and the gateway's host, without its URL path or token. `agent` names the adapter and version.
+`reported_model` uses the agent's model identity, falling back to the configured profile model
+when no identity was reported. Claude's per-turn wire ID wins, then a canonical model ID from ACP
+session configuration, then the bounded session-file fallback for unresolved aliases or display
+names. Grok uses the first per-turn `_meta.modelId`, then the first `modelUsage` key, then the
+profile model. New turn attribution and usage rows use the same choice; raw `modelUsage` and
+historical rows remain unchanged.
 
 `warnings` is the task's warning list, as `task_status` shows it. `quota_warnings` is every
 usage, rate, credit or login refusal a turn of this task ran into, each as

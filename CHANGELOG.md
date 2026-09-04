@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Grok model attribution.** New turns prefer the wire model ID, then the backend `modelUsage`
+  key, then the profile model; attribution and usage agree while raw telemetry stays intact.
 - **Usage by repository.** `repository_id` grouping is available in MCP, the CLI and dashboard,
   including a null group for repository-free tasks; no migration is needed.
 - **Recovery choices.** `continue_task` can ask form-capable MCP clients to retry or cancel

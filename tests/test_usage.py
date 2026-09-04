@@ -241,3 +241,27 @@ def test_repository_rollup_matches_read_only_store_and_preserves_filters(tmp_pat
                 }
                 assert backend.list_turn_usage(task_id=tasks[1])[0]["repository_id"] == "r1"
                 assert backend.list_turn_usage(since="2999-01-01T00:00:00Z") == []
+
+
+@pytest.mark.parametrize(("wire", "backend", "expected"), [
+    (["grok-4.6"], {"grok-4.6-build": {}}, "grok-4.6"),
+    ([], {"grok-4.6-build": {}}, "grok-4.6-build"),
+    ([], {}, "grok-profile"),
+])
+def test_grok_model_precedence_keeps_attribution_and_usage_together(
+    tmp_path: Path, wire, backend, expected,
+) -> None:
+    result = TurnResult(text="done", stop_reason="end_turn", capture=TurnCapture(
+        model_ids=wire, turn_completed={"usage": {
+            "inputTokens": 10, "modelCalls": 1, "modelUsage": backend,
+        }},
+    ))
+    collected = usage.collect(
+        result, profile=Profile(id="grok", auth="oauth", command=("grok",), model="grok-profile"),
+        cwd=tmp_path, session_id="session", home=tmp_path, duration_ms=100,
+    )
+    assert collected.model == collected.usage.model == expected
+    assert collected.usage.raw["modelUsage"] == backend
+    assert collected.usage.input_tokens == 10
+    assert collected.usage.cost_estimate_usd is None
+    assert collected.usage.source == usage.SOURCE_TURN_COMPLETED

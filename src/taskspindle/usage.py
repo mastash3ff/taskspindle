@@ -16,7 +16,7 @@ import json
 import re
 import statistics
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -366,14 +366,16 @@ def collect(
     session_path = claude_session_path(profile, cwd, session_id, home)
     if session_path is not None and model is None:
         model = claude_session_model(session_path)
-    if model is None:
-        model = profile.model
-
     usage: TurnUsage | None = None
     if capture.turn_completed is not None:
         usage = from_turn_completed(capture.turn_completed, model=model, duration_ms=duration_ms)
         if usage is not None and model is None:
             model = usage.model
+    if model is None:
+        model = profile.model
+        if usage is not None:
+            # Update attribution without repricing the unpriced turn_completed record.
+            usage = replace(usage, model=model)
     if usage is None and result.usage:
         priced = profile.family == "claude" or profile.auth == "api_key"
         usage = from_prompt_response(

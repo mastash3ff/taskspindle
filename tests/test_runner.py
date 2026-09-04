@@ -708,7 +708,7 @@ async def test_a_grok_style_turn_completed_update_is_recorded_with_its_model(
                     "reasoningTokens": 12,
                     "modelCalls": 2,
                     "costUsdTicks": 43475800,
-                    "modelUsage": {"fake-model-9": {"inputTokens": 500}},
+                    "modelUsage": {"fake-model-9-build": {"inputTokens": 500}},
                 }
             },
         }
@@ -726,6 +726,7 @@ async def test_a_grok_style_turn_completed_update_is_recorded_with_its_model(
     assert recorded["model"] == "fake-model-9"
     assert (recorded["input_tokens"], recorded["reasoning_tokens"], recorded["model_calls"]) == (500, 12, 2)
     assert recorded["raw"]["costUsdTicks"] == 43475800
+    assert "fake-model-9-build" in recorded["raw"]["modelUsage"]
     assert recorded["cost_estimate_usd"] is None
 
 
