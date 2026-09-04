@@ -1,9 +1,95 @@
 # TaskSpindle
 
-A local MCP worker orchestrator for OAuth-backed coding agents, isolated worktrees,
-review, recovery, and Codex-owned integration.
+A local MCP server that lets a Codex session delegate bounded work to OAuth-backed Claude Code and
+Grok workers in detached git worktrees, then inspect, cross-review and explicitly accept what they
+produced.
 
-Documentation lives in `docs/`. Installation, registration and the tool reference are
-filled in as the v0.1.0 implementation lands.
+## What it does
+
+- **Three modes.** `consult` asks a question, `review` reads and reports, `implement` writes code
+  in its own worktree. Only `implement` can produce something you can accept.
+- **Nothing lands by accident.** A candidate is a commit on a ref of its own, never on a branch you
+  use. Accepting it requires that you retrieved the whole diff, that an independent reviewer looked
+  at that exact candidate, that every blocking finding has an explicit override with a reason, and
+  that the candidate's own verification commands pass — in your repository, before the commit.
+- **Cross-review by default.** A candidate written by Claude is reviewed by Grok, and the other way
+  round. The reviewer must be a genuinely different agent, and the code enforces it.
+- **Durable workers.** Each turn runs as a transient systemd user unit, so the MCP server can exit,
+  crash or restart without taking the work with it. Every continuation reloads the agent's session
+  explicitly rather than starting a new conversation and hoping.
+- **Recovery that does not guess.** A worker that vanished leaves an `INTERRUPTED` task with its
+  worktree and session intact. A situation TaskSpindle cannot settle becomes
+  `RECOVERY_AMBIGUOUS` and waits for you.
+- **Credentials stay where they are.** The environment each agent sees is built by allowlist, not
+  by filtering yours. TaskSpindle never logs in, never copies a credential and never edits your
+  Codex configuration.
+- **OAuth first, metered second.** `claude` and `grok` are first-class and OAuth-only. An API-key
+  or LiteLLM-gateway harness is a configured profile that is never a default, never a fallback, and
+  refuses to run without `allow_metered`.
+
+## Quick start
+
+```sh
+uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.1.0"
+taskspindle setup
+taskspindle doctor
+codex mcp add taskspindle -- taskspindle mcp
+```
+
+Then, in a Codex session, authorize a repository before anything can work in it. See
+[docs/install.md](docs/install.md) and [docs/codex-registration.md](docs/codex-registration.md) —
+the registration needs `tool_timeout_sec = 1800`.
+
+## How a task flows
+
+1. **Authorize.** `authorize_repository` grants specific providers specific modes on one
+   repository, keyed to its canonical identity.
+2. **Start.** `start_task` creates a detached worktree from HEAD, composes the first turn, and
+   launches a worker unit. An `implement` task must declare its acceptance criteria, the path
+   prefixes it may touch, the commands that verify it, and the one-line commit message it is
+   aiming at.
+3. **Work.** The worker drives exactly one ACP turn, collapses the result into a candidate commit,
+   runs the verification commands in the worktree, records everything, and exits. The task is now
+   `RESULT_READY`.
+4. **Inspect.** `task_diff` hands the diff back a page at a time, and each page is receipted. You
+   must retrieve all of it.
+5. **Review.** A second `start_task` in `review` mode, pointed at that candidate, run by the other
+   provider. It returns a structured verdict with findings.
+6. **Accept.** `accept_task` checks every precondition, then a detached unit probes the merge with
+   `git merge-tree`, applies the candidate to your repository, runs your verification commands
+   there, and commits — or undoes everything and tells you why.
+7. **Tidy.** `cleanup_task` gives back the worktree and the refs. It refuses to remove a dirty
+   worktree unless you insist.
+
+At every step the task carries a `state_version`; hand it back with each change, and a task that
+moved underneath you is refused rather than clobbered.
+
+## Documentation
+
+| | |
+| --- | --- |
+| [install.md](docs/install.md) | requirements, installing, XDG locations, uninstalling |
+| [codex-registration.md](docs/codex-registration.md) | registering the server, the timeouts, granting a repository |
+| [tools.md](docs/tools.md) | all sixteen tools, the envelope, the acceptance and review rules |
+| [configuration.md](docs/configuration.md) | `config.toml`, and what second-class providers may not do |
+| [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
+| [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
+| [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
+| [rollback.md](docs/rollback.md) | backing it out without losing anything |
+
+## Supported platforms
+
+Linux with a systemd user manager, and WSL2 with systemd enabled. macOS and Windows are not
+supported in v0.1.0. Python 3.12+, Node 22+, git 2.38+. See
+[docs/platforms.md](docs/platforms.md).
+
+## Status
+
+v0.1.0. The two first-class providers are live-tested; API-key and gateway profiles are configured,
+documented and not tested live.
 
 TaskSpindle is not affiliated with, endorsed by, or sponsored by OpenAI, Anthropic, or xAI.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

@@ -23,7 +23,30 @@ jobs:
       - name: Install the locked Claude adapter
         run: npm ci --ignore-scripts
         working-directory: src/taskspindle/_adapter
-      - name: Install the wheel and run the MCP smoke test
+      - name: Install the wheel
         run: |
           uv tool install --from dist/*.whl taskspindle
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Smoke test the command line
+        run: |
           taskspindle --version
+          # doctor is allowed to report failures on a runner that has no provider logins; what
+          # must hold is that it produces a report and exits 0 or 1 rather than crashing.
+          set +e
+          taskspindle doctor --no-live --json > doctor.json
+          status=$?
+          set -e
+          if [ "$status" -gt 1 ]; then
+            echo "taskspindle doctor exited $status"
+            cat doctor.json
+            exit 1
+          fi
+          python3 -c "
+          import json, sys
+          report = json.load(open('doctor.json'))
+          checks = report['checks']
+          assert isinstance(checks, list) and checks, report
+          print(f'doctor exited $status with {len(checks)} checks')
+          "
+      - name: Smoke test the MCP server
+        run: uv run python .github/scripts/mcp_smoke.py

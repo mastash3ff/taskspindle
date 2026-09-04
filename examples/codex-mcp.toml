@@ -1,0 +1,15 @@
+# Registering TaskSpindle with the Codex CLI.
+#
+# The supported way to add this block is the command, which writes it for you:
+#
+#     codex mcp add taskspindle -- taskspindle mcp
+#
+# The timeouts are not defaults and matter: an acceptance runs verification commands in the root
+# repository before it commits, and a long implement turn holds the tool call open for as long as
+# the agent is working. Append this to ~/.codex/config.toml if you would rather edit it by hand.
+
+[mcp_servers.taskspindle]
+command = "taskspindle"
+args = ["mcp"]
+tool_timeout_sec = 1800
+startup_timeout_sec = 30

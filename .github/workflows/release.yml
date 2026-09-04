@@ -1,0 +1,79 @@
+name: Release
+
+# Publishes a GitHub Release from a distribution "Build tag" already built. It builds nothing:
+# the only files it can attach are the ones that workflow produced, from a run whose commit is
+# the tag's own commit. Dispatch it by hand, with the tag and the run id to publish.
+#
+# No package is pushed anywhere: no PyPI, no npm. TaskSpindle is installed from git.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to release, for example v0.1.0"
+        required: true
+        type: string
+      build_run_id:
+        description: "The id of the 'Build tag' run that built this tag's dist"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ inputs.tag }}
+      RUN_ID: ${{ inputs.build_run_id }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag exists and the build run built it
+        run: |
+          set -euo pipefail
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null; then
+            echo "there is no tag ${TAG}"
+            exit 1
+          fi
+          tag_sha="$(git rev-list -n 1 "refs/tags/${TAG}")"
+          run_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .head_sha)"
+          if [ "$tag_sha" != "$run_sha" ]; then
+            echo "run ${RUN_ID} built ${run_sha}, but ${TAG} is ${tag_sha}"
+            exit 1
+          fi
+          echo "${TAG} is ${tag_sha}, built by run ${RUN_ID}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: taskspindle-dist-${{ inputs.tag }}
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dist
+
+      - name: Take the release notes from the changelog
+        run: |
+          set -euo pipefail
+          awk -v section="## ${TAG}" '
+            $0 == section { inside = 1; next }
+            /^## / { inside = 0 }
+            inside { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "CHANGELOG.md has no '## ${TAG}' section"
+            exit 1
+          fi
+
+      - name: Create the release
+        run: |
+          set -euo pipefail
+          ls -l dist
+          gh release create "${TAG}" dist/* \
+            --title "TaskSpindle ${TAG}" \
+            --notes-file notes.md \
+            --verify-tag
