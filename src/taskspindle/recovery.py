@@ -20,9 +20,10 @@ from typing import Any
 
 from . import service
 from .models import ACTIVE_STATES, TERMINAL_STATES, EventKind, TaskRecord, TaskState
+from .service import TaskSpindleError
 from .store import Store
 from .store import now as _stamp
-from .units import UnitBackend, UnitState, accept_unit_name, worker_unit_name
+from .units import UnitBackend, UnitError, UnitState, accept_unit_name, worker_unit_name
 
 __all__ = [
     "NEVER_STARTED_AFTER_S",
@@ -45,6 +46,8 @@ _WORKER_EXITED = "worker_exited"
 _MISSING_STALE = "unit_missing_stale_heartbeat"
 _MISSING_FRESH = "unit_missing_fresh_heartbeat"
 _NEVER_STARTED = "never_started"
+_NO_LEGAL_TARGET = "no_legal_target"
+_RECONCILE_FAILED = "reconcile_failed"
 
 #: unit kind -> (reason, state to move to). ``active`` and the heartbeat-dependent kinds are
 #: handled separately.
@@ -111,20 +114,27 @@ def reconcile(
     ``accept_recover`` is the server's closure around
     :func:`taskspindle.integration.recover_journal`; without it an interrupted accept is left to
     the ordinary unit rules, which never touch the repository.
+
+    One task can never end the sweep: a systemd hiccup, or a task that moved underneath us while
+    a worker finalised, is recorded as an action with no target state and the next task is
+    examined.
     """
     moment = _aware(now)
     actions: list[ReconcileAction] = []
     for state in sorted(ACTIVE_STATES):
         for task in store.list_tasks(state=state.value, limit=_SCAN_LIMIT):
-            action = _reconcile_task(
-                store,
-                backend,
-                task,
-                boot=boot,
-                moment=moment,
-                stale_after_s=stale_after_s,
-                accept_recover=accept_recover,
-            )
+            try:
+                action = _reconcile_task(
+                    store,
+                    backend,
+                    task,
+                    boot=boot,
+                    moment=moment,
+                    stale_after_s=stale_after_s,
+                    accept_recover=accept_recover,
+                )
+            except (TaskSpindleError, UnitError) as exc:
+                action = _strand(store, task, f"{_RECONCILE_FAILED}:{exc.code}")
             if action is not None:
                 actions.append(action)
     return actions
@@ -146,18 +156,7 @@ def _reconcile_task(
     elif not task.unit_name and task.state in (TaskState.PREPARING, TaskState.QUEUED):
         # Nothing was ever started: the only question is whether it ever will be.
         if _older_than(task.created_at, moment, NEVER_STARTED_AFTER_S):
-            return _apply(
-                store,
-                task,
-                TaskState.FAILED,
-                _NEVER_STARTED,
-                error={
-                    "code": "NEVER_STARTED",
-                    "message": "no unit was started for this task",
-                    "retryable": False,
-                    "details": {},
-                },
-            )
+            return _apply(store, task, TaskState.FAILED, _NEVER_STARTED, error=_never_started())
         return None
     else:
         unit_state = backend.show(_unit_for(task))
@@ -176,7 +175,10 @@ def _reconcile_task(
         return _apply(store, task, TaskState.CANCELLED, reason)
     permitted = _permitted(task.state, target)
     if permitted is None:
-        return None
+        if task.state is TaskState.PREPARING:
+            # PREPARING holds nothing worth retaining: no session, no worktree, no candidate.
+            return _apply(store, task, TaskState.FAILED, _NEVER_STARTED, error=_never_started())
+        return _strand(store, task, f"{_NO_LEGAL_TARGET}:{reason}")
     target = permitted
     if target is TaskState.FAILED:
         status = unit_state.exec_main_status if unit_state else None
@@ -193,6 +195,41 @@ def _reconcile_task(
             },
         )
     return _apply(store, task, target, reason)
+
+
+def _never_started() -> dict[str, Any]:
+    return {
+        "code": "NEVER_STARTED",
+        "message": "no unit was started for this task",
+        "retryable": False,
+        "details": {},
+    }
+
+
+def _strand(store: Store, task: TaskRecord, reason: str) -> ReconcileAction:
+    """Record that a task could not be settled, without moving it.
+
+    The task is left exactly where it was -- reconciliation has nothing safe to do with it -- but
+    an operator has to be able to see that it was looked at and skipped, so the reason is logged
+    once. A sweep that keeps finding the same task in the same condition stays quiet.
+    """
+    if _last_recovery_reason(store, task.id) != reason:
+        store.append_event(
+            task.id,
+            EventKind.RECOVERY,
+            {"reason": reason, "from": task.state.value, "to": None},
+        )
+    return ReconcileAction(
+        task_id=task.id, from_state=task.state.value, to_state=None, reason=reason
+    )
+
+
+def _last_recovery_reason(store: Store, task_id: str) -> str | None:
+    for event in reversed(store.list_events(task_id)):
+        if event["kind"] == EventKind.RECOVERY.value:
+            reason = (event["payload"] or {}).get("reason")
+            return str(reason) if reason is not None else None
+    return None
 
 
 def _permitted(from_state: TaskState, target: TaskState) -> TaskState | None:

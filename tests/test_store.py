@@ -21,7 +21,7 @@ from taskspindle.models import (
     TurnKind,
     Verdict,
 )
-from taskspindle.store import StaleStateVersionError, Store, StoreError, now
+from taskspindle.store import NotFoundError, StaleStateVersionError, Store, StoreError, now
 
 
 def make_store(tmp_path: Path) -> Store:
@@ -195,6 +195,57 @@ def test_turns_checks_artifacts_and_reviews_round_trip(tmp_path: Path) -> None:
     assert review["findings"][0]["id"] == "f1"
     assert store.get_review_for(reviewer.id) == review
     assert store.latest_review_for_subject(record.id, "other") is None
+    store.close()
+
+
+def test_complete_turn_closes_the_row_a_worker_was_given(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    record = make_task(store)
+    turn_id = store.insert_turn(record.id, 1, TurnKind.INITIAL, prompt="go", session_id="s1")
+
+    store.complete_turn(
+        turn_id,
+        stop_reason="end_turn",
+        response="done",
+        attribution={"provider": "claude", "model": "sonnet"},
+    )
+    turn = store.list_turns(record.id)[0]
+    assert turn["ended_at"] is not None
+    assert turn["stop_reason"] == "end_turn"
+    assert turn["response"] == "done"
+    assert turn["attribution"] == {"provider": "claude", "model": "sonnet"}
+    # The session the row already had is kept when the worker has none to add.
+    assert turn["session_id"] == "s1"
+
+    # A turn that produced nothing at all -- a worker that died before it prompted -- still closes.
+    empty_id = store.insert_turn(record.id, 2, TurnKind.REPAIR, prompt="again")
+    store.complete_turn(empty_id)
+    empty = store.list_turns(record.id)[1]
+    assert empty["ended_at"] is not None
+    assert (empty["stop_reason"], empty["response"], empty["attribution"]) == (None, None, None)
+
+    with pytest.raises(NotFoundError):
+        store.complete_turn(empty_id + 1000)
+    store.close()
+
+
+def test_bind_lease_stamps_the_worker_onto_a_lease_it_already_holds(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    holder = make_task(store, "ts_000000000001")
+    other = make_task(store, "ts_000000000002")
+    store.acquire_lease("claude", holder.id, "", 0, "boot-old")
+
+    assert store.bind_lease("claude", holder.id, unit_name="unit-a", pid=99, boot_id="boot-new")
+    lease = store.get_lease("claude")
+    assert (lease["unit_name"], lease["pid"], lease["boot_id"]) == ("unit-a", 99, "boot-new")
+
+    # What is not supplied is left alone, and a task that does not hold the lease cannot sign it.
+    assert store.bind_lease("claude", holder.id)
+    unchanged = store.get_lease("claude")
+    assert (unchanged["unit_name"], unchanged["pid"]) == ("unit-a", 99)
+    assert unchanged["heartbeat_at"] >= lease["heartbeat_at"]
+    assert store.bind_lease("claude", other.id, pid=1) is False
+    assert store.get_lease("claude")["pid"] == 99
     store.close()
 
 

@@ -12,7 +12,7 @@ from taskspindle import service
 from taskspindle.models import AuthMode, EventKind, Mode, StartTaskRequest, TaskRecord, TaskState
 from taskspindle.recovery import ReconcileAction, reconcile
 from taskspindle.store import Store
-from taskspindle.units import UnitState, accept_unit_name, worker_unit_name
+from taskspindle.units import UnitError, UnitState, accept_unit_name, worker_unit_name
 from tests.fakes.units import ACTIVE, EXITED, NOT_FOUND, OOM, SIGNALLED, SUCCESS, FakeUnitBackend
 
 BOOT = "boot-now"
@@ -212,6 +212,87 @@ def test_a_queued_task_that_was_never_started_fails_after_the_grace_period(
     assert store.get_task(stale.id).state is TaskState.FAILED
     assert store.get_task(stale.id).error["code"] == "NEVER_STARTED"
     assert store.get_lease(PROVIDER) is None
+
+
+def test_one_task_that_systemd_cannot_answer_for_does_not_end_the_sweep(store: Store) -> None:
+    broken = make_task(store, state=TaskState.RUNNING)
+    other = make_task(store, state=TaskState.RUNNING, lease=False)
+    broken_unit = worker_unit_name(broken.id)
+
+    def explode(unit: str) -> None:
+        if unit == broken_unit:
+            raise UnitError("UNIT_QUERY_FAILED", "systemctl show exited 1")
+
+    backend = FakeUnitBackend({worker_unit_name(other.id): SUCCESS}, on_show=explode)
+
+    actions = {action.task_id: action for action in run(store, backend)}
+
+    assert actions[broken.id].to_state is None
+    assert actions[broken.id].reason == "reconcile_failed:UNIT_QUERY_FAILED"
+    assert store.get_task(broken.id).state is TaskState.RUNNING
+    assert recovery_reasons(store, broken.id) == ["reconcile_failed:UNIT_QUERY_FAILED"]
+    # The next task was still reconciled.
+    assert actions[other.id].to_state == TaskState.INTERRUPTED.value
+    assert store.get_task(other.id).state is TaskState.INTERRUPTED
+
+    # A sweep that keeps finding the same broken unit reports it again but only logs it once.
+    assert run(store, backend)[0].task_id == broken.id
+    assert recovery_reasons(store, broken.id) == ["reconcile_failed:UNIT_QUERY_FAILED"]
+
+
+def test_a_task_that_finishes_underneath_the_sweep_is_skipped(store: Store) -> None:
+    moving = make_task(store, state=TaskState.RUNNING)
+    other = make_task(store, state=TaskState.RUNNING, lease=False)
+    moving_unit = worker_unit_name(moving.id)
+
+    def finish(unit: str) -> None:
+        if unit == moving_unit and store.get_task(moving.id).state is TaskState.RUNNING:
+            # The worker recorded its outcome between list_tasks and the transition.
+            service.transition(store, moving.id, TaskState.COMPLETED, reason="worker finished")
+
+    backend = FakeUnitBackend(
+        {moving_unit: SUCCESS, worker_unit_name(other.id): SUCCESS}, on_show=finish
+    )
+
+    actions = {action.task_id: action for action in run(store, backend)}
+
+    assert actions[moving.id].to_state is None
+    assert actions[moving.id].reason == f"reconcile_failed:{service.ILLEGAL_TRANSITION}"
+    assert store.get_task(moving.id).state is TaskState.COMPLETED
+    assert store.get_task(other.id).state is TaskState.INTERRUPTED
+
+
+def test_a_preparing_task_from_an_earlier_boot_fails_rather_than_stranding(store: Store) -> None:
+    task = make_task(store, state=TaskState.PREPARING, boot_id="boot-before")
+    backend = FakeUnitBackend()
+
+    actions = run(store, backend)
+
+    # PREPARING cannot be INTERRUPTED and has no retained work, so it fails outright.
+    assert_settled(store, task, actions, TaskState.FAILED, "never_started")
+    assert store.get_task(task.id).error["code"] == "NEVER_STARTED"
+
+
+def test_a_task_with_no_legal_target_is_reported_once_and_left_alone(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = make_task(store, state=TaskState.ACCEPTING, unit="accept", heartbeat_offset_s=-2)
+    backend = FakeUnitBackend({accept_unit_name(task.id): NOT_FOUND})
+    # An accept that the state machine has no settling move for at all.
+    monkeypatch.setitem(
+        service.LEGAL_TRANSITIONS, TaskState.ACCEPTING, frozenset({TaskState.ACCEPTED})
+    )
+
+    actions = run(store, backend)
+
+    assert [(action.to_state, action.reason) for action in actions] == [
+        (None, "no_legal_target:unit_missing_fresh_heartbeat")
+    ]
+    assert store.get_task(task.id).state is TaskState.ACCEPTING
+    assert recovery_reasons(store, task.id) == ["no_legal_target:unit_missing_fresh_heartbeat"]
+    # Seen again on the next sweep, but the operator is only told once.
+    assert len(run(store, backend)) == 1
+    assert recovery_reasons(store, task.id) == ["no_legal_target:unit_missing_fresh_heartbeat"]
 
 
 def test_an_interrupted_accept_that_committed_is_accepted(store: Store) -> None:

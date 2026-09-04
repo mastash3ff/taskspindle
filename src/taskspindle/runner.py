@@ -60,6 +60,9 @@ HEARTBEAT_INTERVAL_S = 5.0
 #: Verification never runs longer than this, whatever the task's own timeout is.
 MAX_VERIFICATION_S = 1800
 
+#: Warning recorded when the pre-dispatch root snapshot is missing, so the root check could not run.
+ROOT_CHECK_SKIPPED = "ROOT_CHECK_SKIPPED"
+
 #: Which turn kinds each entry state may start.
 TURN_KINDS_BY_STATE: dict[TaskState, frozenset[TurnKind]] = {
     TaskState.QUEUED: frozenset({TurnKind.INITIAL}),
@@ -235,6 +238,23 @@ class _Run:
         self.log.write(f"warning {warning}")
 
 
+#: Warnings that describe what one turn did. A later turn re-earns them or it does not: a scope
+#: violation a repair fixed must not follow the task around for the rest of its life.
+_PER_TURN_WARNINGS = (
+    "SCOPE_VIOLATION:",
+    "ROOT_MUTATION:",
+    "READ_ONLY_VIOLATION",
+    "DELEGATION_ATTEMPT",
+)
+
+
+def _carried_warnings(warnings: list[str] | None) -> list[str]:
+    """The task's warnings minus the ones that belong to the turn that raised them."""
+    return [
+        warning for warning in warnings or [] if not warning.startswith(_PER_TURN_WARNINGS)
+    ]
+
+
 def _task_dir(paths: Paths, task_id: str) -> Path:
     return paths.state_dir / "tasks" / task_id
 
@@ -291,59 +311,80 @@ async def run_worker(
         )
 
     directory = _task_dir(paths, task_id)
-    log = _Log(directory / "worker.log")
-    run = _Run(
-        store=store,
-        paths=paths,
-        task=task,
-        dir=directory,
-        log=log,
-        turn_id=int(pending["id"]),
-        revision=int(pending["revision"]),
-        kind=kind,
-        prompt=pending["prompt"] or compose_prompt(task, kind),
-        warnings=list(task.warnings or []),
-    )
-    log.write(f"start task={task_id} state={task.state.value} kind={kind.value} boot={boot}")
-
-    stamp = now()
-    run.task = transition(
-        store,
-        task_id,
-        TaskState.RUNNING,
-        reason=f"{kind.value} turn started",
-        unit_name=units.worker_unit_name(task_id),
-        worker_pid=os.getpid(),
-        boot_id=boot,
-        started_at=stamp,
-        heartbeat_at=stamp,
-    )
-
-    cancel_event = asyncio.Event()
-    heartbeat = asyncio.create_task(_heartbeat(run))
-    handler_installed = _install_signal_handler(cancel_event, run) if signals else False
+    log: _Log | None = None
+    run: _Run | None = None
+    heartbeat: asyncio.Task[None] | None = None
+    handler_installed = False
+    running = False
     try:
+        log = _Log(directory / "worker.log")
+        run = _Run(
+            store=store,
+            paths=paths,
+            task=task,
+            dir=directory,
+            log=log,
+            turn_id=int(pending["id"]),
+            revision=int(pending["revision"]),
+            kind=kind,
+            prompt=pending["prompt"] or compose_prompt(task, kind),
+            warnings=_carried_warnings(task.warnings),
+        )
+        log.write(f"start task={task_id} state={task.state.value} kind={kind.value} boot={boot}")
+
+        stamp = now()
+        run.task = transition(
+            store,
+            task_id,
+            TaskState.RUNNING,
+            reason=f"{kind.value} turn started",
+            unit_name=units.worker_unit_name(task_id),
+            worker_pid=os.getpid(),
+            boot_id=boot,
+            started_at=stamp,
+            heartbeat_at=stamp,
+        )
+        running = True
+
+        cancel_event = asyncio.Event()
+        heartbeat = asyncio.create_task(_heartbeat(run))
+        handler_installed = _install_signal_handler(cancel_event, run) if signals else False
         return await _run_turn(run, cancel_event, boot=boot, profiles=profiles, oauth_runner=oauth_runner)
     except _Failure as failure:
+        if run is None:  # pragma: no cover - _Failure is only raised once the turn is under way
+            raise
         run.log.write(f"failed {failure.code}")
         return _settle(run, TaskState.FAILED, failure.code, error=failure.body)
     except _Interrupted as interrupted:
+        if run is None:  # pragma: no cover - as above
+            raise
         run.warn(
             interrupted.warning,
             EventKind.WARNING,
             {"warning": interrupted.warning, "message": str(interrupted)},
         )
         return _settle(run, TaskState.INTERRUPTED, interrupted.warning)
+    except Exception as exc:
+        # Anything not already shaped into an outcome: record it rather than leaving the task
+        # RUNNING for recovery to puzzle over. Only the class name -- a message may carry secrets.
+        if not running or run is None:
+            raise
+        failure = _Failure("WORKER_ERROR", type(exc).__name__)
+        run.log.write(f"failed {failure.code} ({type(exc).__name__})")
+        return _settle(run, TaskState.FAILED, failure.code, error=failure.body)
     finally:
         if handler_installed:
             _remove_signal_handler()
-        heartbeat.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await heartbeat
-        _complete_turn(run)
-        store.release_lease(run.task.provider, task_id)
-        log.write("done")
-        log.close()
+        if heartbeat is not None:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+        if running and run is not None:
+            _complete_turn(run)
+            store.release_lease(run.task.provider, task_id)
+        if log is not None:
+            log.write("done")
+            log.close()
 
 
 def _install_signal_handler(cancel_event: asyncio.Event, run: _Run) -> bool:
@@ -412,6 +453,11 @@ async def _run_turn(
             await _open_session(run, agent)
             result = await _prompt(run, agent, cancel_event)
     except AcpError as exc:
+        if run.cancelled:
+            # An agent that errors out because it was cancelled was still cancelled: the outcome
+            # the operator asked for is the one to record.
+            run.log.write(f"cancel raised {exc.code}")
+            return _settle_cancelled(run)
         if exc.code == "RESUME_UNAVAILABLE":
             raise _Interrupted("RESUME_UNAVAILABLE", str(exc)) from exc
         raise _Failure(exc.code, str(exc), retryable=exc.code != "TURN_TIMEOUT") from exc
@@ -691,7 +737,13 @@ def _check_root(run: _Run) -> None:
     before = _load_root_snapshot(run)
     root = _root_identity(run)
     if before is None or root is None:
-        run.log.write("root snapshot unavailable; skipping the root check")
+        # The check did not run. That is not the same as the check passing, and the only place it
+        # can be said so is on the task itself.
+        run.warn(
+            ROOT_CHECK_SKIPPED,
+            EventKind.WARNING,
+            {"code": ROOT_CHECK_SKIPPED, "revision": run.revision},
+        )
         return
     try:
         after = repos.snapshot_root(root.toplevel)
@@ -846,7 +898,11 @@ def main(argv: list[str] | None = None) -> int:
         state = asyncio.run(
             run_worker(store, args.task, profiles=profiles, paths=resolved)
         )
-    except Exception:
+    except Exception as exc:
+        # The class name, and a TaskSpindleError's code: enough to tell a config mistake from a
+        # crash, with none of the message text, which can carry paths or credentials.
+        code = f" {exc.code}" if isinstance(exc, TaskSpindleError) else ""
+        print(f"taskspindle-runner: {type(exc).__name__}{code}", file=sys.stderr)
         return 1
     finally:
         if store is not None:

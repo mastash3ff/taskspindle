@@ -180,22 +180,29 @@ def seed_task(
     store.acquire_lease(PROVIDER, task.id, units.worker_unit_name(task.id), 0, BOOT)
 
     if identity is not None:
-        snapshot = repos.snapshot_root(identity.toplevel)
-        payload = json.dumps(
-            {"head": snapshot.head, "branch": snapshot.branch, "dirty": snapshot.dirty}
-        )
-        artifact = paths.state_dir / "tasks" / task.id / "root-snapshot.json"
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        artifact.write_text(payload, encoding="utf-8")
-        store.insert_artifact(
-            task.id,
-            1,
-            "root_snapshot",
-            "sha256:" + hashlib.sha256(payload.encode()).hexdigest(),
-            len(payload),
-            str(artifact),
-        )
+        record_root_snapshot(store, paths, task.id, identity.toplevel, revision=1)
     return task
+
+
+def record_root_snapshot(
+    store: Store, paths: Paths, task_id: str, toplevel: Path, *, revision: int
+) -> None:
+    """Store the pre-dispatch root snapshot the server takes before every turn."""
+    snapshot = repos.snapshot_root(toplevel)
+    payload = json.dumps(
+        {"head": snapshot.head, "branch": snapshot.branch, "dirty": snapshot.dirty}
+    )
+    artifact = paths.state_dir / "tasks" / task_id / f"root-snapshot-{revision}.json"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(payload, encoding="utf-8")
+    store.insert_artifact(
+        task_id,
+        revision,
+        "root_snapshot",
+        "sha256:" + hashlib.sha256(payload.encode()).hexdigest(),
+        len(payload),
+        str(artifact),
+    )
 
 
 def event_kinds(store: Store, task_id: str) -> list[str]:
@@ -282,6 +289,92 @@ async def test_a_write_into_the_root_repository_is_a_root_mutation(
     final = store.get_task(task.id)
     assert final.warnings == ["ROOT_MUTATION:intruder.txt"]
     assert EventKind.ROOT_MUTATION.value in event_kinds(store, task.id)
+
+
+async def test_failing_verification_still_records_the_candidate(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    repo = make_repo()
+    task = seed_task(
+        store, paths, mode=Mode.IMPLEMENT, repo=repo, verification=("false", "true")
+    )
+    script_path = script(
+        {"response": "added the file", "write": {"path": "src/new.txt", "content": "hello\n"}}
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    # The work is not thrown away because a check failed; the summary says so instead.
+    assert state is TaskState.RESULT_READY
+    final = store.get_task(task.id)
+    assert final.check_summary == {"total": 2, "passed": 0, "ok": False}
+    checks = store.list_checks(task.id, 1)
+    # Verification stops at the first failure, so the second command never ran.
+    assert [(check.command, check.ok) for check in checks] == [("false", False)]
+
+
+async def test_a_missing_root_snapshot_is_a_recorded_warning_not_a_silent_skip(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    repo = make_repo()
+    task = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=repo)
+    Path(store.get_artifact(task.id, 1, "root_snapshot")["path"]).unlink()
+    script_path = script(
+        {"response": "added the file", "write": {"path": "src/new.txt", "content": "hello\n"}}
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.RESULT_READY
+    assert store.get_task(task.id).warnings == ["ROOT_CHECK_SKIPPED"]
+    payloads = [
+        event["payload"]
+        for event in store.list_events(task.id)
+        if event["kind"] == EventKind.WARNING.value
+    ]
+    assert any(payload.get("code") == "ROOT_CHECK_SKIPPED" for payload in payloads)
+
+
+async def test_a_violation_warning_does_not_survive_into_the_next_revision(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    repo = make_repo()
+    task = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=repo)
+    first = script(
+        {
+            "response": "touched the root",
+            "write": {"path": "src/new.txt", "content": "hello\n"},
+            "write_abs": {"path": str(repo / "intruder.txt"), "content": "sneaky\n"},
+        }
+    )
+
+    assert await run_task(store, paths, task, first) is TaskState.RESULT_READY
+    assert store.get_task(task.id).warnings == ["ROOT_MUTATION:intruder.txt"]
+
+    # The server opens a repair turn: a new revision, a fresh snapshot, the lease taken again.
+    service.transition(store, task.id, TaskState.REPAIRING, reason="repair requested")
+    repairing = store.get_task(task.id)
+    store.insert_turn(
+        task.id,
+        2,
+        TurnKind.REPAIR.value,
+        prompt=runner.compose_prompt(repairing, TurnKind.REPAIR, continuation="stay in scope"),
+    )
+    store.acquire_lease(PROVIDER, task.id, units.worker_unit_name(task.id), 0, BOOT)
+    record_root_snapshot(store, paths, task.id, repos.resolve_repository(repo).toplevel, revision=2)
+    second = script(
+        {
+            "load_session": True,
+            "response": "behaved",
+            "write": {"path": "src/ok.txt", "content": "tidy\n"},
+        }
+    )
+
+    assert await run_task(store, paths, repairing, second) is TaskState.RESULT_READY
+    final = store.get_task(task.id)
+    # The revision-1 violation was not re-earned, so it is gone.
+    assert final.warnings is None
+    assert final.candidate_revision == 2
 
 
 async def test_a_turn_that_changes_nothing_fails_with_no_changes(
@@ -474,12 +567,8 @@ async def test_an_agent_that_cannot_resume_leaves_the_task_interrupted(
     assert final.finished_at is None
 
 
-async def test_cancelling_a_running_turn_settles_as_cancelled(
-    store: Store, paths: Paths, script
-) -> None:
-    task = seed_task(store, paths, mode=Mode.CONSULT)
-    script_path = script({"block_seconds": 30, "response": "never"})
-
+async def cancel_mid_turn(store: Store, paths: Paths, task: TaskRecord, script_path: Path) -> TaskState:
+    """Start a turn, ask it to cancel as soon as it is in flight, and return where it settled."""
     turn = asyncio.create_task(run_task(store, paths, task, script_path))
     for _ in range(200):
         if runner.request_cancel(task.id):
@@ -488,8 +577,16 @@ async def test_cancelling_a_running_turn_settles_as_cancelled(
     else:  # pragma: no cover - the worker never reached its turn
         turn.cancel()
         pytest.fail("the worker never registered a cancel hook")
+    return await asyncio.wait_for(turn, timeout=30)
 
-    state = await asyncio.wait_for(turn, timeout=30)
+
+async def test_cancelling_a_running_turn_settles_as_cancelled(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    script_path = script({"block_seconds": 30, "response": "never"})
+
+    state = await cancel_mid_turn(store, paths, task, script_path)
 
     assert state is TaskState.CANCELLED
     transitions = [
@@ -498,6 +595,22 @@ async def test_cancelling_a_running_turn_settles_as_cancelled(
         if event["kind"] == EventKind.STATE_CHANGED.value
     ]
     assert transitions[-2:] == [TaskState.CANCELLING.value, TaskState.CANCELLED.value]
+    assert store.get_lease(PROVIDER) is None
+
+
+async def test_an_agent_that_errors_out_when_cancelled_is_still_cancelled(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    script_path = script({"block_seconds": 30, "fail_on_cancel": True, "response": "never"})
+
+    state = await cancel_mid_turn(store, paths, task, script_path)
+
+    # The agent fell over on its way out; what was asked for was a cancel, not a failure.
+    assert state is TaskState.CANCELLED
+    final = store.get_task(task.id)
+    assert final.state is TaskState.CANCELLED
+    assert final.error is None
     assert store.get_lease(PROVIDER) is None
 
 

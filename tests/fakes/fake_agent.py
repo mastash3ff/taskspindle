@@ -13,6 +13,7 @@ Script keys::
      "write_abs": {"path": "/abs/path", "content": "..."},  # writes with no permission prompt
      "delegate": true,                     # asks permission for an "Agent: spawn subagent" call
      "block_seconds": 30,                  # sleep before responding; cancel -> "cancelled"
+     "fail_on_cancel": true,               # ... unless this is set: cancel -> RequestError
      "fail": true,                         # raise a RequestError from prompt
      "malformed_review": true,             # respond with "not json"
      "capture_env_to": "/path/file.json",  # dump os.environ on prompt
@@ -129,6 +130,9 @@ class FakeAgent:
 
         block_seconds = script.get("block_seconds")
         if block_seconds and await self._blocked(session_id, float(block_seconds)):
+            if script.get("fail_on_cancel"):
+                # An agent that falls over when asked to stop, instead of reporting "cancelled".
+                raise RequestError.internal_error({"details": "cancelled mid-turn"})
             return PromptResponse(stop_reason="cancelled")
 
         write_abs = script.get("write_abs")

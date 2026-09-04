@@ -12,6 +12,7 @@ reads that state and only then calls :meth:`UnitBackend.reset_failed`.
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -283,8 +284,13 @@ class SystemdUserBackend(UnitBackend):
             )
 
     def reset_failed(self, unit: str) -> None:
-        """Forget a dead unit. Failure is ignored: the state has already been read."""
-        self._call(["systemctl", "--user", "reset-failed", unit], code="UNIT_QUERY_FAILED")
+        """Forget a dead unit. Failure is ignored: the state has already been read.
+
+        A systemctl that is slow, missing or simply refuses leaves the unit loaded, which costs
+        nothing; raising here would abandon a reconciliation sweep over a piece of tidying.
+        """
+        with contextlib.suppress(UnitError):
+            self._call(["systemctl", "--user", "reset-failed", unit], code="UNIT_QUERY_FAILED")
 
 
 def worker_unit_name(task_id: str) -> str:

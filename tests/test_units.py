@@ -133,6 +133,22 @@ def test_a_failed_systemd_command_raises_but_reset_failed_does_not() -> None:
     backend.reset_failed("taskspindle-worker-ts_1")
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [subprocess.TimeoutExpired("systemctl", 30.0), OSError("no systemctl here")],
+)
+def test_reset_failed_swallows_a_systemctl_that_cannot_run(failure: Exception) -> None:
+    def explode(argv: Sequence[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
+        raise failure
+
+    backend = SystemdUserBackend(runner=explode)
+
+    with pytest.raises(UnitError):
+        backend.show("taskspindle-worker-ts_1")
+    # Tidying up must never be the thing that ends a reconciliation sweep.
+    backend.reset_failed("taskspindle-worker-ts_1")
+
+
 def test_show_of_an_unknown_unit_parses_as_not_found() -> None:
     state = parse_show(NOT_FOUND_OUTPUT)
     assert state.load_state == "not-found"

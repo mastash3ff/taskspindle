@@ -28,8 +28,12 @@ class FakeUnitBackend:
         states: Mapping[str, UnitState] | None = None,
         *,
         on_start: Callable[[str, tuple[str, ...]], None] | None = None,
+        on_show: Callable[[str], None] | None = None,
     ) -> None:
         self.states: dict[str, UnitState] = dict(states or {})
+        #: Called with the unit name before ``show`` answers, so a test can make systemd
+        #: misbehave or move the world underneath the sweep.
+        self.on_show = on_show
         self.started: list[tuple[str, tuple[str, ...]]] = []
         self.killed: list[tuple[str, str]] = []
         self.stopped: list[str] = []
@@ -54,6 +58,8 @@ class FakeUnitBackend:
             self.on_start(unit, tuple(argv))
 
     def show(self, unit: str) -> UnitState:
+        if self.on_show is not None:
+            self.on_show(unit)
         return self.states.get(unit, NOT_FOUND)
 
     def kill(self, unit: str, signal: str) -> None:
