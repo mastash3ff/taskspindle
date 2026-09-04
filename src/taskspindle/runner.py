@@ -61,6 +61,10 @@ HEARTBEAT_INTERVAL_S = 5.0
 #: Verification never runs longer than this, whatever the task's own timeout is.
 MAX_VERIFICATION_S = 1800
 
+#: How long to keep capturing after a prompt response, per provider family, for the agents that
+#: send their turn summary after answering. Grok's ``turn_completed`` arrives within milliseconds.
+LATE_UPDATE_GRACE_S: dict[str, float] = {"grok": 2.0}
+
 #: Warning recorded when the pre-dispatch root snapshot is missing, so the root check could not run.
 ROOT_CHECK_SKIPPED = "ROOT_CHECK_SKIPPED"
 
@@ -453,6 +457,7 @@ async def _run_turn(
         cwd=workspace,
         stderr_path=stderr_path,
         policy=PermissionPolicy(allow_writes=task.mode is Mode.IMPLEMENT),
+        late_update_grace=LATE_UPDATE_GRACE_S.get(profile.family, 0.0),
     )
     try:
         async with worker as agent:
@@ -489,7 +494,7 @@ async def _run_turn(
 
     run.result = result
     _record_provider_health(run, profile, result)
-    _record_usage(run, profile, workspace, result)
+    await _record_usage(run, profile, workspace, result)
     _record_violations(run, result)
     if run.cancelled or result.stop_reason == "cancelled":
         return _settle_cancelled(run)
@@ -689,24 +694,39 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
         run.store.set_provider_status(key, "ok", task_id=run.task_id, source="turn_ok")
 
 
-def _record_usage(run: _Run, profile: Profile, workspace: Path, result: TurnResult) -> None:
+#: How long, and how often, to wait for Claude Code to write the session record that names the
+#: model: it lands a few tens of milliseconds after the prompt response does.
+_SESSION_FILE_RETRIES = 8
+_SESSION_FILE_WAIT_S = 0.25
+
+
+async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: TurnResult) -> None:
     """What the turn cost and which model answered, from the wire first."""
     duration_ms: int | None = None
     if run.prompt_started_at and run.prompt_ended_at:
         started = datetime.fromisoformat(run.prompt_started_at.replace("Z", "+00:00"))
         ended = datetime.fromisoformat(run.prompt_ended_at.replace("Z", "+00:00"))
         duration_ms = int((ended - started).total_seconds() * 1000)
+    home = Path(os.environ.get("HOME", ""))
     collected = usage.collect(
         result,
         profile=profile,
         cwd=workspace,
         session_id=run.session_id,
-        home=Path(os.environ.get("HOME", "")),
+        home=home,
         duration_ms=duration_ms,
         started_at=run.prompt_started_at,
     )
-    run.usage = collected.usage
-    run.reported_model = collected.model
+    model = collected.model
+    session_path = usage.claude_session_path(profile, workspace, run.session_id, home)
+    if model is None and session_path is not None:
+        for _ in range(_SESSION_FILE_RETRIES):
+            await asyncio.sleep(_SESSION_FILE_WAIT_S)
+            model = usage.claude_session_model(session_path)
+            if model is not None:
+                break
+    run.usage = usage.with_model(collected.usage, model) if collected.usage else None
+    run.reported_model = model
 
 
 def _record_violations(run: _Run, result: TurnResult) -> None:

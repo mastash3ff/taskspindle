@@ -24,6 +24,7 @@ Script keys::
                                            # send a usage_update carrying _claude/rateLimit
      "turn_completed": {"usage": {...}},   # send Grok's non-standard turn_completed update
      "model_id": "fake-model-1",           # stamp _meta.modelId on every message chunk
+     "late_turn_completed": true,          # ... sent shortly *after* the prompt response
      "fail_kind": "auth" | "rate_limit" | "usage_limit" | "usage_limit_prefix" | "overloaded"}
                                            # raise a shaped RequestError from prompt
 """
@@ -186,15 +187,13 @@ class FakeAgent:
             await self._emit(session_id, chunk)
 
         turn_completed = script.get("turn_completed")
-        if turn_completed:
-            # Grok's update is not in the ACP schema, so it goes out as a raw notification.
-            await self.conn._conn.send_notification(
-                "session/update",
-                {
-                    "sessionId": session_id,
-                    "update": {"sessionUpdate": "turn_completed", **turn_completed},
-                },
+        if turn_completed and script.get("late_turn_completed"):
+            # Grok answers first and sends its turn summary a moment later.
+            asyncio.get_running_loop().call_later(
+                0.2, lambda: asyncio.ensure_future(self._turn_completed(session_id, turn_completed))
             )
+        elif turn_completed:
+            await self._turn_completed(session_id, turn_completed)
         usage = script.get("usage")
         if usage:
             return PromptResponse(stop_reason="end_turn", usage=Usage.model_validate(usage))
@@ -214,6 +213,14 @@ class FakeAgent:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(event.wait(), timeout=seconds)
         return event.is_set()
+
+    async def _turn_completed(self, session_id: str, payload: dict[str, Any]) -> None:
+        # Grok's update is not in the ACP schema and travels on a vendor-prefixed method, so it
+        # goes out as a raw notification the way Grok 1.0.13 sends it on the wire.
+        await self.conn._conn.send_notification(
+            "_x.ai/session_notification",
+            {"sessionId": session_id, "update": {"sessionUpdate": "turn_completed", **payload}},
+        )
 
     async def _emit(self, session_id: str, text: str) -> None:
         model_id = self.script.get("model_id")

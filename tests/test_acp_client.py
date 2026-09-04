@@ -213,6 +213,69 @@ async def test_a_failing_turn_is_an_acp_turn_error(tmp_path: Path) -> None:
     assert excinfo.value.code == "ACP_TURN_ERROR"
 
 
+# -- usage and late updates -------------------------------------------------------------------------
+
+
+async def test_usage_and_rate_limits_are_captured_from_the_wire(tmp_path: Path) -> None:
+    script = {
+        "response": "done",
+        "usage": {"inputTokens": 10, "outputTokens": 2, "totalTokens": 12, "cachedReadTokens": 5},
+        "rate_limit": {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.4},
+        "model_id": "fake-model-1",
+    }
+    async with running_agent(tmp_path, script) as worker:
+        session_id = await worker.new_session()
+        result = await worker.prompt(session_id, "go", timeout=10)
+
+    assert result.usage == {
+        "total_tokens": 12,
+        "input_tokens": 10,
+        "output_tokens": 2,
+        "cached_read_tokens": 5,
+    }
+    assert result.capture.rate_limits == [
+        {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.4}
+    ]
+    assert result.capture.usage_updates[0]["size"] == 200000
+    assert result.capture.model_ids == ["fake-model-1"]
+
+
+async def test_a_turn_summary_sent_after_the_response_is_captured_within_the_grace(
+    tmp_path: Path,
+) -> None:
+    script = {
+        "response": "done",
+        "turn_completed": {"usage": {"inputTokens": 7}},
+        "late_turn_completed": True,
+    }
+    env = child_env(tmp_path)
+    script_path = tmp_path / "script.json"
+    script_path.write_text(json.dumps(script), encoding="utf-8")
+    env["TASKSPINDLE_FAKE_SCRIPT"] = str(script_path)
+
+    def worker_with(grace: float) -> AcpWorker:
+        return AcpWorker(
+            command=AGENT_ARGV,
+            env=env,
+            cwd=tmp_path,
+            stderr_path=tmp_path / "agent.err",
+            policy=PermissionPolicy(allow_writes=False),
+            late_update_grace=grace,
+        )
+
+    async with worker_with(2.0) as worker:
+        session_id = await worker.new_session()
+        result = await worker.prompt(session_id, "go", timeout=10)
+    assert result.capture.turn_completed == {"sessionUpdate": "turn_completed", "usage": {"inputTokens": 7}}
+
+    # Without the grace the summary lands after capture has closed, and is lost.
+    async with worker_with(0.0) as worker:
+        session_id = await worker.new_session()
+        result = await worker.prompt(session_id, "go", timeout=10)
+        await asyncio.sleep(0.5)
+    assert result.capture.turn_completed is None
+
+
 # -- resume --------------------------------------------------------------------------------------
 
 

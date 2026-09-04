@@ -267,6 +267,7 @@ class AcpWorker:
         stderr_path: Path,
         policy: PermissionPolicy,
         handshake_timeout: float = 60.0,
+        late_update_grace: float = 0.0,
     ) -> None:
         if not command:
             raise AcpError("ACP_SPAWN_FAILED", "empty command")
@@ -276,6 +277,10 @@ class AcpWorker:
         self._stderr_path = stderr_path
         self.policy = policy
         self._handshake_timeout = handshake_timeout
+        #: How long :meth:`prompt` keeps capturing after the response, for an agent that sends
+        #: its turn summary *after* answering. Grok 1.0.13 sends ``turn_completed`` -- the update
+        #: with the turn's token usage -- that way; the wait ends the moment it arrives.
+        self._late_update_grace = late_update_grace
 
         self._stack = contextlib.AsyncExitStack()
         self._conn: Any = None
@@ -347,14 +352,14 @@ class AcpWorker:
         """Synchronous, inline in receive order: see the module docstring."""
         if event.direction is not StreamDirection.INCOMING:
             return
-        if event.message.get("method") != "session/update":
+        params = event.message.get("params")
+        update = params.get("update") if isinstance(params, dict) else None
+        if not _is_session_update(event.message.get("method"), update):
             return
         capture = self._capture
         if capture is None:
             return
         capture.raw_update_count += 1
-        params = event.message.get("params")
-        update = params.get("update") if isinstance(params, dict) else None
         if not isinstance(update, dict):
             return
         kind = update.get("sessionUpdate")
@@ -451,6 +456,11 @@ class AcpWorker:
             raise AcpError(
                 "ACP_TURN_ERROR", f"session/prompt failed: {exc}", cause=error_cause(exc)
             ) from exc
+        except BaseException:
+            self._capture = None
+            raise
+        try:
+            await self._await_late_updates(capture)
         finally:
             self._capture = None
         return TurnResult(
@@ -459,6 +469,17 @@ class AcpWorker:
             capture=capture,
             usage=_usage_data(getattr(response, "usage", None)),
         )
+
+    async def _await_late_updates(self, capture: TurnCapture) -> None:
+        """Keep the capture open a little after the response, until the turn summary lands."""
+        if self._late_update_grace <= 0 or capture.turn_completed is not None:
+            return
+        deadline = asyncio.get_running_loop().time() + self._late_update_grace
+        while capture.turn_completed is None:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(0.05, remaining))
 
     async def cancel(self, session_id: str) -> None:
         """Ask the agent to stop the current turn. Bounded, and never raises."""
@@ -472,6 +493,25 @@ class AcpWorker:
         if self._conn is None:
             raise AcpError("ACP_TURN_ERROR", "worker is not running")
         return self._conn
+
+
+def _is_session_update(method: Any, update: Any) -> bool:
+    """``session/update``, or a vendor notification shaped like one.
+
+    ACP lets an agent prefix a method with ``_<vendor>/`` for what the spec does not cover. Grok
+    1.0.13 sends its ``turn_completed`` update -- the one carrying the turn's token usage -- as
+    ``_x.ai/session_notification`` with the same ``{sessionId, update: {sessionUpdate: ...}}``
+    params (verified on the wire; its own session log names the method differently), and a client
+    that only listens for the plain method never sees it.
+    """
+    if method == "session/update":
+        return True
+    return (
+        isinstance(method, str)
+        and method.startswith("_")
+        and isinstance(update, dict)
+        and isinstance(update.get("sessionUpdate"), str)
+    )
 
 
 def _note_model_id(capture: TurnCapture, update: Mapping[str, Any], params: Any) -> None:

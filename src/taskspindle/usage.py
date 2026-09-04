@@ -33,6 +33,7 @@ __all__ = [
     "TurnUsage",
     "claude_session_file",
     "claude_session_model",
+    "claude_session_path",
     "collect",
     "estimate_cost",
     "from_claude_session_file",
@@ -41,6 +42,7 @@ __all__ = [
     "parse_since",
     "report",
     "windows_report",
+    "with_model",
 ]
 
 #: The date of the published Anthropic price list these rates were copied from.
@@ -320,6 +322,29 @@ def from_claude_session_file(
     )
 
 
+def with_model(turn: TurnUsage, model: str | None) -> TurnUsage:
+    """The same counts attributed to ``model``, priced again now that the model is known."""
+    if model is None or model == turn.model:
+        return turn
+    cost, version = estimate_cost(
+        model,
+        input_tokens=turn.input_tokens,
+        output_tokens=turn.output_tokens,
+        cache_read_tokens=turn.cache_read_tokens,
+        cache_write_tokens=turn.cache_write_tokens,
+    )
+    fields = {**asdict(turn), "model": model, "cost_estimate_usd": cost, "price_table_version": version}
+    return TurnUsage(**fields)
+
+
+def claude_session_path(profile: Profile, cwd: Path, session_id: str | None, home: Path) -> Path | None:
+    """Where this turn's Claude session record is, for a Claude-family profile; else None."""
+    if profile.family != "claude" or not session_id:
+        return None
+    config_dir = Path(profile.env.get("CLAUDE_CONFIG_DIR") or (home / ".claude"))
+    return claude_session_file(config_dir, cwd, session_id)
+
+
 # -- the collector the runner calls -----------------------------------------------------------
 
 
@@ -336,12 +361,9 @@ def collect(
     """What this turn cost and which model answered, from the wire first and a file last."""
     capture = result.capture
     model: str | None = capture.model_ids[0] if capture.model_ids else None
-    session_path: Path | None = None
-    if profile.family == "claude" and session_id:
-        config_dir = Path(profile.env.get("CLAUDE_CONFIG_DIR") or (home / ".claude"))
-        session_path = claude_session_file(config_dir, cwd, session_id)
-        if model is None:
-            model = claude_session_model(session_path)
+    session_path = claude_session_path(profile, cwd, session_id, home)
+    if session_path is not None and model is None:
+        model = claude_session_model(session_path)
     if model is None:
         model = profile.model
 

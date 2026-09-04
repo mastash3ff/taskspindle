@@ -39,6 +39,18 @@ def test_prompt_response_usage_is_priced_for_a_known_model() -> None:
     assert unknown.price_table_version is None
 
 
+def test_with_model_prices_a_turn_once_the_model_is_known() -> None:
+    unknown = usage.from_prompt_response({"input_tokens": 1_000_000}, model=None, duration_ms=None)
+    assert unknown.cost_estimate_usd is None
+
+    priced = usage.with_model(unknown, "claude-sonnet-5")
+    assert priced.model == "claude-sonnet-5"
+    assert priced.cost_estimate_usd == pytest.approx(2.0)
+    assert priced.input_tokens == 1_000_000
+    assert usage.with_model(priced, None) is priced
+    assert usage.with_model(priced, "claude-sonnet-5") is priced
+
+
 def test_turn_completed_keeps_grok_cost_ticks_raw() -> None:
     turn = usage.from_turn_completed(
         {
