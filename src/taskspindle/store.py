@@ -396,6 +396,10 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
+    def list_repositories(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM repositories ORDER BY created_at, id").fetchall()
+        return [dict(row) for row in rows]
+
     def find_repository(self, common_dir: str, root_commit: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM repositories WHERE common_dir = ? AND root_commit = ?",

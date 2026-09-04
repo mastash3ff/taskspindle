@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from taskspindle.units import UnitState
@@ -17,14 +17,24 @@ NOT_FOUND = UnitState("not-found", "inactive", "dead", "success", None, None)
 
 
 class FakeUnitBackend:
-    """Answers ``show`` from a script and records everything else it was asked to do."""
+    """Answers ``show`` from a script and records everything else it was asked to do.
 
-    def __init__(self, states: Mapping[str, UnitState] | None = None) -> None:
+    ``on_start`` is the hook the orchestrator tests use to run a worker in-process: systemd would
+    have detached the unit, so the fake stands in for the whole detour and runs the turn inline.
+    """
+
+    def __init__(
+        self,
+        states: Mapping[str, UnitState] | None = None,
+        *,
+        on_start: Callable[[str, tuple[str, ...]], None] | None = None,
+    ) -> None:
         self.states: dict[str, UnitState] = dict(states or {})
         self.started: list[tuple[str, tuple[str, ...]]] = []
         self.killed: list[tuple[str, str]] = []
         self.stopped: list[str] = []
         self.reset: list[str] = []
+        self.on_start = on_start
 
     def set(self, unit: str, state: UnitState) -> None:
         self.states[unit] = state
@@ -40,6 +50,8 @@ class FakeUnitBackend:
     ) -> None:
         self.started.append((unit, tuple(argv)))
         self.states.setdefault(unit, ACTIVE)
+        if self.on_start is not None:
+            self.on_start(unit, tuple(argv))
 
     def show(self, unit: str) -> UnitState:
         return self.states.get(unit, NOT_FOUND)
