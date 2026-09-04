@@ -42,6 +42,12 @@ _SPINDLE_IDENTITY = {
 #: Largest slice :func:`read_diff_page` will hand back in one call.
 MAX_DIFF_PAGE = 262144
 
+#: The page ``task_diff`` returns when the caller names no length. Small on purpose: the MCP client
+#: truncates tool output at its own token limit (Codex's ``tool_output_token_limit`` defaults to a
+#: few thousand tokens), and a receipt for a page the session never saw in full would let the
+#: "whole diff retrieved" gate pass on bytes nobody read. 16 KiB of diff is about 22 KB of base64.
+DEFAULT_DIFF_PAGE = 16384
+
 
 def _text(raw: bytes) -> str:
     return raw.decode("utf-8", "replace").strip()

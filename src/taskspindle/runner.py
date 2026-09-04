@@ -22,10 +22,11 @@ import signal
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from . import providers, repos, units, worktrees
+from . import limits, providers, repos, units, usage, worktrees
 from .acp_client import AcpError, AcpWorker, PermissionPolicy, TurnResult
 from .config import Paths, load_config
 from .config import paths as default_paths
@@ -225,6 +226,13 @@ class _Run:
     result: TurnResult | None = None
     cancelled: bool = False
     turn_completed: bool = False
+    #: What the agent said about itself at ``initialize``: its name and version, not a model.
+    agent_info: dict[str, Any] = field(default_factory=dict)
+    #: The model that actually answered, when the wire or the session file said.
+    reported_model: str | None = None
+    usage: usage.TurnUsage | None = None
+    prompt_started_at: str | None = None
+    prompt_ended_at: str | None = None
 
     @property
     def task_id(self) -> str:
@@ -448,6 +456,7 @@ async def _run_turn(
     )
     try:
         async with worker as agent:
+            run.agent_info = dict(agent.init.agent_info) if agent.init else {}
             if evidence is None:
                 evidence = _post_init_evidence(profile, agent)
             run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
@@ -461,9 +470,26 @@ async def _run_turn(
             return _settle_cancelled(run)
         if exc.code == "RESUME_UNAVAILABLE":
             raise _Interrupted("RESUME_UNAVAILABLE", str(exc)) from exc
-        raise _Failure(exc.code, str(exc), retryable=exc.code != "TURN_TIMEOUT") from exc
+        verdict = limits.classify_acp_error(exc, family=profile.family)
+        if verdict.provider_state is not None:
+            _record_provider_limit(run, profile, verdict)
+        raise _Failure(
+            verdict.code,
+            verdict.reason,
+            retryable=verdict.retryable,
+            details={
+                "provider": run.task.provider,
+                "status_key": limits.status_key(profile),
+                "window": verdict.window,
+                "reset_at": verdict.reset_at,
+                "acp_code": exc.code,
+                "rpc_data": exc.cause.get("rpc_data"),
+            },
+        ) from exc
 
     run.result = result
+    _record_provider_health(run, profile, result)
+    _record_usage(run, profile, workspace, result)
     _record_violations(run, result)
     if run.cancelled or result.stop_reason == "cancelled":
         return _settle_cancelled(run)
@@ -566,6 +592,7 @@ async def _prompt(run: _Run, agent: AcpWorker, cancel_event: asyncio.Event) -> T
     """Send the turn, racing it against a cancel request."""
     session_id = run.session_id or ""
     _CANCEL_HOOKS[run.task_id] = cancel_event.set
+    run.prompt_started_at = now()
     turn = asyncio.create_task(agent.prompt(session_id, run.prompt, timeout=float(run.task.timeout_s)))
     waiter = asyncio.create_task(cancel_event.wait())
     try:
@@ -576,10 +603,110 @@ async def _prompt(run: _Run, agent: AcpWorker, cancel_event: asyncio.Event) -> T
             await agent.cancel(session_id)
         return await turn
     finally:
+        run.prompt_ended_at = now()
         _CANCEL_HOOKS.pop(run.task_id, None)
         waiter.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await waiter
+
+
+def _record_provider_limit(run: _Run, profile: Profile, verdict: limits.Classification) -> None:
+    """A quota or auth refusal is written on the task, on the provider, and in the event log.
+
+    It is never acted on here: the next ``start_task`` and ``capabilities`` read the provider row
+    and say so, and the caller chooses. Nothing is retried on another provider.
+    """
+    key = limits.status_key(profile)
+    observed = now()
+    payload = {
+        "code": verdict.code,
+        "provider": run.task.provider,
+        "status_key": key,
+        "state": verdict.provider_state,
+        "window": verdict.window,
+        "reset_at": verdict.reset_at,
+        "observed_at": observed,
+        "source": verdict.source,
+        "message": verdict.reason,
+    }
+    run.store.set_provider_status(
+        key,
+        verdict.provider_state or "ok",
+        code=verdict.code,
+        window=verdict.window,
+        reason=verdict.reason,
+        reset_at=verdict.reset_at,
+        task_id=run.task_id,
+        source=verdict.source,
+        observed_at=observed,
+    )
+    run.store.append_event(run.task_id, EventKind.PROVIDER_LIMIT, payload)
+    run.store.append_event(None, EventKind.PROVIDER_STATUS, payload)
+    if verdict.provider_state == "throttled":
+        run.store.insert_provider_window(
+            key,
+            verdict.window or "unknown",
+            status="rejected",
+            used_percent=100.0,
+            resets_at=verdict.reset_at,
+            task_id=run.task_id,
+            source="throttle_error",
+            observed_at=observed,
+        )
+    run.log.write(f"provider {key} {verdict.provider_state} ({verdict.code})")
+
+
+def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> None:
+    """A turn that ran records the windows it saw and clears any throttle on its provider."""
+    key = limits.status_key(profile)
+    rejected = False
+    for info in result.capture.rate_limits:
+        window = limits.rate_limit_window(info)
+        run.store.insert_provider_window(
+            key,
+            window["window"],
+            status=window["status"],
+            used_percent=window["used_percent"],
+            resets_at=window["resets_at"],
+            task_id=run.task_id,
+            source="rate_limit_event",
+        )
+        rejected = rejected or window["status"] == "rejected"
+    current = run.store.get_provider_status(key)
+    if rejected:
+        latest = limits.rate_limit_window(result.capture.rate_limits[-1])
+        run.store.set_provider_status(
+            key,
+            "throttled",
+            code=limits.PROVIDER_THROTTLED,
+            window=latest["window"],
+            reason="the agent reported its usage window as rejected",
+            reset_at=latest["resets_at"],
+            task_id=run.task_id,
+            source="rate_limit_event",
+        )
+    elif current is None or current["state"] != "ok":
+        run.store.set_provider_status(key, "ok", task_id=run.task_id, source="turn_ok")
+
+
+def _record_usage(run: _Run, profile: Profile, workspace: Path, result: TurnResult) -> None:
+    """What the turn cost and which model answered, from the wire first."""
+    duration_ms: int | None = None
+    if run.prompt_started_at and run.prompt_ended_at:
+        started = datetime.fromisoformat(run.prompt_started_at.replace("Z", "+00:00"))
+        ended = datetime.fromisoformat(run.prompt_ended_at.replace("Z", "+00:00"))
+        duration_ms = int((ended - started).total_seconds() * 1000)
+    collected = usage.collect(
+        result,
+        profile=profile,
+        cwd=workspace,
+        session_id=run.session_id,
+        home=Path(os.environ.get("HOME", "")),
+        duration_ms=duration_ms,
+        started_at=run.prompt_started_at,
+    )
+    run.usage = collected.usage
+    run.reported_model = collected.model
 
 
 def _record_violations(run: _Run, result: TurnResult) -> None:
@@ -818,6 +945,8 @@ def _settle(run: _Run, state: TaskState, reason: str, **fields: Any) -> TaskStat
     if transcript is not None:
         fields["transcript_path"] = str(transcript)
     fields["warnings"] = run.warnings or None
+    if run.reported_model:
+        fields.setdefault("reported_model", run.reported_model)
 
     current = run.store.get_task(run.task_id)
     if current is not None and current.state is TaskState.CANCELLING and state not in (
@@ -876,9 +1005,17 @@ def _complete_turn(run: _Run) -> None:
                 "provider": run.task.provider,
                 "profile": profile.id if profile else None,
                 "model": profile.model if profile else None,
+                "reported_model": run.reported_model,
                 "auth": profile.auth if profile else None,
+                "gateway_host": profile.gateway_host if profile else None,
+                "agent": run.agent_info or None,
             },
         )
+    if run.usage is not None:
+        with contextlib.suppress(StoreError):
+            run.store.insert_turn_usage(
+                run.turn_id, run.task_id, run.task.provider, **run.usage.as_fields()
+            )
 
 
 # -- entry point ----------------------------------------------------------------------------

@@ -145,6 +145,10 @@ class EventKind(StrEnum):
     DELEGATION_ATTEMPT = "DELEGATION_ATTEMPT"
     RECOVERY = "RECOVERY"
     WARNING = "WARNING"
+    #: A provider refused a turn because of a quota, rate or subscription limit.
+    PROVIDER_LIMIT = "PROVIDER_LIMIT"
+    #: A provider's availability row changed; not tied to one task.
+    PROVIDER_STATUS = "PROVIDER_STATUS"
 
 
 def _one_line(value: str, field: str) -> str:
@@ -250,6 +254,9 @@ class StartTaskRequest(BaseModel):
     effort: str | None = None
     timeout_s: int = Field(default=1800, ge=60, le=14400)
     allow_metered: bool = False
+    #: Start on a provider TaskSpindle currently believes is throttled or logged out. The turn
+    #: will most likely fail again, but the choice is the caller's, never TaskSpindle's.
+    ignore_provider_status: bool = False
     # implement only
     acceptance_criteria: str | None = None
     path_prefixes: list[str] | None = None
@@ -442,7 +449,12 @@ class TaskResult(BaseModel):
     response: str | None = None
     checks: list[CheckRecord] = Field(default_factory=list)
     attribution: dict[str, Any] = Field(default_factory=dict)
-    quota_warnings: list[str] = Field(default_factory=list)
+    #: The task's warnings, as ``task_status`` shows them.
+    warnings: list[str] = Field(default_factory=list)
+    #: Every quota, rate or subscription limit a turn of this task ran into.
+    quota_warnings: list[dict[str, Any]] = Field(default_factory=list)
+    #: Token usage of the task's turns, newest last; empty when the agent reported none.
+    usage: list[dict[str, Any]] = Field(default_factory=list)
     transcript_locator: str | None = None
 
 

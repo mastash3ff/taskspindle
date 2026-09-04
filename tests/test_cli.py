@@ -95,6 +95,25 @@ def test_doctor_marks_each_check_and_fails_on_a_real_failure(
     ]
 
 
+def test_usage_prints_the_report_as_json_or_as_tables(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["usage", "--json", "--since", "7d", "--group-by", "day"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["group_by"] == "day"
+    assert printed["usage"] == []
+    assert printed["turns"]["count"] == 0
+    assert {entry["provider"] for entry in printed["windows"]} == {"claude", "grok"}
+
+    assert cli.main(["usage"]) == 0
+    text = capsys.readouterr().out
+    assert "(nothing recorded)" in text
+    assert "claude: unknown" in text
+
+    assert cli.main(["usage", "--since", "yesterday"]) == 1
+    assert "since must be" in capsys.readouterr().err
+
+
 def test_a_broken_config_is_one_failed_check_rather_than_a_traceback(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

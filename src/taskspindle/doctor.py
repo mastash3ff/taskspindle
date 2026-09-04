@@ -24,12 +24,13 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import taskspindle
 
-from . import providers
+from . import limits, providers
 from .acp_client import AcpWorker, InitInfo, PermissionPolicy
 from .config import Paths
 from .providers import Profile
@@ -105,12 +106,18 @@ class _Doctor:
         parent_env: Mapping[str, str],
         live_probes: bool,
         runner: Runner,
+        provider_status: Sequence[Mapping[str, Any]] = (),
+        now: datetime | None = None,
     ) -> None:
         self.profiles = dict(profiles)
         self.paths = paths
         self.parent_env = dict(parent_env)
         self.live_probes = live_probes
         self.runner = runner
+        #: Rows of ``provider_status``, read by the caller on its own thread: the store's sqlite
+        #: connection must never be used from the worker thread the blocking checks run on.
+        self.provider_status = {str(row["provider"]): dict(row) for row in provider_status}
+        self.now = now or datetime.now(UTC)
         self.checks: list[Check] = []
 
     # -- plumbing -------------------------------------------------------------------
@@ -161,6 +168,22 @@ class _Doctor:
         self.child_envs()
         self.codex_registration()
         self.profile_commands()
+        self.provider_availability()
+
+    def provider_availability(self) -> None:
+        """What the last turn on each provider learned about its seat. Advisory: a limit lifts."""
+        for profile_id, profile in sorted(self.profiles.items()):
+            row = self.provider_status.get(limits.status_key(profile))
+
+            @self.check(f"availability_{profile_id}", advisory=True)
+            def probe(row: Mapping[str, Any] | None = row) -> str:
+                state = limits.effective_state(row, self.now)
+                if state in ("ok", "unknown"):
+                    return "no limit recorded" if state == "unknown" else "ok"
+                detail = f"{state}: {row.get('reason') or row.get('code')}" if row else state
+                if row and row.get("reset_at"):
+                    detail += f" (resets {row['reset_at']})"
+                raise RuntimeError(detail)
 
     def git(self) -> None:
         @self.check("git")
@@ -417,6 +440,8 @@ async def run_doctor_async(
     parent_env: Mapping[str, str],
     live_probes: bool = True,
     runner: Runner = subprocess.run,
+    provider_status: Sequence[Mapping[str, Any]] = (),
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Ask every question and report the answers; advisory failures never fail the run."""
     doctor = _Doctor(
@@ -425,6 +450,8 @@ async def run_doctor_async(
         parent_env=parent_env,
         live_probes=live_probes,
         runner=runner,
+        provider_status=provider_status,
+        now=now,
     )
     await doctor.collect()
     return {
@@ -440,6 +467,7 @@ def run_doctor(
     parent_env: Mapping[str, str],
     live_probes: bool = True,
     runner: Runner = subprocess.run,
+    provider_status: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """:func:`run_doctor_async` for a caller that owns no event loop, such as the CLI."""
     return asyncio.run(
@@ -449,5 +477,6 @@ def run_doctor(
             parent_env=parent_env,
             live_probes=live_probes,
             runner=runner,
+            provider_status=provider_status,
         )
     )

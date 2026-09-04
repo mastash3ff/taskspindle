@@ -239,7 +239,84 @@ CREATE TABLE integration_journal (
 );
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _MIGRATION_1)]
+_MIGRATION_2 = """
+CREATE TABLE provider_status (
+    provider TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    code TEXT,
+    window TEXT,
+    reason TEXT,
+    reset_at TEXT,
+    observed_at TEXT NOT NULL,
+    task_id TEXT REFERENCES tasks(id),
+    source TEXT NOT NULL
+);
+
+CREATE TABLE turn_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id INTEGER NOT NULL UNIQUE REFERENCES turns(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    model TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    model_calls INTEGER,
+    duration_ms INTEGER,
+    cost_estimate_usd REAL,
+    cost_is_estimate INTEGER NOT NULL DEFAULT 1,
+    price_table_version TEXT,
+    source TEXT NOT NULL,
+    raw TEXT,
+    captured_at TEXT NOT NULL
+);
+
+CREATE INDEX turn_usage_task_idx ON turn_usage(task_id);
+CREATE INDEX turn_usage_provider_idx ON turn_usage(provider, captured_at);
+
+CREATE TABLE provider_windows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    window TEXT NOT NULL,
+    status TEXT,
+    used_percent REAL,
+    resets_at TEXT,
+    observed_at TEXT NOT NULL,
+    task_id TEXT REFERENCES tasks(id),
+    source TEXT NOT NULL
+);
+
+CREATE INDEX provider_windows_idx ON provider_windows(provider, window, observed_at);
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _MIGRATION_1), (2, _MIGRATION_2)]
+
+#: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
+TURN_USAGE_FIELDS: tuple[str, ...] = (
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+    "model_calls",
+    "duration_ms",
+    "cost_estimate_usd",
+    "cost_is_estimate",
+    "price_table_version",
+    "source",
+    "raw",
+)
+
+#: The event kinds that count as violations in a usage report.
+VIOLATION_EVENT_KINDS: tuple[str, ...] = (
+    "SCOPE_VIOLATION",
+    "ROOT_MUTATION",
+    "READ_ONLY_VIOLATION",
+    "DELEGATION_ATTEMPT",
+)
 
 _UPDATABLE_TASK_COLUMNS = frozenset(TASK_COLUMNS) - {"id", "state_version", "updated_at"}
 
@@ -870,9 +947,233 @@ class Store:
         with self._guard(), self.transaction() as conn:
             conn.execute("DELETE FROM integration_journal WHERE task_id = ?", (task_id,))
 
+    # -- provider status --------------------------------------------------------------
+
+    def set_provider_status(
+        self,
+        provider: str,
+        state: str,
+        *,
+        source: str,
+        code: str | None = None,
+        window: str | None = None,
+        reason: str | None = None,
+        reset_at: str | None = None,
+        task_id: str | None = None,
+        observed_at: str | None = None,
+    ) -> None:
+        """Record what TaskSpindle last learned about a provider's willingness to take a turn."""
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO provider_status(provider, state, code, window, reason, reset_at, "
+                "observed_at, task_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(provider) DO UPDATE SET state = excluded.state, "
+                "code = excluded.code, window = excluded.window, reason = excluded.reason, "
+                "reset_at = excluded.reset_at, observed_at = excluded.observed_at, "
+                "task_id = excluded.task_id, source = excluded.source",
+                (
+                    provider,
+                    state,
+                    code,
+                    window,
+                    reason,
+                    reset_at,
+                    observed_at or now(),
+                    task_id,
+                    source,
+                ),
+            )
+
+    def get_provider_status(self, provider: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_status WHERE provider = ?", (provider,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_provider_status(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
+        return [dict(row) for row in rows]
+
+    # -- turn usage -------------------------------------------------------------------
+
+    def insert_turn_usage(self, turn_id: int, task_id: str, provider: str, **fields: Any) -> int:
+        """Record what one turn cost; a second record for the same turn replaces the first."""
+        unknown = set(fields) - set(TURN_USAGE_FIELDS)
+        if unknown:
+            raise StoreError(f"unknown turn_usage columns: {', '.join(sorted(unknown))}")
+        columns = ["turn_id", "task_id", "provider", *fields, "captured_at"]
+        values: list[Any] = [turn_id, task_id, provider]
+        for column, value in fields.items():
+            if column == "raw":
+                values.append(_json_or_none(value))
+            elif column == "cost_is_estimate":
+                values.append(int(bool(value)))
+            else:
+                values.append(value)
+        values.append(now())
+        updates = ", ".join(f"{column} = excluded.{column}" for column in columns[1:])
+        with self._guard(), self.transaction() as conn:
+            cur = conn.execute(
+                f"INSERT INTO turn_usage({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)}) "
+                f"ON CONFLICT(turn_id) DO UPDATE SET {updates}",
+                values,
+            )
+            row = conn.execute(
+                "SELECT id FROM turn_usage WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+            return int(row[0]) if row else int(cur.lastrowid or 0)
+
+    @staticmethod
+    def _usage_row(row: sqlite3.Row) -> dict[str, Any]:
+        usage = dict(row)
+        usage["raw"] = _loads(usage.get("raw"))
+        usage["cost_is_estimate"] = bool(usage.get("cost_is_estimate"))
+        return usage
+
+    def get_turn_usage(self, turn_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM turn_usage WHERE turn_id = ?", (turn_id,)
+        ).fetchone()
+        return self._usage_row(row) if row else None
+
+    def list_turn_usage(
+        self,
+        *,
+        since: str | None = None,
+        provider: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if since is not None:
+            clauses.append("captured_at >= ?")
+            params.append(since)
+        if provider is not None:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM turn_usage{where} ORDER BY id", params
+        ).fetchall()
+        return [self._usage_row(row) for row in rows]
+
+    # -- provider windows -------------------------------------------------------------
+
+    def insert_provider_window(
+        self,
+        provider: str,
+        window: str,
+        *,
+        source: str,
+        status: str | None = None,
+        used_percent: float | None = None,
+        resets_at: str | None = None,
+        task_id: str | None = None,
+        observed_at: str | None = None,
+    ) -> int:
+        """Record one observation of a provider's usage window."""
+        with self._guard(), self.transaction() as conn:
+            cur = conn.execute(
+                "INSERT INTO provider_windows(provider, window, status, used_percent, resets_at, "
+                "observed_at, task_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    provider,
+                    window,
+                    status,
+                    used_percent,
+                    resets_at,
+                    observed_at or now(),
+                    task_id,
+                    source,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def latest_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]:
+        """The newest observation of every ``(provider, window)`` pair."""
+        params: list[Any] = []
+        where = ""
+        if provider is not None:
+            where = " WHERE provider = ?"
+            params.append(provider)
+        rows = self._conn.execute(
+            "SELECT * FROM provider_windows WHERE id IN ("
+            f"SELECT MAX(id) FROM provider_windows{where} GROUP BY provider, window"
+            ") ORDER BY provider, window",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- rollup reads -----------------------------------------------------------------
+
+    def task_counts(self, *, since: str | None = None) -> list[dict[str, Any]]:
+        """How many tasks ended up in each state, per provider and mode."""
+        where = " WHERE created_at >= ?" if since is not None else ""
+        params = [since] if since is not None else []
+        rows = self._conn.execute(
+            "SELECT provider, mode, state, COUNT(*) AS count FROM tasks"
+            f"{where} GROUP BY provider, mode, state ORDER BY provider, mode, state",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def turn_durations_ms(
+        self, *, since: str | None = None, provider: str | None = None
+    ) -> list[tuple[str, str, int]]:
+        """``(provider, mode, milliseconds)`` for every finished turn."""
+        clauses = ["t.started_at IS NOT NULL", "t.ended_at IS NOT NULL"]
+        params: list[Any] = []
+        if since is not None:
+            clauses.append("t.started_at >= ?")
+            params.append(since)
+        if provider is not None:
+            clauses.append("k.provider = ?")
+            params.append(provider)
+        rows = self._conn.execute(
+            "SELECT k.provider, k.mode, "
+            "CAST(ROUND((julianday(t.ended_at) - julianday(t.started_at)) * 86400000) AS INTEGER) "
+            "AS ms FROM turns t JOIN tasks k ON k.id = t.task_id "
+            f"WHERE {' AND '.join(clauses)} ORDER BY t.id",
+            params,
+        ).fetchall()
+        return [(str(row["provider"]), str(row["mode"]), int(row["ms"])) for row in rows]
+
+    def check_durations_ms(self, *, since: str | None = None) -> list[tuple[str, bool, int]]:
+        """``(provider, ok, milliseconds)`` for every verification command that ran."""
+        where = " WHERE c.created_at >= ?" if since is not None else ""
+        params = [since] if since is not None else []
+        rows = self._conn.execute(
+            "SELECT k.provider, c.ok, c.duration_ms FROM checks c JOIN tasks k ON k.id = c.task_id"
+            f"{where} ORDER BY c.id",
+            params,
+        ).fetchall()
+        return [(str(row["provider"]), bool(row["ok"]), int(row["duration_ms"])) for row in rows]
+
+    def violation_counts(self, *, since: str | None = None) -> list[dict[str, Any]]:
+        """How often each violation kind was recorded, per provider."""
+        placeholders = ", ".join("?" for _ in VIOLATION_EVENT_KINDS)
+        clauses = [f"e.kind IN ({placeholders})"]
+        params: list[Any] = list(VIOLATION_EVENT_KINDS)
+        if since is not None:
+            clauses.append("e.at >= ?")
+            params.append(since)
+        rows = self._conn.execute(
+            "SELECT k.provider, e.kind, COUNT(*) AS count FROM events e "
+            "JOIN tasks k ON k.id = e.task_id "
+            f"WHERE {' AND '.join(clauses)} GROUP BY k.provider, e.kind ORDER BY k.provider, e.kind",
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
 
 __all__: Sequence[str] = (
     "MIGRATIONS",
+    "TURN_USAGE_FIELDS",
+    "VIOLATION_EVENT_KINDS",
     "ConstraintError",
     "NotFoundError",
     "StaleStateVersionError",

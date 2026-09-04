@@ -3,9 +3,9 @@
 ## Components
 
 ```
-  Codex session
-        │  MCP over stdio (16 tools, one envelope)
-        ▼
+  Codex session                                  browser (localhost)
+        │  MCP over stdio (17 tools, one envelope)        │  taskspindle web: GET only,
+        ▼                                                 ▼  database opened read-only
   taskspindle mcp ──────────────────────────────────────────────┐
   server.py: envelope, annotations, traceback → server.log      │
   service.py: Orchestrator — every rule lives here              │
@@ -16,6 +16,8 @@
   tasks · events · receipts            │                              taskspindle.slice
   reviews · grants · leases            │                                    │
   artifacts · journals                 │                                    │
+  provider_status · provider_windows   │                                    │
+  turn_usage                           │                                    │
         ▲                              ▼                                    ▼
         │            taskspindle-worker-<task>.service     taskspindle-accept-<task>.service
         │            runner.py: ONE turn, then exit        accept.py: probe, apply, verify, commit
@@ -31,6 +33,9 @@
   providers.py   profiles, child environment allowlist, OAuth evidence
   recovery.py    what to believe when a worker vanished
   review.py      the reviewer's JSON, and what blocks an acceptance
+  limits.py      what a refused turn means for its provider; never what to do about it
+  usage.py       token counts per turn, the price table, the rolled-up report
+  web/           the read-only dashboard: Starlette app, one HTML page, its own read-only store
 ```
 
 The MCP server never owns an ACP connection. It writes rows and starts units; the units talk to
@@ -160,6 +165,37 @@ Four things a task can do that TaskSpindle records rather than hides.
 - **`DELEGATION_ATTEMPT`** — the agent asked for a subagent, team or delegation tool. The request
   is denied and recorded. Both first-class profiles are launched with those tools disabled in the
   first place; this catches the case where they are asked for anyway.
+
+## Provider availability
+
+A provider can refuse a turn for reasons that have nothing to do with the task: a usage window is
+exhausted, credits are gone, the seat is logged out. TaskSpindle records that fact and reports it;
+it does not act on it.
+
+**Classifying.** `acp_client.py` stays thin: it keeps what the wire said — the JSON-RPC code,
+message and data of the agent's error — on the `AcpError` it raises, and interprets none of it.
+`limits.py` does the interpreting, in a fixed order of evidence: the ACP "authentication required"
+code; the Claude adapter's `errorKind` (`authentication_failed`, `oauth_org_not_allowed`,
+`rate_limit`, `billing_error`); the Claude Agent SDK's own usage-limit message prefixes, and the
+older `usage limit reached|<epoch>` sentinel, which also gives the reset time; and, for any other
+agent, a few conservative substrings, because Grok documents no limit telemetry. Anything else is
+the failure it always was.
+
+**Recording.** The runner writes a classified refusal in three places: the task's `error` (code
+`PROVIDER_THROTTLED` or `PROVIDER_AUTH_EXPIRED`, with the window and reset time in `details`), a
+`PROVIDER_LIMIT` event on the task, and the provider's row in `provider_status`, keyed by the
+seat — an OAuth profile derived from `claude` shares `claude`'s seat and therefore its throttle;
+an `api_key` profile is keyed by its own id. A throttle also writes a `provider_windows` row at
+100% for the window it named. A turn that runs writes the windows the agent reported along the way
+(the Claude adapter forwards the SDK's rate-limit events) and sets the provider's row back to `ok`.
+
+**Reporting, and nothing more.** `capabilities` shows each provider's availability, with the
+reset time and the other first-class provider named; `doctor` has an advisory check per provider;
+`start_task` on a throttled or logged-out provider is refused with `PROVIDER_UNAVAILABLE` unless
+the request says `ignore_provider_status`. That refusal is the entire fallback policy. Nothing is
+re-queued on another provider, nothing waits for a reset, and a continuation of an existing task is
+not gated at all, because its provider is fixed. The rule in [configuration.md](configuration.md)
+— never a fallback — is about who decides, and the answer is still the caller, now with the facts.
 
 ## What isolation is, and is not
 

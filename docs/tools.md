@@ -1,6 +1,6 @@
 # Tool reference
 
-Sixteen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
+Seventeen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
 nothing else is: there is no side channel, no implicit action and no tool that decides on a
 candidate's behalf.
 
@@ -20,10 +20,10 @@ did not anticipate comes back as `INTERNAL` with nothing but the exception's cla
 `details`; its traceback goes to `state_dir/server.log`, not into the conversation, where it would
 leak paths and arguments.
 
-Read-only tools are annotated `readOnlyHint: true`. Six are:  `capabilities`, `doctor`,
-`list_repository_policies`, `list_tasks`, `task_status`, `task_result`. **`task_diff` is not one of
-them**, and that is deliberate: handing a page of a diff over appends a receipt that later proves
-the whole candidate was inspected. Reading changes the record.
+Read-only tools are annotated `readOnlyHint: true`. Seven are: `capabilities`, `doctor`,
+`list_repository_policies`, `list_tasks`, `task_status`, `task_result`, `usage_report`.
+**`task_diff` is not one of them**, and that is deliberate: handing a page of a diff over appends a
+receipt that later proves the whole candidate was inspected. Reading changes the record.
 
 ## Discovery
 
@@ -33,12 +33,20 @@ No parameters. What you need to compose a valid request, and nothing about any t
 
 ```json
 {"providers": [{"id": "claude", "first_class": true, "second_class": false, "auth": "oauth",
-                "modes": ["consult", "implement", "review"], "model": null, "gateway_host": null}],
+                "modes": ["consult", "implement", "review"], "model": null, "gateway_host": null,
+                "availability": {"state": "throttled", "status_key": "claude",
+                                 "code": "PROVIDER_THROTTLED", "window": "five_hour",
+                                 "reset_at": "2026-09-04T21:00:00Z",
+                                 "reason": "You've hit your limit · resets 4pm",
+                                 "observed_at": "2026-09-04T18:41:07Z",
+                                 "suggested_alternative": "grok"},
+                "windows": [{"window": "five_hour", "status": "rejected", "used_percent": 100.0,
+                             "resets_at": "2026-09-04T21:00:00Z", "source": "throttle_error"}]}],
  "modes": ["consult", "review", "implement"],
- "versions": {"taskspindle": "0.1.0", "api": 1, "schema": 1,
+ "versions": {"taskspindle": "0.1.0", "api": 1, "schema": 2,
               "adapter_package": "@agentclientprotocol/claude-agent-acp",
               "adapter_version": "0.70.0", "acp": "0.12.0"},
- "limits": {"timeout_s": [60, 14400], "diff_page_bytes": 262144,
+ "limits": {"timeout_s": [60, 14400], "diff_page_bytes": 16384, "diff_page_max_bytes": 262144,
             "concurrent_turns_per_provider": 1},
  "states": ["PREPARING", "…"], "cleanup_states": ["RETAINED", "…"],
  "isolation": "…what isolation does and does not mean…"}
@@ -46,6 +54,14 @@ No parameters. What you need to compose a valid request, and nothing about any t
 
 Read the `isolation` string before you trust anything to it. It says plainly that worktrees and
 allowlisted environments are containment by construction and not an OS sandbox.
+
+`availability` is the one part of this answer that changes. `state` is `unknown` until a turn has
+run on the provider, `ok` after one that did, and `throttled` or `auth_expired` after one the
+provider refused for a usage, rate, credit or login reason; a throttle whose `reset_at` has passed
+reads as `ok` again. `suggested_alternative` names the other first-class provider when there is
+one. Nothing is chosen for you: see [`start_task`](#start_task) for what a throttled provider does
+to a request, and [architecture.md](architecture.md#provider-availability) for why that is all it
+does. `windows` is the newest observation of each usage window, as far as the agent reports them.
 
 ### `doctor` — read-only
 
@@ -81,6 +97,10 @@ Same parameters, with `providers` and `modes` optional — omit either to revoke
 Returns the policy plus `"revoked": <count>`. A task already running is never touched.
 Errors: `INVALID_REQUEST` when the repository was never authorized.
 
+A repository that no longer exists on disk cannot be named by a path. Name it by the
+`repository_id` that `list_repository_policies` shows instead: `revoke_repository` with
+`repository_id` and no `path`.
+
 ### `list_repository_policies` — read-only
 
 No parameters. Returns `{"repositories": [{"repository_id", "display_path", "common_dir",
@@ -102,6 +122,7 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `effort` | string\|null | `null` | as above |
 | `timeout_s` | int | `1800` | 60–14400 |
 | `allow_metered` | bool | `false` | required for an `api_key` profile |
+| `ignore_provider_status` | bool | `false` | start even on a provider currently believed throttled or logged out |
 | `acceptance_criteria` | string\|null | `null` | **implement only, required** |
 | `path_prefixes` | string[]\|null | `null` | **implement only, required**; repository-relative, no `..`, no leading `/` |
 | `verification_commands` | string[]\|null | `null` | **implement only, required**; may be `[]` |
@@ -137,7 +158,17 @@ first turn is composed and it is queued; a worker unit starts if the provider's 
 Errors: `INVALID_REQUEST` (validation, unknown provider, mode not served, a repository with
 uncommitted changes inside the task's own path prefixes — `details.code = DIRTY_OVERLAP`),
 `GRANT_MISSING`, `METERED_NOT_ALLOWED`, `REVIEWER_NOT_INDEPENDENT`, `CANDIDATE_MISMATCH`,
-`TARGET_MOVED`.
+`TARGET_MOVED`, `PROVIDER_UNAVAILABLE`.
+
+**`PROVIDER_UNAVAILABLE`** is the whole of TaskSpindle's answer to a subscription limit. When the
+last turn on a provider was refused for a usage, rate, credit or login reason, the next
+`start_task` on that provider is refused too, with `details` carrying the `state`, the `window`,
+the `reset_at` the provider gave (when it gave one), the `reason` in the provider's own words, and
+`suggested_alternative`, the other first-class provider. The error is `retryable`. Nothing is
+re-queued on another provider and nothing waits for the reset: you either start the task on the
+provider you now choose, wait, or pass `ignore_provider_status: true` and start it anyway — the
+turn will most likely be refused again, and that refusal refreshes the record. A turn that runs
+clears the state.
 
 ### `list_tasks` — read-only
 
@@ -161,10 +192,22 @@ you.
 
 `task_id`. Returns `{"task_id", "state", "response", "checks": [{"command", "exit_code", "ok",
 "duration_ms", "stdout_tail", "stderr_tail"}], "attribution": {"provider", "auth_mode",
-"requested_model", "reported_model", "gateway_host"}, "quota_warnings", "transcript_locator"}`.
+"requested_model", "reported_model", "gateway_host", "agent"}, "warnings", "quota_warnings",
+"usage", "transcript_locator"}`.
 
 `attribution` is how metered work stays visible: an `api_key` profile shows `auth_mode: "api_key"`
-and the gateway's host — never its URL path, never the token.
+and the gateway's host — never its URL path, never the token. `reported_model` is the model that
+actually answered, when the agent said (Grok says so on the wire; for Claude it is read from the
+adapter's own session record), and `agent` is the adapter's name and version.
+
+`warnings` is the task's warning list, as `task_status` shows it. `quota_warnings` is every
+usage, rate, credit or login refusal a turn of this task ran into, each as
+`{"code", "provider", "status_key", "state", "window", "reset_at", "observed_at", "source",
+"message"}`. `usage` is one entry per turn that reported token counts:
+`{"provider", "model", "input_tokens", "output_tokens", "cache_read_tokens",
+"cache_write_tokens", "reasoning_tokens", "model_calls", "duration_ms", "cost_estimate_usd",
+"cost_is_estimate", "price_table_version", "source", "raw", "captured_at"}`. See
+[`usage_report`](#usage_report) for what the cost is and is not.
 
 ### `task_diff` — **not** read-only
 
@@ -172,11 +215,16 @@ and the gateway's host — never its URL path, never the token.
 | --- | --- | --- |
 | `task_id` | string | — |
 | `offset` | int | `0` |
-| `length` | int | `262144` |
+| `length` | int | `16384` (at most `262144`) |
 
 Returns `{"digest", "size", "offset", "length", "data", "receipt_id"}`. `data` is base64; `size` is
 the whole diff, `length` what this page actually contains. Errors: `TASK_NOT_FOUND`,
 `INVALID_REQUEST` (no candidate at this revision, offset past the end, non-positive length).
+
+**Keep pages smaller than your client will truncate.** An MCP client caps the tool output it hands
+the model — Codex's `tool_output_token_limit` is a few thousand tokens by default — and a page that
+was cut off on the way in is still receipted in full here. The default of 16384 bytes (about 22 KB
+of base64) fits under that cap; ask for more only if you have raised the cap.
 
 **The diff-coverage rule.** Every call records a receipt of `(digest, offset, length)`. An
 acceptance requires that the recorded receipts for the exact `diff_digest` cover `[0, size)` with
@@ -192,7 +240,9 @@ have not seen. A new candidate revision has a new digest, and its coverage start
 | `expected_state_version` | int | — |
 | `prompt` | string | `""` |
 
-One more turn. What it means depends on where the task is:
+One more turn. What it means depends on where the task is. A continuation is not gated on the
+provider's availability the way `start_task` is: its provider is fixed by the task, and a refused
+turn records the refusal like any other.
 
 | State | Mode | Turn |
 | --- | --- | --- |
@@ -297,6 +347,60 @@ now. Errors: `TASK_NOT_FOUND`, `STALE_STATE_VERSION`, `ILLEGAL_TRANSITION`.
 `force` is set. Returns `{"task_id", "cleanup_state", "removed": [...], "retained": [...]}` and, on
 a git failure, `cleanup_state: "FAILED"` with an `error` object rather than a raised error.
 
+A task whose repository no longer exists cannot have its worktree removed by git, and the answer
+is `cleanup_state: "FAILED"` with `error.code = REPOSITORY_UNRESOLVABLE`. With `force`, the
+worktree directory — which lives under TaskSpindle's own state directory and holds nothing anyone
+can use any more — is deleted outright and the cleanup completes.
+
+## Usage
+
+### `usage_report` — read-only
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `since` | string\|null | `null` | ISO-8601, or shorthand: `7d`, `24h`, `30m`, `90s` |
+| `provider` | string\|null | `null` | only this profile |
+| `group_by` | `provider`\|`day`\|`provider_day`\|`model`\|`mode` | `provider` | how the token counts are rolled up |
+
+Returns:
+
+```json
+{"since": "2026-08-28T18:41:07.000000Z", "provider": null, "group_by": "provider",
+ "generated_at": "2026-09-04T18:41:07Z", "cost_note": "…",
+ "usage": [{"provider": "claude", "turns": 4, "input_tokens": 20, "output_tokens": 1695,
+            "cache_read_tokens": 194157, "cache_write_tokens": 34570, "reasoning_tokens": 0,
+            "cost_estimate_usd": 0.35, "priced_turns": 4}],
+ "outcomes": [{"provider": "claude", "mode": "implement", "state": "ACCEPTED", "count": 1}],
+ "turns": {"count": 5, "mean_ms": 24000, "p50_ms": 12000, "max_ms": 63000,
+           "by_provider": {"claude": {"count": 3, "…": "…"}}},
+ "checks": {"count": 2, "passed": 2, "mean_ms": 49, "p50_ms": 49, "max_ms": 50},
+ "violations": [{"provider": "grok", "kind": "READ_ONLY_VIOLATION", "count": 1}],
+ "windows": [{"provider": "claude", "state": "ok", "observable": true, "note": "…",
+              "status": {"…": "…"}, "windows": [{"window": "five_hour", "…": "…"}]}]}
+```
+
+Where the numbers come from, and what they are not:
+
+- **Tokens** are what the agent reported on the wire. The Claude adapter puts the turn's counts on
+  every prompt response; Grok sends them in its `turn_completed` update, with `costUsdTicks` and
+  the per-model breakdown kept untouched in the record's `raw`. Only when an agent reported
+  nothing does TaskSpindle read the Claude session record the adapter's own Claude Code wrote —
+  the one file for that turn's session, nothing else under `~/.claude/projects`.
+- **`cost_estimate_usd` is an estimate**, and always says so. A subscription seat is not billed
+  per token; the figure is what the same tokens would cost at the published API rates, from a
+  static price table whose date is `price_table_version`, so seat usage can be compared and
+  budgeted. Grok's own cost figure is not converted, because its unit is not documented; a model
+  the table does not know has no estimate.
+- **Outcomes, timings and violations** are computed from the task, turn, check and event tables
+  on every call; nothing is aggregated ahead of time.
+- **Windows** are observed, never polled. For Claude, the adapter forwards the SDK's rate-limit
+  events while a turn runs, and a refusal records the window as rejected at 100%; there is no
+  local way to ask for the seat's headroom between turns. Grok 1.0.13 reports no window at all, so
+  its entry says `observable: false` and only a refusal is ever recorded.
+
+The same report is `taskspindle usage` on the command line, and the usage panel of the
+[dashboard](dashboard.md).
+
 ## The review contract
 
 A `review` task is asked for exactly one JSON object, and `REVIEW_MALFORMED` is recorded if it does
@@ -359,4 +463,7 @@ invalidates the review: get a new one.
 | `MANUAL_RECOVERY_REQUIRED` | recovery will not guess; see [recovery.md](recovery.md) |
 | `UNIT_START_FAILED` | systemd would not start the unit (retryable) |
 | `DIRTY_OVERLAP` | in `details.code`: the repository is dirty inside the task's own prefixes |
+| `PROVIDER_THROTTLED` | on a FAILED task: the provider refused the turn for a usage, rate or credit limit |
+| `PROVIDER_AUTH_EXPIRED` | on a FAILED task: the provider refused the turn because the seat is logged out or not allowed |
+| `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and the reset has not passed |
 | `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |

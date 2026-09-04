@@ -55,6 +55,7 @@ __all__ = [
     "PermissionPolicy",
     "TurnCapture",
     "TurnResult",
+    "error_cause",
     "sealed_env",
 ]
 
@@ -81,12 +82,24 @@ class AcpError(Exception):
     """An ACP-level failure.
 
     ``code`` is one of ``ACP_SPAWN_FAILED``, ``ACP_HANDSHAKE_FAILED``, ``RESUME_UNAVAILABLE``,
-    ``TURN_TIMEOUT``, ``ACP_TURN_ERROR``.
+    ``TURN_TIMEOUT``, ``ACP_TURN_ERROR``. ``cause`` carries what the wire said -- the JSON-RPC
+    code, message and data of a ``RequestError``, or the class name of anything else -- so that
+    whoever records the failure can tell a quota refusal from a crash. The client itself does not
+    interpret it.
     """
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, cause: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.cause: dict[str, Any] = dict(cause or {})
+
+
+def error_cause(exc: BaseException) -> dict[str, Any]:
+    """What an exception out of the ACP connection said, as plain data."""
+    if isinstance(exc, RequestError):
+        data = exc.data if isinstance(exc.data, dict) else None
+        return {"rpc_code": exc.code, "rpc_message": str(exc), "rpc_data": data}
+    return {"exception": type(exc).__name__, "message": str(exc)}
 
 
 def sealed_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -159,6 +172,14 @@ class TurnCapture:
     permission_events: list[dict[str, Any]] = field(default_factory=list)
     violations: list[str] = field(default_factory=list)
     raw_update_count: int = 0
+    #: Every ``usage_update`` the agent sent: context occupancy, and whatever it put in ``_meta``.
+    usage_updates: list[dict[str, Any]] = field(default_factory=list)
+    #: Rate-limit facts the Claude adapter attaches to ``usage_update`` under ``_claude/rateLimit``.
+    rate_limits: list[dict[str, Any]] = field(default_factory=list)
+    #: Grok's non-standard ``turn_completed`` update, which carries the turn's token usage.
+    turn_completed: dict[str, Any] | None = None
+    #: Model ids seen in any update's ``_meta.modelId``, in the order they appeared.
+    model_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -177,6 +198,8 @@ class TurnResult:
     stop_reason: str
     text: str
     capture: TurnCapture
+    #: The prompt response's ``usage`` (unstable in ACP 0.12), as snake_case plain data.
+    usage: dict[str, Any] | None = None
 
 
 class _WorkerClient:
@@ -301,7 +324,9 @@ class AcpWorker:
         except BaseException as exc:
             await self._stack.aclose()
             if isinstance(exc, Exception):
-                raise AcpError("ACP_HANDSHAKE_FAILED", f"initialize failed: {exc}") from exc
+                raise AcpError(
+                    "ACP_HANDSHAKE_FAILED", f"initialize failed: {exc}", cause=error_cause(exc)
+                ) from exc
             raise
         self.init = _init_info(response)
         return self
@@ -333,6 +358,7 @@ class AcpWorker:
         if not isinstance(update, dict):
             return
         kind = update.get("sessionUpdate")
+        _note_model_id(capture, update, params)
         if kind == "agent_message_chunk":
             content = update.get("content")
             text = content.get("text") if isinstance(content, dict) else None
@@ -350,6 +376,16 @@ class AcpWorker:
                     "status": update.get("status"),
                 }
             )
+        elif kind == "usage_update":
+            meta = update.get("_meta")
+            capture.usage_updates.append(
+                {"used": update.get("used"), "size": update.get("size"), "_meta": meta}
+            )
+            rate_limit = meta.get("_claude/rateLimit") if isinstance(meta, dict) else None
+            if isinstance(rate_limit, dict):
+                capture.rate_limits.append(dict(rate_limit))
+        elif kind == "turn_completed":
+            capture.turn_completed = dict(update)
 
     def _record_permission(
         self,
@@ -412,10 +448,17 @@ class AcpWorker:
             await self.cancel(session_id)
             raise AcpError("TURN_TIMEOUT", f"turn exceeded {timeout}s") from exc
         except Exception as exc:
-            raise AcpError("ACP_TURN_ERROR", f"session/prompt failed: {exc}") from exc
+            raise AcpError(
+                "ACP_TURN_ERROR", f"session/prompt failed: {exc}", cause=error_cause(exc)
+            ) from exc
         finally:
             self._capture = None
-        return TurnResult(stop_reason=response.stop_reason, text="".join(capture.text), capture=capture)
+        return TurnResult(
+            stop_reason=response.stop_reason,
+            text="".join(capture.text),
+            capture=capture,
+            usage=_usage_data(getattr(response, "usage", None)),
+        )
 
     async def cancel(self, session_id: str) -> None:
         """Ask the agent to stop the current turn. Bounded, and never raises."""
@@ -429,6 +472,26 @@ class AcpWorker:
         if self._conn is None:
             raise AcpError("ACP_TURN_ERROR", "worker is not running")
         return self._conn
+
+
+def _note_model_id(capture: TurnCapture, update: Mapping[str, Any], params: Any) -> None:
+    """Remember a model id an update carried, on the update or on the notification."""
+    for holder in (update, params if isinstance(params, dict) else {}):
+        meta = holder.get("_meta")
+        model_id = meta.get("modelId") if isinstance(meta, dict) else None
+        if isinstance(model_id, str) and model_id and model_id not in capture.model_ids:
+            capture.model_ids.append(model_id)
+
+
+def _usage_data(usage: Any) -> dict[str, Any] | None:
+    """The prompt response's usage as plain snake_case data, whatever the SDK salvaged it into."""
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return dict(usage)
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump(mode="json", by_alias=False, exclude_none=True)
+    return None
 
 
 def _capabilities() -> ClientCapabilities:

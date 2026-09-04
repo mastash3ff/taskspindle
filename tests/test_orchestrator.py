@@ -536,6 +536,19 @@ def test_cleanup_of_a_task_whose_repository_is_gone_fails_loudly(
     assert result["error"]["code"] == "REPOSITORY_UNRESOLVABLE"
     assert Path(status["worktree_path"]).exists()
 
+    # With force, the directory is TaskSpindle's own to delete, and the dead grants can be
+    # withdrawn by id since no path resolves any more.
+    forced = harness.orchestrator.cleanup_task(task_id, force=True)
+    assert forced["cleanup_state"] == CleanupState.COMPLETE.value
+    assert status["worktree_path"] in forced["removed"]
+    assert not Path(status["worktree_path"]).exists()
+    revoked = harness.orchestrator.revoke_repository(repository_id=status["repository_id"])
+    assert revoked["revoked"] == 6
+    assert all(not grant["active"] for grant in revoked["grants"])
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.revoke_repository(repository_id="repo_nope")
+    assert excinfo.value.code == service.INVALID_REQUEST
+
 
 def test_cleanup_refuses_a_task_that_is_still_working(harness: Harness, make_repo) -> None:
     repo = make_repo()
@@ -560,10 +573,88 @@ def test_capabilities_describes_the_providers_and_the_limits(harness: Harness) -
     assert capabilities["versions"]["acp"] == "0.12.0"
     assert capabilities["limits"] == {
         "timeout_s": [60, 14400],
-        "diff_page_bytes": 262144,
+        "diff_page_bytes": 16384,
+        "diff_page_max_bytes": 262144,
         "concurrent_turns_per_provider": 1,
     }
     assert "not an OS sandbox" in capabilities["isolation"]
+    availability = capabilities["providers"][0]["availability"]
+    assert availability["state"] == "unknown"
+    assert availability["suggested_alternative"] is None
+    assert capabilities["providers"][0]["windows"] == []
+
+
+def test_a_throttled_provider_is_refused_until_its_reset_unless_overridden(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+    store = harness.orchestrator.store
+    store.set_provider_status(
+        AUTHOR,
+        "throttled",
+        code="PROVIDER_THROTTLED",
+        window="five_hour",
+        reason="You've hit your limit",
+        reset_at="2999-01-01T00:00:00Z",
+        source="acp_error",
+    )
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.start_task(implement_request(repo))
+
+    assert excinfo.value.code == service.PROVIDER_UNAVAILABLE
+    assert excinfo.value.retryable is True
+    assert excinfo.value.details["reset_at"] == "2999-01-01T00:00:00Z"
+    assert excinfo.value.details["window"] == "five_hour"
+    assert "ignore_provider_status" in excinfo.value.details["override"]
+    shown = harness.orchestrator.capabilities()["providers"][0]["availability"]
+    assert shown["state"] == "throttled"
+    assert store.list_tasks() == []
+
+    # The caller may insist, and the task then runs like any other.
+    started = harness.orchestrator.start_task(
+        implement_request(repo, ignore_provider_status=True)
+    )
+    assert started["state"] == TaskState.RESULT_READY.value
+    # ... and a turn that ran is what clears the throttle.
+    assert harness.orchestrator.capabilities()["providers"][0]["availability"]["state"] == "ok"
+
+    # A throttle whose reset has passed is not a refusal at all.
+    store.set_provider_status(
+        REVIEWER, "throttled", code="PROVIDER_THROTTLED", reset_at="2000-01-01T00:00:00Z",
+        source="acp_error",
+    )
+    assert harness.orchestrator.capabilities()["providers"][1]["availability"]["state"] == "ok"
+
+
+def test_usage_report_rolls_the_finished_tasks_up(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+
+    report = harness.orchestrator.usage_report(since="1d", group_by="mode")
+
+    assert report["group_by"] == "mode"
+    assert report["since"] is not None
+    assert {(row["provider"], row["mode"], row["state"]) for row in report["outcomes"]} == {
+        (AUTHOR, "implement", "RESULT_READY")
+    }
+    assert report["turns"]["count"] == 1
+    assert report["checks"]["passed"] == 1
+    # The fake agent reports no usage, so the token table is empty and says so honestly.
+    assert report["usage"] == []
+    assert {entry["provider"] for entry in report["windows"]} == {AUTHOR, REVIEWER}
+    assert harness.orchestrator.task_result(task_id)["usage"] == []
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.usage_report(since="yesterday")
+    assert excinfo.value.code == service.INVALID_REQUEST
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.usage_report(group_by="colour")
+    assert excinfo.value.code == service.INVALID_REQUEST
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.usage_report(provider="nobody")
+    assert excinfo.value.code == service.INVALID_REQUEST
 
 
 def test_revoking_a_grant_leaves_the_tasks_alone(harness: Harness, make_repo) -> None:

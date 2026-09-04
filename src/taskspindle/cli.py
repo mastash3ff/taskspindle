@@ -1,9 +1,9 @@
 """The ``taskspindle`` command line.
 
-Five subcommands, and none of them is the interesting part: the MCP server is what a Codex
+Seven subcommands, and none of them is the interesting part: the MCP server is what a Codex
 session talks to, and ``worker`` and ``accept`` exist so that the two detached entry points the
-systemd units run can also be run by hand when something has gone wrong. ``setup`` and ``doctor``
-are the ones a person actually types.
+systemd units run can also be run by hand when something has gone wrong. ``setup``, ``doctor``,
+``usage`` and ``web`` are the ones a person actually types.
 
 Nothing here decides anything. Each subcommand resolves the paths, hands off to the module that
 owns the work, and turns whatever comes back into an exit code and a line of output. Failures are
@@ -77,6 +77,22 @@ def build_parser() -> argparse.ArgumentParser:
     accept = sub.add_parser("accept", help="run a pending acceptance by hand")
     accept.add_argument("--task", required=True, help="the task id to accept")
 
+    usage = sub.add_parser("usage", help="tokens, estimated cost, outcomes and timings")
+    usage.add_argument("--since", help="ISO-8601, or shorthand like 7d, 24h, 30m")
+    usage.add_argument("--provider", help="only this provider")
+    usage.add_argument(
+        "--group-by",
+        default="provider",
+        choices=("provider", "day", "provider_day", "model", "mode"),
+        help="how to roll the token counts up (default: provider)",
+    )
+    usage.add_argument("--json", action="store_true", help="print the report as JSON")
+
+    web = sub.add_parser("web", help="serve the read-only dashboard on localhost")
+    web.add_argument("--host", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
+    web.add_argument("--port", type=int, default=8765, help="port to bind (default: 8765)")
+    web.add_argument("--open", action="store_true", help="open the page in a browser")
+
     return parser
 
 
@@ -99,6 +115,10 @@ def main(argv: list[str] | None = None) -> int:
         return _mcp()
     if args.command == "worker":
         return _worker(args.task)
+    if args.command == "usage":
+        return _usage(args.since, args.provider, args.group_by, as_json=args.json)
+    if args.command == "web":
+        return _web(args.host, args.port, open_browser=args.open)
     return _accept(args.task)
 
 
@@ -146,8 +166,36 @@ def _doctor(*, live_probes: bool, as_json: bool) -> int:
         paths=paths,
         parent_env=os.environ,
         live_probes=live_probes,
+        provider_status=_provider_status(paths),
     )
     return _report(report, as_json=as_json)
+
+
+def _provider_status(paths: Paths) -> list[dict[str, Any]]:
+    """The provider rows, when a store exists; a machine that never ran a task has none."""
+    from .store import Store, StoreError
+
+    database = paths.state_dir / "taskspindle.sqlite3"
+    if not database.exists():
+        return []
+    try:
+        with Store.open(database) as store:
+            return store.list_provider_status()
+    except (StoreError, OSError):
+        return []
+
+
+def _profiles(paths: Paths) -> dict[str, Any]:
+    from . import providers
+    from .config import load_config
+
+    settings = load_config(paths.config_file)
+    return providers.load_profiles(
+        settings,
+        runtime_dir=paths.runtime_dir,
+        home=Path(os.environ.get("HOME", "")),
+        state_dir=paths.state_dir,
+    )
 
 
 def _check(name: str, detail: str) -> dict[str, Any]:
@@ -169,6 +217,104 @@ def _report(report: dict[str, Any], *, as_json: bool) -> int:
         for check in report.get("checks", []):
             print(f"{_mark(check)} {check['name']}: {check['detail']}")
     return 0 if report.get("ok") else 1
+
+
+# -- usage ---------------------------------------------------------------------------
+
+
+def _usage(since: str | None, provider: str | None, group_by: str, *, as_json: bool) -> int:
+    from . import providers, usage
+    from .store import Store
+
+    paths = resolve_paths()
+    try:
+        profiles = _profiles(paths)
+        with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+            report = usage.report(
+                store,
+                since=usage.parse_since(since),
+                provider=provider,
+                group_by=group_by,
+                profiles=profiles,
+            )
+    except (ConfigError, providers.ProfileError, OSError, ValueError) as exc:
+        print(f"taskspindle usage: {exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
+    _print_usage(report)
+    return 0
+
+
+def _print_usage(report: dict[str, Any]) -> None:
+    """A few fixed-width tables; the JSON form carries everything."""
+    keys = [key for key in ("provider", "day", "model", "mode") if any(key in row for row in report["usage"])]
+    columns = [*keys, "turns", "input", "output", "cache_read", "cache_write", "est_usd"]
+    rows = [
+        [
+            *(str(row.get(key) or "-") for key in keys),
+            str(row["turns"]),
+            str(row["input_tokens"]),
+            str(row["output_tokens"]),
+            str(row["cache_read_tokens"]),
+            str(row["cache_write_tokens"]),
+            f"{row['cost_estimate_usd']:.4f}" if row["priced_turns"] else "-",
+        ]
+        for row in report["usage"]
+    ]
+    print("usage" + (f" since {report['since']}" if report["since"] else ""))
+    _table(columns, rows)
+    print()
+    print("outcomes")
+    _table(
+        ["provider", "mode", "state", "count"],
+        [[r["provider"], r["mode"], r["state"], str(r["count"])] for r in report["outcomes"]],
+    )
+    print()
+    turns = report["turns"]
+    print(
+        f"turns: {turns['count']} (mean {turns['mean_ms']} ms, p50 {turns['p50_ms']} ms); "
+        f"checks: {report['checks']['passed']}/{report['checks']['count']} passed"
+    )
+    for entry in report["windows"]:
+        marks = ", ".join(
+            f"{w['window']} {w['status'] or '?'} {w['used_percent'] or '?'}%" for w in entry["windows"]
+        )
+        print(f"{entry['provider']}: {entry['state']}" + (f"; windows: {marks}" if marks else ""))
+    print(report["cost_note"])
+
+
+def _table(columns: list[str], rows: list[list[str]]) -> None:
+    widths = [
+        max([len(column), *(len(row[index]) for row in rows)]) for index, column in enumerate(columns)
+    ]
+    print("  ".join(column.ljust(widths[index]) for index, column in enumerate(columns)))
+    for row in rows:
+        print("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)))
+    if not rows:
+        print("(nothing recorded)")
+
+
+# -- web -----------------------------------------------------------------------------
+
+
+def _web(host: str, port: int, *, open_browser: bool) -> int:
+    from . import providers
+    from .web import serve
+
+    paths = resolve_paths()
+    try:
+        profiles = _profiles(paths)
+    except (ConfigError, providers.ProfileError, OSError) as exc:
+        print(f"taskspindle web: {exc}", file=sys.stderr)
+        return 1
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"taskspindle web: binding {host}; the dashboard has no authentication",
+            file=sys.stderr,
+        )
+    return serve(paths, profiles, host=host, port=port, open_browser=open_browser)
 
 
 # -- the three entry points ----------------------------------------------------------

@@ -1,4 +1,4 @@
-"""The MCP server: sixteen tools, one envelope, no surprises.
+"""The MCP server: seventeen tools, one envelope, no surprises.
 
 Every tool returns the same shape whether it succeeded or not, so a caller never has to tell an
 exception from a result. Errors carry a stable code; an error TaskSpindle did not anticipate is
@@ -34,7 +34,7 @@ from .models import (
     RecordIntegrationRequest,
     StartTaskRequest,
 )
-from .orchestrator import Orchestrator
+from .orchestrator import DIFF_PAGE_BYTES, Orchestrator
 from .service import INVALID_REQUEST, TaskSpindleError
 from .store import Store
 from .units import SystemdUserBackend
@@ -52,6 +52,7 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "list_tasks",
         "task_status",
         "task_result",
+        "usage_report",
     }
 )
 
@@ -73,6 +74,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "reject_task",
     "cancel_task",
     "cleanup_task",
+    "usage_report",
 )
 
 
@@ -203,7 +205,8 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
 
     @tool("doctor")
     async def doctor(live_probes: bool = True) -> dict[str, Any]:
-        """Check git, systemd, node, the pinned adapter, credentials and every profile."""
+        """Check git, systemd, node, the pinned adapter, credentials, every profile, and whether
+        any provider is currently throttled or logged out."""
         return await _guard_async(
             "doctor",
             log_path,
@@ -212,6 +215,8 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
                 paths=orchestrator.paths,
                 parent_env=orchestrator.parent_env,
                 live_probes=live_probes,
+                provider_status=orchestrator.store.list_provider_status(),
+                now=orchestrator.clock(),
             ),
         )
 
@@ -233,14 +238,18 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
 
     @tool("revoke_repository")
     def revoke_repository(
-        path: str,
+        path: str | None = None,
         providers: list[str] | None = None,
         modes: list[str] | None = None,
+        repository_id: str | None = None,
     ) -> dict[str, Any]:
-        """Withdraw grants. Omit providers or modes to revoke every one of them."""
+        """Withdraw grants. Omit providers or modes to revoke every one of them. Name the
+        repository by a path inside it, or by repository_id when it no longer exists on disk."""
         return call(
             "revoke_repository",
-            lambda: orchestrator.revoke_repository(path, providers, modes),
+            lambda: orchestrator.revoke_repository(
+                path, providers, modes, repository_id=repository_id
+            ),
         )
 
     @tool("list_repository_policies")
@@ -289,10 +298,11 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
 
     @tool("task_diff")
     def task_diff(
-        task_id: str, offset: int = 0, length: int = 262144
+        task_id: str, offset: int = 0, length: int = DIFF_PAGE_BYTES
     ) -> dict[str, Any]:
         """One base64 page of the candidate diff. Every page is receipted: acceptance requires
-        that the whole diff has been retrieved."""
+        that the whole diff has been retrieved. Keep pages small enough that your client does not
+        truncate them; page until offset + length reaches size."""
         return call("task_diff", lambda: orchestrator.task_diff(task_id, offset, length))
 
     @tool("continue_task")
@@ -358,9 +368,22 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
 
     @tool("cleanup_task")
     def cleanup_task(task_id: str, force: bool = False) -> dict[str, Any]:
-        """Give back a finished task's worktree, refs and scratch space. A dirty worktree is
-        retained unless force is set."""
+        """Give back a finished task's worktree, refs and scratch space. A dirty worktree, or one
+        whose repository no longer exists, is retained unless force is set."""
         return call("cleanup_task", lambda: orchestrator.cleanup_task(task_id, force))
+
+    @tool("usage_report")
+    def usage_report(
+        since: str | None = None,
+        provider: str | None = None,
+        group_by: str = "provider",
+    ) -> dict[str, Any]:
+        """Tokens and estimated cost per provider, day, model or mode; outcomes by state; turn
+        and check timings; violations; and each provider's usage windows as far as they are
+        observable. since is ISO-8601 or shorthand like 7d, 24h, 30m."""
+        return call(
+            "usage_report", lambda: orchestrator.usage_report(since, provider, group_by)
+        )
 
     return mcp
 

@@ -393,12 +393,38 @@ def test_views_and_results(store: Store) -> None:
         record.id,
         None,
         response="done",
-        warnings=["quota is low"],
-        oauth_evidence={"gateway_host": "api.anthropic.com"},
+        warnings=["SCOPE_VIOLATION:docs/x"],
         transcript_path="/tmp/transcript.jsonl",
+    )
+    turn_id = store.insert_turn(
+        record.id,
+        1,
+        "initial",
+        ended_at="2030-01-01T00:00:01Z",
+        attribution={
+            "provider": "claude",
+            "reported_model": "claude-opus-5",
+            "gateway_host": "gateway.internal",
+            "agent": {"name": "claude-agent-acp"},
+        },
+    )
+    store.insert_turn_usage(
+        turn_id, record.id, "claude", input_tokens=10, output_tokens=5, source="acp_prompt_response"
+    )
+    store.append_event(
+        record.id,
+        "PROVIDER_LIMIT",
+        {"code": "PROVIDER_THROTTLED", "window": "five_hour", "reset_at": "2030-01-01T01:00:00Z"},
     )
     result = service.task_result(store, record.id)
     assert result.response == "done"
-    assert result.attribution["gateway_host"] == "api.anthropic.com"
-    assert result.quota_warnings == ["quota is low"]
+    assert result.attribution["gateway_host"] == "gateway.internal"
+    assert result.attribution["reported_model"] == "claude-opus-5"
+    assert result.attribution["agent"] == {"name": "claude-agent-acp"}
+    assert result.warnings == ["SCOPE_VIOLATION:docs/x"]
+    assert result.quota_warnings == [
+        {"code": "PROVIDER_THROTTLED", "window": "five_hour", "reset_at": "2030-01-01T01:00:00Z"}
+    ]
+    assert [row["input_tokens"] for row in result.usage] == [10]
+    assert "turn_id" not in result.usage[0]
     assert result.transcript_locator == "/tmp/transcript.jsonl"

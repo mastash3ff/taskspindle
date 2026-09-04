@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Provider availability, reported rather than acted on.** A turn a provider refuses for a
+  usage, rate, credit or login reason is classified (`PROVIDER_THROTTLED`, `PROVIDER_AUTH_EXPIRED`)
+  with the window and reset time the provider gave, recorded on the task, as a `PROVIDER_LIMIT`
+  event and in a new `provider_status` table, and surfaced in `capabilities`, in an advisory
+  `doctor` check, and as a `PROVIDER_UNAVAILABLE` refusal of the next `start_task` on that
+  provider (`ignore_provider_status` overrides it). Nothing is retried elsewhere: the rule that a
+  provider is never substituted is unchanged.
+- **Usage.** Token counts are captured per turn from the agents themselves — the Claude adapter's
+  prompt response and Grok's `turn_completed` update — into a new `turn_usage` table, with an
+  estimated cost at published rates that is labelled an estimate, and the usage windows the Claude
+  adapter reports into `provider_windows`. New read-only tool `usage_report`, new command
+  `taskspindle usage`, and `task_result` now carries `usage`, `warnings` and structured
+  `quota_warnings`.
+- **Dashboard.** `taskspindle web` serves a read-only page on localhost: tasks, timelines,
+  transcripts, diffs, reviews, provider availability and the usage report. The database is opened
+  read-only and there are no mutation endpoints.
+- **Attribution fixed.** `reported_model`, `gateway_host` and the adapter's `agent` name and
+  version are now filled in; they were always null before.
+- **`task_diff` defaults to 16384 bytes** (the maximum stays 262144), because an MCP client
+  truncates tool output at its own token limit and a receipt for a truncated page proved nothing.
+- **Orphans can be cleaned.** `cleanup_task` with `force` removes the worktree of a task whose
+  repository no longer exists, and `revoke_repository` accepts a `repository_id` for a repository
+  that no longer has a path.
+- Schema version 2. The migration is applied on the next open.
+
 ## v0.1.0
 
 First release.

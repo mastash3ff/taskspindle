@@ -8,8 +8,10 @@ those rules into tool behaviour -- git, systemd, the filesystem -- lives in
 from __future__ import annotations
 
 import secrets
+from datetime import datetime
 from typing import Any, Protocol
 
+from . import limits
 from .models import (
     AcceptTaskRequest,
     AuthMode,
@@ -28,6 +30,7 @@ from .models import (
     TaskView,
     Verdict,
 )
+from .providers import Profile
 from .store import StaleStateVersionError, Store, now
 
 # -- error codes --------------------------------------------------------------------
@@ -56,6 +59,9 @@ CHECKS_FAILED = "CHECKS_FAILED"
 UNIT_START_FAILED = "UNIT_START_FAILED"
 DIRTY_OVERLAP = "DIRTY_OVERLAP"
 CLEANUP_FAILED = "CLEANUP_FAILED"
+PROVIDER_UNAVAILABLE = limits.PROVIDER_UNAVAILABLE
+PROVIDER_THROTTLED = limits.PROVIDER_THROTTLED
+PROVIDER_AUTH_EXPIRED = limits.PROVIDER_AUTH_EXPIRED
 
 
 class TaskSpindleError(Exception):
@@ -255,6 +261,51 @@ def require_task(store: Store, task_id: str) -> TaskRecord:
 
 
 # -- task creation ------------------------------------------------------------------
+
+
+def provider_availability(
+    store: Store, profile: Profile, *, now: datetime
+) -> dict[str, Any]:
+    """What TaskSpindle currently believes about a provider's willingness to take a turn."""
+    key = limits.status_key(profile)
+    row = store.get_provider_status(key)
+    state = limits.effective_state(row, now)
+    return {
+        "state": state,
+        "status_key": key,
+        "code": row.get("code") if row and state != "ok" else None,
+        "window": row.get("window") if row and state != "ok" else None,
+        "reset_at": row.get("reset_at") if row and state != "ok" else None,
+        "reason": row.get("reason") if row and state != "ok" else None,
+        "observed_at": row.get("observed_at") if row else None,
+        "suggested_alternative": (
+            limits.suggested_alternative(profile.id) if state not in ("ok", "unknown") else None
+        ),
+    }
+
+
+def require_provider_available(
+    store: Store, profile: Profile, *, now: datetime, ignore: bool = False
+) -> None:
+    """Refuse to start on a provider the last turn found throttled or logged out.
+
+    This is the whole of the fallback policy: the refusal names the reset time and the other
+    first-class provider, and the caller decides. ``ignore`` starts the task anyway.
+    """
+    availability = provider_availability(store, profile, now=now)
+    if ignore or availability["state"] in ("ok", "unknown"):
+        return
+    raise TaskSpindleError(
+        PROVIDER_UNAVAILABLE,
+        f"provider {profile.id!r} is {availability['state']} "
+        f"({availability['reason'] or availability['code']})",
+        retryable=True,
+        details={
+            "provider": profile.id,
+            **availability,
+            "override": "set ignore_provider_status=true to start anyway",
+        },
+    )
 
 
 def require_grant(store: Store, repository_id: str, provider: str, mode: Mode | str) -> None:
@@ -624,7 +675,12 @@ def task_result(store: Store, task_id: str) -> TaskResult:
     """Assemble the ``task_result`` payload for a task."""
     record = require_task(store, task_id)
     checks: list[CheckRecord] = store.list_checks(task_id, record.candidate_revision)
-    evidence = record.oauth_evidence or {}
+    turns = store.list_turns(task_id)
+    latest = turns[-1]["attribution"] or {} if turns else {}
+    usage_rows = [
+        {key: value for key, value in row.items() if key not in ("id", "turn_id", "task_id")}
+        for row in store.list_turn_usage(task_id=task_id)
+    ]
     return TaskResult(
         task_id=record.id,
         state=record.state,
@@ -634,10 +690,17 @@ def task_result(store: Store, task_id: str) -> TaskResult:
             "provider": record.provider,
             "auth_mode": record.auth_mode.value,
             "requested_model": record.requested_model,
-            "reported_model": record.reported_model,
-            "gateway_host": evidence.get("gateway_host"),
+            "reported_model": record.reported_model or latest.get("reported_model"),
+            "gateway_host": latest.get("gateway_host"),
+            "agent": latest.get("agent"),
         },
-        quota_warnings=list(record.warnings or []),
+        warnings=list(record.warnings or []),
+        quota_warnings=[
+            dict(event["payload"] or {})
+            for event in store.list_events(task_id)
+            if event["kind"] == EventKind.PROVIDER_LIMIT.value
+        ],
+        usage=usage_rows,
         transcript_locator=record.transcript_path,
     )
 

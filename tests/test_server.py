@@ -1,4 +1,4 @@
-"""The MCP surface: the sixteen tools, their annotations, and the envelope they all return."""
+"""The MCP surface: the seventeen tools, their annotations, and the envelope they all return."""
 
 from __future__ import annotations
 
@@ -52,12 +52,12 @@ def server(store: Store, paths: Paths):
     return build_server(orchestrator)
 
 
-async def test_the_sixteen_tools_are_exposed_with_honest_annotations(server) -> None:
+async def test_the_seventeen_tools_are_exposed_with_honest_annotations(server) -> None:
     async with Client(server) as client:
         tools = await client.list_tools()
 
     assert [tool.name for tool in tools] == list(TOOL_NAMES)
-    assert len(tools) == 16
+    assert len(tools) == 17
     read_only = {tool.name for tool in tools if tool.annotations.readOnlyHint}
     assert read_only == set(READ_ONLY_TOOLS)
     assert "task_diff" not in read_only
@@ -106,6 +106,18 @@ async def test_the_request_object_tools_describe_their_fields(server) -> None:
     assert "- acceptance_criteria: string | null (optional)" in tools["start_task"].description
     assert "- provider: string (required)" in tools["start_task"].description
     assert "- modes: array of" in tools["authorize_repository"].description
+
+
+async def test_usage_report_and_the_diff_page_default_are_on_the_wire(server) -> None:
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+        result = await client.call_tool("usage_report", {"since": "7d"})
+
+    assert tools["task_diff"].inputSchema["properties"]["length"]["default"] == 16384
+    assert result.data["ok"] is True
+    assert result.data["result"]["usage"] == []
+    assert result.data["result"]["turns"]["count"] == 0
+    assert "cost_note" in result.data["result"]
 
 
 async def test_a_missing_task_is_reported_by_code(server) -> None:

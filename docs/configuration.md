@@ -55,6 +55,11 @@ These are rules the code enforces, not advice:
 - **Never a default.** A task uses a configured profile only when `start_task` names it in
   `provider` *and* the repository grant lists that exact id.
 - **Never a fallback.** Nothing is ever retried on a different provider, in either direction.
+  A provider that refused a turn for a usage or login reason is *reported* — in `capabilities`,
+  in `doctor`, and as a `PROVIDER_UNAVAILABLE` refusal of the next `start_task` on it — and the
+  caller chooses what to do; see [architecture.md](architecture.md#provider-availability). An
+  OAuth profile with `base = "claude"` shares the `claude` seat and so shares its availability;
+  an `api_key` profile is tracked under its own id.
 - **`allow_metered` gate.** An `auth = "api_key"` profile refuses to run unless the request sets
   `allow_metered: true`. Otherwise: `METERED_NOT_ALLOWED`. There is no configuration key that turns
   this off.

@@ -18,7 +18,14 @@ Script keys::
      "malformed_review": true,             # respond with "not json"
      "capture_env_to": "/path/file.json",  # dump os.environ on prompt
      "capture_meta_to": "/path/meta.json", # dump the _meta new_session received
-     "replay_count": 2}                    # message chunks emitted during load_session
+     "replay_count": 2,                    # message chunks emitted during load_session
+     "usage": {"inputTokens": 1, ...},     # attach a Usage object to the prompt response
+     "rate_limit": {"status": "allowed", "rateLimitType": "five_hour", ...},
+                                           # send a usage_update carrying _claude/rateLimit
+     "turn_completed": {"usage": {...}},   # send Grok's non-standard turn_completed update
+     "model_id": "fake-model-1",           # stamp _meta.modelId on every message chunk
+     "fail_kind": "auth" | "rate_limit" | "usage_limit" | "usage_limit_prefix" | "overloaded"}
+                                           # raise a shaped RequestError from prompt
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from acp import RequestError
 from acp.helpers import start_tool_call, update_agent_message_text
 from acp.schema import (
     AgentCapabilities,
+    AgentMessageChunk,
     AuthMethodAgent,
     Implementation,
     InitializeResponse,
@@ -43,7 +51,19 @@ from acp.schema import (
     PermissionOption,
     PromptResponse,
     ToolCallUpdate,
+    Usage,
+    UsageUpdate,
 )
+
+#: The shaped failures a script can ask for, by the name the runner's classifier keys on.
+FAILURES: dict[str, RequestError] = {
+    "auth": RequestError.auth_required({"reason": "logged out"}),
+    "rate_limit": RequestError.internal_error({"errorKind": "rate_limit"}),
+    "overloaded": RequestError.internal_error({"errorKind": "overloaded"}),
+    "usage_limit": RequestError(-32603, "Claude AI usage limit reached|1893456000", None),
+    "usage_limit_prefix": RequestError(-32603, "You've hit your limit \u00b7 resets 3pm", None),
+    "grok_429": RequestError(-32603, "request failed: 429 Too Many Requests", None),
+}
 
 DEFAULT_SCRIPT: dict[str, Any] = {"response": "OK"}
 _AGENT_INFO = Implementation(name="taskspindle-fake-agent", version="0.0.0")
@@ -127,6 +147,9 @@ class FakeAgent:
             Path(capture_env_to).write_text(json.dumps(dict(os.environ)), encoding="utf-8")
         if script.get("fail"):
             raise RequestError.internal_error({"details": "scripted failure"})
+        fail_kind = script.get("fail_kind")
+        if fail_kind:
+            raise FAILURES[str(fail_kind)]
 
         block_seconds = script.get("block_seconds")
         if block_seconds and await self._blocked(session_id, float(block_seconds)):
@@ -144,9 +167,37 @@ class FakeAgent:
         if script.get("delegate"):
             await self._attempt_delegation(session_id)
 
+        rate_limit = script.get("rate_limit")
+        if rate_limit:
+            await self.conn.session_update(
+                session_id=session_id,
+                update=UsageUpdate.model_validate(
+                    {
+                        "sessionUpdate": "usage_update",
+                        "used": 1234,
+                        "size": 200000,
+                        "_meta": {"_claude/rateLimit": rate_limit},
+                    }
+                ),
+            )
+
         text = "not json" if script.get("malformed_review") else str(script.get("response", "OK"))
         for chunk in _two_chunks(text):
             await self._emit(session_id, chunk)
+
+        turn_completed = script.get("turn_completed")
+        if turn_completed:
+            # Grok's update is not in the ACP schema, so it goes out as a raw notification.
+            await self.conn._conn.send_notification(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {"sessionUpdate": "turn_completed", **turn_completed},
+                },
+            )
+        usage = script.get("usage")
+        if usage:
+            return PromptResponse(stop_reason="end_turn", usage=Usage.model_validate(usage))
         return PromptResponse(stop_reason="end_turn")
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
@@ -165,7 +216,18 @@ class FakeAgent:
         return event.is_set()
 
     async def _emit(self, session_id: str, text: str) -> None:
-        await self.conn.session_update(session_id=session_id, update=update_agent_message_text(text))
+        model_id = self.script.get("model_id")
+        if model_id:
+            update: Any = AgentMessageChunk.model_validate(
+                {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": text},
+                    "_meta": {"modelId": str(model_id)},
+                }
+            )
+        else:
+            update = update_agent_message_text(text)
+        await self.conn.session_update(session_id=session_id, update=update)
 
     async def _ask(self, session_id: str, tool_call_id: str, title: str, kind: str) -> bool:
         await self.conn.session_update(

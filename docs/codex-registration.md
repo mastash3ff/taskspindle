@@ -54,6 +54,35 @@ long time:
 Thirty seconds of startup timeout covers opening the SQLite database, reading the configuration
 and reconciling any task left over from a previous session.
 
+## Why the diff is paged small
+
+Codex hands a tool's output to the model only up to its `tool_output_token_limit` — a few thousand
+tokens by default — and truncates the rest without telling the server. A `task_diff` page that was
+cut off on the way in is still receipted in full, and the "whole diff retrieved" gate that
+`accept_task` enforces would then pass on bytes the session never read. So `task_diff` returns
+16384 bytes by default (about 22 KB of base64, under the default limit), and the session should
+page — `offset` advancing by each page's `length` until it reaches `size` — rather than ask for
+the 262144-byte maximum. Put that rule in the instructions Codex reads (`AGENTS.md`); raising
+`tool_output_token_limit` globally makes every other tool's output larger too.
+
+## What Codex offers that TaskSpindle does not use
+
+TaskSpindle is a server Codex calls, and most of what recent Codex releases added is on the other
+side of that line: `spawn_agent` and the multi-agent roles, goals, memories and the app-server
+protocol are Codex's own, and a TaskSpindle worker is deliberately not one of Codex's threads.
+Three things on the Codex side are worth knowing about:
+
+- **Hooks.** Codex's `PostToolUse` and `SubagentStop` hooks can run a command when a tool call
+  finishes. A hook on `accept_task` could, for example, record the accepted candidate somewhere of
+  your own. Nothing in TaskSpindle needs one.
+- **Elicitation.** Codex supports MCP elicitation, so a future TaskSpindle could ask the session a
+  question in the middle of a tool call — the natural shape for `RECOVERY_AMBIGUOUS` — instead of
+  returning `MANUAL_RECOVERY_REQUIRED` and waiting. It does not today.
+- **Codex's own rate limits.** Every Codex turn carries its account's usage windows, and the
+  app-server exposes them. Those are Codex's limits, not the workers': TaskSpindle's
+  `usage_report` and `capabilities` describe the Claude and Grok seats it drives, and say plainly
+  where a window is only observable from a refusal.
+
 ## Granting a repository
 
 Registration lets Codex reach the tools. It does not let any provider touch any repository:

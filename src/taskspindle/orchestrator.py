@@ -23,7 +23,7 @@ from typing import Any
 
 import taskspindle
 
-from . import integration, providers, recovery, repos, units, worktrees
+from . import integration, providers, recovery, repos, units, usage, worktrees
 from .config import Paths
 from .integration import Journal
 from .models import (
@@ -64,10 +64,12 @@ from .service import (
     apply_acceptance,
     check_acceptance,
     create_task,
+    provider_availability,
     record_diff_receipt,
     require_diff_retrieved,
     require_grant,
     require_independent_review,
+    require_provider_available,
     require_task,
     task_result,
     task_view,
@@ -80,10 +82,12 @@ __all__ = [
     "ACP_VERSION",
     "CONCURRENT_TURNS_PER_PROVIDER",
     "DIFF_PAGE_BYTES",
+    "DIFF_PAGE_MAX_BYTES",
     "DISPATCHABLE_STATES",
     "ISOLATION",
     "MANUAL_ACTION",
     "TIMEOUT_BOUNDS",
+    "USAGE_GROUP_BY",
     "Orchestrator",
     "new_repository_id",
     "utcnow",
@@ -92,8 +96,14 @@ __all__ = [
 #: The ACP revision the pinned client and adapter speak.
 ACP_VERSION = "0.12.0"
 
-#: Largest slice of a candidate diff one ``task_diff`` call will return.
-DIFF_PAGE_BYTES = worktrees.MAX_DIFF_PAGE
+#: The slice of a candidate diff ``task_diff`` returns when no length is named.
+DIFF_PAGE_BYTES = worktrees.DEFAULT_DIFF_PAGE
+
+#: Largest slice one ``task_diff`` call will return, whatever length is asked for.
+DIFF_PAGE_MAX_BYTES = worktrees.MAX_DIFF_PAGE
+
+#: The groupings ``usage_report`` accepts.
+USAGE_GROUP_BY: tuple[str, ...] = ("provider", "day", "provider_day", "model", "mode")
 
 #: Inclusive bounds on a task's own timeout, mirroring ``StartTaskRequest``.
 TIMEOUT_BOUNDS = (60, 14400)
@@ -292,7 +302,13 @@ class Orchestrator:
     # -- capabilities ---------------------------------------------------------------
 
     def capabilities(self) -> dict[str, Any]:
-        """Everything a caller needs to compose a valid request, and nothing about a task."""
+        """Everything a caller needs to compose a valid request, and nothing about a task.
+
+        ``availability`` is the one thing here that changes: what the last turn on each provider
+        learned about its seat. A throttled provider is reported, with its reset time and the
+        other first-class provider named, so the caller can choose; nothing is chosen for it.
+        """
+        now = self.clock()
         return {
             "providers": [
                 {
@@ -303,6 +319,8 @@ class Orchestrator:
                     "modes": sorted(profile.modes),
                     "model": profile.model,
                     "gateway_host": profile.gateway_host,
+                    "availability": provider_availability(self.store, profile, now=now),
+                    "windows": self.store.latest_provider_windows(limits_key(profile)),
                 }
                 for profile in sorted(self.profiles.values(), key=lambda item: item.id)
             ],
@@ -318,6 +336,7 @@ class Orchestrator:
             "limits": {
                 "timeout_s": list(TIMEOUT_BOUNDS),
                 "diff_page_bytes": DIFF_PAGE_BYTES,
+                "diff_page_max_bytes": DIFF_PAGE_MAX_BYTES,
                 "concurrent_turns_per_provider": CONCURRENT_TURNS_PER_PROVIDER,
             },
             "states": [state.value for state in TaskState],
@@ -347,20 +366,41 @@ class Orchestrator:
 
     def revoke_repository(
         self,
-        path: str,
+        path: str | None = None,
         providers_: Sequence[str] | None = None,
         modes: Sequence[str] | None = None,
+        *,
+        repository_id: str | None = None,
     ) -> dict[str, Any]:
-        """Withdraw matching active grants. Tasks already running are never touched."""
+        """Withdraw matching active grants. Tasks already running are never touched.
+
+        A repository is named by a path inside it, or -- when it no longer exists on disk and
+        only its grants remain -- by the ``repository_id`` that ``list_repository_policies`` shows.
+        """
         with self._cycle():
-            identity = self._resolve(path)
-            row = self.store.find_repository(str(identity.common_dir), identity.root_commit)
-            if row is None:
-                raise TaskSpindleError(
-                    INVALID_REQUEST,
-                    f"repository {path} has never been authorized",
-                    details={"repository": str(identity.toplevel)},
-                )
+            if repository_id is not None:
+                row = self.store.get_repository(repository_id)
+                if row is None:
+                    raise TaskSpindleError(
+                        INVALID_REQUEST,
+                        f"no such repository: {repository_id}",
+                        details={"repository_id": repository_id},
+                    )
+                display = str(row["display_path"] or Path(row["common_dir"]).parent)
+            else:
+                if not path:
+                    raise TaskSpindleError(
+                        INVALID_REQUEST, "revoke_repository needs a path or a repository_id"
+                    )
+                identity = self._resolve(path)
+                row = self.store.find_repository(str(identity.common_dir), identity.root_commit)
+                if row is None:
+                    raise TaskSpindleError(
+                        INVALID_REQUEST,
+                        f"repository {path} has never been authorized",
+                        details={"repository": str(identity.toplevel)},
+                    )
+                display = str(identity.toplevel)
             repository_id = str(row["id"])
             targets = set(self._known_providers(providers_)) if providers_ else None
             wanted = {mode.value for mode in self._known_modes(modes)} if modes else None
@@ -374,8 +414,12 @@ class Orchestrator:
                     continue
                 if self.store.revoke_grant(repository_id, grant["provider"], grant["mode"]):
                     revoked += 1
-            result = self._policy(repository_id, identity)
-            result["revoked"] = revoked
+            result = {
+                "repository_id": repository_id,
+                "display_path": display,
+                "grants": [_grant_view(grant) for grant in self.store.list_grants(repository_id)],
+                "revoked": revoked,
+            }
         return result
 
     def list_repository_policies(self) -> dict[str, Any]:
@@ -467,6 +511,9 @@ class Orchestrator:
         """Create, prepare and queue one task."""
         with self._cycle():
             profile = self._profile_for(request)
+            require_provider_available(
+                self.store, profile, now=self.clock(), ignore=request.ignore_provider_status
+            )
             placement = self._placement(request)
             record = create_task(
                 self.store,
@@ -783,6 +830,37 @@ class Orchestrator:
             result = task_result(self.store, task_id).model_dump(mode="json")
         return result
 
+    def usage_report(
+        self,
+        since: str | None = None,
+        provider: str | None = None,
+        group_by: str = "provider",
+    ) -> dict[str, Any]:
+        """Tokens, estimated cost, outcomes, timings, violations and windows, rolled up on read."""
+        if group_by not in USAGE_GROUP_BY:
+            raise TaskSpindleError(
+                INVALID_REQUEST,
+                f"no such group_by: {group_by}",
+                details={"group_by": group_by, "known": list(USAGE_GROUP_BY)},
+            )
+        if provider is not None and provider not in self.profiles:
+            self._known_providers([provider])
+        now = self.clock()
+        try:
+            since_iso = usage.parse_since(since, now)
+        except ValueError as exc:
+            raise TaskSpindleError(INVALID_REQUEST, str(exc), details={"since": since}) from exc
+        with self._cycle():
+            result = usage.report(
+                self.store,
+                since=since_iso,
+                provider=provider,
+                group_by=group_by,
+                profiles=self.profiles,
+                now=now,
+            )
+        return result
+
     def task_diff(
         self,
         task_id: str,
@@ -816,7 +894,7 @@ class Orchestrator:
                     f"offset {offset} is outside a diff of {size} bytes",
                     details={"task_id": task_id, "offset": offset, "size": size},
                 )
-            wanted = max(0, min(length, DIFF_PAGE_BYTES, size - offset))
+            wanted = max(0, min(length, DIFF_PAGE_MAX_BYTES, size - offset))
             if wanted <= 0:
                 raise TaskSpindleError(
                     INVALID_REQUEST,
@@ -1139,7 +1217,15 @@ class Orchestrator:
                 identity = None
 
         if record.worktree_path and Path(record.worktree_path).exists():
-            if identity is None:
+            if identity is None and force and self._owns(Path(record.worktree_path)):
+                # The repository is gone, so ``git worktree remove`` has nothing to talk to. With
+                # ``force`` the directory is TaskSpindle's own to delete: it lives under the state
+                # directory and the only thing in it is a checkout nobody can use any more.
+                shutil.rmtree(record.worktree_path, ignore_errors=True)
+                (removed if not Path(record.worktree_path).exists() else retained).append(
+                    record.worktree_path
+                )
+            elif identity is None:
                 # The repository the worktree belongs to cannot be found, so nothing here can
                 # remove it safely. That is a failed cleanup, not a complete one.
                 retained.append(record.worktree_path)
@@ -1150,9 +1236,10 @@ class Orchestrator:
                     code="REPOSITORY_UNRESOLVABLE",
                     message=(
                         f"the repository of task {record.id} could not be resolved; "
-                        "its worktree has to be removed by hand"
+                        "pass force to remove its worktree directory anyway"
                     ),
                 )
+        if record.worktree_path and Path(record.worktree_path).exists() and identity is not None:
             try:
                 worktrees.remove_worktree(
                     identity, Path(record.worktree_path), force=force
@@ -1192,6 +1279,13 @@ class Orchestrator:
             "removed": removed,
             "retained": retained,
         }
+
+    def _owns(self, path: Path) -> bool:
+        """True when ``path`` is inside the state directory: something TaskSpindle made."""
+        try:
+            return path.resolve().is_relative_to(self.paths.state_dir.resolve())
+        except OSError:
+            return False
 
     def _cleanup_failed(
         self,
@@ -1304,6 +1398,13 @@ def _unacknowledged_root_mutation(
         ):
             return False
     return True
+
+
+def limits_key(profile: Profile) -> str:
+    """The provider row a profile's availability lives under (see :mod:`taskspindle.limits`)."""
+    from .limits import status_key
+
+    return status_key(profile)
 
 
 def _acknowledge(record: TaskRecord) -> dict[str, Any]:

@@ -51,12 +51,12 @@ def make_task(store: Store, task_id: str = "ts_000000000001", provider: str = "c
     return store.insert_task(record)
 
 
-def test_open_creates_a_private_file_and_applies_migration_1(tmp_path: Path) -> None:
+def test_open_creates_a_private_file_and_applies_every_migration(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     mode = stat.S_IMODE(store.path.stat().st_mode)
     assert mode == 0o600
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
-    assert store.schema_version() == 1
+    assert store.schema_version() == 2
     store.close()
 
 
@@ -66,7 +66,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store.close()
     reopened = Store.open(tmp_path / "state" / "taskspindle.sqlite3")
     assert reopened.migrate() == []
-    assert reopened.schema_version() == 1
+    assert reopened.schema_version() == 2
     reopened.close()
 
 

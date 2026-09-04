@@ -614,6 +614,121 @@ async def test_an_agent_that_errors_out_when_cancelled_is_still_cancelled(
     assert store.get_lease(PROVIDER) is None
 
 
+# -- provider limits and usage ------------------------------------------------------------------
+
+
+async def test_a_usage_limit_refusal_marks_the_provider_throttled(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+
+    state = await run_task(store, paths, task, script({"fail_kind": "usage_limit"}))
+
+    assert state is TaskState.FAILED
+    final = store.get_task(task.id)
+    assert final.error["code"] == "PROVIDER_THROTTLED"
+    assert final.error["retryable"] is True
+    assert final.error["details"]["reset_at"] == "2030-01-01T00:00:00Z"
+    assert final.error["details"]["status_key"] == PROVIDER
+    status = store.get_provider_status(PROVIDER)
+    assert status["state"] == "throttled"
+    assert status["reset_at"] == "2030-01-01T00:00:00Z"
+    assert status["task_id"] == task.id
+    assert EventKind.PROVIDER_LIMIT.value in event_kinds(store, task.id)
+    windows = store.latest_provider_windows(PROVIDER)
+    assert [(row["window"], row["status"], row["used_percent"]) for row in windows] == [
+        ("unknown", "rejected", 100.0)
+    ]
+    assert store.get_lease(PROVIDER) is None
+
+
+async def test_an_auth_refusal_is_recorded_and_not_retryable(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+
+    state = await run_task(store, paths, task, script({"fail_kind": "auth"}))
+
+    assert state is TaskState.FAILED
+    final = store.get_task(task.id)
+    assert final.error["code"] == "PROVIDER_AUTH_EXPIRED"
+    assert final.error["retryable"] is False
+    assert store.get_provider_status(PROVIDER)["state"] == "auth_expired"
+
+
+async def test_a_turn_that_runs_clears_the_throttle_and_records_its_usage(
+    store: Store, paths: Paths, script
+) -> None:
+    store.set_provider_status(PROVIDER, "throttled", code="PROVIDER_THROTTLED", source="acp_error")
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    script_path = script(
+        {
+            "response": "fine now",
+            "usage": {"inputTokens": 120, "outputTokens": 30, "cachedReadTokens": 1000, "totalTokens": 1150},
+            "rate_limit": {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.8},
+        }
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.COMPLETED
+    assert store.get_provider_status(PROVIDER)["state"] == "ok"
+    windows = store.latest_provider_windows(PROVIDER)
+    assert [(row["window"], row["status"], row["used_percent"]) for row in windows] == [
+        ("five_hour", "allowed_warning", 80.0)
+    ]
+    turn = store.list_turns(task.id)[-1]
+    assert turn["attribution"]["agent"] == {"name": "taskspindle-fake-agent", "version": "0.0.0"}
+    assert turn["attribution"]["gateway_host"] is None
+    recorded = store.get_turn_usage(turn["id"])
+    assert recorded["source"] == "acp_prompt_response"
+    assert (recorded["input_tokens"], recorded["output_tokens"], recorded["cache_read_tokens"]) == (
+        120,
+        30,
+        1000,
+    )
+    assert recorded["duration_ms"] is not None
+    # The fake profile is neither a Claude seat nor an API key, so nothing is priced.
+    assert recorded["cost_estimate_usd"] is None
+
+
+async def test_a_grok_style_turn_completed_update_is_recorded_with_its_model(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    script_path = script(
+        {
+            "response": "done",
+            "model_id": "fake-model-9",
+            "turn_completed": {
+                "usage": {
+                    "inputTokens": 500,
+                    "outputTokens": 40,
+                    "cachedReadTokens": 200,
+                    "reasoningTokens": 12,
+                    "modelCalls": 2,
+                    "costUsdTicks": 43475800,
+                    "modelUsage": {"fake-model-9": {"inputTokens": 500}},
+                }
+            },
+        }
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.COMPLETED
+    final = store.get_task(task.id)
+    assert final.reported_model == "fake-model-9"
+    turn = store.list_turns(task.id)[-1]
+    assert turn["attribution"]["reported_model"] == "fake-model-9"
+    recorded = store.get_turn_usage(turn["id"])
+    assert recorded["source"] == "acp_turn_completed"
+    assert recorded["model"] == "fake-model-9"
+    assert (recorded["input_tokens"], recorded["reasoning_tokens"], recorded["model_calls"]) == (500, 12, 2)
+    assert recorded["raw"]["costUsdTicks"] == 43475800
+    assert recorded["cost_estimate_usd"] is None
+
+
 # -- entry conditions --------------------------------------------------------------------------
 
 

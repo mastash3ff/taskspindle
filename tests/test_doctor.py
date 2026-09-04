@@ -171,6 +171,34 @@ def test_a_healthy_machine_passes_every_check(paths: Paths, tmp_path: Path) -> N
     assert checks["child_env_shell"]["ok"] is True
 
 
+def test_a_throttled_provider_is_an_advisory_check(paths: Paths, tmp_path: Path) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    register_codex(tmp_path)
+    throttled = {
+        "provider": "shell",
+        "state": "throttled",
+        "code": "PROVIDER_THROTTLED",
+        "reason": "You've hit your limit",
+        "reset_at": "2999-01-01T00:00:00Z",
+    }
+
+    report = run(paths, tmp_path, RecordedRunner(), provider_status=[throttled])
+
+    checks = by_name(report)
+    assert checks["availability_shell"]["ok"] is False
+    assert checks["availability_shell"]["advisory"] is True
+    assert "resets 2999-01-01T00:00:00Z" in checks["availability_shell"]["detail"]
+    assert report["ok"] is True
+
+    clear = by_name(run(paths, tmp_path, RecordedRunner()))
+    assert clear["availability_shell"] == {
+        "name": "availability_shell",
+        "ok": True,
+        "detail": "no limit recorded",
+        "advisory": True,
+    }
+
+
 def test_an_old_git_is_reported_with_the_version_it_found(paths: Paths, tmp_path: Path) -> None:
     install_adapter(paths, taskspindle.ADAPTER_VERSION)
     runner = RecordedRunner({**HEALTHY, "git": (0, "git version 2.34.1\n")})

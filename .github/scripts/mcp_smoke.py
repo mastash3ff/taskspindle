@@ -13,7 +13,7 @@ import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-EXPECTED_TOOLS = 16
+EXPECTED_TOOLS = 17
 
 
 async def probe() -> list[str]:
