@@ -187,3 +187,135 @@ async def test_the_server_log_captures_a_traceback(server, paths: Paths, monkeyp
     assert "the store fell over" not in result.data["error"]["message"]
     log = (paths.state_dir / "server.log").read_text(encoding="utf-8")
     assert "RuntimeError: the store fell over" in log
+
+
+@pytest.mark.parametrize("choice", ["retry", "cancel"])
+async def test_ambiguous_recovery_elicits_without_changing_the_callers_version(
+    server, monkeypatch, choice: str,
+) -> None:
+    from taskspindle.service import MANUAL_RECOVERY_REQUIRED, TaskSpindleError
+
+    calls = []
+
+    def attempt(self, task_id, version, prompt=""):
+        calls.append(("retry", task_id, version, prompt))
+        if len(calls) == 1:
+            raise TaskSpindleError(MANUAL_RECOVERY_REQUIRED, "ambiguous", details={"evidence": "worker"})
+        return {"state": "QUEUED"}
+
+    def cancel(self, task_id, version):
+        calls.append(("cancel", task_id, version))
+        return {"state": "CANCELLED"}
+
+    async def answer(message, response_type, params, context):
+        assert "worker" in message
+        return {"value": choice}
+
+    monkeypatch.setattr(Orchestrator, "continue_task", attempt)
+    monkeypatch.setattr(Orchestrator, "cancel_task", cancel)
+    async with Client(server, elicitation_handler=answer) as client:
+        tools = await client.list_tools()
+        schema = next(t.inputSchema for t in tools if t.name == "continue_task")
+        assert "ctx" not in schema["properties"]
+        result = await client.call_tool("continue_task", {
+            "task_id": "ts_example", "expected_state_version": 7, "prompt": "resume",
+        })
+    assert result.data["ok"] is True
+    assert calls[0] == ("retry", "ts_example", 7, "resume")
+    assert calls[1] == (("retry", "ts_example", 7, "resume") if choice == "retry"
+                        else ("cancel", "ts_example", 7))
+
+
+@pytest.mark.parametrize("action", [None, "decline", "cancel", "broken", "invalid"])
+async def test_ambiguous_recovery_keeps_the_error_without_an_accepted_choice(
+    server, monkeypatch, action,
+) -> None:
+    from fastmcp.client.elicitation import ElicitResult
+
+    from taskspindle.service import MANUAL_RECOVERY_REQUIRED, TaskSpindleError
+
+    calls = []
+
+    def attempt(self, *args):
+        calls.append(args)
+        raise TaskSpindleError(MANUAL_RECOVERY_REQUIRED, "ambiguous", details={"evidence": "worker"})
+
+    async def answer(*args):
+        if action == "broken":
+            raise RuntimeError("client could not ask")
+        if action == "invalid":
+            return {"value": "neither"}
+        return ElicitResult(action=action)
+
+    monkeypatch.setattr(Orchestrator, "continue_task", attempt)
+    async with Client(server, elicitation_handler=answer if action else None) as client:
+        result = await client.call_tool("continue_task", {
+            "task_id": "ts_example", "expected_state_version": 7,
+        })
+    assert result.data["error"]["code"] == MANUAL_RECOVERY_REQUIRED
+    assert result.data["error"]["details"] == {"evidence": "worker"}
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("next_error", ["STALE_STATE_VERSION", "MANUAL_RECOVERY_REQUIRED"])
+async def test_elicited_retry_preserves_recovery_guards(server, monkeypatch, next_error) -> None:
+    from taskspindle.service import MANUAL_RECOVERY_REQUIRED, TaskSpindleError
+
+    version = 7
+
+    def attempt(self, task_id, expected, prompt):
+        assert expected == 7
+        if version != expected:
+            raise TaskSpindleError(next_error, "state changed or still ambiguous")
+        raise TaskSpindleError(MANUAL_RECOVERY_REQUIRED, "ambiguous")
+
+    async def answer(*args):
+        nonlocal version
+        version = 8
+        return {"value": "retry"}
+
+    monkeypatch.setattr(Orchestrator, "continue_task", attempt)
+    async with Client(server, elicitation_handler=answer) as client:
+        result = await client.call_tool("continue_task", {
+            "task_id": "ts_example", "expected_state_version": 7,
+        })
+    assert result.data["error"]["code"] == next_error
+
+
+
+async def test_url_only_client_keeps_the_recovery_error(server, monkeypatch) -> None:
+    from mcp.server.session import ServerSession
+    from mcp.types import ElicitationCapability, UrlElicitationCapability
+
+    from taskspindle.service import MANUAL_RECOVERY_REQUIRED, TaskSpindleError
+
+    original = ServerSession.client_params.fget
+
+    def url_only(session):
+        params = original(session)
+        if params is None:
+            return None
+        capability = ElicitationCapability(url=UrlElicitationCapability())
+        return params.model_copy(update={"capabilities": params.capabilities.model_copy(
+            update={"elicitation": capability},
+        )})
+
+    def attempt(self, *args):
+        raise TaskSpindleError(MANUAL_RECOVERY_REQUIRED, "ambiguous", details={"evidence": "worker"})
+
+    asked = False
+
+    async def answer(*args):
+        nonlocal asked
+        asked = True
+        return {"value": "retry"}
+
+    monkeypatch.setattr(ServerSession, "client_params", property(url_only))
+    monkeypatch.setattr(Orchestrator, "continue_task", attempt)
+    async with Client(server, elicitation_handler=answer) as client:
+        result = await client.call_tool("continue_task", {
+            "task_id": "ts_example", "expected_state_version": 7,
+        })
+    assert asked is False
+    assert result.data["error"]["code"] == MANUAL_RECOVERY_REQUIRED
+    assert result.data["error"]["details"] == {"evidence": "worker"}

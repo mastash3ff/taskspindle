@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Recovery choices.** `continue_task` can ask form-capable MCP clients to retry or cancel
+  ambiguous recovery, while preserving recovery and stale-version checks and the existing error fallback.
 - **Claude model metadata.** Canonical model ids returned by ACP session creation or loading
   are preferred over the session file. Aliases and display names retain the existing file fallback.
 - **Provider availability, reported rather than acted on.** A turn a provider refuses for a

@@ -262,6 +262,13 @@ Anything else is `ILLEGAL_TRANSITION`. A resume of a task with no stored session
 still ambiguous the answer is `MANUAL_RECOVERY_REQUIRED`. Other errors: `TASK_NOT_FOUND`,
 `STALE_STATE_VERSION`. Returns `{"task_id", "state", "state_version"}`.
 
+Clients advertising form elicitation can receive a single retry-or-cancel question when recovery
+remains ambiguous. Both choices use the caller's original `expected_state_version` and the same
+recovery checks: neither forces resolution or cancellation. A changed state returns
+`STALE_STATE_VERSION`; unresolved recovery still returns `MANUAL_RECOVERY_REQUIRED`. The original
+error also remains when the question is declined or dismissed, elicitation fails or returns
+malformed data, or the client lacks form support.
+
 ## Acceptance
 
 ### `accept_task`

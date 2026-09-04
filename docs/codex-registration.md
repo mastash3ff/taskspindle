@@ -82,9 +82,10 @@ Three things on the Codex side are worth knowing about:
 - **Hooks.** Codex's `PostToolUse` and `SubagentStop` hooks can run a command when a tool call
   finishes. A hook on `accept_task` could, for example, record the accepted candidate somewhere of
   your own. Nothing in TaskSpindle needs one.
-- **Elicitation.** Codex supports MCP elicitation, so a future TaskSpindle could ask the session a
-  question in the middle of a tool call — the natural shape for `RECOVERY_AMBIGUOUS` — instead of
-  returning `MANUAL_RECOVERY_REQUIRED` and waiting. It does not today.
+- **Elicitation.** `continue_task` can ask form-capable clients whether to retry or cancel
+  ambiguous recovery. Both choices retain the original state version and recovery checks;
+  unavailable, declined or failed elicitation retains `MANUAL_RECOVERY_REQUIRED`. See
+  [the tool reference](tools.md#continue_task).
 - **Codex's own rate limits.** Every Codex turn carries its account's usage windows, and the
   app-server exposes them. Those are Codex's limits, not the workers': TaskSpindle's
   `usage_report` and `capabilities` describe the Claude and Grok seats it drives, and say plainly

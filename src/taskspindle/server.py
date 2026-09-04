@@ -17,9 +17,9 @@ import os
 import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from pydantic import BaseModel, ValidationError
 
 from . import doctor as doctor_module
@@ -35,7 +35,7 @@ from .models import (
     StartTaskRequest,
 )
 from .orchestrator import DIFF_PAGE_BYTES, Orchestrator
-from .service import INVALID_REQUEST, TaskSpindleError
+from .service import INVALID_REQUEST, MANUAL_RECOVERY_REQUIRED, TaskSpindleError
 from .store import Store
 from .units import SystemdUserBackend
 
@@ -186,8 +186,8 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
 
     def tool(name: str, description: str | None = None) -> Callable[[Callable[..., Any]], Any]:
         # ``run_in_thread=False`` is load-bearing: the store is one sqlite connection bound to
-        # the thread that opened it, and tool calls arrive one at a time from a single session.
-        # Serialising them on the loop thread is both correct and what the protocol already does.
+        # the thread that opened it. Synchronous orchestrator calls stay on the loop thread;
+        # elicitation awaits after the cycle context exits, with no store transaction open.
         return mcp.tool(
             name=name,
             description=description,
@@ -306,14 +306,40 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         return call("task_diff", lambda: orchestrator.task_diff(task_id, offset, length))
 
     @tool("continue_task")
-    def continue_task(
-        task_id: str, expected_state_version: int, prompt: str = ""
+    async def continue_task(
+        task_id: str, expected_state_version: int, ctx: Context, prompt: str = ""
     ) -> dict[str, Any]:
-        """Send one more turn: a repair on a candidate, a follow-up question, or a resume."""
-        return call(
-            "continue_task",
-            lambda: orchestrator.continue_task(task_id, expected_state_version, prompt),
-        )
+        """Send one more turn; optionally ask retry or cancel when recovery remains ambiguous."""
+        async def body() -> dict[str, Any]:
+            try:
+                return orchestrator.continue_task(task_id, expected_state_version, prompt)
+            except TaskSpindleError as exc:
+                if exc.code != MANUAL_RECOVERY_REQUIRED:
+                    raise
+                try:
+                    params = ctx.session.client_params
+                    capability = params.capabilities.elicitation if params is not None else None
+                    # Empty capabilities are the legacy form advertisement; URL-only is insufficient.
+                    if capability is None or (capability.form is None and capability.url is not None):
+                        raise
+                    # The cycle context has exited and no transaction is open. Keep the caller's
+                    # version so concurrent changes are caught when either choice runs.
+                    answer = await ctx.elicit(
+                        "Recovery is still ambiguous. Retry recovery or request cancellation? "
+                        "Both choices retain the existing recovery and state-version checks. "
+                        + json.dumps(exc.details),
+                        response_type=Literal["retry", "cancel"],
+                    )
+                except Exception:
+                    # Elicitation is optional; a failed question must retain the recovery signal.
+                    raise exc from None
+                if answer.action != "accept":
+                    raise
+                if answer.data == "cancel":
+                    return orchestrator.cancel_task(task_id, expected_state_version)
+                return orchestrator.continue_task(task_id, expected_state_version, prompt)
+
+        return await _guard_async("continue_task", log_path, body)
 
     @tool(
         "accept_task",
