@@ -35,6 +35,9 @@ owns and writes an example `config.toml` if you do not already have one. It runs
 `npm ci --ignore-scripts --no-audit --no-fund` against a lock file shipped inside the package, in
 an environment holding only `PATH`, `HOME` and `LANG`, so no registry token or proxy setting
 reaches npm. It never logs in, never copies credentials and never edits your Codex configuration.
+It also pins whichever `node` it finds on your PATH at that moment into the adapter launcher, so a
+worker unit's short PATH never needs its own `node` entry; re-run `taskspindle setup` after
+installing or switching Node versions to re-pin it.
 
 `taskspindle doctor` asks one question at a time and prints the whole list, so a first run on a
 fresh machine tells you everything that is missing rather than the first thing that broke:

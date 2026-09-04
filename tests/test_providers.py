@@ -22,6 +22,7 @@ from taskspindle.providers import (
     grok_oauth_evidence,
     load_profiles,
     opposite_provider,
+    pinned_node,
     profile_for_task,
     reviewer_independent,
     session_options,
@@ -133,6 +134,70 @@ def test_child_env_path_drops_foreign_node_modules_and_prepends_the_runtime(tmp_
     assert entries[0] == str(_dirs(tmp_path)["runtime_dir"] / "node_modules" / ".bin")
     assert "/opt/whatever/node_modules/.bin" not in entries[1:]
     assert entries[1:] == ["/usr/bin", "/bin"]
+
+
+def _pin_node(runtime_dir: Path, node: Path) -> None:
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    (runtime_dir / "node-path").write_text(f"{node}\n", encoding="utf-8")
+
+
+def test_pinned_node_reads_back_what_setup_wrote(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "runtime"
+    node = tmp_path / "node-bin" / "node"
+    _pin_node(runtime_dir, node)
+
+    assert pinned_node(runtime_dir) == node
+
+
+def test_pinned_node_is_none_when_setup_never_pinned_one(tmp_path: Path) -> None:
+    assert pinned_node(tmp_path / "no-such-runtime") is None
+
+
+def test_child_env_path_puts_the_pinned_node_ahead_of_the_runtime_bin_for_claude(tmp_path: Path) -> None:
+    dirs = _dirs(tmp_path)
+    node = tmp_path / "node-bin" / "node"
+    _pin_node(dirs["runtime_dir"], node)
+    claude = _builtins(tmp_path)["claude"]
+
+    entries = build_child_env(claude, LEAKY_PARENT, task_tmp=tmp_path).get("PATH", "").split(":")
+
+    assert entries[0] == str(node.parent)
+    assert entries[1] == str(dirs["runtime_dir"] / "node_modules" / ".bin")
+    assert entries[2:] == ["/usr/bin", "/bin"]
+
+
+def test_child_env_path_puts_the_pinned_node_ahead_for_a_claude_based_profile(tmp_path: Path) -> None:
+    dirs = _dirs(tmp_path)
+    node = tmp_path / "node-bin" / "node"
+    _pin_node(dirs["runtime_dir"], node)
+    builtins = _builtins(tmp_path)
+    based_on_claude = Profile(
+        id="claude-litellm",
+        auth="api_key",
+        command=builtins["claude"].command,
+        env={"ANTHROPIC_BASE_URL": "https://gateway.internal/v1"},
+        secret_env=("ANTHROPIC_AUTH_TOKEN",),
+        base="claude",
+    )
+    parent = {**LEAKY_PARENT, "ANTHROPIC_AUTH_TOKEN": "gateway-token"}
+
+    entries = build_child_env(based_on_claude, parent, task_tmp=tmp_path).get("PATH", "").split(":")
+
+    assert entries[0] == str(node.parent)
+    assert entries[1] == str(dirs["runtime_dir"] / "node_modules" / ".bin")
+
+
+def test_child_env_path_leaves_grok_alone_even_when_a_node_is_pinned(tmp_path: Path) -> None:
+    dirs = _dirs(tmp_path)
+    node = tmp_path / "node-bin" / "node"
+    _pin_node(dirs["runtime_dir"], node)
+    grok = _builtins(tmp_path)["grok"]
+
+    entries = build_child_env(grok, LEAKY_PARENT, task_tmp=tmp_path).get("PATH", "").split(":")
+
+    assert str(node.parent) not in entries
+    assert str(dirs["runtime_dir"] / "node_modules" / ".bin") not in entries
+    assert entries == ["/usr/bin", "/bin"]
 
 
 def test_api_key_profile_passes_exactly_its_declared_secret(tmp_path: Path) -> None:

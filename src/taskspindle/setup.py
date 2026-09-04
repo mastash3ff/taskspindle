@@ -6,6 +6,11 @@ packaged ``package.json`` and ``package-lock.json`` into a versioned runtime dir
 ``npm ci`` there, so the tree that ends up installed is the one the lock file describes and not
 whatever the registry offers today.
 
+It also resolves the ``node`` on the setup operator's own PATH, records its absolute path, and
+rewrites ``node_modules/.bin/claude-agent-acp`` from the ``npm``-linked symlink (shebang
+``#!/usr/bin/env node``) into a shim that execs that node directly. A worker unit's PATH is
+short and has no ``node`` on it at all; the shim needs none.
+
 It never logs in, never reads or copies a credential, and never edits Codex's configuration.
 Authentication belongs to the provider CLIs, and registering the MCP server is a command the
 operator runs themselves -- both are documented rather than automated, because a tool that
@@ -16,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from collections.abc import Callable, Mapping
 from importlib import resources
@@ -27,6 +33,9 @@ import taskspindle
 from .config import Paths
 
 __all__ = ["ADAPTER_BIN", "EXAMPLE_CONFIG", "MANIFESTS", "NPM_ARGS", "SetupError", "install_runtime"]
+
+#: The oldest Node the pinned adapter is supported on.
+MIN_NODE_MAJOR = 22
 
 #: The two files copied out of the package into the runtime directory.
 MANIFESTS: tuple[str, ...] = ("package.json", "package-lock.json")
@@ -182,6 +191,73 @@ def _verify_adapter(runtime_dir: Path) -> str:
     return found
 
 
+def _resolve_node() -> Path:
+    """Find the node the setup operator has on PATH, resolved past any symlink.
+
+    This deliberately looks at the setup process's own PATH rather than the restricted one a
+    worker unit runs with -- an interactive shell or a login profile is where ``nvm`` and
+    friends put ``node``, and the whole point of pinning it here is that a worker never has to
+    find it again on its own.
+    """
+    found = shutil.which("node")
+    if not found:
+        raise SetupError("node is not on PATH; install Node 22+ before running setup")
+    return Path(found).resolve()
+
+
+def _verify_node(node: Path) -> str:
+    """Run the resolved node and confirm it reports a supported version."""
+    try:
+        proc = subprocess.run(
+            [str(node), "--version"], capture_output=True, text=True, timeout=_TIMEOUT, check=False
+        )
+    except FileNotFoundError as exc:
+        raise SetupError(f"{node} could not be run: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SetupError(f"{node} --version did not finish within {_TIMEOUT:.0f}s") from exc
+    except OSError as exc:
+        raise SetupError(f"could not run {node}: {exc}") from exc
+    reported = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not reported.startswith("v"):
+        raise SetupError(f"{node} --version did not report a usable version: {reported or 'no output'}")
+    try:
+        major = int(reported[1:].split(".", 1)[0])
+    except ValueError as exc:
+        raise SetupError(f"{node} --version reported {reported!r}, which is not a version") from exc
+    if major < MIN_NODE_MAJOR:
+        raise SetupError(f"node {reported} is older than the required v{MIN_NODE_MAJOR}")
+    return reported
+
+
+def _write_node_path(runtime_dir: Path, node: Path) -> Path:
+    """Record the pinned node next to the runtime, mode 0600, for :func:`providers.pinned_node`."""
+    path = runtime_dir / "node-path"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{node}\n")
+    path.chmod(0o600)
+    return path
+
+
+def _write_launcher_shim(runtime_dir: Path, node: Path) -> Path:
+    """Replace the npm-linked launcher with a shim that execs the pinned node directly.
+
+    ``npm ci`` links ``node_modules/.bin/claude-agent-acp`` as a symlink to the adapter's entry
+    point, whose shebang is ``#!/usr/bin/env node`` -- fine in an interactive shell, useless
+    under the restricted PATH a worker unit runs with. The shim hardcodes the node this setup
+    just resolved, so the launcher needs no ``node`` on PATH at all. Idempotent: a rerun removes
+    whatever is there, symlink or an earlier shim, and writes a fresh one.
+    """
+    entry = runtime_dir / "node_modules" / taskspindle.ADAPTER_PACKAGE / "dist" / "index.js"
+    launcher = runtime_dir / "node_modules" / ".bin" / ADAPTER_BIN
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    if launcher.is_symlink() or launcher.exists():
+        launcher.unlink()
+    launcher.write_text(f'#!/bin/sh\nexec "{node}" "{entry}" "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
+
+
 def _write_config(config_file: Path) -> bool:
     """Write the example configuration, unless the operator already has one.
 
@@ -211,8 +287,9 @@ def install_runtime(
 ) -> dict[str, Any]:
     """Install the pinned adapter into ``paths.runtime_dir`` and lay out the other directories.
 
-    Returns what was done: the runtime directory, the adapter version now installed, the
-    configuration file, and whether this call is the one that created it.
+    Returns what was done: the runtime directory, the adapter version now installed, the node
+    pinned into the launcher, the configuration file, and whether this call is the one that
+    created it.
     """
     runtime_dir = _private(paths.runtime_dir)
     for name in MANIFESTS:
@@ -221,6 +298,11 @@ def install_runtime(
     _run_npm(runtime_dir, npm, runner, parent_env)
     adapter_version = _verify_adapter(runtime_dir)
 
+    node = _resolve_node()
+    _verify_node(node)
+    _write_node_path(runtime_dir, node)
+    _write_launcher_shim(runtime_dir, node)
+
     _private(paths.state_dir)
     _private(paths.data_dir)
     created = _write_config(paths.config_file)
@@ -228,6 +310,7 @@ def install_runtime(
     return {
         "runtime_dir": str(runtime_dir),
         "adapter_version": adapter_version,
+        "node": str(node),
         "config_file": str(paths.config_file),
         "created_config": created,
     }

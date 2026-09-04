@@ -16,12 +16,16 @@ from taskspindle.config import Paths
 from taskspindle.doctor import run_doctor
 from taskspindle.providers import Profile
 
+#: The node ``install_adapter`` pins by default, standing in for what ``taskspindle setup`` would
+#: have resolved and recorded.
+FAKE_NODE = "/opt/fakenode/bin/node"
+
 #: What a healthy machine answers.
 HEALTHY: dict[str, tuple[int, str]] = {
     "git": (0, "git version 2.43.0\n"),
     "systemctl": (0, "running\n"),
     "systemd-run": (0, ""),
-    "node": (0, "v22.11.0\n"),
+    FAKE_NODE: (0, "v22.11.0\n"),
     "grok": (0, "grok 1.0.13\n"),
     "claude": (
         0,
@@ -85,10 +89,37 @@ def paths(tmp_path: Path) -> Paths:
     )
 
 
-def install_adapter(paths: Paths, version: str) -> None:
+def install_adapter(paths: Paths, version: str, *, pin_node: bool = True) -> None:
     manifest = paths.runtime_dir / "node_modules" / taskspindle.ADAPTER_PACKAGE / "package.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps({"version": version}), encoding="utf-8")
+    if pin_node:
+        pin_node_and_launcher(paths, FAKE_NODE)
+
+
+def pin_node_and_launcher(paths: Paths, node: str) -> Path:
+    """Lay out what a pinned ``taskspindle setup`` leaves: the node-path file and the shim."""
+    (paths.runtime_dir / "node-path").write_text(f"{node}\n", encoding="utf-8")
+    entry = paths.runtime_dir / "node_modules" / taskspindle.ADAPTER_PACKAGE / "dist" / "index.js"
+    launcher = paths.runtime_dir / "node_modules" / ".bin" / "claude-agent-acp"
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_text(f'#!/bin/sh\nexec "{node}" "{entry}" "$@"\n', encoding="utf-8")
+    launcher.chmod(0o755)
+    return launcher
+
+
+def install_symlinked_launcher(paths: Paths) -> None:
+    """Lay out the pre-fix launcher: ``npm``'s own relative symlink into ``dist/index.js``."""
+    modules = paths.runtime_dir / "node_modules"
+    dist = modules / taskspindle.ADAPTER_PACKAGE / "dist"
+    dist.mkdir(parents=True, exist_ok=True)
+    (dist / "index.js").write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    binaries = modules / ".bin"
+    binaries.mkdir(parents=True, exist_ok=True)
+    link = binaries / "claude-agent-acp"
+    if link.exists() or link.is_symlink():
+        link.unlink()
+    link.symlink_to(Path("..") / taskspindle.ADAPTER_PACKAGE / "dist" / "index.js")
 
 
 def register_codex(home: Path, *, present: bool = True) -> None:
@@ -134,7 +165,7 @@ def test_a_healthy_machine_passes_every_check(paths: Paths, tmp_path: Path) -> N
     assert report["ok"] is True
     checks = by_name(report)
     assert checks["git"]["detail"] == "git version 2.43.0"
-    assert checks["node"]["detail"] == "v22.11.0"
+    assert checks["node"]["detail"] == f"pinned v22.11.0 at {FAKE_NODE}"
     assert checks["adapter"]["detail"].startswith(taskspindle.ADAPTER_PACKAGE)
     assert checks["profile_shell_command"]["detail"] == "/bin/sh"
     assert checks["child_env_shell"]["ok"] is True
@@ -185,6 +216,36 @@ def test_an_adapter_at_the_wrong_version_is_flagged(paths: Paths, tmp_path: Path
     assert check["ok"] is False
     assert "0.1.0" in check["detail"]
     assert taskspindle.ADAPTER_VERSION in check["detail"]
+
+
+def test_an_unpinned_launcher_is_flagged_even_at_the_right_adapter_version(
+    paths: Paths, tmp_path: Path
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION, pin_node=False)
+    install_symlinked_launcher(paths)
+    runner = RecordedRunner()
+
+    report = run(paths, tmp_path, runner)
+
+    check = by_name(report)["adapter"]
+    assert check["ok"] is False
+    assert "launcher not pinned; run taskspindle setup" in check["detail"]
+
+
+def test_node_falls_back_to_the_parent_env_path_when_nothing_is_pinned(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION, pin_node=False)
+    found = "/usr/local/bin/node"
+    monkeypatch.setattr(
+        doctor.shutil, "which", lambda name, path=None: found if name == "node" else None
+    )
+    runner = RecordedRunner({**HEALTHY, found: (0, "v22.11.0\n")})
+
+    check = by_name(run(paths, tmp_path, runner))["node"]
+
+    assert check["ok"] is True
+    assert check["detail"] == "v22.11.0"
 
 
 def test_a_missing_codex_registration_is_only_advisory(paths: Paths, tmp_path: Path) -> None:

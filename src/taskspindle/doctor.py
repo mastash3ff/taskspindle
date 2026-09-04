@@ -33,6 +33,7 @@ from . import providers
 from .acp_client import AcpWorker, InitInfo, PermissionPolicy
 from .config import Paths
 from .providers import Profile
+from .setup import ADAPTER_BIN
 
 __all__ = [
     "GROK_VERSION_PREFIX",
@@ -200,7 +201,23 @@ class _Doctor:
     def node(self) -> None:
         @self.check("node")
         def probe() -> str:
-            proc = self.run(["node", "--version"])
+            pinned = providers.pinned_node(self.paths.runtime_dir)
+            if pinned is not None:
+                proc = self.run([str(pinned), "--version"])
+                if proc.returncode != 0:
+                    raise RuntimeError(f"{pinned} --version exited {proc.returncode}")
+                found = _version(proc.stdout or "")
+                if found < MIN_NODE:
+                    raise RuntimeError(
+                        f"pinned node {'.'.join(map(str, found))} is older than the required "
+                        f"{'.'.join(map(str, MIN_NODE))}"
+                    )
+                return f"pinned {(proc.stdout or '').strip()} at {pinned}"
+
+            found_path = shutil.which("node", path=self.parent_env.get("PATH"))
+            if not found_path:
+                raise RuntimeError("node is not on PATH and no pinned node was found")
+            proc = self.run([found_path, "--version"])
             if proc.returncode != 0:
                 raise RuntimeError(f"node --version exited {proc.returncode}")
             found = _version(proc.stdout or "")
@@ -218,6 +235,7 @@ class _Doctor:
             / taskspindle.ADAPTER_PACKAGE
             / "package.json"
         )
+        launcher = self.paths.runtime_dir / "node_modules" / ".bin" / ADAPTER_BIN
 
         @self.check("adapter")
         def probe() -> str:
@@ -228,6 +246,13 @@ class _Doctor:
                     f"{taskspindle.ADAPTER_PACKAGE} is at {found or 'no version'}, "
                     f"not the pinned {taskspindle.ADAPTER_VERSION}"
                 )
+            pinned = providers.pinned_node(self.paths.runtime_dir)
+            if launcher.is_symlink() or pinned is None:
+                raise RuntimeError("launcher not pinned; run taskspindle setup")
+            if not launcher.is_file():
+                raise RuntimeError(f"{launcher} is missing")
+            if str(pinned) not in launcher.read_text(encoding="utf-8"):
+                raise RuntimeError("launcher not pinned; run taskspindle setup")
             return f"{taskspindle.ADAPTER_PACKAGE} {found} at {manifest.parent}"
 
     def grok_cli(self) -> None:

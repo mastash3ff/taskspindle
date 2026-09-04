@@ -37,6 +37,7 @@ __all__ = [
     "grok_overlay_path",
     "load_profiles",
     "opposite_provider",
+    "pinned_node",
     "profile_for_task",
     "reviewer_independent",
     "session_options",
@@ -397,6 +398,22 @@ def reviewer_independent(author: Profile, reviewer: Profile) -> bool:
     return author.command != reviewer.command or author.model != reviewer.model
 
 
+def pinned_node(runtime_dir: Path) -> Path | None:
+    """The absolute node ``taskspindle setup`` pinned into ``runtime_dir``, if it did.
+
+    ``taskspindle setup`` writes the node it resolved to ``runtime_dir / "node-path"`` and bakes
+    the same path into the adapter launcher shim, so a worker never needs ``node`` on its own
+    PATH. A runtime installed before that fix, or one whose file was removed, has no such record
+    -- ``None`` says so rather than guessing.
+    """
+    try:
+        text = (runtime_dir / "node-path").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    text = text.strip()
+    return Path(text) if text else None
+
+
 # --------------------------------------------------------------------------------------------
 # child environment
 
@@ -412,8 +429,10 @@ def build_child_env(
     Built by allowlist: a name is present only because this function put it there. ``PATH`` is
     scrubbed of every ``node_modules/.bin`` entry so a stray global adapter cannot shadow the
     pinned one, and the profile's own runtime bin dir goes back on the front for the Claude
-    family. Secrets are copied only for ``api_key`` profiles, and only by the exact names the
-    profile declared.
+    family. When that runtime pinned a node (see :func:`pinned_node`), its directory is
+    prepended ahead of the runtime bin dir too, so the family works even under a PATH that has
+    no ``node`` of its own. Secrets are copied only for ``api_key`` profiles, and only by the
+    exact names the profile declared.
     """
     env = {name: parent[name] for name in ENV_ALLOWLIST if name in parent}
 
@@ -423,8 +442,12 @@ def build_child_env(
         if entry and "node_modules/.bin" not in entry
     ]
     if profile.family == "claude":
-        runtime_bin = str(Path(profile.command[0]).parent)
+        launcher = Path(profile.command[0])
+        runtime_bin = str(launcher.parent)
         entries.insert(0, runtime_bin)
+        node = pinned_node(launcher.parent.parent.parent)
+        if node is not None:
+            entries.insert(0, str(node.parent))
     env["PATH"] = os.pathsep.join(entries)
 
     env["TERM"] = "dumb"

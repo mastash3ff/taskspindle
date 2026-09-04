@@ -118,6 +118,7 @@ def test_setup_prints_the_adapter_it_installed(
         lambda paths, **_: {
             "runtime_dir": str(paths.runtime_dir),
             "adapter_version": taskspindle.ADAPTER_VERSION,
+            "node": "/opt/fakenode/bin/node",
             "config_file": str(paths.config_file),
             "created_config": True,
         },
@@ -128,6 +129,7 @@ def test_setup_prints_the_adapter_it_installed(
     out = capsys.readouterr().out
     assert f"{taskspindle.ADAPTER_PACKAGE} {taskspindle.ADAPTER_VERSION}" in out
     assert str(home / "runtime") in out
+    assert "/opt/fakenode/bin/node" in out
     assert "(written)" in out
 
 

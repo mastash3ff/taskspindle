@@ -116,6 +116,7 @@ def _setup(runtime_dir: str | None, npm: str) -> int:
         return 1
     print(f"adapter {taskspindle.ADAPTER_PACKAGE} {report['adapter_version']}")
     print(f"runtime {report['runtime_dir']}")
+    print(f"node    {report['node']}")
     print(f"config  {report['config_file']} ({'written' if report['created_config'] else 'kept'})")
     return 0
 

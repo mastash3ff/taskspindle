@@ -35,6 +35,9 @@
 
 The MCP server never owns an ACP connection. It writes rows and starts units; the units talk to
 agents. That is what lets the server exit, crash or be restarted without taking the work with it.
+`claude-agent-acp` is launched through a shim `taskspindle setup` writes over npm's own symlink,
+execing the `node` it pinned at setup time by absolute path, since a worker unit's PATH is too
+short to find one on its own.
 
 ## The state machine
 
