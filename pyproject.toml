@@ -47,6 +47,7 @@ include = ["src", "tests", "docs", "examples", "README.md", "LICENSE", "CHANGELO
 
 [tool.ruff]
 line-length = 110
+extend-exclude = [".claude"]
 target-version = "py312"
 src = ["src", "tests"]
 

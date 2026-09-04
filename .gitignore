@@ -8,3 +8,4 @@ build/
 .ruff_cache/
 .superpowers/
 node_modules/
+.claude/
