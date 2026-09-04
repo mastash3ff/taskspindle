@@ -589,9 +589,12 @@
     var columns = keys.concat([
       "turns", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_estimate_usd",
     ]);
-    wrap.appendChild(tableOf(columns, rows, function (r) {
+    wrap.appendChild(tableOf(columns.map(function (c) {
+      return c === "repository_id" ? "repository" : c;
+    }), rows, function (r) {
       return columns.map(function (c) {
         if (c === "cost_estimate_usd") return r.priced_turns ? String(r[c]) : "-";
+        if (c === "repository_id") return r.repository_path || r.repository_id || "No repository";
         return textOrDash(r[c]);
       });
     }));

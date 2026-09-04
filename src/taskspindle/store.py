@@ -40,6 +40,8 @@ class UsageReader(ProviderStatusReader, Protocol):
 
     def get_task(self, task_id: str) -> TaskRecord | None: ...
 
+    def list_repositories(self) -> list[dict[str, Any]]: ...
+
     def list_turn_usage(
         self, *, since: str | None = None, provider: str | None = None,
         task_id: str | None = None,

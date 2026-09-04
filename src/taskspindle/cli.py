@@ -330,10 +330,12 @@ def _print_usage(report: dict[str, Any]) -> None:
         key for key in ("provider", "day", "model", "mode", "repository_id")
         if any(key in row for row in report["usage"])
     ]
-    columns = [*keys, "turns", "input", "output", "cache_read", "cache_write", "est_usd"]
+    columns = [*("repository" if key == "repository_id" else key for key in keys),
+               "turns", "input", "output", "cache_read", "cache_write", "est_usd"]
     rows = [
         [
-            *(str(row.get(key) or "-") for key in keys),
+            *(str(row.get("repository_path") or row.get(key) or "No repository")
+              if key == "repository_id" else str(row.get(key) or "-") for key in keys),
             str(row["turns"]),
             str(row["input_tokens"]),
             str(row["output_tokens"]),

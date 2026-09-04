@@ -487,6 +487,12 @@ def report(
             bucket["cost_estimate_usd"] = round(bucket["cost_estimate_usd"] + float(cost), 6)
             bucket["priced_turns"] += 1
 
+    if group_by == "repository_id":
+        repositories = {row["id"]: row for row in store.list_repositories()}
+        for bucket in groups.values():
+            repository = repositories.get(bucket["repository_id"], {})
+            bucket["repository_path"] = repository.get("display_path") or None
+
     outcomes = [
         row
         for row in store.task_counts(since=since)

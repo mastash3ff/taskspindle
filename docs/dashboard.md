@@ -79,3 +79,7 @@ never a traceback.
 
 `/` serves the page itself; `/static/*` serves its assets. The page is one static HTML file plus
 vanilla JavaScript — no build step, no CDN, no request ever leaves the browser's own origin.
+
+Repository usage groups display the registered repository path when available. The JSON keeps
+`repository_id` as its stable grouping key and adds `repository_path`; missing paths fall back
+to the ID, while repository-free turns display as "No repository".

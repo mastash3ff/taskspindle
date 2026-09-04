@@ -232,6 +232,9 @@ def test_repository_rollup_matches_read_only_store_and_preserves_filters(tmp_pat
             "r1": 300, "r2": 400, None: 800,
         }
         assert next(row for row in result["usage"] if row["repository_id"] == "r1")["turns"] == 2
+        assert {row["repository_id"]: row["repository_path"] for row in result["usage"]} == {
+            "r1": "/r1", "r2": "/r2", None: None,
+        }
         with ReadOnlyStore(path) as reader:
             assert usage.report(reader, group_by="repository_id", now=NOW) == result
             for backend in (store, reader):
