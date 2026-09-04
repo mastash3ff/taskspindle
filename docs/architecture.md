@@ -232,3 +232,17 @@ with your filesystem permissions. It can read anything you can read, and it can 
 worktree if it tries. TaskSpindle detects a write to the root repository and reports it as
 `ROOT_MUTATION`; it does not, and cannot, prevent one. If you need a real boundary, run TaskSpindle
 in a VM or a container.
+
+### Grok continuation measurement (2026-09-04)
+
+Grok 1.0.13 reported per-turn usage for a TaskSpindle consult followed by two `continue_task`
+turns in the same persisted session: input/output tokens were 14500/34, 14561/32 and 14620/27;
+each reported one model call. A direct ACP same-process/reloaded-session comparison also
+reported per-turn counts. Keep the raw `acp_turn_completed` counters; subtracting preceding
+turns would undercount usage.
+
+Continuation reliability is still unresolved. In a separate direct run using the same ACP
+client, `session/load` completed and replayed ten updates, but the following prompt timed out
+at 90 seconds. Another fresh-process load succeeded. This narrows the failure beyond the
+TaskSpindle orchestrator but does not establish its cause. Publication and activation of 0.2.0
+remain on hold pending resolution; the accounting measurement alone does not close that blocker.
