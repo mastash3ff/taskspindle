@@ -135,7 +135,7 @@ async def test_doctor_runs_its_live_probes_on_the_servers_own_loop(
         return InitInfo(load_session=True, auth_method_ids=("cached_token",), agent_info={})
 
     monkeypatch.setattr(doctor._Doctor, "run", run)
-    monkeypatch.setattr(doctor._Doctor, "_grok_init", handshake)
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", handshake)
     orchestrator = Orchestrator(
         store=store,
         paths=paths,

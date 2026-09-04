@@ -198,6 +198,28 @@ def test_names_argv_and_unit_environment() -> None:
     }
 
 
+def test_declared_secrets_are_forwarded_to_the_unit() -> None:
+    """The worker rebuilds the agent's environment from its own, so the name has to reach it."""
+    parent = {
+        "PATH": "/usr/bin",
+        "HOME": "/home/tester",
+        "ANTHROPIC_AUTH_TOKEN": "gateway-token",
+        "ANTHROPIC_API_KEY": "sk-secret",
+    }
+
+    env = unit_env(
+        parent,
+        config_file=Path("/cfg/config.toml"),
+        secret_names=("ANTHROPIC_AUTH_TOKEN", "NOT_SET_ANYWHERE"),
+    )
+
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "gateway-token"
+    # A name the parent does not have is left out, not blanked.
+    assert "NOT_SET_ANYWHERE" not in env
+    # Nothing is forwarded that was not asked for by name.
+    assert "ANTHROPIC_API_KEY" not in env
+
+
 def test_boot_id_is_a_stable_non_empty_string() -> None:
     assert boot_id() == boot_id()
     assert boot_id()

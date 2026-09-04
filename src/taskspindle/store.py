@@ -233,6 +233,7 @@ CREATE TABLE integration_journal (
     phase TEXT NOT NULL,
     target_head TEXT,
     candidate_sha TEXT,
+    changed_paths TEXT NOT NULL DEFAULT '[]',
     started_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -839,24 +840,31 @@ class Store:
         phase: str,
         target_head: str | None = None,
         candidate_sha: str | None = None,
+        changed_paths: Sequence[str] = (),
     ) -> None:
         stamp = now()
+        paths = json.dumps(list(changed_paths))
         with self._guard(), self.transaction() as conn:
             conn.execute(
                 "INSERT INTO integration_journal"
-                "(task_id, phase, target_head, candidate_sha, started_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+                "(task_id, phase, target_head, candidate_sha, changed_paths, "
+                "started_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(task_id) DO UPDATE SET phase = excluded.phase, "
                 "target_head = excluded.target_head, candidate_sha = excluded.candidate_sha, "
-                "updated_at = excluded.updated_at",
-                (task_id, phase, target_head, candidate_sha, stamp, stamp),
+                "changed_paths = excluded.changed_paths, updated_at = excluded.updated_at",
+                (task_id, phase, target_head, candidate_sha, paths, stamp, stamp),
             )
 
     def read_journal(self, task_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM integration_journal WHERE task_id = ?", (task_id,)
         ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        journal = dict(row)
+        journal["changed_paths"] = json.loads(journal["changed_paths"] or "[]")
+        return journal
 
     def clear_journal(self, task_id: str) -> None:
         with self._guard(), self.transaction() as conn:

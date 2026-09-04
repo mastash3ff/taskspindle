@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 
 import taskspindle
+from taskspindle import doctor
+from taskspindle.acp_client import InitInfo
 from taskspindle.config import Paths
 from taskspindle.doctor import run_doctor
 from taskspindle.providers import Profile
@@ -33,6 +35,23 @@ HEALTHY: dict[str, tuple[int, str]] = {
         ),
     ),
 }
+
+
+#: What a well-behaved agent answers at ``initialize``.
+HANDSHAKE = InitInfo(
+    load_session=True, auth_method_ids=("cached_token",), agent_info={"name": "a-harness"}
+)
+
+
+def _fake_probe(answer: InitInfo | Exception):
+    """A stand-in for the ACP initialize probe: no process is started."""
+
+    async def probe(self: object, profile: Profile, workspace: Path) -> InitInfo:
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    return probe
 
 
 class RecordedRunner:
@@ -189,20 +208,33 @@ def test_a_missing_api_key_secret_is_only_advisory(paths: Paths, tmp_path: Path)
 
     report = run(paths, tmp_path, runner, profiles={"metered": metered})
 
-    check = by_name(report)["profile_metered_secret_SOME_API_KEY"]
+    checks = by_name(report)
+    check = checks["profile_metered_secret_SOME_API_KEY"]
     assert check["ok"] is False
     assert check["advisory"] is True
     assert "SOME_API_KEY" in check["detail"]
-    assert report["ok"] is False  # the child env cannot be built without the secret
+    # The child env cannot be built without the secret, and that is reported the same way: a
+    # machine that was never given a metered provider's key is not a broken machine.
+    assert checks["child_env_metered"] == {
+        "name": "child_env_metered",
+        "ok": False,
+        "detail": "secret not set: SOME_API_KEY",
+        "advisory": True,
+    }
+    assert report["ok"] is True
 
 
-def test_live_probes_can_be_skipped(paths: Paths, tmp_path: Path) -> None:
+def test_live_probes_can_be_skipped(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", _fake_probe(HANDSHAKE))
     runner = RecordedRunner()
 
     skipped = by_name(run(paths, tmp_path, runner))
     assert "transient_unit" not in skipped
     assert "grok_acp" not in skipped
+    assert "acp_shell" not in skipped
     assert all(argv[0] != "systemd-run" for argv in runner.calls)
 
     live = RecordedRunner()
@@ -212,3 +244,54 @@ def test_live_probes_can_be_skipped(paths: Paths, tmp_path: Path) -> None:
     assert report["grok_acp"]["ok"] is False
     assert any(argv[0] == "systemd-run" for argv in live.calls)
     assert all(argv[0] != "grok" or argv[1] == "--version" for argv in live.calls)
+
+
+def test_a_configured_profile_is_probed_for_an_acp_handshake(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", _fake_probe(HANDSHAKE))
+
+    report = by_name(run(paths, tmp_path, RecordedRunner(), live_probes=True))
+
+    assert report["acp_shell"]["ok"] is True
+    assert report["acp_shell"]["detail"] == "configured: a-harness answered initialize"
+
+
+def test_an_unreachable_configured_profile_is_reported_as_such(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", _fake_probe(RuntimeError("no such agent")))
+
+    report = by_name(run(paths, tmp_path, RecordedRunner(), live_probes=True))
+
+    assert report["acp_shell"]["ok"] is False
+    assert report["acp_shell"]["detail"] == "unreachable: RuntimeError: no such agent"
+
+
+def test_a_profile_whose_secret_is_missing_is_not_probed(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metered = profile("metered", auth="api_key", secret_env=("SOME_API_KEY",))
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    monkeypatch.setattr(
+        doctor._Doctor, "_init_probe", _fake_probe(AssertionError("must not be probed"))
+    )
+
+    report = by_name(
+        run(
+            paths,
+            tmp_path,
+            RecordedRunner(),
+            live_probes=True,
+            profiles={"metered": metered},
+        )
+    )
+
+    assert report["acp_metered"] == {
+        "name": "acp_metered",
+        "ok": False,
+        "detail": "secret not set: SOME_API_KEY",
+        "advisory": True,
+    }

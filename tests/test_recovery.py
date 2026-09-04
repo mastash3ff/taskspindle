@@ -10,7 +10,7 @@ import pytest
 
 from taskspindle import service
 from taskspindle.models import AuthMode, EventKind, Mode, StartTaskRequest, TaskRecord, TaskState
-from taskspindle.recovery import ReconcileAction, reconcile
+from taskspindle.recovery import AcceptOutcome, ReconcileAction, reconcile
 from taskspindle.store import Store
 from taskspindle.units import UnitError, UnitState, accept_unit_name, worker_unit_name
 from tests.fakes.units import ACTIVE, EXITED, NOT_FOUND, OOM, SIGNALLED, SUCCESS, FakeUnitBackend
@@ -257,7 +257,9 @@ def test_a_task_that_finishes_underneath_the_sweep_is_skipped(store: Store) -> N
     actions = {action.task_id: action for action in run(store, backend)}
 
     assert actions[moving.id].to_state is None
-    assert actions[moving.id].reason == f"reconcile_failed:{service.ILLEGAL_TRANSITION}"
+    # The version the sweep read is stale, so the transition is refused before the state machine
+    # is even consulted: whoever moved the task owns it.
+    assert actions[moving.id].reason == f"reconcile_failed:{service.STALE_STATE_VERSION}"
     assert store.get_task(moving.id).state is TaskState.COMPLETED
     assert store.get_task(other.id).state is TaskState.INTERRUPTED
 
@@ -299,7 +301,7 @@ def test_an_interrupted_accept_that_committed_is_accepted(store: Store) -> None:
     task = make_task(store, state=TaskState.ACCEPTING, unit="accept")
     backend = FakeUnitBackend({accept_unit_name(task.id): SUCCESS})
 
-    actions = run(store, backend, accept_recover=lambda _task: "committed")
+    actions = run(store, backend, accept_recover=lambda _task: AcceptOutcome("committed"))
 
     assert [(action.to_state, action.reason) for action in actions] == [
         (TaskState.ACCEPTED.value, "accept_committed:worker_exited_without_record")
@@ -312,7 +314,7 @@ def test_an_interrupted_accept_that_was_aborted_returns_to_result_ready(store: S
     task = make_task(store, state=TaskState.ACCEPTING, unit="accept")
     backend = FakeUnitBackend({accept_unit_name(task.id): OOM})
 
-    actions = run(store, backend, accept_recover=lambda _task: "aborted")
+    actions = run(store, backend, accept_recover=lambda _task: AcceptOutcome("aborted"))
 
     assert [action.to_state for action in actions] == [TaskState.RESULT_READY.value]
     settled = store.get_task(task.id)
@@ -322,3 +324,89 @@ def test_an_interrupted_accept_that_was_aborted_returns_to_result_ready(store: S
     kinds = [event["kind"] for event in store.list_events(task.id)]
     assert EventKind.ACCEPT_FAILED.value in kinds
     assert EventKind.RECOVERY.value in kinds
+
+
+def test_an_accept_that_could_not_be_settled_waits_for_a_person(store: Store) -> None:
+    """A recovery that refused to touch the repository is never reported as an abort."""
+    task = make_task(store, state=TaskState.ACCEPTING, unit="accept")
+    backend = FakeUnitBackend({accept_unit_name(task.id): OOM})
+
+    actions = run(store, backend, accept_recover=lambda _task: AcceptOutcome("manual"))
+
+    assert [(action.to_state, action.reason) for action in actions] == [
+        (TaskState.RECOVERY_AMBIGUOUS.value, "accept_recovery_manual:oom_killed")
+    ]
+    settled = store.get_task(task.id)
+    assert settled.state is TaskState.RECOVERY_AMBIGUOUS
+    assert settled.candidate_sha == "c0ffeeba"
+    assert EventKind.ACCEPT_FAILED.value not in [
+        event["kind"] for event in store.list_events(task.id)
+    ]
+
+
+def test_a_committed_accept_records_the_head_it_landed_at(store: Store) -> None:
+    task = make_task(store, state=TaskState.ACCEPTING, unit="accept")
+    backend = FakeUnitBackend({accept_unit_name(task.id): SUCCESS})
+
+    run(store, backend, accept_recover=lambda _task: AcceptOutcome("committed", "beefcafe"))
+
+    settled = store.get_task(task.id)
+    assert settled.state is TaskState.ACCEPTED
+    assert settled.target_head == "beefcafe"
+
+
+def test_an_ambiguous_accept_unit_is_never_asked_about_its_journal(store: Store) -> None:
+    """The accept may still be running: consulting the journal would undo an apply in flight."""
+    task = make_task(
+        store, state=TaskState.ACCEPTING, unit="accept", heartbeat_offset_s=-2
+    )
+    backend = FakeUnitBackend({accept_unit_name(task.id): NOT_FOUND})
+    asked: list[str] = []
+
+    def recover(record: TaskRecord) -> AcceptOutcome:
+        asked.append(record.id)
+        return AcceptOutcome("aborted")
+
+    actions = run(store, backend, accept_recover=recover)
+
+    assert asked == []
+    assert_settled(
+        store, task, actions, TaskState.RECOVERY_AMBIGUOUS, "unit_missing_fresh_heartbeat"
+    )
+
+
+def test_a_cancel_the_worker_ignores_is_escalated_to_a_stop(store: Store) -> None:
+    task = make_task(store, state=TaskState.CANCELLING)
+    unit = worker_unit_name(task.id)
+    backend = FakeUnitBackend({unit: ACTIVE})
+    store.append_event(
+        task.id, EventKind.CANCEL_REQUESTED, {"from": "RUNNING", "at": stamp(-45)}
+    )
+
+    actions = run(store, backend)
+
+    assert [(action.to_state, action.reason) for action in actions] == [
+        (None, "cancel_escalated")
+    ]
+    assert backend.stopped == [unit]
+    # The unit's own post-mortem settles the task on a later sweep; nothing is guessed here.
+    assert store.get_task(task.id).state is TaskState.CANCELLING
+    assert recovery_reasons(store, task.id) == ["cancel_escalated"]
+
+    # A sweep that finds it still running says so again, but only tells the operator once.
+    assert [action.reason for action in run(store, backend)] == ["cancel_escalated"]
+    assert recovery_reasons(store, task.id) == ["cancel_escalated"]
+    assert backend.stopped == [unit, unit]
+
+
+def test_a_cancel_still_within_the_grace_period_is_left_alone(store: Store) -> None:
+    task = make_task(store, state=TaskState.CANCELLING)
+    unit = worker_unit_name(task.id)
+    backend = FakeUnitBackend({unit: ACTIVE})
+    store.append_event(
+        task.id, EventKind.CANCEL_REQUESTED, {"from": "RUNNING", "at": stamp(-5)}
+    )
+
+    assert run(store, backend) == []
+    assert backend.stopped == []
+    assert store.get_task(task.id).state is TaskState.CANCELLING

@@ -84,6 +84,7 @@ def run_accept(
         phase=str(stored["phase"]),
         target_head=str(stored["target_head"] or ""),
         candidate_sha=str(stored["candidate_sha"] or task.candidate_sha or ""),
+        changed_paths=tuple(stored["changed_paths"] or task.changed_paths or ()),
     )
 
     probe = integration.probe_merge(
@@ -101,6 +102,7 @@ def run_accept(
             updated.phase,
             target_head=updated.target_head,
             candidate_sha=updated.candidate_sha,
+            changed_paths=updated.changed_paths,
         )
 
     try:

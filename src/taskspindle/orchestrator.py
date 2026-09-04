@@ -194,6 +194,32 @@ class Orchestrator:
         self.clock = clock
         _mkdir(paths.state_dir)
 
+    def _unit_env(self) -> dict[str, str]:
+        """The environment a worker or accept unit is started with.
+
+        The declared secrets of every ``api_key`` profile are forwarded by name, because the
+        worker rebuilds the agent's own environment from its own and cannot invent a credential
+        the unit was never given. Values are never logged.
+        """
+        return units.unit_env(
+            self.parent_env,
+            config_file=self.paths.config_file,
+            secret_names=self._secret_names(),
+        )
+
+    def _secret_names(self) -> tuple[str, ...]:
+        """Every secret name any configured ``api_key`` profile declares, in sorted order."""
+        return tuple(
+            sorted(
+                {
+                    name
+                    for profile in self.profiles.values()
+                    if profile.auth == "api_key"
+                    for name in profile.secret_env
+                }
+            )
+        )
+
     # -- state-dir layout -----------------------------------------------------------
 
     def task_dir(self, task_id: str) -> Path:
@@ -235,11 +261,16 @@ class Orchestrator:
             accept_recover=self._recover_accept,
         )
 
-    def _recover_accept(self, task: TaskRecord) -> str:
-        """What an interrupted accept actually did to the root repository."""
+    def _recover_accept(self, task: TaskRecord) -> recovery.AcceptOutcome:
+        """What an interrupted accept actually did to the root repository.
+
+        A failure to settle it is never reported as an abort: an abort is a claim about the
+        operator's repository, and a recovery that could not look at it, or that refused to touch
+        it, has no basis for making one. Such a task goes to a person with its journal intact.
+        """
         journal = self.store.read_journal(task.id)
         if journal is None:
-            return "aborted"
+            return recovery.AcceptOutcome("aborted")
         try:
             identity = self._identity_for(task.repository_id)
             outcome = integration.recover_journal(
@@ -249,13 +280,14 @@ class Orchestrator:
                     phase=str(journal["phase"]),
                     target_head=str(journal["target_head"] or ""),
                     candidate_sha=str(journal["candidate_sha"] or ""),
+                    changed_paths=tuple(journal["changed_paths"] or ()),
                 ),
             )
+            head = repos.current_head(identity.toplevel) if outcome == "committed" else None
         except (GitError, TaskSpindleError, ValueError):
-            # The repository could not be inspected: report the outcome that keeps the candidate.
-            return "aborted"
+            return recovery.AcceptOutcome("manual")
         self.store.clear_journal(task.id)
-        return outcome
+        return recovery.AcceptOutcome(outcome, target_head=head)
 
     # -- capabilities ---------------------------------------------------------------
 
@@ -608,6 +640,9 @@ class Orchestrator:
 
         identity = placement.identity
         base = placement.base or repos.current_head(identity.toplevel)
+        # A review or a consult is no less able to write outside its worktree than an implement
+        # is, so every task with a repository behind it gets the snapshot the root check needs.
+        self._write_root_snapshot(record.id, repos.snapshot_root(identity.toplevel))
         worktree = worktrees.create_worktree(identity, base, self.worktree_dir(record.id))
         return {
             "base_head": base,
@@ -686,7 +721,7 @@ class Orchestrator:
                 unit,
                 units.worker_argv(task.id),
                 working_dir=self.paths.state_dir,
-                env=units.unit_env(self.parent_env, config_file=self.paths.config_file),
+                env=self._unit_env(),
                 properties=units.WORKER_PROPERTIES,
             )
         except UnitError as exc:
@@ -896,6 +931,7 @@ class Orchestrator:
                     "probing",
                     target_head=request.expected_target_head,
                     candidate_sha=request.candidate_sha,
+                    changed_paths=list(record.changed_paths or []),
                 )
                 updated = apply_acceptance(self.store, request, unit_name=unit)
             try:
@@ -903,7 +939,7 @@ class Orchestrator:
                     unit,
                     [sys.executable, "-m", "taskspindle.accept", "--task", record.id],
                     working_dir=self.paths.state_dir,
-                    env=units.unit_env(self.parent_env, config_file=self.paths.config_file),
+                    env=self._unit_env(),
                     properties=units.WORKER_PROPERTIES,
                 )
             except UnitError as exc:
@@ -941,9 +977,10 @@ class Orchestrator:
     def record_integration(self, request: RecordIntegrationRequest) -> dict[str, Any]:
         """Record what a person did by hand: a resolved conflict, a manual merge, or a mutation.
 
-        A hand-made integration skips the checks, scope and probe gates -- Codex ran the merge and
-        the checks itself -- but not the two gates that prove the candidate was *looked at*: the
-        whole diff has been retrieved and an independent review covers this candidate. The head it
+        A hand-made integration skips the checks and probe gates -- Codex ran the merge and the
+        checks itself -- but not the gates that prove the candidate was *looked at*: the whole
+        diff has been retrieved, an independent review covers this candidate, it stayed inside its
+        declared scope, and any mutation of the root repository has been acknowledged. The head it
         claims to have landed at must also exist in the repository and differ from the base.
         """
         with self._cycle():
@@ -976,6 +1013,7 @@ class Orchestrator:
                 )
             require_diff_retrieved(self.store, record)
             require_independent_review(self.store, record)
+            _accept_gates(self.store, record, require_checks=False)
             head = self._resolve_head(record, request.resulting_head)
             payload["resulting_head"] = head
             payload["warnings"] = list(record.warnings or [])
@@ -1053,8 +1091,12 @@ class Orchestrator:
                 reason="cancel requested",
                 expected_state_version=record.state_version,
             )
+            # The moment is recorded so that reconciliation can tell a worker that is still
+            # shutting down from one that is ignoring the signal.
             self.store.append_event(
-                task_id, EventKind.CANCEL_REQUESTED, {"from": record.state.value}
+                task_id,
+                EventKind.CANCEL_REQUESTED,
+                {"from": record.state.value, "at": now()},
             )
             if record.state in ACTIVE_STATES and cancelling.unit_name:
                 with contextlib.suppress(UnitError):
@@ -1207,13 +1249,16 @@ _CONTINUATIONS: dict[tuple[TaskState, Mode], tuple[TurnKind, TaskState]] = {
 }
 
 
-def _accept_gates(store: Store, record: TaskRecord) -> None:
+def _accept_gates(store: Store, record: TaskRecord, *, require_checks: bool = True) -> None:
     """The gates that need the candidate's own evidence, not just the review.
 
     They run before anything moves, so a refusal leaves the task exactly as it was.
+    ``require_checks`` is dropped for a hand-made integration: Codex ran the checks itself. The
+    scope and root-mutation gates are not dropped -- what the agent did outside the ground it was
+    given is not something a manual merge has answered for.
     """
     summary = record.check_summary or {}
-    if summary.get("ok") is not True:
+    if require_checks and summary.get("ok") is not True:
         raise TaskSpindleError(
             CHECKS_FAILED,
             "the candidate's verification commands did not all pass",

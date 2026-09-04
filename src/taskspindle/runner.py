@@ -245,6 +245,7 @@ _PER_TURN_WARNINGS = (
     "ROOT_MUTATION:",
     "READ_ONLY_VIOLATION",
     "DELEGATION_ATTEMPT",
+    ROOT_CHECK_SKIPPED,
 )
 
 
@@ -592,6 +593,9 @@ def _record_violations(run: _Run, result: TurnResult) -> None:
 
 
 async def _finalize(run: _Run, workspace: Path, result: TurnResult) -> TaskState:
+    # Every mode is checked against the root snapshot: a consult or a review can write outside
+    # its worktree just as easily as an implement can, and it is just as much a warning.
+    _check_root(run)
     if run.task.mode is Mode.CONSULT:
         return _settle(run, TaskState.COMPLETED, "consult turn finished", response=result.text)
     if run.task.mode is Mode.REVIEW:
@@ -639,8 +643,6 @@ def _finalize_review(run: _Run, workspace: Path, result: TurnResult) -> TaskStat
 
 async def _finalize_implement(run: _Run, workspace: Path, result: TurnResult) -> TaskState:
     task = run.task
-    _check_root(run)
-
     identity = _identity(workspace)
     revision = task.candidate_revision + 1
     try:
@@ -733,7 +735,13 @@ def _identity(path: Path) -> RepositoryIdentity:
 
 
 def _check_root(run: _Run) -> None:
-    """Compare the root repository against the snapshot the server took before dispatch."""
+    """Compare the root repository against the snapshot the server took before dispatch.
+
+    A task with no repository behind it -- a consult in a scratch repository -- has no root to
+    check and is not reported as one that skipped the check.
+    """
+    if not run.task.repository_id:
+        return
     before = _load_root_snapshot(run)
     root = _root_identity(run)
     if before is None or root is None:

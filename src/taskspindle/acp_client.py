@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,8 +62,14 @@ _CLIENT_INFO = Implementation(name="taskspindle", version=taskspindle.__version_
 _STREAM_LIMIT = 16 * 1024 * 1024
 _CANCEL_TIMEOUT = 2.0
 
-#: Tool-call words that mean the agent is trying to spawn helpers of its own.
-_DELEGATION_WORDS = ("agent", "subagent", "task", "team")
+#: Whole words in a tool-call title that mean the agent is trying to spawn helpers of its own.
+#: Whole words only: ``Edit src/tasks.py`` and ``Run pytest tests/test_task.py`` are ordinary work.
+_DELEGATION_WORDS = re.compile(r"\b(?:subagent|agent|team)\b", re.IGNORECASE)
+
+#: Tool names that are delegation whatever they are titled with, matched at the start of the
+#: title so that a path or a sentence merely containing one of them is not caught.
+_DELEGATION_TOOLS = re.compile(r"^(?:Agent|Task|TeamCreate|SendMessage)\b")
+
 _DELEGATION_EXEMPT_KINDS = ("read", "fetch")
 _WRITE_KINDS = ("edit", "delete", "move", "execute")
 
@@ -96,6 +103,11 @@ def sealed_env(env: Mapping[str, str]) -> dict[str, str]:
     return sealed
 
 
+def _is_delegation(title: str) -> bool:
+    """True when a tool-call title names one of the agent-spawning tools."""
+    return bool(_DELEGATION_TOOLS.match(title) or _DELEGATION_WORDS.search(title))
+
+
 class PermissionPolicy:
     """TaskSpindle's answer to ``session/request_permission``.
 
@@ -113,10 +125,9 @@ class PermissionPolicy:
     ) -> tuple[str | None, str | None]:
         """Return ``(option_id, violation)``; ``option_id`` of ``None`` cancels the request."""
         kind = getattr(tool_call, "kind", None) or ""
-        title = getattr(tool_call, "title", None) or ""
-        haystack = f"{title} {kind}".lower()
+        title = (getattr(tool_call, "title", None) or "").strip()
 
-        if kind not in _DELEGATION_EXEMPT_KINDS and any(word in haystack for word in _DELEGATION_WORDS):
+        if kind not in _DELEGATION_EXEMPT_KINDS and _is_delegation(title):
             return self._deny(options), DELEGATION_ATTEMPT
         if not self.allow_writes and kind in _WRITE_KINDS:
             return self._deny(options), READ_ONLY_VIOLATION

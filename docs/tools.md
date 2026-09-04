@@ -64,7 +64,9 @@ its common git directory plus its root commit.
 
 ### `authorize_repository`
 
-| Parameter | Type | Meaning |
+Takes one object parameter, `request`; the fields below go inside it.
+
+| Fields of `request` | Type | Meaning |
 | --- | --- | --- |
 | `path` | string | any path inside the repository |
 | `providers` | string[] | profile ids, which must exist |
@@ -88,7 +90,9 @@ No parameters. Returns `{"repositories": [{"repository_id", "display_path", "com
 
 ### `start_task`
 
-| Parameter | Type | Default | Meaning |
+Takes one object parameter, `request`; the fields below go inside it.
+
+| Fields of `request` | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `provider` | string | — | a profile id from `capabilities` |
 | `mode` | `consult`\|`review`\|`implement` | — | what the task may do |
@@ -108,6 +112,24 @@ No parameters. Returns `{"repositories": [{"repository_id", "display_path", "com
 `{"kind": "candidate", "task_id": …, "candidate_sha": …}` — review another task's staged candidate —
 or `{"kind": "snapshot", "repository": …, "expected_head": …, "paths": [...]}`, which commits the
 current working tree to `refs/taskspindle/snapshots/<id>` and reviews that.
+
+One call, in full:
+
+```json
+{
+  "request": {
+    "provider": "claude",
+    "mode": "implement",
+    "prompt": "Add a --json flag to the report command",
+    "repository": "/home/you/src/project",
+    "acceptance_criteria": "report --json prints one JSON object and exits 0",
+    "path_prefixes": ["src/report"],
+    "verification_commands": ["uv run pytest -q tests/test_report.py"],
+    "candidate_message": "Add a JSON output mode to report",
+    "timeout_s": 1800
+  }
+}
+```
 
 Returns `{"task_id", "state", "state_version"}`. The task is created, its worktree is made, its
 first turn is composed and it is queued; a worker unit starts if the provider's lease is free.
@@ -187,7 +209,9 @@ still ambiguous the answer is `MANUAL_RECOVERY_REQUIRED`. Other errors: `TASK_NO
 
 ### `accept_task`
 
-| Parameter | Type | Meaning |
+Takes one object parameter, `request`; the fields below go inside it.
+
+| Fields of `request` | Type | Meaning |
 | --- | --- | --- |
 | `task_id` | string | the implement task holding the candidate |
 | `expected_state_version` | int | the version you last saw |
@@ -224,7 +248,9 @@ Errors also include `UNIT_START_FAILED` (retryable; nothing touched the reposito
 
 ### `record_integration`
 
-| Parameter | Type | Meaning |
+Takes one object parameter, `request`; the fields below go inside it.
+
+| Fields of `request` | Type | Meaning |
 | --- | --- | --- |
 | `task_id` | string | — |
 | `expected_state_version` | int | — |
@@ -236,7 +262,17 @@ What you did by hand, written into the record. `conflict_resolved` and `manual_i
 the task straight to `ACCEPTED` at `resulting_head` and require the task to be in `RESULT_READY`.
 `root_mutation_acknowledged` moves nothing: it clears the `ROOT_MUTATION` warning that was blocking
 acceptance, so somebody has signed for what the agent did outside its worktree.
-Errors: `TASK_NOT_FOUND`, `STALE_STATE_VERSION`, `INVALID_REQUEST`, `ILLEGAL_TRANSITION`.
+
+A hand-made integration skips the checks and probe gates — you ran the merge and the checks
+yourself — but not the gates that prove the candidate was looked at. `conflict_resolved` and
+`manual_integration` still require the whole diff to have been retrieved
+(`DIFF_NOT_FULLY_RETRIEVED`), an independent review covering this candidate (`REVIEW_REQUIRED`,
+`REVIEW_STALE`, `REVIEWER_NOT_INDEPENDENT`), no `SCOPE_VIOLATION` warning and no unacknowledged
+`ROOT_MUTATION` warning (`ACCEPT_BLOCKED`), and a `resulting_head` that exists in the repository
+and differs from the candidate's base (`INVALID_REQUEST`).
+Errors: `TASK_NOT_FOUND`, `STALE_STATE_VERSION`, `INVALID_REQUEST`, `ILLEGAL_TRANSITION`,
+`DIFF_NOT_FULLY_RETRIEVED`, `REVIEW_REQUIRED`, `REVIEW_STALE`, `REVIEWER_NOT_INDEPENDENT`,
+`ACCEPT_BLOCKED`.
 
 ### `reject_task`
 
@@ -323,5 +359,4 @@ invalidates the review: get a new one.
 | `MANUAL_RECOVERY_REQUIRED` | recovery will not guess; see [recovery.md](recovery.md) |
 | `UNIT_START_FAILED` | systemd would not start the unit (retryable) |
 | `DIRTY_OVERLAP` | in `details.code`: the repository is dirty inside the task's own prefixes |
-| `CLEANUP_FAILED` | a worktree could not be given back |
 | `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |

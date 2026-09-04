@@ -240,3 +240,26 @@ def test_a_task_that_is_not_accepting_is_refused(store: Store, paths: Paths, mak
         run_accept(store, task.id, paths=paths, parent_env=ENV)
 
     assert excinfo.value.code == "ILLEGAL_TRANSITION"
+
+
+def test_an_edit_the_journal_does_not_own_stops_the_undo(
+    store: Store, paths: Paths, make_repo
+) -> None:
+    """The undo would have to discard a root edit nobody signed for, so it refuses."""
+    repo = make_repo()
+    task = seed_accepting(
+        store, paths, repo, verification=["echo mine >> README.md; false"]
+    )
+    before = repos.current_head(repo)
+
+    with pytest.raises(repos.GitError) as excinfo:
+        run_accept(store, task.id, paths=paths, parent_env=ENV)
+
+    assert excinfo.value.code == "JOURNAL_MISMATCH"
+    assert excinfo.value.paths == ("README.md",)
+    assert (repo / "README.md").read_text() == "readme\nmine\n"
+    assert repos.current_head(repo) == before
+    # The task keeps its journal, so reconciliation hands it to a person rather than guessing.
+    assert store.get_task(task.id).state is TaskState.ACCEPTING
+    assert store.read_journal(task.id)["phase"] == "staged"
+    assert store.read_journal(task.id)["changed_paths"] == ["src/new.txt"]

@@ -24,6 +24,7 @@ __all__ = [
     "normalize_prefixes",
     "overlapping_dirty_paths",
     "path_in_scope",
+    "porcelain_paths",
     "resolve_repository",
     "run_git",
     "snapshot_root",
@@ -189,7 +190,7 @@ def _fingerprint(toplevel: Path, rel: str) -> str:
     return hashlib.blake2b(target.read_bytes(), digest_size=32).hexdigest()
 
 
-def _porcelain_paths(raw: bytes) -> list[str]:
+def porcelain_paths(raw: bytes) -> list[str]:
     """Parse ``status --porcelain=v1 -z`` output into the paths it mentions.
 
     In ``-z`` mode rename and copy entries emit the new path first and the original path as the
@@ -219,7 +220,7 @@ def snapshot_root(toplevel: Path) -> RootSnapshot:
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         cwd=toplevel,
     )
-    dirty = {path: _fingerprint(toplevel, path) for path in _porcelain_paths(status.stdout)}
+    dirty = {path: _fingerprint(toplevel, path) for path in porcelain_paths(status.stdout)}
     return RootSnapshot(head=current_head(toplevel), branch=current_branch(toplevel), dirty=dirty)
 
 

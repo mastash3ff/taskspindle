@@ -15,6 +15,7 @@ import json
 import shutil
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -35,7 +36,7 @@ from taskspindle.orchestrator import Orchestrator
 from taskspindle.providers import Profile
 from taskspindle.service import TaskSpindleError
 from taskspindle.store import Store
-from tests.fakes.units import ACTIVE, FakeUnitBackend
+from tests.fakes.units import ACTIVE, SUCCESS, FakeUnitBackend
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT = "boot-under-test"
@@ -928,3 +929,119 @@ def test_an_empty_diff_is_a_page_of_nothing_and_is_fully_retrieved(
         "receipt_id": 0,
     }
     assert service.diff_fully_retrieved(store, record.id, digest, 0) == []
+
+
+def test_a_metered_tasks_unit_is_given_the_secret_by_name(
+    harness: Harness, make_repo, script
+) -> None:
+    """The worker rebuilds the agent's environment from its own, so the name has to reach it."""
+    repo = make_repo()
+    metered = replace(
+        fake_profile("metered", script({"response": "done"})),
+        auth="api_key",
+        secret_env=("SOME_API_KEY",),
+    )
+    harness.orchestrator.profiles["metered"] = metered
+    harness.orchestrator.parent_env["SOME_API_KEY"] = "sk-metered"
+    harness.orchestrator.authorize_repository(str(repo), ["metered"], ["implement"])
+    harness.defer()
+
+    started = harness.orchestrator.start_task(
+        implement_request(repo, provider="metered", allow_metered=True)
+    )
+
+    env = harness.backend.envs[f"taskspindle-worker-{started['task_id']}"]
+    assert env["SOME_API_KEY"] == "sk-metered"
+    assert env["TASKSPINDLE_CONFIG"] == str(harness.orchestrator.paths.config_file)
+
+
+def test_a_scope_violation_cannot_be_recorded_as_integrated(
+    harness: Harness, make_repo, script
+) -> None:
+    """A hand-made integration answers for the merge, not for what the agent did outside scope."""
+    repo = make_repo()
+    harness.orchestrator.profiles[AUTHOR] = fake_profile(
+        AUTHOR,
+        script(
+            {
+                "response": "and a note outside the scope",
+                "write": {"path": "docs/note.md", "content": "outside\n"},
+            }
+        ),
+    )
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+    review_candidate(harness, repo, task_id)
+    assert harness.orchestrator.task_status(task_id)["warnings"] == [
+        "SCOPE_VIOLATION:docs/note.md"
+    ]
+    head = integrate_by_hand(repo)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.record_integration(manual_integration(harness, task_id, head))
+
+    assert excinfo.value.code == service.ACCEPT_BLOCKED
+    assert excinfo.value.details["warnings"] == ["SCOPE_VIOLATION:docs/note.md"]
+    assert harness.orchestrator.task_status(task_id)["state"] == TaskState.RESULT_READY.value
+
+
+def test_a_review_that_writes_into_the_root_is_flagged(
+    harness: Harness, make_repo, script
+) -> None:
+    """Root protection is not an implement-only rule: every mode is checked against the snapshot."""
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    harness.orchestrator.profiles[REVIEWER] = fake_profile(
+        REVIEWER,
+        script(
+            {
+                "response": json.dumps(PASSING_REVIEW),
+                "write_abs": {"path": str(repo / "intruder.txt"), "content": "sneaky\n"},
+            }
+        ),
+        unbuffered=True,
+    )
+
+    review_task_id = review_candidate(harness, repo, task_id)
+
+    assert harness.orchestrator.task_status(review_task_id)["warnings"] == [
+        "ROOT_MUTATION:intruder.txt"
+    ]
+    snapshot = harness.orchestrator.store.get_artifact(review_task_id, 0, "root_snapshot")
+    assert snapshot is not None
+
+
+def test_an_accept_that_cannot_be_undone_waits_for_a_person(
+    harness: Harness, make_repo
+) -> None:
+    """The recovery would have to discard an operator edit, so the task goes to a person."""
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+    review_task_id = review_candidate(harness, repo, task_id)
+    harness.orchestrator.accept_task(accept_request(harness, repo, task_id, review_task_id))
+
+    # What a killed accept unit leaves behind: a staged journal, and an operator who has since
+    # started editing something the candidate never touched.
+    status = harness.orchestrator.task_status(task_id)
+    harness.orchestrator.store.write_journal(
+        task_id,
+        "staged",
+        target_head=repos.current_head(repo),
+        candidate_sha=status["candidate_sha"],
+        changed_paths=["src/new.txt"],
+    )
+    (repo / "README.md").write_text("the operator was working too\n")
+    harness.backend.set(f"taskspindle-accept-{task_id}", SUCCESS)
+
+    actions = harness.orchestrator.reconcile()
+
+    assert [(action.task_id, action.to_state) for action in actions] == [
+        (task_id, TaskState.RECOVERY_AMBIGUOUS.value)
+    ]
+    assert harness.orchestrator.task_status(task_id)["state"] == (
+        TaskState.RECOVERY_AMBIGUOUS.value
+    )
+    # Nothing was touched, and the journal is kept for whoever looks at it.
+    assert (repo / "README.md").read_text() == "the operator was working too\n"
+    assert harness.orchestrator.store.read_journal(task_id)["phase"] == "staged"

@@ -107,7 +107,7 @@ def test_stage_then_commit_produces_the_probed_tree(make_repo, tmp_path: Path) -
         message="Accept candidate",
     )
 
-    assert save.phases == ["staged", "committed"]
+    assert save.phases == ["staged", "committing", "committed"]
     assert current_head(root) == sha
     assert _out(["rev-parse", f"{sha}^{{tree}}"], root) == probe.tree
     assert _out(["log", "-1", "--format=%an <%ae>"], root) == "Test User <test@example.com>"
@@ -160,7 +160,13 @@ def test_conflicting_stage_leaves_the_root_clean(make_repo, tmp_path: Path) -> N
     run_git(["commit", "-q", "-m", "Diverge in the root"], cwd=root)
     target = current_head(root)
 
-    journal = Journal(task_id="task-1", phase="probing", target_head=target, candidate_sha=candidate)
+    journal = Journal(
+        task_id="task-1",
+        phase="probing",
+        target_head=target,
+        candidate_sha=candidate,
+        changed_paths=("file.txt",),
+    )
     save = _Recorder()
     with pytest.raises(GitError) as excinfo:
         stage_candidate(identity, journal=journal, save=save)
@@ -198,7 +204,13 @@ def test_recover_journal_aborts_a_staged_apply(make_repo, tmp_path: Path) -> Non
     base = current_head(root)
     candidate = _candidate(identity, base, tmp_path / "wt" / "a", "one\ntwo\ncandidate\n")
 
-    journal = Journal(task_id="task-1", phase="probing", target_head=base, candidate_sha=candidate)
+    journal = Journal(
+        task_id="task-1",
+        phase="probing",
+        target_head=base,
+        candidate_sha=candidate,
+        changed_paths=("file.txt",),
+    )
     stage_candidate(identity, journal=journal, save=_Recorder())
     assert _out(["status", "--porcelain"], root) != ""
 
@@ -255,3 +267,113 @@ def test_run_verification_records_a_timeout(tmp_path: Path) -> None:
     assert results[0].exit_code == -1
     assert results[0].ok is False
     assert results[0].stderr_tail == "timed out after 1s"
+
+
+def test_recover_journal_recognises_a_commit_that_landed(make_repo, tmp_path: Path) -> None:
+    """A ``committing`` journal is settled by the repository, not by the phase alone."""
+    root = make_repo()
+    identity = resolve_repository(root)
+    base = current_head(root)
+    candidate = _candidate(identity, base, tmp_path / "wt" / "a", "one\ntwo\ncandidate\n")
+
+    journal = Journal(
+        task_id="task-1",
+        phase="probing",
+        target_head=base,
+        candidate_sha=candidate,
+        changed_paths=("file.txt",),
+    )
+    stage_candidate(identity, journal=journal, save=_Recorder())
+    landed = commit_staged(
+        identity,
+        journal=replace(journal, phase="verified"),
+        save=_Recorder(),
+        message="Accept candidate",
+    )
+    # The unit died between the commit and the journal reaching "committed".
+    committing = replace(journal, phase="committing")
+
+    assert recover_journal(identity, committing) == "committed"
+    assert current_head(root) == landed
+    assert _out(["status", "--porcelain"], root) == ""
+    assert (root / "file.txt").read_text() == "one\ntwo\ncandidate\n"
+
+
+def test_recover_journal_aborts_a_commit_that_never_ran(make_repo, tmp_path: Path) -> None:
+    root = make_repo()
+    identity = resolve_repository(root)
+    base = current_head(root)
+    candidate = _candidate(identity, base, tmp_path / "wt" / "a", "one\ntwo\ncandidate\n")
+
+    journal = Journal(
+        task_id="task-1",
+        phase="probing",
+        target_head=base,
+        candidate_sha=candidate,
+        changed_paths=("file.txt",),
+    )
+    stage_candidate(identity, journal=journal, save=_Recorder())
+
+    assert recover_journal(identity, replace(journal, phase="committing")) == "aborted"
+    assert current_head(root) == base
+    assert _out(["status", "--porcelain"], root) == ""
+    assert (root / "file.txt").read_text() == "one\ntwo\nthree\n"
+
+
+def test_abort_refuses_when_the_tree_holds_work_the_journal_does_not_own(
+    make_repo, tmp_path: Path
+) -> None:
+    """An operator edit made while the accept was in flight is never reset away."""
+    root = make_repo()
+    identity = resolve_repository(root)
+    base = current_head(root)
+    candidate = _candidate(identity, base, tmp_path / "wt" / "a", "one\ntwo\ncandidate\n")
+
+    journal = Journal(
+        task_id="task-1",
+        phase="probing",
+        target_head=base,
+        candidate_sha=candidate,
+        changed_paths=("file.txt",),
+    )
+    stage_candidate(identity, journal=journal, save=_Recorder())
+    (root / "README.md").write_text("the operator was working too\n")
+    before = {path.name: path.read_bytes() for path in sorted(root.iterdir()) if path.is_file()}
+    status = _out(["status", "--porcelain"], root)
+
+    with pytest.raises(GitError) as excinfo:
+        recover_journal(identity, replace(journal, phase="staged"))
+
+    assert excinfo.value.code == "JOURNAL_MISMATCH"
+    assert excinfo.value.paths == ("README.md",)
+    assert {
+        path.name: path.read_bytes() for path in sorted(root.iterdir()) if path.is_file()
+    } == before
+    assert _out(["status", "--porcelain"], root) == status
+    assert current_head(root) == base
+
+
+def test_abort_removes_the_candidates_own_untracked_files(make_repo, tmp_path: Path) -> None:
+    """``reset --hard`` leaves an untracked file behind; it is candidate content, so it goes."""
+    root = make_repo()
+    identity = resolve_repository(root)
+    base = current_head(root)
+    candidate = _candidate(identity, base, tmp_path / "wt" / "a", "one\ntwo\ncandidate\n")
+
+    journal = Journal(
+        task_id="task-1",
+        phase="probing",
+        target_head=base,
+        candidate_sha=candidate,
+        changed_paths=("file.txt", "src/new.txt"),
+    )
+    stage_candidate(identity, journal=journal, save=_Recorder())
+    # A file the candidate created that never reached the index, as a killed apply would leave it.
+    (root / "src").mkdir()
+    (root / "src" / "new.txt").write_text("candidate content\n")
+
+    assert recover_journal(identity, replace(journal, phase="staged")) == "aborted"
+    assert not (root / "src" / "new.txt").exists()
+    assert (root / "file.txt").read_text() == "one\ntwo\nthree\n"
+    assert _out(["status", "--porcelain"], root) == ""
+    assert current_head(root) == base

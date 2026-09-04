@@ -76,12 +76,25 @@ Three refinements matter:
   no path to `FAILED`, so an accept unit that exited badly becomes `INTERRUPTED` and keeps its
   candidate. If nothing legal exists, the task is left exactly where it is and the reason is logged
   once as a `RECOVERY` event — a sweep that keeps finding the same stuck task stays quiet.
-- **A `CANCELLING` task whose unit is gone is `CANCELLED`.** The cancel got what it asked for.
-- **An `ACCEPTING` task consults its journal.** If the journal says `committed`, the commit
-  happened and the task is `ACCEPTED`. Otherwise the apply is aborted — `cherry-pick --abort`, or a
-  `reset --hard` back to the journalled head, and it refuses to touch anything if HEAD is somewhere
-  else — and the task returns to `RESULT_READY` with an `ACCEPT_FAILED` warning. Your repository is
-  where it started.
+- **A `CANCELLING` task whose unit is gone is `CANCELLED`.** The cancel got what it asked for. A
+  `CANCELLING` task whose unit is *still running* thirty seconds after the cancel was asked for is
+  stopped (`systemctl --user stop`), logged once as `cancel_escalated`, and left for the next sweep
+  to settle from the unit's own post-mortem.
+- **An `ACCEPTING` task consults its journal**, unless the unit itself is ambiguous — then the
+  accept may still be in flight, and asking the journal would undo an apply that is still running.
+  The journal has five phases: `probing`, `staged`, `verified`, `committing`, `committed`.
+  - `committed`, or `committing` where `HEAD^` is the journalled target head: the commit landed.
+    The task is `ACCEPTED` at the head the repository is actually on.
+  - `probing`: nothing was ever applied. The task returns to `RESULT_READY`.
+  - anything else: the apply is undone — `cherry-pick --abort`, or a `reset --hard` back to the
+    journalled head followed by the removal of the candidate's own untracked files — and the task
+    returns to `RESULT_READY` with an `ACCEPT_FAILED` warning.
+  - The undo is refused outright if HEAD has moved, or if `git status` mentions **any path the
+    candidate does not touch**: a `reset --hard` would discard work nobody signed for. That is
+    `JOURNAL_MISMATCH`; the repository is not touched, the journal is kept, and the task becomes
+    `RECOVERY_AMBIGUOUS` with the reason `accept_recovery_manual`. Look at the repository, then
+    decide: finish the merge by hand and `record_integration`, or clean the tree and let the next
+    sweep undo the apply.
 
 One task can never end a sweep. A systemd hiccup, or a task that moved underneath the sweep while a
 worker finalised, is recorded and the next task is examined.

@@ -35,6 +35,8 @@ class FakeUnitBackend:
         #: misbehave or move the world underneath the sweep.
         self.on_show = on_show
         self.started: list[tuple[str, tuple[str, ...]]] = []
+        #: The environment each unit was started with, keyed by unit name.
+        self.envs: dict[str, dict[str, str]] = {}
         self.killed: list[tuple[str, str]] = []
         self.stopped: list[str] = []
         self.reset: list[str] = []
@@ -53,6 +55,7 @@ class FakeUnitBackend:
         properties: Mapping[str, str],
     ) -> None:
         self.started.append((unit, tuple(argv)))
+        self.envs[unit] = dict(env)
         self.states.setdefault(unit, ACTIVE)
         if self.on_start is not None:
             self.on_start(unit, tuple(argv))

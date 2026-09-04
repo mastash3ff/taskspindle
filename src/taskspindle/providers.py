@@ -451,7 +451,14 @@ def build_child_env(
         allowed = ()
 
     leaked = env_violations(env, allowed=allowed)
-    assert not leaked, f"forbidden names leaked into the child environment: {', '.join(sorted(leaked))}"
+    if leaked:
+        # Not an assertion: this guard is the last thing between a credential in the parent
+        # environment and the agent process, and it has to hold with optimisations on.
+        raise ProfileError(
+            "PROFILE_INVALID",
+            f"provider {profile.id!r}: forbidden names would reach the child environment: "
+            f"{', '.join(sorted(leaked))}",
+        )
     return env
 
 

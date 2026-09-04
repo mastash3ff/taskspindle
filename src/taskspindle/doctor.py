@@ -5,10 +5,11 @@ others -- so a first run on a fresh machine reports the whole list of what is mi
 the first thing that broke. Checks marked *advisory* describe a setup that is merely convenient;
 they never make the overall result fail.
 
-``live_probes=False`` drops the two checks that actually start something: the transient unit and
-the Grok ACP handshake. That is the mode a packaging smoke test runs in.
+``live_probes=False`` drops the checks that actually start something: the transient unit, the Grok
+ACP handshake, and the initialize probe each configured profile gets. That is the mode a packaging
+smoke test runs in.
 
-:func:`run_doctor_async` is the form the MCP server calls: the Grok handshake is awaited on the
+:func:`run_doctor_async` is the form the MCP server calls: the handshakes are awaited on the
 running loop and every blocking subprocess check happens in a worker thread, so nothing here
 starts a second event loop inside one that is already running. :func:`run_doctor` is the same
 thing for a command line, with the loop supplied.
@@ -139,11 +140,14 @@ class _Doctor:
     # -- the checks -----------------------------------------------------------------
 
     async def collect(self) -> None:
-        """Ask every question: the ACP handshake on this loop, everything else in a thread."""
-        grok_acp = await self._grok_acp() if self.live_probes else None
-        await asyncio.to_thread(self._collect_blocking, grok_acp)
+        """Ask every question: the ACP handshakes on this loop, everything else in a thread."""
+        live: list[Check] = []
+        if self.live_probes:
+            live.append(await self._grok_acp())
+            live.extend(await self._configured_acp())
+        await asyncio.to_thread(self._collect_blocking, live)
 
-    def _collect_blocking(self, grok_acp: Check | None) -> None:
+    def _collect_blocking(self, live: list[Check]) -> None:
         self.git()
         self.systemd_user()
         if self.live_probes:
@@ -152,8 +156,7 @@ class _Doctor:
         self.adapter()
         self.grok_cli()
         self.claude_oauth()
-        if grok_acp is not None:
-            self.checks.append(grok_acp)
+        self.checks.extend(live)
         self.child_envs()
         self.codex_registration()
         self.profile_commands()
@@ -263,7 +266,7 @@ class _Doctor:
     async def _grok_handshake(self, profile: Profile) -> str:
         with tempfile.TemporaryDirectory(prefix="taskspindle-doctor-") as raw:
             workspace = Path(raw)
-            init = await self._grok_init(profile, workspace)
+            init = await self._init_probe(profile, workspace)
             if init is None or init.load_session is not True:
                 raise RuntimeError("grok did not advertise load_session")
             evidence = providers.grok_oauth_evidence(
@@ -272,7 +275,41 @@ class _Doctor:
             )
             return f"load_session and {', '.join(evidence['auth_method_ids'])}"
 
-    async def _grok_init(self, profile: Profile, workspace: Path) -> InitInfo | None:
+    async def _configured_acp(self) -> list[Check]:
+        """Ask every configured profile's agent to initialize, in a directory of its own.
+
+        A first-class provider already has a check of its own -- ``claude_oauth`` and
+        ``grok_acp`` -- so this is the answer for the profiles that come from ``config.toml``,
+        which until now were only ever checked for a command on PATH.
+        """
+        checks: list[Check] = []
+        for profile_id, profile in sorted(self.profiles.items()):
+            if profile.first_class:
+                continue
+            name = f"acp_{profile_id}"
+            missing = self._missing_secrets(profile)
+            if missing:
+                checks.append(
+                    Check(name, False, f"secret not set: {', '.join(missing)}", advisory=True)
+                )
+                continue
+            try:
+                with tempfile.TemporaryDirectory(prefix="taskspindle-doctor-") as raw:
+                    init = await self._init_probe(profile, Path(raw))
+            except Exception as exc:
+                checks.append(Check(name, False, f"unreachable: {type(exc).__name__}: {exc}"))
+                continue
+            agent = (init.agent_info.get("name") if init else None) or profile.command[0]
+            checks.append(Check(name, True, f"configured: {agent} answered initialize"))
+        return checks
+
+    def _missing_secrets(self, profile: Profile) -> list[str]:
+        """The secrets an ``api_key`` profile declares that this environment does not have."""
+        if profile.auth != "api_key":
+            return []
+        return [name for name in profile.secret_env if name not in self.parent_env]
+
+    async def _init_probe(self, profile: Profile, workspace: Path) -> InitInfo | None:
         """Start the agent, keep what it said about itself at ``initialize``, and stop it."""
         env = providers.build_child_env(profile, self.parent_env, task_tmp=workspace / "tmp")
         (workspace / "tmp").mkdir(parents=True, exist_ok=True)
@@ -282,12 +319,23 @@ class _Doctor:
             cwd=workspace,
             stderr_path=workspace / "agent.stderr",
             policy=PermissionPolicy(allow_writes=False),
+            handshake_timeout=_TIMEOUT,
         )
         async with worker as agent:
             return agent.init
 
     def child_envs(self) -> None:
         for profile_id, profile in sorted(self.profiles.items()):
+            missing = self._missing_secrets(profile)
+            if missing:
+                # The environment cannot be built without the secret, but a machine that has not
+                # been given a metered provider's key is not a broken machine.
+                self.fail(
+                    f"child_env_{profile_id}",
+                    f"secret not set: {', '.join(missing)}",
+                    advisory=True,
+                )
+                continue
 
             @self.check(f"child_env_{profile_id}")
             def probe(profile: Profile = profile) -> str:

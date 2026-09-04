@@ -32,6 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # The tag itself, not the default branch: the changelog notes and the tag check must
+          # read the commit that is being released.
+          ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Check the tag exists and the build run built it

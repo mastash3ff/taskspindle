@@ -26,13 +26,18 @@ from .store import now as _stamp
 from .units import UnitBackend, UnitError, UnitState, accept_unit_name, worker_unit_name
 
 __all__ = [
+    "CANCEL_ESCALATE_AFTER_S",
     "NEVER_STARTED_AFTER_S",
+    "AcceptOutcome",
     "ReconcileAction",
     "reconcile",
 ]
 
 #: How long a task may sit in PREPARING or QUEUED without a unit before it is declared dead.
 NEVER_STARTED_AFTER_S = 600
+
+#: How long a cancelled task's unit may keep running after the SIGTERM before it is stopped.
+CANCEL_ESCALATE_AFTER_S = 30
 
 #: Most tasks ever examined in one active state; a backlog larger than this is not a thing
 #: reconciliation should be quietly hiding.
@@ -48,6 +53,8 @@ _MISSING_FRESH = "unit_missing_fresh_heartbeat"
 _NEVER_STARTED = "never_started"
 _NO_LEGAL_TARGET = "no_legal_target"
 _RECONCILE_FAILED = "reconcile_failed"
+_CANCEL_ESCALATED = "cancel_escalated"
+_ACCEPT_MANUAL = "accept_recovery_manual"
 
 #: unit kind -> (reason, state to move to). ``active`` and the heartbeat-dependent kinds are
 #: handled separately.
@@ -64,6 +71,18 @@ _RESET_KINDS = frozenset(_BY_KIND)
 #: States a continuation enters before its worker unit exists. Without a unit name and with a
 #: turn still open, such a task is waiting for its provider's lease, not for a vanished worker.
 _AWAITING_DISPATCH = frozenset({TaskState.REPAIRING, TaskState.RESUMING})
+
+
+@dataclass(frozen=True)
+class AcceptOutcome:
+    """What an interrupted accept turned out to have done.
+
+    ``outcome`` is ``"committed"``, ``"aborted"`` or ``"manual"``; ``target_head`` is the commit
+    the repository was left at, known only when the commit landed.
+    """
+
+    outcome: str
+    target_head: str | None = None
 
 
 @dataclass(frozen=True)
@@ -116,7 +135,7 @@ def reconcile(
     boot: str,
     now: datetime,
     stale_after_s: int = 30,
-    accept_recover: Callable[[TaskRecord], str] | None = None,
+    accept_recover: Callable[[TaskRecord], AcceptOutcome] | None = None,
 ) -> list[ReconcileAction]:
     """Settle every task that claims to be active but may no longer be.
 
@@ -157,7 +176,7 @@ def _reconcile_task(
     boot: str,
     moment: datetime,
     stale_after_s: int,
-    accept_recover: Callable[[TaskRecord], str] | None,
+    accept_recover: Callable[[TaskRecord], AcceptOutcome] | None,
 ) -> ReconcileAction | None:
     unit_state: UnitState | None = None
     if task.boot_id and task.boot_id != boot:
@@ -173,6 +192,8 @@ def _reconcile_task(
         return None
     else:
         unit_state = backend.show(_unit_for(task))
+        if task.state is TaskState.CANCELLING and unit_state.kind == "active":
+            return _escalate_cancel(store, backend, task, moment=moment)
         outcome = _from_unit(unit_state, task, moment=moment, stale_after_s=stale_after_s)
         if outcome is None:
             return None
@@ -181,7 +202,13 @@ def _reconcile_task(
     if unit_state is not None and unit_state.kind in _RESET_KINDS:
         backend.reset_failed(_unit_for(task))
 
-    if task.state is TaskState.ACCEPTING and accept_recover is not None:
+    if (
+        task.state is TaskState.ACCEPTING
+        and accept_recover is not None
+        and target is not TaskState.RECOVERY_AMBIGUOUS
+    ):
+        # An ambiguous unit is ambiguous whatever the journal says: the accept may still be
+        # running, and asking the journal would undo an apply that is in flight.
         return _recover_accept(store, task, reason, accept_recover)
     if task.state is TaskState.CANCELLING:
         # The cancel got what it asked for: the unit is gone.
@@ -279,16 +306,49 @@ def _from_unit(
     return _MISSING_FRESH, TaskState.RECOVERY_AMBIGUOUS
 
 
+def _escalate_cancel(
+    store: Store,
+    backend: UnitBackend,
+    task: TaskRecord,
+    *,
+    moment: datetime,
+) -> ReconcileAction | None:
+    """Stop a unit that has ignored the SIGTERM ``cancel_task`` sent it.
+
+    The task is not moved: the unit's own post-mortem settles it on a later sweep, exactly as it
+    would have done had the worker gone away on its own.
+    """
+    if not _older_than(_cancelled_at(store, task.id), moment, CANCEL_ESCALATE_AFTER_S):
+        return None
+    backend.stop(_unit_for(task))
+    return _strand(store, task, _CANCEL_ESCALATED)
+
+
+def _cancelled_at(store: Store, task_id: str) -> str | None:
+    """When cancellation was asked for, as ``cancel_task`` recorded it."""
+    for event in reversed(store.list_events(task_id)):
+        if event["kind"] == EventKind.CANCEL_REQUESTED.value:
+            at = (event["payload"] or {}).get("at")
+            return str(at) if at else None
+    return None
+
+
 def _recover_accept(
     store: Store,
     task: TaskRecord,
     reason: str,
-    accept_recover: Callable[[TaskRecord], str],
+    accept_recover: Callable[[TaskRecord], AcceptOutcome],
 ) -> ReconcileAction | None:
     """Let the integration journal decide what an interrupted accept actually did."""
-    outcome = accept_recover(task)
-    if outcome == "committed":
-        return _apply(store, task, TaskState.ACCEPTED, f"accept_committed:{reason}")
+    settled = accept_recover(task)
+    if settled.outcome == "committed":
+        fields = {"target_head": settled.target_head} if settled.target_head else {}
+        return _apply(
+            store, task, TaskState.ACCEPTED, f"accept_committed:{reason}", **fields
+        )
+    if settled.outcome == "manual":
+        # The repository could not be settled without discarding something. A person decides.
+        return _apply(store, task, TaskState.RECOVERY_AMBIGUOUS, f"{_ACCEPT_MANUAL}:{reason}")
     warning = f"ACCEPT_FAILED:{reason}"
     warnings = list(task.warnings or [])
     if warning not in warnings:
@@ -314,10 +374,22 @@ def _apply(
     reason: str,
     **fields: Any,
 ) -> ReconcileAction:
-    """Move the task, log a RECOVERY event, and drop the provider lease it was holding."""
+    """Move the task, log a RECOVERY event, and drop the provider lease it was holding.
+
+    The transition is pinned to the version the sweep read: a task that moved underneath it --
+    because its worker recorded an outcome after ``list_tasks`` -- is left to whoever moved it,
+    exactly as an illegal transition is.
+    """
     if to_state in TERMINAL_STATES:
         fields.setdefault("finished_at", _stamp())
-    service.transition(store, task.id, to_state, reason=f"recovery: {reason}", **fields)
+    service.transition(
+        store,
+        task.id,
+        to_state,
+        reason=f"recovery: {reason}",
+        expected_state_version=task.state_version,
+        **fields,
+    )
     store.append_event(
         task.id,
         EventKind.RECOVERY,

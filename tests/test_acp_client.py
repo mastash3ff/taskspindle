@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from acp.schema import PermissionOption, ToolCallUpdate
 
 from taskspindle.acp_client import AcpError, AcpWorker, PermissionPolicy, sealed_env
 from taskspindle.providers import Profile, build_child_env, env_violations, session_options
@@ -128,6 +129,56 @@ async def test_delegation_is_refused_even_when_writes_are_allowed(tmp_path: Path
     assert result.capture.violations == ["DELEGATION_ATTEMPT"]
     assert result.capture.permission_events[0]["option_id"] == "reject-once"
     assert result.text == "done"
+
+
+#: (title, kind) pairs the delegation gate must let through: ordinary work whose name merely
+#: contains one of the words the gate looks for.
+ALLOWED_CALLS = [
+    ("Edit src/tasks.py", "edit"),
+    ("Run pytest tests/test_task.py", "execute"),
+    ("Read agents.md", "read"),
+    ("Write taskspindle/units.py", "edit"),
+]
+
+#: Titles that name one of the tools an agent would spawn helpers with.
+DENIED_CALLS = [
+    ("Agent: spawn subagent", "other"),
+    ("Task(...)", "other"),
+    ("TeamCreate", "other"),
+    ("Delegate to a subagent", "other"),
+    ("SendMessage to the reviewer", "other"),
+]
+
+
+def _permission_options() -> list[PermissionOption]:
+    return [
+        PermissionOption(option_id="allow-once", name="Allow once", kind="allow_once"),
+        PermissionOption(option_id="reject-once", name="Reject once", kind="reject_once"),
+    ]
+
+
+@pytest.mark.parametrize(("title", "kind"), ALLOWED_CALLS)
+def test_ordinary_work_is_not_mistaken_for_delegation(title: str, kind: str) -> None:
+    policy = PermissionPolicy(allow_writes=True)
+
+    option_id, violation = policy.select(
+        ToolCallUpdate(tool_call_id="tc-1", title=title, kind=kind), _permission_options()
+    )
+
+    assert violation is None
+    assert option_id == "allow-once"
+
+
+@pytest.mark.parametrize(("title", "kind"), DENIED_CALLS)
+def test_delegation_tools_are_denied_by_name(title: str, kind: str) -> None:
+    policy = PermissionPolicy(allow_writes=True)
+
+    option_id, violation = policy.select(
+        ToolCallUpdate(tool_call_id="tc-1", title=title, kind=kind), _permission_options()
+    )
+
+    assert violation == "DELEGATION_ATTEMPT"
+    assert option_id == "reject-once"
 
 
 # -- cancellation and timeouts ---------------------------------------------------------------------

@@ -308,13 +308,22 @@ def worker_argv(task_id: str) -> list[str]:
     return [sys.executable, "-m", "taskspindle.runner", "--task", task_id]
 
 
-def unit_env(parent: Mapping[str, str], *, config_file: Path) -> dict[str, str]:
+def unit_env(
+    parent: Mapping[str, str],
+    *,
+    config_file: Path,
+    secret_names: Sequence[str] = (),
+) -> dict[str, str]:
     """The environment a unit is started with: enough to find Python, the user and the config.
 
     This is the *unit's* environment, not the agent's; the agent's is rebuilt from scratch by
-    :func:`taskspindle.providers.build_child_env` inside the worker.
+    :func:`taskspindle.providers.build_child_env` inside the worker. That rebuild copies an
+    ``api_key`` profile's declared secrets out of the worker's own environment, so the names in
+    ``secret_names`` are forwarded here -- by name only, and only when the parent has them. A
+    name that is not set is left out rather than blanked, and no value is ever logged.
     """
     env = {name: parent[name] for name in _UNIT_ENV_NAMES if name in parent}
     env.update({name: value for name, value in parent.items() if name.startswith("XDG_")})
+    env.update({name: parent[name] for name in secret_names if name in parent})
     env["TASKSPINDLE_CONFIG"] = str(config_file)
     return env

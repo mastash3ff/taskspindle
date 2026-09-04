@@ -92,7 +92,10 @@ systemd has forgotten a unit.
 `cancel_task` moves the task to `CANCELLING` and asks systemd to deliver `SIGTERM` to the unit. The
 worker traps it, sends ACP `session/cancel`, waits — bounded — for the prompt response, writes
 `CANCELLED` with its transcript, and exits. `KillMode=control-group` and `TimeoutStopSec=30` mean a
-worker that does not exit takes its whole process group with it when systemd escalates.
+worker that does not exit takes its whole process group with it when systemd escalates. The cancel
+time is recorded on the `CANCEL_REQUESTED` event: a unit still running thirty seconds later is
+stopped outright by the next reconciliation, which logs `cancel_escalated` once and lets the
+unit's own post-mortem settle the task.
 
 Nothing else crosses between the server and a worker. There is no socket, no pipe and no shared
 memory: the SQLite database is the only channel, and a signal is the only interrupt.
@@ -108,7 +111,8 @@ integration journal, moves the task to `ACCEPTING` and starts
    a repository you are actively working in. Conflicts here mean the candidate does not apply: the
    task goes back to `RESULT_READY` with a `CONFLICT:<paths>` warning and the repository is
    untouched.
-2. **Journal, then apply.** The journal — task, phase, target head, candidate sha — is written
+2. **Journal, then apply.** The journal — task, phase, target head, candidate sha, changed paths —
+   is written
    *before* git is allowed to touch anything, so a crash mid-apply is always recognisable. The
    apply is `git cherry-pick --no-commit <candidate>` in the root, which first requires the root to
    be clean and its HEAD to still be at the journalled target.
@@ -117,13 +121,17 @@ integration journal, moves the task to `ACCEPTING` and starts
    `TERM=dumb` and `CI=1`. A check that needs a credential is a check that does not belong in an
    automated acceptance. Results are recorded with a `[root]` prefix so they are distinguishable
    from the worktree run.
-4. **Commit.** `git commit -m <the message the accepting session signed for>`. Author and committer
-   come from the repository's own configuration: the commit belongs to you, not to TaskSpindle.
+4. **Commit.** The journal moves to `committing`, then `git commit -m <the message the accepting
+   session signed for>`, then `committed`. Author and committer come from the repository's own
+   configuration: the commit belongs to you, not to TaskSpindle. The `committing` phase is what
+   lets a recovery tell a commit that landed from one that never ran.
 
 Any failure after step 2 aborts the apply (`git cherry-pick --abort`, or a `reset --hard` back to
-the journalled head — and it refuses to act at all if HEAD is somewhere unexpected), leaves the
+the journalled head followed by the removal of the candidate's own untracked files), leaves the
 repository byte-for-byte where it started, and returns the task to `RESULT_READY` with an
-`ACCEPT_FAILED:<reason>` warning. Untracked files are never removed.
+`ACCEPT_FAILED:<reason>` warning. The abort refuses to act at all if HEAD is somewhere unexpected,
+or if the working tree is dirty with anything the candidate does not touch: discarding work nobody
+signed for is not a decision recovery gets to make. See [recovery.md](recovery.md).
 
 Candidate commits themselves are made in the task's worktree with hooks and signing disabled, and
 live under `refs/taskspindle/<task_id>/rev/<n>` so they are never on a branch you use.
@@ -139,9 +147,13 @@ Four things a task can do that TaskSpindle records rather than hides.
   review mode is denied at the ACP boundary, and after the turn the review worktree must be clean;
   if it is not, the violation is recorded.
 - **`ROOT_MUTATION`** — the agent changed the root repository, outside its worktree. TaskSpindle
-  snapshots the root's HEAD, branch and dirty state before dispatch and compares afterwards. The
-  warning blocks acceptance until someone calls `record_integration` with
-  `root_mutation_acknowledged`, which is written to the event log with their summary.
+  snapshots the root's HEAD, branch and dirty state before dispatch and compares afterwards. Every
+  task with a repository behind it is checked this way, `consult` and `review` included; only a
+  repository-less consult, which has no root, is not. The warning blocks acceptance — and a
+  `record_integration` of a hand-made merge — until someone calls `record_integration` with
+  `root_mutation_acknowledged`, which is written to the event log with their summary. If the
+  snapshot cannot be read the check did not run, and that is recorded as `ROOT_CHECK_SKIPPED`
+  rather than passed.
 - **`DELEGATION_ATTEMPT`** — the agent asked for a subagent, team or delegation tool. The request
   is denied and recorded. Both first-class profiles are launched with those tools disabled in the
   first place; this catches the case where they are asked for anyway.

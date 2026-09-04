@@ -107,7 +107,15 @@ def collapse_candidate(
     run_git(["update-ref", f"refs/taskspindle/{task_id}/rev/{revision}", sha], cwd=worktree)
     # The index and files already match the new commit, so a soft reset only moves HEAD.
     run_git(["reset", "--soft", sha], cwd=worktree)
-    changed = sorted(_nul_paths(run_git(["diff", "--name-only", "-z", base_sha, sha], cwd=worktree).stdout))
+    # --no-renames: a rename is two paths, and the source is one of them. Letting git collapse
+    # the pair into the destination alone would hide a file moved *out* of the task's scope.
+    changed = sorted(
+        _nul_paths(
+            run_git(
+                ["diff", "--name-only", "--no-renames", "-z", base_sha, sha], cwd=worktree
+            ).stdout
+        )
+    )
     return CandidateCommit(sha=sha, revision=revision, changed_paths=tuple(changed))
 
 

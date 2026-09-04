@@ -13,13 +13,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .repos import GitError, RepositoryIdentity, current_head, run_git
+from .repos import GitError, RepositoryIdentity, current_head, porcelain_paths, run_git
 
 __all__ = [
     "CheckResult",
     "Journal",
     "ProbeResult",
     "abort_staged",
+    "commit_landed",
     "commit_staged",
     "probe_merge",
     "recover_journal",
@@ -27,8 +28,9 @@ __all__ = [
     "stage_candidate",
 ]
 
-#: Phases a journal can be in, in the order they are entered.
-PHASES = ("probing", "staged", "verified", "committed")
+#: Phases a journal can be in, in the order they are entered. ``committing`` is written before
+#: ``git commit`` runs, so a crash inside the commit itself is told apart from one before it.
+PHASES = ("probing", "staged", "verified", "committing", "committed")
 
 #: How much of a check's output is retained.
 TAIL_CHARS = 4096
@@ -101,11 +103,28 @@ class Journal:
     phase: str
     target_head: str
     candidate_sha: str
+    #: The paths the candidate touches. Nothing outside them is ever reset or removed, so an
+    #: operator edit made while the accept was in flight can never be discarded by a recovery.
+    changed_paths: tuple[str, ...] = ()
 
 
 def _git_dir(identity: RepositoryIdentity) -> Path:
     raw = run_git(["rev-parse", "--absolute-git-dir"], cwd=identity.toplevel).stdout
     return Path(raw.decode("utf-8", "replace").strip())
+
+
+def _dirty_paths(identity: RepositoryIdentity) -> tuple[str, ...]:
+    """Every path ``git status`` mentions, untracked files included."""
+    status = run_git(
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        cwd=identity.toplevel,
+    )
+    return tuple(porcelain_paths(status.stdout))
+
+
+def _untracked_paths(identity: RepositoryIdentity) -> tuple[str, ...]:
+    proc = run_git(["ls-files", "--others", "--exclude-standard", "-z"], cwd=identity.toplevel)
+    return tuple(f.decode("utf-8", "surrogateescape") for f in proc.stdout.split(b"\0") if f)
 
 
 def _conflicted_paths(identity: RepositoryIdentity) -> tuple[str, ...]:
@@ -231,31 +250,64 @@ def commit_staged(
 
     Author and committer come from the repository's own configuration: this commit belongs to the
     operator, not to TaskSpindle.
+
+    ``committing`` is journalled before git is asked to commit, so a crash between the two is
+    recognisable: the recovery can look at ``HEAD^`` and see whether the commit landed.
     """
+    save(replace(journal, phase="committing"))
     run_git(["commit", "-m", message], cwd=identity.toplevel)
     sha = current_head(identity.toplevel)
     save(replace(journal, phase="committed"))
     return sha
 
 
+def commit_landed(identity: RepositoryIdentity, journal: Journal) -> bool:
+    """True when the commit a ``committing`` journal was writing is the repository's HEAD."""
+    head = current_head(identity.toplevel)
+    if head == journal.target_head:
+        return False
+    proc = run_git(
+        ["rev-parse", "--verify", "--quiet", "HEAD^"],
+        cwd=identity.toplevel,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    return proc.stdout.decode("utf-8", "replace").strip() == journal.target_head
+
+
 def abort_staged(identity: RepositoryIdentity, *, journal: Journal) -> None:
     """Undo a staged apply, leaving the repository exactly at ``journal.target_head``.
 
-    Untracked files are never removed: this only ever aborts the cherry-pick or resets tracked
-    state back to the recorded head, and it refuses to act at all if HEAD has moved somewhere
-    unexpected.
+    A reset is only ever permitted when everything the working tree is dirty with belongs to the
+    candidate: if ``git status`` mentions a path the journal does not list, somebody else's work
+    is in the tree and discarding it is not this function's decision to make. When the reset is
+    permitted, the candidate's own untracked files are removed too -- they are candidate content,
+    and ``reset --hard`` leaves them behind.
     """
     if (_git_dir(identity) / "CHERRY_PICK_HEAD").exists():
         proc = run_git(["cherry-pick", "--abort"], cwd=identity.toplevel, check=False)
         if proc.returncode == 0:
             return
-    if current_head(identity.toplevel) == journal.target_head:
-        run_git(["reset", "--hard", journal.target_head], cwd=identity.toplevel)
-        return
-    raise GitError(
-        "JOURNAL_MISMATCH",
-        f"HEAD is not at the journalled target {journal.target_head}; refusing to change anything",
-    )
+    if current_head(identity.toplevel) != journal.target_head:
+        raise GitError(
+            "JOURNAL_MISMATCH",
+            f"HEAD is not at the journalled target {journal.target_head}; "
+            "refusing to change anything",
+        )
+    owned = set(journal.changed_paths)
+    foreign = sorted(path for path in _dirty_paths(identity) if path not in owned)
+    if foreign:
+        raise GitError(
+            "JOURNAL_MISMATCH",
+            "the target repository is dirty outside the candidate's own paths; "
+            "refusing to change anything",
+            paths=foreign,
+        )
+    run_git(["reset", "--hard", journal.target_head], cwd=identity.toplevel)
+    for path in _untracked_paths(identity):
+        if path in owned:
+            (identity.toplevel / path).unlink(missing_ok=True)
 
 
 def recover_journal(identity: RepositoryIdentity, journal: Journal) -> str:
@@ -263,12 +315,15 @@ def recover_journal(identity: RepositoryIdentity, journal: Journal) -> str:
 
     A ``probing`` journal is settled already: the probe is a pure ``merge-tree`` that never
     touches the index or the working tree, so there is nothing to undo and the operator's own
-    uncommitted work is left exactly where it is.
+    uncommitted work is left exactly where it is. A ``committing`` journal is the one case where
+    the repository has to be asked what happened: the commit either landed or it did not.
     """
-    if journal.phase == PHASES[-1]:
+    if journal.phase == "committed":
         return "committed"
-    if journal.phase == PHASES[0]:
+    if journal.phase == "probing":
         return "aborted"
+    if journal.phase == "committing" and commit_landed(identity, journal):
+        return "committed"
     if journal.phase in PHASES:
         abort_staged(identity, journal=journal)
         return "aborted"

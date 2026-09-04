@@ -166,8 +166,10 @@ def test_oauth_profile_may_not_carry_a_gateway_base_url(tmp_path: Path) -> None:
         env={"ANTHROPIC_BASE_URL": "https://gateway.internal/v1"},
     )
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ProfileError) as excinfo:
         build_child_env(profile, LEAKY_PARENT, task_tmp=tmp_path)
+
+    assert excinfo.value.code == "PROFILE_INVALID"
 
 
 def test_env_violations_spots_proxies_in_any_case_but_not_grok_flags() -> None:

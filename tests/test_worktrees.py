@@ -90,6 +90,31 @@ def test_scope_violations_reports_out_of_scope_paths() -> None:
     assert scope_violations(["src/a.py", "docs/b.md"], ["."]) == []
 
 
+def test_a_rename_reports_both_of_its_paths(make_repo, tmp_path: Path) -> None:
+    """A file moved into scope was also moved out of somewhere: the source is a change too."""
+    root = make_repo()
+    identity = resolve_repository(root)
+    (root / "secret.txt").write_text("secret\n")
+    run_git(["add", "-A"], cwd=root)
+    run_git(["commit", "-q", "-m", "Add a file outside src"], cwd=root)
+    base = current_head(root)
+
+    worktree = create_worktree(identity, base, tmp_path / "wt" / "task")
+    (worktree / "src").mkdir()
+    run_git(["mv", "secret.txt", "src/secret.txt"], cwd=worktree)
+    candidate = collapse_candidate(
+        identity,
+        worktree,
+        task_id="task-rename",
+        revision=1,
+        base_sha=base,
+        message="Move the file",
+    )
+
+    assert candidate.changed_paths == ("secret.txt", "src/secret.txt")
+    assert scope_violations(candidate.changed_paths, ["src"]) == ["secret.txt"]
+
+
 def test_diff_artifacts_are_byte_identical_across_writes(make_repo, tmp_path: Path) -> None:
     root = make_repo()
     identity = resolve_repository(root)
