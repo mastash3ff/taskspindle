@@ -60,10 +60,17 @@ Codex hands a tool's output to the model only up to its `tool_output_token_limit
 tokens by default — and truncates the rest without telling the server. A `task_diff` page that was
 cut off on the way in is still receipted in full, and the "whole diff retrieved" gate that
 `accept_task` enforces would then pass on bytes the session never read. So `task_diff` returns
-16384 bytes by default (about 22 KB of base64, under the default limit), and the session should
+16384 bytes by default (about 22 KB of base64), and the session should
 page — `offset` advancing by each page's `length` until it reaches `size` — rather than ask for
 the 262144-byte maximum. Put that rule in the instructions Codex reads (`AGENTS.md`); raising
 `tool_output_token_limit` globally makes every other tool's output larger too.
+
+On September 4, a native Codex MCP call returned an intact 16384-byte page from a 36200-byte
+catalog diff with the output limit set to 8000 tokens. Decoding the received base64 produced
+exactly the declared `length`. The remaining pages covered all 36200 bytes. The registered
+0.1.0 server was used only for this explicitly sized native call; the branch build ran the live
+cycle. This measures that fixture and output path, not every possible diff: always check the
+decoded length and re-read smaller pages if the client truncates them.
 
 ## What Codex offers that TaskSpindle does not use
 

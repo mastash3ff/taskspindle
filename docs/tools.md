@@ -223,8 +223,10 @@ the whole diff, `length` what this page actually contains. Errors: `TASK_NOT_FOU
 
 **Keep pages smaller than your client will truncate.** An MCP client caps the tool output it hands
 the model — Codex's `tool_output_token_limit` is a few thousand tokens by default — and a page that
-was cut off on the way in is still receipted in full here. The default of 16384 bytes (about 22 KB
-of base64) fits under that cap; ask for more only if you have raised the cap.
+was cut off on the way in is still receipted in full here. A 16384-byte page (about 22 KB of
+base64) arrived intact in the September 4 Codex measurement with an 8000-token output limit;
+tokenization depends on the content, so this is not a guarantee for every diff. Decode each
+received page and check its byte length against `length`; re-read smaller pages if truncated.
 
 **The diff-coverage rule.** Every call records a receipt of `(digest, offset, length)`. An
 acceptance requires that the recorded receipts for the exact `diff_digest` cover `[0, size)` with
