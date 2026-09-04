@@ -7,6 +7,11 @@ they never make the overall result fail.
 
 ``live_probes=False`` drops the two checks that actually start something: the transient unit and
 the Grok ACP handshake. That is the mode a packaging smoke test runs in.
+
+:func:`run_doctor_async` is the form the MCP server calls: the Grok handshake is awaited on the
+running loop and every blocking subprocess check happens in a worker thread, so nothing here
+starts a second event loop inside one that is already running. :func:`run_doctor` is the same
+thing for a command line, with the loop supplied.
 """
 
 from __future__ import annotations
@@ -24,10 +29,18 @@ from typing import Any
 import taskspindle
 
 from . import providers
+from .acp_client import AcpWorker, InitInfo, PermissionPolicy
 from .config import Paths
 from .providers import Profile
 
-__all__ = ["GROK_VERSION_PREFIX", "MIN_GIT", "MIN_NODE", "Check", "run_doctor"]
+__all__ = [
+    "GROK_VERSION_PREFIX",
+    "MIN_GIT",
+    "MIN_NODE",
+    "Check",
+    "run_doctor",
+    "run_doctor_async",
+]
 
 #: The oldest git whose ``merge-tree --write-tree`` behaves the way integration relies on.
 MIN_GIT = (2, 38)
@@ -125,7 +138,12 @@ class _Doctor:
 
     # -- the checks -----------------------------------------------------------------
 
-    def collect(self) -> None:
+    async def collect(self) -> None:
+        """Ask every question: the ACP handshake on this loop, everything else in a thread."""
+        grok_acp = await self._grok_acp() if self.live_probes else None
+        await asyncio.to_thread(self._collect_blocking, grok_acp)
+
+    def _collect_blocking(self, grok_acp: Check | None) -> None:
         self.git()
         self.systemd_user()
         if self.live_probes:
@@ -134,8 +152,8 @@ class _Doctor:
         self.adapter()
         self.grok_cli()
         self.claude_oauth()
-        if self.live_probes:
-            self.grok_acp()
+        if grok_acp is not None:
+            self.checks.append(grok_acp)
         self.child_envs()
         self.codex_registration()
         self.profile_commands()
@@ -231,41 +249,42 @@ class _Doctor:
                 f"{evidence['apiProvider']}"
             )
 
-    def grok_acp(self) -> None:
+    async def _grok_acp(self) -> Check:
+        """The one check that talks to an agent, awaited rather than run in its own loop."""
         profile = self.profiles.get("grok")
         if profile is None:
-            self.fail("grok_acp", "no grok profile is configured")
-            return
-
-        @self.check("grok_acp")
-        def probe() -> str:
-            return asyncio.run(self._grok_handshake(profile))
+            return Check("grok_acp", False, "no grok profile is configured")
+        try:
+            detail = await self._grok_handshake(profile)
+        except Exception as exc:
+            return Check("grok_acp", False, f"{type(exc).__name__}: {exc}")
+        return Check("grok_acp", True, detail)
 
     async def _grok_handshake(self, profile: Profile) -> str:
-        from .acp_client import AcpWorker, PermissionPolicy
-
         with tempfile.TemporaryDirectory(prefix="taskspindle-doctor-") as raw:
             workspace = Path(raw)
-            env = providers.build_child_env(
-                profile, self.parent_env, task_tmp=workspace / "tmp"
+            init = await self._grok_init(profile, workspace)
+            if init is None or init.load_session is not True:
+                raise RuntimeError("grok did not advertise load_session")
+            evidence = providers.grok_oauth_evidence(
+                [{"id": method_id} for method_id in init.auth_method_ids],
+                home=Path(self.parent_env.get("HOME", "")),
             )
-            (workspace / "tmp").mkdir(parents=True, exist_ok=True)
-            worker = AcpWorker(
-                command=profile.command,
-                env=env,
-                cwd=workspace,
-                stderr_path=workspace / "agent.stderr",
-                policy=PermissionPolicy(allow_writes=False),
-            )
-            async with worker as agent:
-                init = agent.init
-                if init is None or init.load_session is not True:
-                    raise RuntimeError("grok did not advertise load_session")
-                evidence = providers.grok_oauth_evidence(
-                    [{"id": method_id} for method_id in init.auth_method_ids],
-                    home=Path(self.parent_env.get("HOME", "")),
-                )
             return f"load_session and {', '.join(evidence['auth_method_ids'])}"
+
+    async def _grok_init(self, profile: Profile, workspace: Path) -> InitInfo | None:
+        """Start the agent, keep what it said about itself at ``initialize``, and stop it."""
+        env = providers.build_child_env(profile, self.parent_env, task_tmp=workspace / "tmp")
+        (workspace / "tmp").mkdir(parents=True, exist_ok=True)
+        worker = AcpWorker(
+            command=profile.command,
+            env=env,
+            cwd=workspace,
+            stderr_path=workspace / "agent.stderr",
+            policy=PermissionPolicy(allow_writes=False),
+        )
+        async with worker as agent:
+            return agent.init
 
     def child_envs(self) -> None:
         for profile_id, profile in sorted(self.profiles.items()):
@@ -318,7 +337,7 @@ class _Doctor:
                     return f"{name} is set"
 
 
-def run_doctor(
+async def run_doctor_async(
     *,
     profiles: Mapping[str, Profile],
     paths: Paths,
@@ -334,8 +353,28 @@ def run_doctor(
         live_probes=live_probes,
         runner=runner,
     )
-    doctor.collect()
+    await doctor.collect()
     return {
         "ok": all(check.ok for check in doctor.checks if not check.advisory),
         "checks": [check.as_dict() for check in doctor.checks],
     }
+
+
+def run_doctor(
+    *,
+    profiles: Mapping[str, Profile],
+    paths: Paths,
+    parent_env: Mapping[str, str],
+    live_probes: bool = True,
+    runner: Runner = subprocess.run,
+) -> dict[str, Any]:
+    """:func:`run_doctor_async` for a caller that owns no event loop, such as the CLI."""
+    return asyncio.run(
+        run_doctor_async(
+            profiles=profiles,
+            paths=paths,
+            parent_env=parent_env,
+            live_probes=live_probes,
+            runner=runner,
+        )
+    )

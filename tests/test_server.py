@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import json
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastmcp import Client
 
+import taskspindle
+from taskspindle import doctor
+from taskspindle.acp_client import InitInfo
 from taskspindle.config import Paths
+from taskspindle.orchestrator import Orchestrator
+from taskspindle.providers import Profile
 from taskspindle.server import READ_ONLY_TOOLS, TOOL_NAMES, build_server
-from taskspindle.service import Orchestrator
 from taskspindle.store import Store
 from tests.fakes.units import FakeUnitBackend
+from tests.test_doctor import HEALTHY, RecordedRunner, install_adapter
 
 
 @pytest.fixture
@@ -69,14 +76,36 @@ async def test_capabilities_returns_an_envelope(server) -> None:
 
 async def test_a_bad_start_task_payload_is_an_invalid_request(server) -> None:
     async with Client(server) as client:
-        result = await client.call_tool(
-            "start_task", {"provider": "claude", "mode": "implement", "prompt": "do it"}
+        incomplete = await client.call_tool(
+            "start_task",
+            {"request": {"provider": "claude", "mode": "implement", "prompt": "do it"}},
         )
+        nonsense = await client.call_tool("start_task", {"request": {"mode": "bogus"}})
 
-    assert result.data["ok"] is False
-    assert result.data["result"] is None
-    assert result.data["error"]["code"] == "INVALID_REQUEST"
-    assert "acceptance_criteria" in result.data["error"]["details"]["errors"][0]["msg"]
+    assert incomplete.data["ok"] is False
+    assert incomplete.data["result"] is None
+    assert incomplete.data["error"]["code"] == "INVALID_REQUEST"
+    assert "acceptance_criteria" in incomplete.data["error"]["details"]["errors"][0]["msg"]
+
+    # A value the schema itself rejects still comes back inside the envelope, not as a fault.
+    assert nonsense.data["ok"] is False
+    assert nonsense.data["error"]["code"] == "INVALID_REQUEST"
+    locations = {
+        tuple(error["loc"]) for error in nonsense.data["error"]["details"]["errors"]
+    }
+    assert ("mode",) in locations
+
+
+async def test_the_request_object_tools_describe_their_fields(server) -> None:
+    async with Client(server) as client:
+        tools = {tool.name: tool for tool in await client.list_tools()}
+
+    for name in ("start_task", "accept_task", "record_integration", "authorize_repository"):
+        assert list(tools[name].inputSchema["properties"]) == ["request"]
+        assert tools[name].inputSchema["properties"]["request"]["type"] == "object"
+    assert "- acceptance_criteria: string | null (optional)" in tools["start_task"].description
+    assert "- provider: string (required)" in tools["start_task"].description
+    assert "- modes: array of" in tools["authorize_repository"].description
 
 
 async def test_a_missing_task_is_reported_by_code(server) -> None:
@@ -86,6 +115,50 @@ async def test_a_missing_task_is_reported_by_code(server) -> None:
     assert result.data["ok"] is False
     assert result.data["error"]["code"] == "TASK_NOT_FOUND"
     assert result.data["error"]["details"]["task_id"] == "ts_absent"
+
+
+async def test_doctor_runs_its_live_probes_on_the_servers_own_loop(
+    store: Store, paths: Paths, monkeypatch
+) -> None:
+    """The Grok handshake is awaited, not run in a second event loop inside the running one."""
+    home = paths.state_dir / "home"
+    (home / ".grok").mkdir(parents=True)
+    (home / ".grok" / "auth.json").write_text(json.dumps({"token": "cached"}), encoding="utf-8")
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    grok = Profile(id="grok", auth="oauth", command=("/bin/sh",))
+    recorded = RecordedRunner(HEALTHY)
+
+    def run(self: object, argv: Sequence[str], *, timeout: float = 30.0) -> Any:
+        return recorded(argv, timeout=timeout)
+
+    async def handshake(self: object, profile: Profile, workspace: Path) -> InitInfo:
+        return InitInfo(load_session=True, auth_method_ids=("cached_token",), agent_info={})
+
+    monkeypatch.setattr(doctor._Doctor, "run", run)
+    monkeypatch.setattr(doctor._Doctor, "_grok_init", handshake)
+    orchestrator = Orchestrator(
+        store=store,
+        paths=paths,
+        profiles={"grok": grok},
+        units=FakeUnitBackend(),
+        boot="boot-under-test",
+        parent_env={"HOME": str(home), "PATH": "/usr/bin"},
+    )
+
+    async with Client(build_server(orchestrator)) as client:
+        result = await client.call_tool("doctor", {"live_probes": True})
+
+    assert result.data["ok"] is True
+    report = result.data["result"]
+    checks = {check["name"]: check for check in report["checks"]}
+    assert checks["grok_acp"] == {
+        "name": "grok_acp",
+        "ok": True,
+        "detail": "load_session and cached_token",
+        "advisory": False,
+    }
+    assert checks["transient_unit"]["ok"] is True
+    assert report["ok"] is True
 
 
 async def test_the_server_log_captures_a_traceback(server, paths: Paths, monkeypatch) -> None:

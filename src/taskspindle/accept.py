@@ -137,7 +137,6 @@ def run_accept(
         store.clear_journal(task_id)
         return _abandon(store, task, "CHECKS_FAILED", {"commands": failed})
 
-    save(replace(staged, phase="verified"))
     head = integration.commit_staged(
         identity,
         journal=staged,
@@ -224,7 +223,11 @@ def main(argv: list[str] | None = None) -> int:
         load_config(config_file)
         store = Store.open(resolved.state_dir / "taskspindle.sqlite3")
         outcome = run_accept(store, args.task, paths=resolved, parent_env=os.environ)
-    except Exception:
+    except Exception as exc:
+        # The message may quote paths and commands, so only the shape of the failure is printed;
+        # the task's own event log carries the rest.
+        code = f": {exc.code}" if isinstance(exc, TaskSpindleError) else ""
+        print(f"accept of {args.task} failed: {type(exc).__name__}{code}", file=sys.stderr)
         return 1
     finally:
         if store is not None:

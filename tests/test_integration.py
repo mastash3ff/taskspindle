@@ -209,6 +209,27 @@ def test_recover_journal_aborts_a_staged_apply(make_repo, tmp_path: Path) -> Non
     assert recover_journal(identity, Journal("task-1", "committed", base, candidate)) == "committed"
 
 
+def test_recover_journal_leaves_a_probing_tree_untouched(make_repo, tmp_path: Path) -> None:
+    """The probe stages nothing, so recovering one must not reset the operator's own work."""
+    root = make_repo()
+    identity = resolve_repository(root)
+    base = current_head(root)
+    candidate = _candidate(identity, base, tmp_path / "wt" / "a", "one\ntwo\ncandidate\n")
+    (root / "file.txt").write_text("one\ntwo\nmine\n")
+    (root / "scratch.txt").write_text("not committed\n")
+    before = {
+        path.name: path.read_bytes() for path in sorted(root.glob("*.txt"))
+    }
+    status = _out(["status", "--porcelain"], root)
+
+    journal = Journal(task_id="task-1", phase="probing", target_head=base, candidate_sha=candidate)
+
+    assert recover_journal(identity, journal) == "aborted"
+    assert {path.name: path.read_bytes() for path in sorted(root.glob("*.txt"))} == before
+    assert _out(["status", "--porcelain"], root) == status
+    assert current_head(root) == base
+
+
 def test_run_verification_stops_at_the_first_failure(tmp_path: Path) -> None:
     env = {"PATH": os.environ["PATH"]}
     results = run_verification(

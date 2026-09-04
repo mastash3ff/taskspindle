@@ -722,7 +722,7 @@ class Store:
     # -- leases ---------------------------------------------------------------------
 
     def acquire_lease(
-        self, provider: str, task_id: str, unit_name: str, pid: int, boot_id: str
+        self, provider: str, task_id: str, unit_name: str, pid: int | None, boot_id: str
     ) -> bool:
         """Atomically take the single-flight lease for ``provider``; False if it is held."""
         stamp = now()

@@ -220,6 +220,23 @@ class ReviewTarget(BaseModel):
         return self
 
 
+class AuthorizeRepositoryRequest(BaseModel):
+    """Arguments of the ``authorize_repository`` tool."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    providers: list[str] = Field(min_length=1)
+    modes: list[Mode] = Field(min_length=1)
+
+    @field_validator("path")
+    @classmethod
+    def _non_empty_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path must not be empty")
+        return value
+
+
 class StartTaskRequest(BaseModel):
     """Arguments of the ``start_task`` tool."""
 

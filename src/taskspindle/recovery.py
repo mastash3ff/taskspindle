@@ -61,6 +61,10 @@ _BY_KIND: dict[str, tuple[str, TaskState]] = {
 #: Kinds whose unit is dead and should be forgotten once its state has been read.
 _RESET_KINDS = frozenset(_BY_KIND)
 
+#: States a continuation enters before its worker unit exists. Without a unit name and with a
+#: turn still open, such a task is waiting for its provider's lease, not for a vanished worker.
+_AWAITING_DISPATCH = frozenset({TaskState.REPAIRING, TaskState.RESUMING})
+
 
 @dataclass(frozen=True)
 class ReconcileAction:
@@ -92,6 +96,11 @@ def _older_than(stamp: str | None, moment: datetime, seconds: int) -> bool:
     if parsed is None:
         return True
     return parsed < moment - timedelta(seconds=seconds)
+
+
+def _has_pending_turn(store: Store, task: TaskRecord) -> bool:
+    """True when a turn has been written for this task and nothing has finished it yet."""
+    return any(turn["ended_at"] is None for turn in store.list_turns(task.id))
 
 
 def _unit_for(task: TaskRecord) -> str:
@@ -157,6 +166,10 @@ def _reconcile_task(
         # Nothing was ever started: the only question is whether it ever will be.
         if _older_than(task.created_at, moment, NEVER_STARTED_AFTER_S):
             return _apply(store, task, TaskState.FAILED, _NEVER_STARTED, error=_never_started())
+        return None
+    elif not task.unit_name and task.state in _AWAITING_DISPATCH and _has_pending_turn(store, task):
+        # A continuation that lost the race for its provider's lease. Its turn is written and
+        # waiting; the next dispatch pass will start it. There is no unit to ask about.
         return None
     else:
         unit_state = backend.show(_unit_for(task))

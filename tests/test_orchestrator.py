@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
+import shutil
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -21,6 +23,7 @@ from taskspindle import repos, runner, service
 from taskspindle.config import Paths
 from taskspindle.models import (
     AcceptTaskRequest,
+    AuthMode,
     CleanupState,
     Mode,
     RecordIntegrationRequest,
@@ -28,10 +31,11 @@ from taskspindle.models import (
     StartTaskRequest,
     TaskState,
 )
+from taskspindle.orchestrator import Orchestrator
 from taskspindle.providers import Profile
-from taskspindle.service import Orchestrator, TaskSpindleError
+from taskspindle.service import TaskSpindleError
 from taskspindle.store import Store
-from tests.fakes.units import FakeUnitBackend
+from tests.fakes.units import ACTIVE, FakeUnitBackend
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT = "boot-under-test"
@@ -515,6 +519,23 @@ def test_cleanup_refuses_a_dirty_worktree_without_force(harness: Harness, make_r
     ).stdout == b""
 
 
+def test_cleanup_of_a_task_whose_repository_is_gone_fails_loudly(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    status = harness.orchestrator.task_status(task_id)
+    harness.orchestrator.reject_task(task_id, status["state_version"], "not needed")
+    shutil.rmtree(repo)
+
+    result = harness.orchestrator.cleanup_task(task_id)
+
+    assert result["cleanup_state"] == CleanupState.FAILED.value
+    assert result["retained"] == [status["worktree_path"]]
+    assert result["error"]["code"] == "REPOSITORY_UNRESOLVABLE"
+    assert Path(status["worktree_path"]).exists()
+
+
 def test_cleanup_refuses_a_task_that_is_still_working(harness: Harness, make_repo) -> None:
     repo = make_repo()
     authorize(harness, repo)
@@ -616,27 +637,98 @@ def test_an_acknowledged_root_mutation_stops_blocking_acceptance(
     assert accepted["state"] == TaskState.ACCEPTING.value
 
 
+def integrate_by_hand(repo: Path) -> str:
+    """Land something in the root the way Codex would, and return the head it produced."""
+    (repo / "landed.txt").write_text("integrated by hand\n")
+    repos.run_git(["add", "-A"], cwd=repo)
+    repos.run_git(["commit", "-q", "-m", "Land the candidate by hand"], cwd=repo)
+    return repos.current_head(repo)
+
+
+def manual_integration(
+    harness: Harness, task_id: str, head: str
+) -> RecordIntegrationRequest:
+    status = harness.orchestrator.task_status(task_id)
+    return RecordIntegrationRequest(
+        task_id=task_id,
+        expected_state_version=status["state_version"],
+        kind="manual_integration",
+        resulting_head=head,
+        summary="cherry-picked it by hand",
+    )
+
+
 def test_a_manual_integration_records_the_head_it_landed_at(
     harness: Harness, make_repo
 ) -> None:
     repo = make_repo()
     task_id = build_candidate(harness, repo)
-    status = harness.orchestrator.task_status(task_id)
+    whole_diff(harness, task_id)
+    review_candidate(harness, repo, task_id)
+    head = integrate_by_hand(repo)
 
     recorded = harness.orchestrator.record_integration(
-        RecordIntegrationRequest(
-            task_id=task_id,
-            expected_state_version=status["state_version"],
-            kind="manual_integration",
-            resulting_head="0" * 40,
-            summary="cherry-picked it by hand",
-        )
+        manual_integration(harness, task_id, head)
     )
 
     assert recorded["state"] == TaskState.ACCEPTED.value
-    assert harness.orchestrator.task_status(task_id)["target_head"] == "0" * 40
-    kinds = [event["kind"] for event in harness.orchestrator.store.list_events(task_id)]
-    assert "INTEGRATION_RECORDED" in kinds
+    assert harness.orchestrator.task_status(task_id)["target_head"] == head
+    payload = [
+        event["payload"]
+        for event in harness.orchestrator.store.list_events(task_id)
+        if event["kind"] == "INTEGRATION_RECORDED"
+    ]
+    assert payload[0]["resulting_head"] == head
+    assert payload[0]["warnings"] == []
+
+
+def test_a_manual_integration_still_needs_a_review(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+    head = integrate_by_hand(repo)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.record_integration(manual_integration(harness, task_id, head))
+
+    assert excinfo.value.code == service.REVIEW_REQUIRED
+    assert harness.orchestrator.task_status(task_id)["state"] == TaskState.RESULT_READY.value
+
+
+def test_a_manual_integration_still_needs_the_whole_diff(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    harness.orchestrator.task_diff(task_id, 0, 40)
+    review_candidate(harness, repo, task_id)
+    head = integrate_by_hand(repo)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.record_integration(manual_integration(harness, task_id, head))
+
+    assert excinfo.value.code == service.DIFF_NOT_FULLY_RETRIEVED
+
+
+def test_a_manual_integration_at_a_head_that_does_not_exist_is_refused(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+    review_candidate(harness, repo, task_id)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.record_integration(
+            manual_integration(harness, task_id, "0" * 40)
+        )
+    assert excinfo.value.code == service.INVALID_REQUEST
+
+    with pytest.raises(TaskSpindleError) as unchanged:
+        # The base is a real commit, but nothing was integrated into it.
+        harness.orchestrator.record_integration(
+            manual_integration(harness, task_id, repos.current_head(repo))
+        )
+    assert unchanged.value.code == service.INVALID_REQUEST
+    assert harness.orchestrator.task_status(task_id)["state"] == TaskState.RESULT_READY.value
 
 
 def test_an_ambiguous_recovery_asks_for_a_person(harness: Harness, make_repo) -> None:
@@ -659,3 +751,180 @@ def test_an_ambiguous_recovery_asks_for_a_person(harness: Harness, make_repo) ->
 
     assert excinfo.value.code == service.MANUAL_RECOVERY_REQUIRED
     assert excinfo.value.details["evidence"]["to"] == TaskState.RECOVERY_AMBIGUOUS.value
+
+
+def make_ambiguous(harness: Harness, repo: Path) -> str:
+    """Start a task and leave it where recovery refuses to guess what happened."""
+    authorize(harness, repo)
+    harness.defer()
+    task_id = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    harness.orchestrator.store.heartbeat(task_id)
+    harness.backend.states.pop(f"taskspindle-worker-{task_id}")
+    assert harness.orchestrator.task_status(task_id)["state"] == (
+        TaskState.RECOVERY_AMBIGUOUS.value
+    )
+    return str(task_id)
+
+
+def test_cancelling_an_ambiguous_task_asks_for_a_person_too(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    task_id = make_ambiguous(harness, repo)
+    status = harness.orchestrator.task_status(task_id)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.cancel_task(task_id, status["state_version"])
+
+    assert excinfo.value.code == service.MANUAL_RECOVERY_REQUIRED
+    assert excinfo.value.details["evidence"]["reason"] == "unit_missing_fresh_heartbeat"
+    after = harness.orchestrator.task_status(task_id)
+    assert after["state"] == TaskState.RECOVERY_AMBIGUOUS.value
+    assert after["state_version"] == status["state_version"]
+    assert harness.backend.killed == []
+
+
+def test_cancelling_a_task_recovery_settled_underneath_us_is_refused_as_stale(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    task_id = make_ambiguous(harness, repo)
+    status = harness.orchestrator.task_status(task_id)
+    unit = f"taskspindle-worker-{task_id}"
+    sweeps = {"count": 0}
+    real_reconcile = harness.orchestrator.reconcile
+
+    def settling_reconcile() -> list[object]:
+        """A sweep that finds the worker again, the second time it is asked."""
+        sweeps["count"] += 1
+        if sweeps["count"] == 2:
+            harness.backend.set(unit, ACTIVE)
+            service.transition(
+                harness.orchestrator.store,
+                task_id,
+                TaskState.RESUMING,
+                reason="a person restarted the worker",
+            )
+        return real_reconcile()
+
+    harness.orchestrator.reconcile = settling_reconcile  # type: ignore[method-assign]
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.cancel_task(task_id, status["state_version"])
+
+    assert excinfo.value.code == service.STALE_STATE_VERSION
+    settled = harness.orchestrator.task_status(task_id)
+    assert settled["state"] == TaskState.RESUMING.value
+
+    cancelled = harness.orchestrator.cancel_task(task_id, settled["state_version"])
+
+    assert cancelled["state"] == TaskState.CANCELLING.value
+    assert harness.backend.killed == [(unit, "SIGTERM")]
+
+
+def test_a_repair_that_loses_the_lease_waits_instead_of_being_reconciled_away(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.defer()
+    first = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    harness.orchestrator.start_task(implement_request(repo))
+    harness.run_pending()  # the first task finishes and gives the lease back
+    assert harness.orchestrator.task_status(first)["state"] == TaskState.RESULT_READY.value
+    # Reading the status dispatched the second task, so the provider's lease is busy again.
+    second = harness.orchestrator.store.get_lease(AUTHOR)["task_id"]
+    assert second != first
+
+    status = harness.orchestrator.task_status(first)
+    repairing = harness.orchestrator.continue_task(first, status["state_version"], "again")
+
+    assert repairing["state"] == TaskState.REPAIRING.value
+    assert harness.orchestrator.task_status(first)["unit_name"] is None
+    # A reconcile runs on every call: a repair waiting for a lease must survive it.
+    assert harness.orchestrator.task_status(first)["state"] == TaskState.REPAIRING.value
+
+    harness.run_pending()  # the second task finishes and gives the lease back
+
+    assert harness.orchestrator.dispatch_queued() == [first]
+    assert harness.orchestrator.task_status(first)["unit_name"] == f"taskspindle-worker-{first}"
+    assert [unit for unit, _ in harness.backend.started].count(
+        f"taskspindle-worker-{first}"
+    ) == 2
+
+
+def test_an_acknowledged_root_mutation_does_not_cover_the_next_candidate(
+    harness: Harness, make_repo, script
+) -> None:
+    repo = make_repo()
+    harness.orchestrator.profiles[AUTHOR] = fake_profile(
+        AUTHOR,
+        script(
+            {
+                # The repair turn resumes the session, so the agent has to support loading it.
+                "load_session": True,
+                "response": "and a note in the root",
+                "write": {"path": "src/new.txt", "content": "hello\n"},
+                "write_abs": {"path": str(repo / "intruder.txt"), "content": "sneaky\n"},
+            }
+        ),
+    )
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+    review_candidate(harness, repo, task_id)
+    status = harness.orchestrator.task_status(task_id)
+    assert status["candidate_revision"] == 1
+    harness.orchestrator.record_integration(
+        RecordIntegrationRequest(
+            task_id=task_id,
+            expected_state_version=status["state_version"],
+            kind="root_mutation_acknowledged",
+            summary="I put that file there myself",
+        )
+    )
+
+    repaired = harness.orchestrator.continue_task(
+        task_id, status["state_version"], "write it again"
+    )
+    assert repaired["state"] == TaskState.RESULT_READY.value
+    after = harness.orchestrator.task_status(task_id)
+    assert after["candidate_revision"] == 2
+    assert "ROOT_MUTATION:intruder.txt" in after["warnings"]
+
+    whole_diff(harness, task_id)
+    review_task_id = review_candidate(harness, repo, task_id)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.accept_task(
+            accept_request(harness, repo, task_id, review_task_id)
+        )
+
+    assert excinfo.value.code == service.ACCEPT_BLOCKED
+    assert excinfo.value.details["warnings"] == ["ROOT_MUTATION:intruder.txt"]
+
+
+def test_an_empty_diff_is_a_page_of_nothing_and_is_fully_retrieved(
+    harness: Harness, make_repo, tmp_path: Path
+) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+    store = harness.orchestrator.store
+    record = service.create_task(
+        store, implement_request(repo), repository_id=None, auth_mode=AuthMode.OAUTH
+    )
+    empty = tmp_path / "empty.diff"
+    empty.write_bytes(b"")
+    digest = "sha256:" + hashlib.sha256(b"").hexdigest()
+    store.insert_artifact(record.id, 0, "candidate_diff", digest, 0, str(empty))
+
+    page = harness.orchestrator.task_diff(record.id)
+
+    assert page == {
+        "digest": digest,
+        "size": 0,
+        "offset": 0,
+        "length": 0,
+        "data": "",
+        "receipt_id": 0,
+    }
+    assert service.diff_fully_retrieved(store, record.id, digest, 0) == []

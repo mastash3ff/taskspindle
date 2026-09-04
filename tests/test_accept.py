@@ -209,6 +209,26 @@ def test_a_dirty_target_refuses_the_apply(store: Store, paths: Paths, make_repo)
     assert (repo / "README.md").read_text() == "edited while the accept was queued\n"
 
 
+def test_the_unit_reports_the_shape_of_a_failure_on_stderr(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from taskspindle import accept
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.delenv("TASKSPINDLE_CONFIG", raising=False)
+
+    assert accept.main(["--task", "ts_absent"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == (
+        "accept of ts_absent failed: TaskSpindleError: TASK_NOT_FOUND"
+    )
+
+
 def test_a_task_that_is_not_accepting_is_refused(store: Store, paths: Paths, make_repo) -> None:
     from taskspindle.service import TaskSpindleError
 

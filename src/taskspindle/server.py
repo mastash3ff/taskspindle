@@ -15,12 +15,12 @@ from __future__ import annotations
 import json
 import os
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from . import doctor as doctor_module
 from . import providers, units
@@ -28,15 +28,14 @@ from .config import Paths, load_config
 from .config import paths as default_paths
 from .models import (
     AcceptTaskRequest,
+    AuthorizeRepositoryRequest,
     Envelope,
     ErrorBody,
-    FindingDisposition,
-    Mode,
     RecordIntegrationRequest,
-    ReviewTarget,
     StartTaskRequest,
 )
-from .service import INVALID_REQUEST, Orchestrator, TaskSpindleError
+from .orchestrator import Orchestrator
+from .service import INVALID_REQUEST, TaskSpindleError
 from .store import Store
 from .units import SystemdUserBackend
 
@@ -96,13 +95,43 @@ def _log_traceback(log_path: Path, name: str, exc: BaseException) -> None:
         pass
 
 
-def _guard(name: str, log_path: Path, call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    """Run one tool body and turn whatever happens into an envelope."""
-    try:
-        return _envelope(call())
-    except TaskSpindleError as exc:
+def _type_name(spec: Mapping[str, Any], defs: Mapping[str, Any]) -> str:
+    """A one-token description of a JSON-schema field, for a tool description."""
+    if "$ref" in spec:
+        return _type_name(defs.get(str(spec["$ref"]).rsplit("/", 1)[-1], {}), defs)
+    if "anyOf" in spec:
+        return " | ".join(_type_name(item, defs) for item in spec["anyOf"])
+    if "enum" in spec:
+        return " | ".join(json.dumps(value) for value in spec["enum"])
+    if "const" in spec:
+        return json.dumps(spec["const"])
+    kind = str(spec.get("type", "any"))
+    if kind == "array":
+        return f"array of {_type_name(spec.get('items', {}), defs)}"
+    return kind
+
+
+def request_fields(model: type[BaseModel]) -> str:
+    """The request object's own fields, so a caller never has to guess at the schema."""
+    schema = model.model_json_schema()
+    defs = schema.get("$defs", {})
+    required = set(schema.get("required", ()))
+    lines = [f"{model.__name__} fields (pass them inside the request object):"]
+    for name, spec in schema.get("properties", {}).items():
+        mark = "required" if name in required else "optional"
+        lines.append(f"- {name}: {_type_name(spec, defs)} ({mark})")
+    return "\n".join(lines)
+
+
+def _describe(summary: str, model: type[BaseModel]) -> str:
+    return f"{summary}\n\n{request_fields(model)}"
+
+
+def _failure_for(name: str, log_path: Path, exc: Exception) -> dict[str, Any]:
+    """Turn whatever a tool body raised into the envelope's error body."""
+    if isinstance(exc, TaskSpindleError):
         return _failure(exc.to_error_body())
-    except ValidationError as exc:
+    if isinstance(exc, ValidationError):
         return _failure(
             ErrorBody(
                 code=INVALID_REQUEST,
@@ -112,15 +141,32 @@ def _guard(name: str, log_path: Path, call: Callable[[], dict[str, Any]]) -> dic
                 },
             )
         )
-    except Exception as exc:
-        _log_traceback(log_path, name, exc)
-        return _failure(
-            ErrorBody(
-                code=INTERNAL,
-                message="the server hit an unexpected error; see the server log",
-                details={"exception": type(exc).__name__},
-            )
+    _log_traceback(log_path, name, exc)
+    return _failure(
+        ErrorBody(
+            code=INTERNAL,
+            message="the server hit an unexpected error; see the server log",
+            details={"exception": type(exc).__name__},
         )
+    )
+
+
+def _guard(name: str, log_path: Path, call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    """Run one tool body and turn whatever happens into an envelope."""
+    try:
+        return _envelope(call())
+    except Exception as exc:
+        return _failure_for(name, log_path, exc)
+
+
+async def _guard_async(
+    name: str, log_path: Path, call: Callable[[], Awaitable[dict[str, Any]]]
+) -> dict[str, Any]:
+    """The same, for a tool body that has to be awaited on the server's own loop."""
+    try:
+        return _envelope(await call())
+    except Exception as exc:
+        return _failure_for(name, log_path, exc)
 
 
 def build_server(orchestrator: Orchestrator) -> FastMCP:
@@ -136,12 +182,13 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
     )
     log_path = orchestrator.paths.state_dir / "server.log"
 
-    def tool(name: str) -> Callable[[Callable[..., Any]], Any]:
+    def tool(name: str, description: str | None = None) -> Callable[[Callable[..., Any]], Any]:
         # ``run_in_thread=False`` is load-bearing: the store is one sqlite connection bound to
         # the thread that opened it, and tool calls arrive one at a time from a single session.
         # Serialising them on the loop thread is both correct and what the protocol already does.
         return mcp.tool(
             name=name,
+            description=description,
             annotations={"readOnlyHint": name in READ_ONLY_TOOLS},
             run_in_thread=False,
         )
@@ -155,11 +202,12 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         return call("capabilities", orchestrator.capabilities)
 
     @tool("doctor")
-    def doctor(live_probes: bool = True) -> dict[str, Any]:
+    async def doctor(live_probes: bool = True) -> dict[str, Any]:
         """Check git, systemd, node, the pinned adapter, credentials and every profile."""
-        return call(
+        return await _guard_async(
             "doctor",
-            lambda: doctor_module.run_doctor(
+            log_path,
+            lambda: doctor_module.run_doctor_async(
                 profiles=orchestrator.profiles,
                 paths=orchestrator.paths,
                 parent_env=orchestrator.parent_env,
@@ -167,15 +215,21 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
             ),
         )
 
-    @tool("authorize_repository")
-    def authorize_repository(
-        path: str, providers: list[str], modes: list[str]
-    ) -> dict[str, Any]:
-        """Grant providers the modes they may use on the repository containing ``path``."""
-        return call(
-            "authorize_repository",
-            lambda: orchestrator.authorize_repository(path, providers, modes),
-        )
+    @tool(
+        "authorize_repository",
+        _describe(
+            "Grant providers the modes they may use on the repository containing `path`.",
+            AuthorizeRepositoryRequest,
+        ),
+    )
+    def authorize_repository(request: dict[str, Any]) -> dict[str, Any]:
+        def body() -> dict[str, Any]:
+            parsed = AuthorizeRepositoryRequest.model_validate(request)
+            return orchestrator.authorize_repository(
+                parsed.path, parsed.providers, [mode.value for mode in parsed.modes]
+            )
+
+        return call("authorize_repository", body)
 
     @tool("revoke_repository")
     def revoke_repository(
@@ -194,43 +248,19 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         """Every repository TaskSpindle knows and the grants each one holds."""
         return call("list_repository_policies", orchestrator.list_repository_policies)
 
-    @tool("start_task")
-    def start_task(
-        provider: str,
-        mode: Mode,
-        prompt: str,
-        repository: str | None = None,
-        model: str | None = None,
-        effort: str | None = None,
-        timeout_s: int = 1800,
-        allow_metered: bool = False,
-        acceptance_criteria: str | None = None,
-        path_prefixes: list[str] | None = None,
-        verification_commands: list[str] | None = None,
-        candidate_message: str | None = None,
-        review_target: ReviewTarget | None = None,
-    ) -> dict[str, Any]:
-        """Create one task and queue it. Implement mode needs a repository, acceptance criteria,
-        path prefixes, verification commands and a one-line candidate commit message."""
+    @tool(
+        "start_task",
+        _describe(
+            "Create one task and queue it. Implement mode needs a repository, acceptance "
+            "criteria, path prefixes, verification commands and a one-line candidate commit "
+            "message; review mode needs a review_target.",
+            StartTaskRequest,
+        ),
+    )
+    def start_task(request: dict[str, Any]) -> dict[str, Any]:
         return call(
             "start_task",
-            lambda: orchestrator.start_task(
-                StartTaskRequest(
-                    provider=provider,
-                    mode=mode,
-                    prompt=prompt,
-                    repository=repository,
-                    model=model,
-                    effort=effort,
-                    timeout_s=timeout_s,
-                    allow_metered=allow_metered,
-                    acceptance_criteria=acceptance_criteria,
-                    path_prefixes=path_prefixes,
-                    verification_commands=verification_commands,
-                    candidate_message=candidate_message,
-                    review_target=review_target,
-                )
-            ),
+            lambda: orchestrator.start_task(StartTaskRequest.model_validate(request)),
         )
 
     @tool("list_tasks")
@@ -275,57 +305,36 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
             lambda: orchestrator.continue_task(task_id, expected_state_version, prompt),
         )
 
-    @tool("accept_task")
-    def accept_task(
-        task_id: str,
-        expected_state_version: int,
-        candidate_sha: str,
-        diff_digest: str,
-        inspection_summary: str,
-        expected_target_head: str,
-        review_task_id: str,
-        commit_message: str,
-        dispositions: list[FindingDisposition] | None = None,
-    ) -> dict[str, Any]:
-        """Accept a candidate into the repository. Requires the full diff to have been retrieved,
-        an independent review, and a disposition for every blocking or critical finding."""
+    @tool(
+        "accept_task",
+        _describe(
+            "Accept a candidate into the repository. Requires the full diff to have been "
+            "retrieved, an independent review, and a disposition for every blocking or critical "
+            "finding.",
+            AcceptTaskRequest,
+        ),
+    )
+    def accept_task(request: dict[str, Any]) -> dict[str, Any]:
         return call(
             "accept_task",
-            lambda: orchestrator.accept_task(
-                AcceptTaskRequest(
-                    task_id=task_id,
-                    expected_state_version=expected_state_version,
-                    candidate_sha=candidate_sha,
-                    diff_digest=diff_digest,
-                    inspection_summary=inspection_summary,
-                    expected_target_head=expected_target_head,
-                    review_task_id=review_task_id,
-                    dispositions=dispositions or [],
-                    commit_message=commit_message,
-                )
-            ),
+            lambda: orchestrator.accept_task(AcceptTaskRequest.model_validate(request)),
         )
 
-    @tool("record_integration")
-    def record_integration(
-        task_id: str,
-        expected_state_version: int,
-        kind: str,
-        summary: str,
-        resulting_head: str | None = None,
-    ) -> dict[str, Any]:
-        """Record what you did by hand: conflict_resolved, manual_integration, or
-        root_mutation_acknowledged (which clears the warning blocking an acceptance)."""
+    @tool(
+        "record_integration",
+        _describe(
+            "Record what you did by hand: conflict_resolved, manual_integration (both still "
+            "require the whole diff and an independent review, and a resulting_head that exists "
+            "in the repository), or root_mutation_acknowledged, which clears the warning "
+            "blocking an acceptance of this candidate revision.",
+            RecordIntegrationRequest,
+        ),
+    )
+    def record_integration(request: dict[str, Any]) -> dict[str, Any]:
         return call(
             "record_integration",
             lambda: orchestrator.record_integration(
-                RecordIntegrationRequest(
-                    task_id=task_id,
-                    expected_state_version=expected_state_version,
-                    kind=kind,  # type: ignore[arg-type]
-                    resulting_head=resulting_head,
-                    summary=summary,
-                )
+                RecordIntegrationRequest.model_validate(request)
             ),
         )
 

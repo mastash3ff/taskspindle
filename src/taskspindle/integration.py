@@ -259,9 +259,16 @@ def abort_staged(identity: RepositoryIdentity, *, journal: Journal) -> None:
 
 
 def recover_journal(identity: RepositoryIdentity, journal: Journal) -> str:
-    """Bring a journal recovered from disk back to a settled state."""
+    """Bring a journal recovered from disk back to a settled state.
+
+    A ``probing`` journal is settled already: the probe is a pure ``merge-tree`` that never
+    touches the index or the working tree, so there is nothing to undo and the operator's own
+    uncommitted work is left exactly where it is.
+    """
     if journal.phase == PHASES[-1]:
         return "committed"
+    if journal.phase == PHASES[0]:
+        return "aborted"
     if journal.phase in PHASES:
         abort_staged(identity, journal=journal)
         return "aborted"
