@@ -31,7 +31,7 @@ from .models import (
     Verdict,
 )
 from .providers import Profile
-from .store import StaleStateVersionError, Store, now
+from .store import ProviderStatusReader, StaleStateVersionError, Store, now
 
 # -- error codes --------------------------------------------------------------------
 
@@ -264,7 +264,7 @@ def require_task(store: Store, task_id: str) -> TaskRecord:
 
 
 def provider_availability(
-    store: Store, profile: Profile, *, now: datetime
+    store: ProviderStatusReader, profile: Profile, *, now: datetime
 ) -> dict[str, Any]:
     """What TaskSpindle currently believes about a provider's willingness to take a turn."""
     key = limits.status_key(profile)

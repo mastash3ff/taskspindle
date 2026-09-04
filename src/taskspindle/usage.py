@@ -24,7 +24,7 @@ from typing import Any, Literal
 from . import limits
 from .acp_client import TurnResult
 from .providers import Profile
-from .store import Store
+from .store import UsageReader
 
 __all__ = [
     "PRICES_USD_PER_MTOK",
@@ -434,7 +434,7 @@ def _stats(values: list[int]) -> dict[str, Any]:
 
 
 def report(
-    store: Store,
+    store: UsageReader,
     *,
     since: str | None = None,
     provider: str | None = None,
@@ -536,7 +536,7 @@ _WINDOW_NOTES = {
 
 
 def windows_report(
-    store: Store, profiles: Mapping[str, Profile], now: datetime
+    store: UsageReader, profiles: Mapping[str, Profile], now: datetime
 ) -> list[dict[str, Any]]:
     """Per provider: what is known about its usage windows, and how much can be known at all."""
     keys: dict[str, str] = {}

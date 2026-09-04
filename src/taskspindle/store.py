@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .models import (
     TASK_BOOL_COLUMNS,
@@ -26,6 +26,38 @@ from .models import (
     ReviewOutput,
     TaskRecord,
 )
+
+
+class ProviderStatusReader(Protocol):
+    """The read interface needed to describe provider availability."""
+
+    def get_provider_status(self, provider: str) -> dict[str, Any] | None: ...
+
+
+class UsageReader(ProviderStatusReader, Protocol):
+    """The store reads needed by usage and window reports."""
+
+    def get_task(self, task_id: str) -> TaskRecord | None: ...
+
+    def list_turn_usage(
+        self, *, since: str | None = None, provider: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def list_provider_status(self) -> list[dict[str, Any]]: ...
+
+    def latest_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]: ...
+
+    def task_counts(self, *, since: str | None = None) -> list[dict[str, Any]]: ...
+
+    def turn_durations_ms(
+        self, *, since: str | None = None, provider: str | None = None,
+    ) -> list[tuple[str, str, int]]: ...
+
+    def check_durations_ms(self, *, since: str | None = None) -> list[tuple[str, bool, int]]: ...
+
+    def violation_counts(self, *, since: str | None = None) -> list[dict[str, Any]]: ...
+
 
 BUSY_TIMEOUT_MS = 10_000
 
@@ -1176,8 +1208,10 @@ __all__: Sequence[str] = (
     "VIOLATION_EVENT_KINDS",
     "ConstraintError",
     "NotFoundError",
+    "ProviderStatusReader",
     "StaleStateVersionError",
     "Store",
     "StoreError",
+    "UsageReader",
     "now",
 )

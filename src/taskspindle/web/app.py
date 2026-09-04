@@ -88,6 +88,7 @@ def build_app(
     """Build the dashboard app. ``clock`` lets tests fix "now" for provider/usage windows."""
     clock = clock or (lambda: datetime.now(UTC))
     db_path = paths.state_dir / "taskspindle.sqlite3"
+    # The dashboard serves assets from an unpacked filesystem installation (including wheels).
     static_dir = importlib.resources.files("taskspindle.web") / "static"
 
     def _store() -> ReadOnlyStore:
@@ -303,7 +304,7 @@ def build_app(
 
     routes = [
         Route("/", index, methods=["GET"]),
-        Mount("/static", app=StaticFiles(directory=static_dir), name="static"),
+        Mount("/static", app=StaticFiles(directory=Path(str(static_dir))), name="static"),
         Route("/api/health", health, methods=["GET"]),
         Route("/api/tasks", list_tasks_endpoint, methods=["GET"]),
         Route("/api/tasks/{task_id}", task_detail_endpoint, methods=["GET"]),
