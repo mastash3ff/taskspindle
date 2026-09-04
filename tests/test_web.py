@@ -305,17 +305,18 @@ def test_providers_shape_and_throttled_availability(tmp_path: Path) -> None:
 # -- usage ----------------------------------------------------------------------------
 
 
-def test_usage_endpoint_matches_usage_report(tmp_path: Path) -> None:
+@pytest.mark.parametrize("group_by", ["provider", "repository_id"])
+def test_usage_endpoint_matches_usage_report(tmp_path: Path, group_by: str) -> None:
     paths = _paths(tmp_path)
     _seed(paths)
     client = _client(paths)
 
-    resp = client.get("/api/usage", params={"group_by": "provider"})
+    resp = client.get("/api/usage", params={"group_by": group_by})
     assert resp.status_code == 200
     body = resp.json()
 
     store = Store.open(paths.state_dir / "taskspindle.sqlite3")
-    expected = usage.report(store, group_by="provider", profiles=PROFILES, now=NOW)
+    expected = usage.report(store, group_by=group_by, profiles=PROFILES, now=NOW)
     store.close()
 
     assert body["usage"] == expected["usage"]

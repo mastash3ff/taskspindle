@@ -142,7 +142,8 @@ def test_claude_configuration_model_precedes_the_session_file(
     assert bool(reads) is (session_model is None)
 
 
-def _seed(store: Store, provider: str, mode: Mode, *, state: TaskState, ms: int, tokens: int) -> str:
+def _seed(store: Store, provider: str, mode: Mode, *, state: TaskState, ms: int, tokens: int,
+          repository_id: str | None = None) -> str:
     fields: dict[str, object] = {"provider": provider, "mode": mode, "prompt": "p"}
     if mode is Mode.IMPLEMENT:
         fields.update(
@@ -151,7 +152,9 @@ def _seed(store: Store, provider: str, mode: Mode, *, state: TaskState, ms: int,
         )
     if mode is Mode.REVIEW:
         fields["review_target"] = {"kind": "candidate", "task_id": "ts_x", "candidate_sha": "abc"}
-    record = create_task(store, StartTaskRequest(**fields), repository_id=None, auth_mode=AuthMode.OAUTH)
+    record = create_task(
+        store, StartTaskRequest(**fields), repository_id=repository_id, auth_mode=AuthMode.OAUTH
+    )
     store.update_task(record.id, None, state=state)
     started = "2030-01-02T11:00:00.000000Z"
     ended = f"2030-01-02T11:00:{ms // 1000:02d}.{ms % 1000:03d}000Z"
@@ -208,3 +211,33 @@ def test_report_rolls_up_tokens_outcomes_and_timings(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="group_by"):
         usage.report(store, group_by="colour", now=NOW)
     store.close()
+
+
+def test_repository_rollup_matches_read_only_store_and_preserves_filters(tmp_path: Path) -> None:
+    from taskspindle.web.db import ReadOnlyStore
+
+    path = tmp_path / "s.sqlite3"
+    with Store.open(path) as store:
+        for repo in ("r1", "r2"):
+            store.insert_repository(repo, f"/{repo}/.git", repo, f"/{repo}")
+        tasks = []
+        for repo, provider, tokens in [
+            ("r1", "claude", 100), ("r1", "grok", 200), ("r2", "claude", 400),
+            (None, "grok", 800),
+        ]:
+            tasks.append(_seed(store, provider, Mode.CONSULT, state=TaskState.COMPLETED,
+                               ms=1000, tokens=tokens, repository_id=repo))
+        result = usage.report(store, group_by="repository_id", now=NOW)
+        assert {row["repository_id"]: row["input_tokens"] for row in result["usage"]} == {
+            "r1": 300, "r2": 400, None: 800,
+        }
+        assert next(row for row in result["usage"] if row["repository_id"] == "r1")["turns"] == 2
+        with ReadOnlyStore(path) as reader:
+            assert usage.report(reader, group_by="repository_id", now=NOW) == result
+            for backend in (store, reader):
+                filtered = usage.report(backend, provider="claude", group_by="repository_id", now=NOW)
+                assert {r["repository_id"]: r["input_tokens"] for r in filtered["usage"]} == {
+                    "r1": 100, "r2": 400,
+                }
+                assert backend.list_turn_usage(task_id=tasks[1])[0]["repository_id"] == "r1"
+                assert backend.list_turn_usage(since="2999-01-01T00:00:00Z") == []

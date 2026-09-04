@@ -404,9 +404,9 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         provider: str | None = None,
         group_by: str = "provider",
     ) -> dict[str, Any]:
-        """Tokens and estimated cost per provider, day, model or mode; outcomes by state; turn
-        and check timings; violations; and each provider's usage windows as far as they are
-        observable. since is ISO-8601 or shorthand like 7d, 24h, 30m."""
+        """Tokens and estimated cost grouped by provider, day, provider_day, model, mode or repository_id;
+        outcomes by state; turn and check timings; violations; and each provider's observable
+        usage windows. since is ISO-8601 or shorthand like 7d, 24h, 30m."""
         return call(
             "usage_report", lambda: orchestrator.usage_report(since, provider, group_by)
         )

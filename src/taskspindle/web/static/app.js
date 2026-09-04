@@ -11,7 +11,7 @@
     "RECOVERY_AMBIGUOUS", "CANCELLING", "CANCELLED", "FAILED",
   ];
   var TASK_MODES = ["consult", "review", "implement"];
-  var GROUP_BY_OPTIONS = ["provider", "day", "provider_day", "model", "mode"];
+  var GROUP_BY_OPTIONS = ["provider", "day", "provider_day", "model", "mode", "repository_id"];
 
   var taskFilters = { state: "", provider: "", mode: "" };
   var usageFilters = { since: "7d", group_by: "provider", provider: "" };
@@ -583,7 +583,7 @@
   function renderUsageTable(rows) {
     var wrap = h("div", { class: "panel" });
     wrap.appendChild(h("h2", null, "Token usage"));
-    var keys = ["provider", "day", "model", "mode"].filter(function (k) {
+    var keys = ["provider", "day", "model", "mode", "repository_id"].filter(function (k) {
       return rows.some(function (r) { return k in r; });
     });
     var columns = keys.concat([

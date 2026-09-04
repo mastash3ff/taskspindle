@@ -257,16 +257,19 @@ class ReadOnlyStore:
         clauses: list[str] = []
         params: list[Any] = []
         if since is not None:
-            clauses.append("captured_at >= ?")
+            clauses.append("u.captured_at >= ?")
             params.append(since)
         if provider is not None:
-            clauses.append("provider = ?")
+            clauses.append("u.provider = ?")
             params.append(provider)
         if task_id is not None:
-            clauses.append("task_id = ?")
+            clauses.append("u.task_id = ?")
             params.append(task_id)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(f"SELECT * FROM turn_usage{where} ORDER BY id", params).fetchall()
+        rows = self._conn.execute(
+            "SELECT u.*, t.repository_id FROM turn_usage u JOIN tasks t ON t.id = u.task_id "
+            f"{where} ORDER BY u.id", params
+        ).fetchall()
         return [self._usage_row(row) for row in rows]
 
     # -- provider windows -------------------------------------------------------------

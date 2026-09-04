@@ -201,3 +201,20 @@ def test_web_parses_defaults_and_calls_serve(home: Path, monkeypatch: pytest.Mon
     assert seen["port"] == 8765
     assert seen["open_browser"] is False
     assert seen["profiles"] == ["claude", "grok"]
+
+
+
+def test_repository_usage_prints_the_repository_label(home: Path, capsys) -> None:
+    from taskspindle.models import Mode, TaskState
+    from taskspindle.store import Store
+    from tests.test_usage import _seed
+
+    with Store.open(cli.resolve_paths().state_dir / "taskspindle.sqlite3") as store:
+        store.insert_repository("repo-example", "/repo/.git", "root", "/repo")
+        _seed(store, "claude", Mode.CONSULT, state=TaskState.COMPLETED,
+              ms=1000, tokens=123, repository_id="repo-example")
+    assert cli.main(["usage", "--group-by", "repository_id"]) == 0
+    output = capsys.readouterr().out
+    assert "repository_id" in output
+    assert "repo-example" in output
+    assert "123" in output

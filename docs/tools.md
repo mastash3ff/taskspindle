@@ -209,7 +209,7 @@ display names such as a `default` description still use the bounded file-read fa
 usage, rate, credit or login refusal a turn of this task ran into, each as
 `{"code", "provider", "status_key", "state", "window", "reset_at", "observed_at", "source",
 "message"}`. `usage` is one entry per turn that reported token counts:
-`{"provider", "model", "input_tokens", "output_tokens", "cache_read_tokens",
+`{"provider", "repository_id", "model", "input_tokens", "output_tokens", "cache_read_tokens",
 "cache_write_tokens", "reasoning_tokens", "model_calls", "duration_ms", "cost_estimate_usd",
 "cost_is_estimate", "price_table_version", "source", "raw", "captured_at"}`. See
 [`usage_report`](#usage_report) for what the cost is and is not.
@@ -374,7 +374,11 @@ can use any more — is deleted outright and the cleanup completes.
 | --- | --- | --- | --- |
 | `since` | string\|null | `null` | ISO-8601, or shorthand: `7d`, `24h`, `30m`, `90s` |
 | `provider` | string\|null | `null` | only this profile |
-| `group_by` | `provider`\|`day`\|`provider_day`\|`model`\|`mode` | `provider` | how the token counts are rolled up |
+| `group_by` | `provider`\|`day`\|`provider_day`\|`model`\|`mode`\|`repository_id` | `provider` | how the token counts are rolled up |
+
+`repository_id` combines providers within each repository; repository-free turns share a `null`
+group, displayed as `-` in tables. Tables show stable repository IDs, not paths. Individual
+`task_result.usage` entries also include `repository_id`. Existing provider and time filters apply.
 
 Returns:
 

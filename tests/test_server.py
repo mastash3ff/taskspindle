@@ -111,10 +111,11 @@ async def test_the_request_object_tools_describe_their_fields(server) -> None:
 async def test_usage_report_and_the_diff_page_default_are_on_the_wire(server) -> None:
     async with Client(server) as client:
         tools = {tool.name: tool for tool in await client.list_tools()}
-        result = await client.call_tool("usage_report", {"since": "7d"})
+        result = await client.call_tool("usage_report", {"since": "7d", "group_by": "repository_id"})
 
     assert tools["task_diff"].inputSchema["properties"]["length"]["default"] == 16384
     assert result.data["ok"] is True
+    assert result.data["result"]["group_by"] == "repository_id"
     assert result.data["result"]["usage"] == []
     assert result.data["result"]["turns"]["count"] == 0
     assert "cost_note" in result.data["result"]

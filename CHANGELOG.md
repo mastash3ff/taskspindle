@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Usage by repository.** `repository_id` grouping is available in MCP, the CLI and dashboard,
+  including a null group for repository-free tasks; no migration is needed.
 - **Recovery choices.** `continue_task` can ask form-capable MCP clients to retry or cancel
   ambiguous recovery, while preserving recovery and stale-version checks and the existing error fallback.
 - **Claude model metadata.** Canonical model ids returned by ACP session creation or loading

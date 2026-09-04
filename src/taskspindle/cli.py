@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument(
         "--group-by",
         default="provider",
-        choices=("provider", "day", "provider_day", "model", "mode"),
+        choices=("provider", "day", "provider_day", "model", "mode", "repository_id"),
         help="how to roll the token counts up (default: provider)",
     )
     usage.add_argument("--json", action="store_true", help="print the report as JSON")
@@ -263,7 +263,10 @@ def _usage(since: str | None, provider: str | None, group_by: str, *, as_json: b
 
 def _print_usage(report: dict[str, Any]) -> None:
     """A few fixed-width tables; the JSON form carries everything."""
-    keys = [key for key in ("provider", "day", "model", "mode") if any(key in row for row in report["usage"])]
+    keys = [
+        key for key in ("provider", "day", "model", "mode", "repository_id")
+        if any(key in row for row in report["usage"])
+    ]
     columns = [*keys, "turns", "input", "output", "cache_read", "cache_write", "est_usd"]
     rows = [
         [

@@ -70,7 +70,7 @@ SOURCE_SESSION_FILE = "session_file"
 _SINCE_SHORTHAND = re.compile(r"^(\d+)([smhd])$")
 _SINCE_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
 
-GroupBy = Literal["provider", "day", "provider_day", "model", "mode"]
+GroupBy = Literal["provider", "day", "provider_day", "model", "mode", "repository_id"]
 
 
 @dataclass(frozen=True)
@@ -409,6 +409,8 @@ def parse_since(text: str | None, now: datetime | None = None) -> str | None:
 
 def _group_key(row: Mapping[str, Any], mode_by_task: Mapping[str, str], group_by: str) -> dict[str, Any]:
     day = str(row.get("captured_at") or "")[:10]
+    if group_by == "repository_id":
+        return {"repository_id": row.get("repository_id")}
     if group_by == "provider":
         return {"provider": row["provider"]}
     if group_by == "day":

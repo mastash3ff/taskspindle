@@ -48,7 +48,7 @@ may not exist yet — `/api/health` says so, and every list renders empty instea
   usage windows, and the same preflight checks `taskspindle doctor` runs. A "run live probes"
   button re-runs those checks live, from the browser, on demand.
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
-  choose (since, provider, group-by), task outcomes, turn and check timing summaries, violation
+  choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
   counts, window telemetry notes, and the cost-estimate disclaimer.
 
 The task and providers views poll every 5 seconds; usage polls every 30. Polling pauses while the
