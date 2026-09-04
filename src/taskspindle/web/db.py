@@ -48,6 +48,8 @@ class ReadOnlyStore:
         if self.exists:
             self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            self._conn.create_function("casefold", 1, lambda value: (value or "").casefold(),
+                                       deterministic=True)
             self._conn.execute("PRAGMA query_only=1")
 
     def close(self) -> None:
@@ -101,6 +103,7 @@ class ReadOnlyStore:
         mode: str | None = None,
         state: str | None = None,
         limit: int = 50,
+        q: str | None = None,
     ) -> list[TaskRecord]:
         if self._conn is None:
             return []
@@ -115,6 +118,11 @@ class ReadOnlyStore:
             if value is not None:
                 clauses.append(f"{column} = ?")
                 params.append(value)
+        if q and q.strip():
+            clauses.append(
+                "(instr(casefold(id), casefold(?)) > 0 OR instr(casefold(prompt), casefold(?)) > 0)"
+            )
+            params.extend([q.strip(), q.strip()])
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(int(limit))
         rows = self._conn.execute(

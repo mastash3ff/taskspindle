@@ -374,3 +374,31 @@ def test_page_and_static_assets_serve_and_stay_same_origin(tmp_path: Path) -> No
 
     css = client.get("/static/style.css")
     assert css.status_code == 200
+
+
+def test_task_search_combines_filters_and_matches_literals(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    seeded = _seed(paths)
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        store.update_task(seeded["task_id"], None, prompt="ÉTAPE 50%_OFF literally")
+    client = _client(paths)
+    result = client.get("/api/tasks", params={
+        "q": " étape 50%_off ", "provider": "claude", "limit": 1,
+    }).json()
+    assert [t["id"] for t in result["tasks"]] == [seeded["task_id"]]
+    assert client.get("/api/tasks", params={"q": "50%_off", "provider": "grok"}).json()["tasks"] == []
+    result = client.get("/api/tasks", params={"q": seeded["reviewer_id"].upper()}).json()
+    assert [t["id"] for t in result["tasks"]] == [seeded["reviewer_id"]]
+
+
+def test_diff_comparison_rejects_a_moved_candidate(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    seeded = _seed(paths)
+    client = _client(paths)
+    url = f"/api/tasks/{seeded['task_id']}/diff"
+    assert client.get(url, params={"revision": 1, "candidate_sha": "cand1"}).text == seeded["diff_text"]
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        store.update_task(seeded["task_id"], None, candidate_sha="cand2", candidate_revision=2)
+    assert client.get(url, params={"revision": 1, "candidate_sha": "cand1"}).status_code == 409
+    assert client.get(f"/api/tasks/{seeded['task_id']}").json()["review"] is None
+    assert client.get(url, params={"revision": 1}).text == seeded["diff_text"]

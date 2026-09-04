@@ -116,3 +116,10 @@ button:hover { background: var(--code-bg); }
 .kv dd { margin: 0; }
 
 .section-title { margin-top: 1.5rem; }
+
+.candidate-review { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1rem; }
+.candidate-review > .panel { min-width: 0; }
+.candidate-review td { white-space: normal; overflow-wrap: anywhere; }
+.candidate-review pre { max-height: 65vh; overflow: auto; }
+.diff-line:focus { outline: 2px solid var(--accent); background: var(--panel); }
+@media (max-width: 800px) { .candidate-review { grid-template-columns: minmax(0, 1fr); } }

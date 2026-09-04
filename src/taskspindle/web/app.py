@@ -153,6 +153,7 @@ def build_app(
                 mode=params.get("mode"),
                 state=params.get("state"),
                 limit=limit,
+                q=params.get("q"),
             )
         tasks = [task_view(record).model_dump(mode="json") for record in records]
         return JSONResponse({"tasks": tasks})
@@ -239,6 +240,11 @@ def build_app(
                 revision = int(revision_raw) if revision_raw is not None else record.candidate_revision
             except ValueError:
                 return JSONResponse({"error": "INVALID_REVISION"}, status_code=400)
+            expected_sha = params.get("candidate_sha")
+            if expected_sha is not None and (
+                revision != record.candidate_revision or expected_sha != record.candidate_sha
+            ):
+                return JSONResponse({"error": "CANDIDATE_CHANGED"}, status_code=409)
             artifact = store.get_artifact(task_id, revision, "candidate_diff")
         if artifact is None:
             return JSONResponse({"error": "DIFF_NOT_FOUND"}, status_code=404)

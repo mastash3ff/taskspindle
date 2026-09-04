@@ -13,7 +13,9 @@
   var TASK_MODES = ["consult", "review", "implement"];
   var GROUP_BY_OPTIONS = ["provider", "day", "provider_day", "model", "mode", "repository_id"];
 
-  var taskFilters = { state: "", provider: "", mode: "" };
+  var taskFilters = { state: "", provider: "", mode: "", q: "" };
+  var searchTimer = null;
+  var taskRequest = 0;
   var usageFilters = { since: "7d", group_by: "provider", provider: "" };
 
   // -- small DOM helpers ------------------------------------------------------------
@@ -175,6 +177,8 @@
   }
 
   function navigate() {
+    taskRequest += 1;
+    clearTimeout(searchTimer);
     var route = parseRoute();
     highlightNav(route);
     stopPolling();
@@ -199,24 +203,44 @@
   // -- tasks list -----------------------------------------------------------------
 
   function renderTasks() {
+    var request = ++taskRequest;
     var params = new URLSearchParams();
     if (taskFilters.state) params.set("state", taskFilters.state);
     if (taskFilters.provider) params.set("provider", taskFilters.provider);
     if (taskFilters.mode) params.set("mode", taskFilters.mode);
+    if (taskFilters.q) params.set("q", taskFilters.q);
     params.set("limit", "200");
     return getJSON("/api/tasks?" + params.toString()).then(function (data) {
+      if (request !== taskRequest || parseRoute().name !== "tasks") return;
+      var active = document.activeElement;
+      var cursor = active && active.id === "task-search" ? active.selectionStart : null;
       clearNode(APP);
       var panel = h("div", { class: "panel" });
       panel.appendChild(h("h1", null, "Tasks"));
       panel.appendChild(renderTaskFilters());
       panel.appendChild(renderTaskTable(data.tasks));
       APP.appendChild(panel);
+      if (cursor !== null) {
+        var search = document.getElementById("task-search");
+        search.focus();
+        search.setSelectionRange(cursor, cursor);
+      }
       setRefreshed();
     });
   }
 
   function renderTaskFilters() {
     var wrap = h("div", { class: "filters" });
+    var search = h("input", { id: "task-search", type: "search", placeholder: "Search ID or prompt",
+      "aria-label": "Search task ID or prompt" });
+    search.value = taskFilters.q;
+    search.addEventListener("input", function () {
+      taskFilters.q = search.value;
+      taskRequest += 1;
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(function () { renderTasks().catch(showError); }, 250);
+    });
+    wrap.appendChild(search);
     wrap.appendChild(selectWithAll("states", taskFilters.state, TASK_STATES, function (v) {
       taskFilters.state = v;
       renderTasks().catch(showError);
@@ -261,9 +285,16 @@
   // -- task detail ------------------------------------------------------------------
 
   function renderTaskDetail(id) {
+    var request = ++taskRequest;
     return getJSON("/api/tasks/" + encodeURIComponent(id)).then(function (data) {
-      clearNode(APP);
+      if (request !== taskRequest || parseRoute().id !== id) return;
       var task = data.task;
+      var key = [id, task.candidate_sha, task.candidate_revision].join(":");
+      var prior = APP.querySelector("[data-candidate]");
+      var priorDiff = prior && prior.dataset.candidate === key && prior.querySelector(".candidate-diff");
+      var scroll = priorDiff ? { top: priorDiff.scrollTop, left: priorDiff.scrollLeft } : null;
+      var focused = priorDiff && priorDiff.contains(document.activeElement) ? document.activeElement.id : null;
+      clearNode(APP);
       var top = h("div", { class: "panel" });
       top.appendChild(h("h1", null, "Task " + task.id));
       top.appendChild(h("p", null, h("a", { href: "#/tasks" }, "← back to tasks")));
@@ -272,12 +303,23 @@
       APP.appendChild(renderEvents(data.events));
       APP.appendChild(renderTurns(data.turns));
       APP.appendChild(renderChecksPanel(data.checks));
-      APP.appendChild(renderReview(data.review));
+      var comparison = h("div", { "data-candidate": key });
+      APP.appendChild(comparison);
       APP.appendChild(renderWarnings(task.warnings));
       APP.appendChild(renderWorkerLog(data.worker_log));
       setRefreshed();
       return renderDiffSection(task).then(function (diffPanel) {
-        APP.appendChild(diffPanel);
+        if (request !== taskRequest || !comparison.isConnected) return;
+        comparison.appendChild(diffPanel);
+        var diff = diffPanel.querySelector(".candidate-diff");
+        if (diff) comparison.className = "candidate-review";
+        comparison.appendChild(renderReview(data.review, diffPanel));
+        if (diff && scroll) {
+          diff.scrollTop = scroll.top;
+          diff.scrollLeft = scroll.left;
+          var target = focused && document.getElementById(focused);
+          if (target) target.focus({ preventScroll: true });
+        }
       });
     });
   }
@@ -391,11 +433,11 @@
     return wrap;
   }
 
-  function renderReview(review) {
+  function renderReview(review, diffPanel) {
     var wrap = h("div", { class: "panel" });
     wrap.appendChild(h("h2", null, "Review"));
     if (!review) {
-      wrap.appendChild(h("p", { class: "muted" }, "no review"));
+      wrap.appendChild(h("p", { class: "muted" }, "no review for this candidate"));
       return wrap;
     }
     wrap.appendChild(kv([
@@ -408,7 +450,19 @@
       wrap.appendChild(tableOf(
         ["id", "severity", "path", "line", "evidence", "remedy"],
         review.findings,
-        function (f) { return [f.id, f.severity, f.path, f.line, f.evidence, f.remedy]; }
+        function (f) {
+          var location = f.path;
+          var target = diffPanel && diffPanel.querySelector('[id="' + diffAnchor(f.path, f.line) + '"]');
+          if (target) {
+            location = h("a", { href: "#" + target.id }, f.path);
+            location.addEventListener("click", function (event) {
+              event.preventDefault();
+              target.scrollIntoView({ block: "center" });
+              target.focus({ preventScroll: true });
+            });
+          }
+          return [f.id, f.severity, location, f.line, f.evidence, f.remedy];
+        }
       ));
     }
     return wrap;
@@ -438,10 +492,44 @@
     return wrap;
   }
 
+  function diffAnchor(path, line) {
+    return "diff-" + encodeURIComponent(path || "").replace(/'/g, "%27") + "-" + String(line || "file");
+  }
+
+  function renderDiffLines(text) {
+    var pre = h("pre", { class: "candidate-diff" });
+    var path = "", line = null;
+    text.split("\n").forEach(function (value) {
+      var node = h("span", { class: "diff-line", tabindex: "-1" }, value + "\n");
+      if (value.indexOf("+++ b/") === 0) {
+        path = value.slice(6);
+        node.id = diffAnchor(path, null);
+        line = null;
+      } else if (value.indexOf("diff --git ") === 0) {
+        path = ""; line = null;
+      } else {
+        var hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(value);
+        if (hunk) line = Number(hunk[1]);
+        else if (path && line !== null && /^[ +]/.test(value)) {
+          node.id = diffAnchor(path, line);
+          line += 1;
+        }
+      }
+      pre.appendChild(node);
+    });
+    return pre;
+  }
+
   function renderDiffSection(task) {
     var wrap = h("div", { class: "panel" });
     wrap.appendChild(h("h2", null, "Diff"));
-    return fetch("/api/tasks/" + encodeURIComponent(task.id) + "/diff").then(function (resp) {
+    var query = new URLSearchParams({ revision: task.candidate_revision });
+    if (task.candidate_sha) query.set("candidate_sha", task.candidate_sha);
+    return fetch("/api/tasks/" + encodeURIComponent(task.id) + "/diff?" + query).then(function (resp) {
+      if (resp.status === 409) {
+        wrap.appendChild(h("p", { class: "muted" }, "Candidate changed. Refresh this task to compare its current diff and review."));
+        return wrap;
+      }
       if (resp.status === 404) {
         wrap.appendChild(h("p", { class: "muted" }, "no diff for this task"));
         return wrap;
@@ -450,7 +538,7 @@
       return resp.text().then(function (text) {
         var lines = text ? text.split("\n").length : 0;
         wrap.appendChild(h("p", { class: "muted" }, lines + " lines"));
-        wrap.appendChild(h("pre", null, text));
+        wrap.appendChild(renderDiffLines(text));
         return wrap;
       });
     }).catch(function (err) {

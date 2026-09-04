@@ -83,3 +83,10 @@ vanilla JavaScript — no build step, no CDN, no request ever leaves the browser
 Repository usage groups display the registered repository path when available. The JSON keeps
 `repository_id` as its stable grouping key and adds `repository_path`; missing paths fall back
 to the ID, while repository-free turns display as "No repository".
+
+Task search matches a literal, case-insensitive substring of the ID or prompt and combines with
+provider, mode and state filters. `/api/tasks?q=...` applies search before its result limit.
+Candidate details place the revision's diff alongside its review, stacking on narrow screens.
+Finding links target available new-file line locations; deleted or unavailable locations remain
+plain text. Diff requests may include `revision` and `candidate_sha`; a moved candidate returns
+409 so a stale review cannot silently be paired with its replacement diff.
