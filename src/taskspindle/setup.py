@@ -11,18 +11,22 @@ rewrites ``node_modules/.bin/claude-agent-acp`` from the ``npm``-linked symlink 
 ``#!/usr/bin/env node``) into a shim that execs that node directly. A worker unit's PATH is
 short and has no ``node`` on it at all; the shim needs none.
 
-It never logs in, never reads or copies a credential, and never edits Codex's configuration.
-Authentication belongs to the provider CLIs, and registering the MCP server is a command the
-operator runs themselves -- both are documented rather than automated, because a tool that
-silently rewrites ``~/.codex/config.toml`` is a tool you cannot audit.
+``taskspindle setup --provider agy`` pins a verified copy of the installed native Linux CLI.
+Setup never logs in, reads or copies a credential, or edits Codex's configuration. Antigravity
+login stays with the terminal CLI; ``taskspindle auth agy`` checks its cached login.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
+import stat
 import subprocess
+import tempfile
+import urllib.request
+import zipfile
 from collections.abc import Callable, Mapping
 from importlib import resources
 from pathlib import Path
@@ -32,7 +36,10 @@ import taskspindle
 
 from .config import Paths
 
-__all__ = ["ADAPTER_BIN", "EXAMPLE_CONFIG", "MANIFESTS", "NPM_ARGS", "SetupError", "install_runtime"]
+__all__ = [
+    "ADAPTER_BIN", "EXAMPLE_CONFIG", "MANIFESTS", "NPM_ARGS", "SetupError",
+    "install_agy_runtime", "install_runtime",
+]
 
 #: The oldest Node the pinned adapter is supported on.
 MIN_NODE_MAJOR = 22
@@ -56,8 +63,8 @@ _TIMEOUT = 900.0
 EXAMPLE_CONFIG = """\
 # TaskSpindle configuration.
 #
-# Every key is optional. With no configuration at all TaskSpindle offers the two first-class
-# providers -- `claude` and `grok` -- both OAuth-only, and that is the supported setup.
+# Every key is optional. Built-in providers are `claude`, `grok`, and `agy`, all OAuth-only.
+# AGY uses a separately pinned native CLI and its existing personal login; see docs/antigravity.md.
 #
 # A [providers.<id>] table adds a second-class profile. Second-class is a rule, not a label:
 # such a profile is never a default, never a fallback, and never chosen as a reviewer on its
@@ -65,7 +72,7 @@ EXAMPLE_CONFIG = """\
 # id, and `auth = "api_key"` additionally requires start_task(allow_metered = true).
 #
 # Keys:
-#   base        "claude" or "grok" -- inherit that built-in's launch command and quirks.
+#   base        "claude", "grok", or "agy" -- inherit its launch command and quirks.
 #   auth        "oauth" or "api_key". Required.
 #   command     argv of an ACP stdio agent. Required unless `base` supplies one.
 #   env         plain environment names and values passed to the agent.
@@ -313,4 +320,154 @@ def install_runtime(
         "node": str(node),
         "config_file": str(paths.config_file),
         "created_config": created,
+    }
+
+
+def _download_agy_archive(url: str, target: Path) -> None:
+    """Fetch the pinned Google distribution without inheriting proxy or credential settings."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=60) as response, target.open("wb") as output:
+        if response.geturl() != url:
+            raise SetupError("the pinned Antigravity download redirected unexpectedly")
+        shutil.copyfileobj(response, output)
+
+
+def install_agy_acp_runtime(
+    paths: Paths,
+    *,
+    downloader: Callable[[str, Path], None] | None = None,
+) -> dict[str, Any]:
+    """Install Google's separately pinned Linux ACP server; leave the terminal CLI alone."""
+    from .agy_adapter import (
+        ADAPTER_FILES,
+        ADAPTER_ID,
+        ADAPTER_VERSION,
+        DOWNLOAD_URL,
+        adapter_command,
+        prepare_agy_home,
+    )
+    from .providers import ProfileError
+
+    if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
+        raise SetupError("Antigravity ACP 1.1.1 setup currently supports Linux x86-64 only")
+    runtime_dir = _private(paths.runtime_dir)
+    destination = runtime_dir / ADAPTER_ID / ADAPTER_VERSION
+    installed = destination.is_dir() and not destination.is_symlink() and all(
+        (destination / name).is_file() and not (destination / name).is_symlink()
+        and (destination / name).stat().st_size > 0 and os.access(destination / name, os.X_OK)
+        for name in ADAPTER_FILES
+    )
+    try:
+        if not installed:
+            if destination.exists():
+                raise SetupError(
+                    f"incomplete pinned adapter directory: {destination}; move it aside and rerun setup"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with tempfile.TemporaryDirectory(prefix=".agy-install-", dir=destination.parent) as raw:
+                temporary = Path(raw)
+                archive = temporary / "adapter.zip"
+                (downloader or _download_agy_archive)(DOWNLOAD_URL, archive)
+                extracted = temporary / "extracted"
+                extracted.mkdir(mode=0o700)
+                with zipfile.ZipFile(archive) as bundle:
+                    names = bundle.namelist()
+                    if len(names) != len(ADAPTER_FILES) or set(names) != set(ADAPTER_FILES):
+                        raise SetupError(
+                            "the Antigravity archive does not contain exactly the expected executables"
+                        )
+                    for name in ADAPTER_FILES:
+                        member = bundle.getinfo(name)
+                        kind = stat.S_IFMT(member.external_attr >> 16)
+                        if member.is_dir() or member.file_size == 0 or kind not in (0, stat.S_IFREG):
+                            raise SetupError(f"the Antigravity archive has an invalid executable: {name}")
+                        target = extracted / name
+                        with bundle.open(member) as source, target.open("wb") as output:
+                            shutil.copyfileobj(source, output)
+                        target.chmod(0o700)
+                extracted.rename(destination)
+        _private(paths.state_dir)
+        _private(paths.data_dir)
+        home = prepare_agy_home(paths.data_dir)
+        created = _write_config(paths.config_file)
+    except (OSError, ValueError, zipfile.BadZipFile, ProfileError) as exc:
+        raise SetupError(f"Antigravity ACP setup failed: {exc}") from exc
+    return {
+        "provider": "agy", "adapter_package": ADAPTER_ID, "adapter_version": ADAPTER_VERSION,
+        "runtime_dir": str(runtime_dir), "adapter_dir": str(destination),
+        "command": list(adapter_command(runtime_dir)), "agy_home": str(home),
+        "already_installed": installed, "config_file": str(paths.config_file), "created_config": created,
+    }
+
+
+def install_agy_runtime(
+    paths: Paths, *, source: Path | None = None, runner: Runner = subprocess.run,
+    parent_env: Mapping[str, str] = os.environ,
+) -> dict[str, Any]:
+    """Copy the exact installed native build into the runtime; never copy its credentials."""
+    from .agy_cli_adapter import ADAPTER_ID, ADAPTER_VERSION, adapter_command, verify_cli_version
+    from .providers import ProfileError
+
+    if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
+        raise SetupError("Antigravity CLI setup currently supports Linux x86-64 only")
+    if not parent_env.get("HOME"):
+        raise SetupError("HOME is required to locate the installed Antigravity CLI")
+    source = source or Path(parent_env["HOME"]) / ".local/bin/agy"
+    destination = paths.runtime_dir / ADAPTER_ID / ADAPTER_VERSION
+    binary = destination / "agy"
+    installed = destination.exists()
+    try:
+        for directory in (paths.runtime_dir, destination.parent, destination):
+            if directory.is_symlink():
+                raise SetupError(f"Antigravity runtime directory must not be a symlink: {directory}")
+            if directory.exists() and (not directory.is_dir() or directory.stat().st_uid != os.getuid()):
+                raise SetupError(f"Antigravity runtime directory must be owned by this user: {directory}")
+        if installed:
+            verify_cli_version(binary, runner=runner, parent_env=parent_env)
+            companions = destination / "bin"
+            if (companions.is_symlink() or not companions.is_dir()
+                    or companions.stat().st_uid != os.getuid() or companions.stat().st_mode & 0o022):
+                raise SetupError(
+                    "incomplete Antigravity CLI pin: companion bin directory is missing or unsafe"
+                )
+            for companion in companions.iterdir():
+                if (companion.is_symlink() or not companion.is_file()
+                        or companion.stat().st_uid != os.getuid() or companion.stat().st_mode & 0o022):
+                    raise SetupError("Antigravity pinned companions must be regular owned executables")
+        else:
+            # Verify before touching the destination; an updated daily CLI cannot silently
+            # change the build that a qualified TaskSpindle release executes.
+            verify_cli_version(source, runner=runner, parent_env=parent_env)
+            _private(paths.runtime_dir)
+            _private(destination.parent)
+            with tempfile.TemporaryDirectory(prefix=".agy-cli-install-", dir=destination.parent) as raw:
+                staging = Path(raw) / ADAPTER_VERSION
+                staging.mkdir(mode=0o700)
+                target = staging / "agy"
+                shutil.copyfile(source, target)
+                target.chmod(0o700)
+                verify_cli_version(target, runner=runner, parent_env=parent_env)
+                companion_source = Path(parent_env["HOME"]) / ".gemini/antigravity-cli/bin"
+                companion_target = staging / "bin"
+                companion_target.mkdir(mode=0o700)
+                if companion_source.is_symlink():
+                    raise SetupError("Antigravity companion executable directory must not be a symlink")
+                if companion_source.exists():
+                    for companion in companion_source.iterdir():
+                        if (companion.is_symlink() or not companion.is_file()
+                                or companion.stat().st_uid != os.getuid()):
+                            raise SetupError("Antigravity companion executables must be regular owned files")
+                        shutil.copyfile(companion, companion_target / companion.name)
+                        (companion_target / companion.name).chmod(0o700)
+                staging.rename(destination)
+        _private(paths.state_dir)
+        _private(paths.data_dir)
+        created = _write_config(paths.config_file)
+    except (OSError, ProfileError) as exc:
+        raise SetupError(f"Antigravity CLI setup failed: {exc}") from exc
+    return {
+        "provider": "agy", "adapter_package": ADAPTER_ID, "adapter_version": ADAPTER_VERSION,
+        "runtime_dir": str(paths.runtime_dir), "adapter_dir": str(destination),
+        "command": list(adapter_command(paths.runtime_dir)), "already_installed": installed,
+        "config_file": str(paths.config_file), "created_config": created,
     }

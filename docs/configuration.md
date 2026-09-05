@@ -1,14 +1,13 @@
 # Configuration
 
 TaskSpindle reads one file: `$XDG_CONFIG_HOME/taskspindle/config.toml`, or whatever
-`TASKSPINDLE_CONFIG` points at. With no file at all you get the two first-class providers, and
-that is the supported setup. `taskspindle setup` writes
+`TASKSPINDLE_CONFIG` points at. Built-in provider ids are reserved. `taskspindle setup` writes
 [`examples/config.toml`](../examples/config.toml) there if the file does not already exist, and
 never overwrites one that does.
 
 ## First-class providers
 
-Two profiles ship built in, live-tested, and OAuth-only:
+The released Claude and Grok profiles use OAuth:
 
 - **`claude`** — the pinned `@agentclientprotocol/claude-agent-acp` adapter that `taskspindle setup`
   installs, launched with `CLAUDE_CONFIG_DIR` pointed at `~/.claude`. Its session options deny the
@@ -23,13 +22,17 @@ Two profiles ship built in, live-tested, and OAuth-only:
 
 Their ids are reserved. You cannot redefine them in `config.toml`.
 
+**`agy`** is an OAuth-only profile using Google's separately pinned native CLI and its existing
+personal login. Setup, authentication and the enforced worker policy are described in
+[antigravity.md](antigravity.md). An `agy`-derived profile cannot switch to API-key authentication.
+
 ## `[providers.<id>]`
 
 Any other ACP-speaking stdio agent is a **configured, second-class profile**.
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `base` | `"claude"` or `"grok"` | inherit that built-in's launch command, environment and quirks |
+| `base` | `"claude"`, `"grok"`, or `"agy"` | inherit that built-in's launch command, environment and quirks |
 | `auth` | `"oauth"` or `"api_key"` | **required** |
 | `command` | string[] | argv of an ACP stdio agent; required unless `base` supplies one |
 | `env` | table of strings | plain environment names and values handed to the agent |
@@ -63,19 +66,22 @@ These are rules the code enforces, not advice:
 - **`allow_metered` gate.** An `auth = "api_key"` profile refuses to run unless the request sets
   `allow_metered: true`. Otherwise: `METERED_NOT_ALLOWED`. There is no configuration key that turns
   this off.
-- **Explicit reviewer.** Automatic opposite-provider routing exists only between `claude` and
-  `grok`. A candidate produced by a configured profile has no automatic reviewer at all; you name
-  the reviewing profile yourself.
-- **Independence rule.** A reviewer of a first-class author must be the *other* first-class
-  provider. A reviewer of a second-class author must differ from the author in id and in either
-  command or model. Otherwise: `REVIEWER_NOT_INDEPENDENT`.
+- **Explicit reviewer.** Name the reviewing provider yourself. A suggested alternative in a
+  quota error does not start a task or switch providers.
+- **Independence rule.** A reviewer of a built-in author must be a different built-in provider.
+  Every reviewer must differ in id and family. Configured profiles additionally require a
+  different command or model. These checks apply at creation, acceptance and manual integration,
+  including when profiles have changed since a review. Tasks retain immutable `provider_family`
+  provenance. Changed profile families return `PROVIDER_FAMILY_CHANGED`; historical configured
+  tasks without that record return `PROVIDER_FAMILY_UNKNOWN`. Old reserved Claude/Grok IDs remain
+  valid historical evidence. Same-family review returns `REVIEWER_NOT_INDEPENDENT`.
 - **Attribution.** Every task records `auth_mode`, the requested and reported model, and — for a
   gateway — the *host* of `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`, never the full URL and never
   the token. `task_result` shows all of it, so metered work is visible after the fact.
 
 The child environment is built by allowlist, never by filtering the parent: a name reaches the
 agent only because TaskSpindle put it there. `HOME`, `LANG`, `LC_ALL`, `USER`, `LOGNAME`,
-`XDG_RUNTIME_DIR` and `NO_COLOR` are copied if present; `PATH` is copied with every
+`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` and `NO_COLOR` are copied if present; `PATH` is copied with every
 `node_modules/.bin` entry stripped so a stray global adapter cannot shadow the pinned one;
 `TERM=dumb`, `CI=1`, `NO_BROWSER=1` and a per-task `TMPDIR` are set. Then the profile's `env`, then
 its `secret_env` values. An OAuth profile gets no exemption from the credential-shaped-name check

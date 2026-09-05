@@ -69,7 +69,7 @@ def test_doctor_json_prints_the_report_and_an_advisory_failure_still_passes(
     assert [check["name"] for check in printed["checks"]] == ["git", "codex_registration"]
     assert printed["ok"] is True
     assert seen["live_probes"] is False
-    assert sorted(seen["profiles"]) == ["claude", "grok"]
+    assert sorted(seen["profiles"]) == ["agy", "claude", "grok"]
 
 
 def test_doctor_marks_each_check_and_fails_on_a_real_failure(
@@ -103,7 +103,7 @@ def test_usage_prints_the_report_as_json_or_as_tables(
     assert printed["group_by"] == "day"
     assert printed["usage"] == []
     assert printed["turns"]["count"] == 0
-    assert {entry["provider"] for entry in printed["windows"]} == {"claude", "grok"}
+    assert {entry["provider"] for entry in printed["windows"]} == {"agy", "claude", "grok"}
 
     assert cli.main(["usage"]) == 0
     text = capsys.readouterr().out
@@ -200,7 +200,7 @@ def test_web_parses_defaults_and_calls_serve(home: Path, monkeypatch: pytest.Mon
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == 8765
     assert seen["open_browser"] is False
-    assert seen["profiles"] == ["claude", "grok"]
+    assert seen["profiles"] == ["agy", "claude", "grok"]
 
 
 

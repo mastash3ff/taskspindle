@@ -319,11 +319,14 @@ class TaskRecord(BaseModel):
     cleanup_state: CleanupState = CleanupState.RETAINED
     repository_id: str | None = None
     provider: str
+    provider_family: str | None = None
     auth_mode: AuthMode
     mode: Mode
     prompt: str
     requested_model: str | None = None
     requested_effort: str | None = None
+    resolved_model: str | None = None
+    resolved_effort: str | None = None
     timeout_s: int = 1800
     allow_metered: bool = False
     acceptance_criteria: str | None = None
@@ -400,6 +403,7 @@ class TaskView(BaseModel):
     state_version: int
     cleanup_state: CleanupState
     provider: str
+    provider_family: str | None = None
     auth_mode: AuthMode
     mode: Mode
     repository_id: str | None = None
@@ -409,6 +413,8 @@ class TaskView(BaseModel):
     worktree_path: str | None = None
     session_id: str | None = None
     requested_model: str | None = None
+    resolved_model: str | None = None
+    resolved_effort: str | None = None
     reported_model: str | None = None
     oauth_evidence: dict[str, Any] = Field(default_factory=dict)
     candidate_sha: str | None = None

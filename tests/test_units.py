@@ -185,6 +185,7 @@ def test_names_argv_and_unit_environment() -> None:
             "HOME": "/home/tester",
             "LANG": "C.UTF-8",
             "XDG_RUNTIME_DIR": "/run/user/1000",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
             "ANTHROPIC_API_KEY": "sk-secret",
         },
         config_file=Path("/cfg/config.toml"),
@@ -194,6 +195,7 @@ def test_names_argv_and_unit_environment() -> None:
         "HOME": "/home/tester",
         "LANG": "C.UTF-8",
         "XDG_RUNTIME_DIR": "/run/user/1000",
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
         "TASKSPINDLE_CONFIG": "/cfg/config.toml",
     }
 
@@ -232,13 +234,21 @@ def test_boot_id_is_a_stable_non_empty_string() -> None:
 def test_a_real_transient_unit_runs_and_reports_success(tmp_path: Path) -> None:
     backend = SystemdUserBackend()
     unit = f"taskspindle-selftest-{os.getpid()}"
-    backend.start(unit, ["/bin/true"], working_dir=tmp_path, env={}, properties={})
+    # Retain the completed oneshot until it is inspected. An ordinary successful transient
+    # unit may be collected before the first show() and cannot prove its exit status.
+    backend.start(
+        unit, ["/bin/true"], working_dir=tmp_path, env={},
+        properties={"Type": "oneshot", "RemainAfterExit": "yes"},
+    )
     try:
         for _ in range(100):
             state = backend.show(unit)
-            if state.kind != "active":
+            if state.sub_state == "exited" or state.kind != "active":
                 break
             time.sleep(0.1)
-        assert state.kind == "success"
+        assert state.sub_state == "exited"
+        assert state.result == "success"
+        assert state.exec_main_status == 0
     finally:
+        backend.stop(unit)
         backend.reset_failed(unit)

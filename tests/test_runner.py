@@ -112,6 +112,7 @@ def seed_task(
     state: TaskState = TaskState.QUEUED,
     kind: TurnKind = TurnKind.INITIAL,
     session_id: str | None = None,
+    provider_family: str = PROVIDER,
 ) -> TaskRecord:
     """Set a task up exactly the way the server will before it starts a worker unit.
 
@@ -152,6 +153,7 @@ def seed_task(
         StartTaskRequest(**fields),
         repository_id=repository_id,
         auth_mode=AuthMode.OAUTH,
+        provider_family=provider_family,
     )
 
     placement: dict[str, object] = {}
@@ -411,6 +413,7 @@ def seed_subject(store: Store) -> TaskRecord:
         ),
         repository_id=None,
         auth_mode=AuthMode.OAUTH,
+        provider_family="other",
     )
     return store.update_task(record.id, None, candidate_sha="c0ffeeba")
 

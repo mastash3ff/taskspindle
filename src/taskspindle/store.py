@@ -323,7 +323,18 @@ CREATE TABLE provider_windows (
 CREATE INDEX provider_windows_idx ON provider_windows(provider, window, observed_at);
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _MIGRATION_1), (2, _MIGRATION_2)]
+_MIGRATION_3 = """
+ALTER TABLE tasks ADD COLUMN resolved_model TEXT;
+ALTER TABLE tasks ADD COLUMN resolved_effort TEXT;
+ALTER TABLE tasks ADD COLUMN provider_family TEXT;
+CREATE TRIGGER tasks_family_immutable BEFORE UPDATE OF provider_family ON tasks
+WHEN NEW.provider_family IS NOT OLD.provider_family
+BEGIN
+    SELECT RAISE(ABORT, 'task provider family is immutable');
+END;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3)]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
 TURN_USAGE_FIELDS: tuple[str, ...] = (
@@ -348,9 +359,10 @@ VIOLATION_EVENT_KINDS: tuple[str, ...] = (
     "ROOT_MUTATION",
     "READ_ONLY_VIOLATION",
     "DELEGATION_ATTEMPT",
+    "MODE_SWITCH_ATTEMPT",
 )
 
-_UPDATABLE_TASK_COLUMNS = frozenset(TASK_COLUMNS) - {"id", "state_version", "updated_at"}
+_UPDATABLE_TASK_COLUMNS = frozenset(TASK_COLUMNS) - {"id", "state_version", "updated_at", "provider_family"}
 
 
 def _split_statements(script: str) -> list[str]:

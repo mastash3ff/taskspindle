@@ -1,7 +1,7 @@
 # TaskSpindle
 
-A local MCP server that lets a Codex session delegate bounded work to OAuth-backed Claude Code and
-Grok workers in detached git worktrees, then inspect, cross-review and explicitly accept what they
+A local MCP server that lets a Codex session delegate bounded work to OAuth-backed Claude Code,
+Grok and Antigravity workers in detached git worktrees, then inspect, cross-review and explicitly accept what they
 produced.
 
 ## What it does
@@ -12,8 +12,8 @@ produced.
   use. Accepting it requires that you retrieved the whole diff, that an independent reviewer looked
   at that exact candidate, that every blocking finding has an explicit override with a reason, and
   that the candidate's own verification commands pass — in your repository, before the commit.
-- **Cross-review by default.** A candidate written by Claude is reviewed by Grok, and the other way
-  round. The reviewer must be a genuinely different agent, and the code enforces it.
+- **Independent review.** Codex explicitly selects a different built-in provider to review a
+  candidate. Self-review and aliases of the author's family are refused, including at acceptance.
 - **Durable workers.** Each turn runs as a transient systemd user unit, so the MCP server can exit,
   crash or restart without taking the work with it. Every continuation reloads the agent's session
   explicitly rather than starting a new conversation and hoping.
@@ -25,9 +25,9 @@ produced.
   permission request TaskSpindle refuses; an implement runs Claude in `default` mode so every
   write and command is decided by TaskSpindle's own gate, not by your Claude settings.
 - **Credentials stay where they are.** The environment each agent sees is built by allowlist, not
-  by filtering yours. TaskSpindle never logs in, never copies a credential and never edits your
-  Codex configuration.
-- **OAuth first, metered second.** `claude` and `grok` are first-class and OAuth-only. An API-key
+  by filtering yours. Workers reuse cached authentication. `auth agy` checks the native CLI's
+  existing Google login; credentials are never copied.
+- **OAuth first, metered second.** `claude`, `grok` and `agy` are first-class and OAuth-only. An API-key
   or LiteLLM-gateway harness is a configured profile that is never a default, never a fallback, and
   refuses to run without `allow_metered`.
 - **Limits are reported, not worked around.** A turn a provider refused for a usage or login
@@ -59,7 +59,7 @@ the registration needs `tool_timeout_sec = 1800`.
    launches a worker unit. An `implement` task must declare its acceptance criteria, the path
    prefixes it may touch, the commands that verify it, and the one-line commit message it is
    aiming at.
-3. **Work.** The worker drives exactly one ACP turn, collapses the result into a candidate commit,
+3. **Work.** The worker drives exactly one provider turn, collapses the result into a candidate commit,
    runs the verification commands in the worktree, records everything, and exits. The task is now
    `RESULT_READY`.
 4. **Inspect.** `task_diff` hands the diff back a page at a time, and each page is receipted. You
@@ -83,6 +83,7 @@ moved underneath you is refused rather than clobbered.
 | [codex-registration.md](docs/codex-registration.md) | registering the server, the timeouts, granting a repository |
 | [tools.md](docs/tools.md) | all seventeen tools, the envelope, the acceptance and review rules |
 | [configuration.md](docs/configuration.md) | `config.toml`, `taskspindle discover`, and what second-class providers may not do |
+| [antigravity.md](docs/antigravity.md) | native AGY login reuse, model selection, containment and release gates |
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
@@ -92,15 +93,16 @@ moved underneath you is refused rather than clobbered.
 ## Supported platforms
 
 Linux with a systemd user manager, and WSL2 with systemd enabled. macOS and Windows are not
-supported in v0.1.0. Python 3.12+, Node 22+, git 2.38+. See
+supported in v0.2.0. Python 3.12+, Node 22+, git 2.38+. See
 [docs/platforms.md](docs/platforms.md).
 
 ## Status
 
-v0.1.0. The two first-class providers are live-tested; API-key and gateway profiles are configured,
-documented and not tested live.
+v0.2.0 adds native Antigravity alongside Claude and Grok. API-key and gateway profiles remain
+configured second-class providers. See [the Antigravity guide](docs/antigravity.md) for cached
+authentication, model selection and isolation requirements.
 
-TaskSpindle is not affiliated with, endorsed by, or sponsored by OpenAI, Anthropic, or xAI.
+TaskSpindle is not affiliated with, endorsed by, or sponsored by OpenAI, Anthropic, Google, or xAI.
 
 ## License
 

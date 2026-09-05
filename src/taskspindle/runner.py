@@ -28,6 +28,8 @@ from typing import Any
 
 from . import limits, providers, repos, units, usage, worktrees
 from .acp_client import AcpError, AcpWorker, PermissionPolicy, TurnResult
+from .agy_cli import AgyCliWorker
+from .agy_cli import model_catalog as cli_model_catalog
 from .config import Paths, load_config
 from .config import paths as default_paths
 from .integration import run_verification
@@ -44,7 +46,7 @@ from .models import (
 from .providers import Profile, ProfileError
 from .repos import GitError, RepositoryIdentity, RootSnapshot
 from .review import ReviewParseError, parse_review_output
-from .service import LEASE_BUSY, TaskSpindleError, transition
+from .service import LEASE_BUSY, TaskSpindleError, require_task_profile, transition
 from .store import Store, StoreError, now
 
 __all__ = [
@@ -475,23 +477,41 @@ async def _run_turn(
     workspace = _workspace(run)
 
     stderr_path = run.dir / f"agent-{run.revision}.stderr"
-    worker = AcpWorker(
+    native = profile.family == "agy"
+    worker = _native_agy_worker(run, profile, workspace, stderr_path) if native else AcpWorker(
         command=providers.launch_command(profile, task.mode.value),
         env=run.child_env,
         cwd=workspace,
         stderr_path=stderr_path,
-        policy=PermissionPolicy(allow_writes=task.mode is Mode.IMPLEMENT),
+        policy=_permission_policy(profile, task, workspace),
         late_update_grace=LATE_UPDATE_GRACE_S.get(profile.family, 0.0),
     )
     try:
         async with worker as agent:
-            run.agent_info = dict(agent.init.agent_info) if agent.init else {}
-            if evidence is None:
-                evidence = _post_init_evidence(profile, agent)
-            run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
-            await _open_session(run, agent)
-            result = await _prompt(run, agent, cancel_event)
+            if native:
+                catalog = await cli_model_catalog(agent.command, run.child_env, workspace)
+                _configure_native_agy(run, profile, catalog)
+                from .agy_cli_adapter import ADAPTER_VERSION
+
+                run.agent_info = {"name": "antigravity-cli", "version": ADAPTER_VERSION}
+                evidence = {"auth": "oauth", "auth_method_id": "cached_native_cli",
+                            "source": "authenticated_model_catalog"}
+                run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
+                result = await _prompt(run, agent, cancel_event, native=True)
+            else:
+                run.agent_info = dict(agent.init.agent_info) if agent.init else {}
+                if evidence is None:
+                    evidence = _post_init_evidence(profile, agent)
+                run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
+                await _open_session(run, agent)
+                result = await _prompt(run, agent, cancel_event)
     except AcpError as exc:
+        # The client retains updates even when prompt/cancel/timeout raises. Capture
+        # them before settling so failure never discards useful partial work.
+        run.result = worker.last_result
+        if run.result is not None:
+            await _record_usage(run, profile, workspace, run.result)
+            _record_violations(run, run.result)
         if run.cancelled:
             # An agent that errors out because it was cancelled was still cancelled: the outcome
             # the operator asked for is the one to record.
@@ -525,6 +545,79 @@ async def _run_turn(
     return await _finalize(run, workspace, result)
 
 
+def _native_agy_worker(run: _Run, profile: Profile, workspace: Path, stderr_path: Path) -> AgyCliWorker:
+    from .agy_cli_policy import prepare_launch
+
+    if len(profile.command) != 1:
+        raise _Failure("PROFILE_INVALID", "Native AGY requires one pinned executable")
+    if run.kind is not TurnKind.INITIAL and not run.task.session_id:
+        raise _Interrupted("RESUME_UNAVAILABLE", "the task has no native AGY session to resume")
+    run.session_id = run.task.session_id
+    previous = run.store.list_turn_usage(task_id=run.task_id)
+    prior_usage = None
+    for row in reversed(previous):
+        raw = row.get("raw") or {}
+        if isinstance(raw.get("_agy_cli_cumulative"), dict):
+            prior_usage = raw["_agy_cli_cumulative"]
+            break
+
+    def remember_session(session_id: str) -> None:
+        if run.task.session_id and session_id != run.task.session_id:
+            raise AcpError("RESUME_UNAVAILABLE", "Native AGY returned a different conversation")
+        run.session_id = session_id
+        run.task = run.store.update_task(run.task_id, None, session_id=session_id)
+
+    try:
+        command = prepare_launch(
+            binary=Path(profile.command[0]), workspace=workspace, task_dir=run.dir,
+            home=Path(run.child_env["HOME"]), mode=run.task.mode.value,
+            allowed_prefixes=run.task.path_prefixes or (),
+            verification_commands=run.task.verification_commands or (),
+        )
+    except (OSError, ValueError) as exc:
+        raise _Failure("AGY_POLICY_UNAVAILABLE", str(exc)) from exc
+    return AgyCliWorker(
+        command=command, env=run.child_env, cwd=workspace, stderr_path=stderr_path,
+        on_session=remember_session, prior_usage=prior_usage, mode=run.task.mode.value,
+    )
+
+
+def _configure_native_agy(run: _Run, profile: Profile, catalog: list[tuple[str, str]]) -> None:
+    from .agy import ModelSelection, ModelSelectionError, resolve_model
+
+    persisted = (
+        ModelSelection(run.task.resolved_model, run.task.resolved_effort)
+        if run.task.resolved_model else None
+    )
+    if run.kind is not TurnKind.INITIAL and persisted is None:
+        raise _Interrupted("RESUME_UNAVAILABLE", "AGY session has no recorded model selection")
+    defaults = profile if persisted is None else None
+    try:
+        selection = resolve_model(
+            {"models": {"availableModels": [{"modelId": key, "name": name} for key, name in catalog]}},
+            model=run.task.requested_model or (defaults.model if defaults else None),
+            effort=run.task.requested_effort or (defaults.effort if defaults else None),
+            persisted=persisted,
+        )
+    except ModelSelectionError as exc:
+        raise _Failure(exc.code, str(exc)) from exc
+    run.session_model = selection.model_id
+    run.task = run.store.update_task(
+        run.task_id, None, resolved_model=selection.model_id, resolved_effort=selection.effort,
+    )
+
+
+def _permission_policy(profile: Profile, task: TaskRecord, workspace: Path) -> PermissionPolicy:
+    if profile.family == "agy":
+        from .agy_policy import AgyPermissionPolicy
+
+        return AgyPermissionPolicy(
+            allow_writes=task.mode is Mode.IMPLEMENT, workspace=workspace,
+            commands=task.verification_commands or (),
+        )
+    return PermissionPolicy(allow_writes=task.mode is Mode.IMPLEMENT)
+
+
 def _check_lease(run: _Run, *, boot: str) -> None:
     """The server takes the lease before starting the unit; the worker only signs it."""
     lease = run.store.get_lease(run.task.provider)
@@ -546,14 +639,18 @@ def _check_lease(run: _Run, *, boot: str) -> None:
 
 def _resolve_profile(run: _Run, profiles: Mapping[str, Profile]) -> Profile:
     try:
-        return providers.profile_for_task(
+        profile = providers.profile_for_task(
             profiles,
             run.task.provider,
             mode=run.task.mode.value,
             allow_metered=run.task.allow_metered,
         )
+        require_task_profile(run.task, profile)
+        return profile
     except ProfileError as exc:
         raise _Failure(exc.code, str(exc)) from exc
+    except TaskSpindleError as exc:
+        raise _Failure(exc.code, exc.message, details=exc.details) from exc
 
 
 def _pre_spawn_evidence(
@@ -576,6 +673,9 @@ def _pre_spawn_evidence(
         except ProfileError as exc:
             raise _Failure(exc.code, str(exc)) from exc
     if profile.family == "grok":
+        return None
+    if profile.family == "agy":
+        # The native CLI validates its existing login while fetching the model catalog.
         return None
     return {"auth": profile.auth}
 
@@ -606,6 +706,10 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
     session id are untouched, so the turn can be tried again against an agent that can load it.
     """
     options = providers.session_options(run.profile) if run.profile else {}
+    if run.profile and run.profile.family == "agy":
+        if agent.init is None or "oauth-personal" not in agent.init.auth_method_ids:
+            raise _Failure("OAUTH_REJECTED", "AGY adapter did not advertise oauth-personal authentication")
+        options = {"mcp_servers": []}
     if run.kind is TurnKind.INITIAL:
         session_id = await agent.new_session(**options)
         run.session_id = session_id
@@ -615,10 +719,42 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
             raise _Interrupted("RESUME_UNAVAILABLE", "the task has no session to resume")
         await agent.load_session(run.task.session_id, **options)
         run.session_id = run.task.session_id
+    if run.profile and run.profile.family == "agy":
+        await _configure_agy_session(run, agent)
+        return
     await _apply_session_mode(run, agent)
     run.session_model = agent.session_model
     if run.session_model is not None:
         run.log.write(f"session model from ACP: {run.session_model}")
+
+
+async def _configure_agy_session(run: _Run, agent: AcpWorker) -> None:
+    from .agy import ModelSelection, ModelSelectionError, resolve_model
+
+    persisted = None
+    if run.task.resolved_model:
+        persisted = ModelSelection(run.task.resolved_model, run.task.resolved_effort)
+    elif run.kind is not TurnKind.INITIAL:
+        raise _Interrupted("RESUME_UNAVAILABLE", "AGY session has no recorded model selection")
+    # Profile defaults apply once. A later profile edit cannot renegotiate the
+    # model or effort already bound to this task's conversation.
+    defaults = run.profile if persisted is None else None
+    try:
+        selection = resolve_model(
+            {"configOptions": agent.session_config_options},
+            model=run.task.requested_model or (defaults.model if defaults else None),
+            effort=run.task.requested_effort or (defaults.effort if defaults else None),
+            persisted=persisted,
+        )
+    except ModelSelectionError as exc:
+        raise _Failure(exc.code, str(exc)) from exc
+    session_id = run.session_id or ""
+    await agent.set_config_option(session_id, "mode", "default")
+    await agent.set_config_option(session_id, "model", selection.model_id)
+    run.session_model = selection.model_id
+    run.task = run.store.update_task(
+        run.task_id, None, resolved_model=selection.model_id, resolved_effort=selection.effort,
+    )
 
 
 async def _apply_session_mode(run: _Run, agent: AcpWorker) -> None:
@@ -635,12 +771,19 @@ async def _apply_session_mode(run: _Run, agent: AcpWorker) -> None:
     run.log.write(f"session mode {mode}")
 
 
-async def _prompt(run: _Run, agent: AcpWorker, cancel_event: asyncio.Event) -> TurnResult:
+async def _prompt(
+    run: _Run, agent: AcpWorker | AgyCliWorker, cancel_event: asyncio.Event, *, native: bool = False,
+) -> TurnResult:
     """Send the turn, racing it against a cancel request."""
     session_id = run.session_id or ""
     _CANCEL_HOOKS[run.task_id] = cancel_event.set
     run.prompt_started_at = now()
-    turn = asyncio.create_task(agent.prompt(session_id, run.prompt, timeout=float(run.task.timeout_s)))
+    options = {"model": run.task.resolved_model, "effort": run.task.resolved_effort} if native else {}
+    turn = asyncio.create_task(agent.prompt(
+        session_id or None if native else session_id,
+        f"TaskSpindle workspace: {agent.cwd}\n\n{run.prompt}" if native else run.prompt,
+        timeout=float(run.task.timeout_s), **options,
+    ))
     waiter = asyncio.create_task(cancel_event.wait())
     try:
         done, _ = await asyncio.wait({turn, waiter}, return_when=asyncio.FIRST_COMPLETED)
@@ -758,7 +901,8 @@ async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: Tu
         home=home,
         duration_ms=duration_ms,
         started_at=run.prompt_started_at,
-        session_model=run.session_model,
+        # AGY picker IDs describe our selection, not the backend that answered.
+        session_model=None if profile.family == "agy" else run.session_model,
     )
     model = collected.model
     session_path = usage.claude_session_path(profile, workspace, run.session_id, home)
@@ -769,7 +913,11 @@ async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: Tu
             if model is not None:
                 break
     run.usage = usage.with_model(collected.usage, model) if collected.usage else None
-    run.reported_model = model
+    # AGY's selected picker ID is a resolved request, not evidence of which
+    # backend actually answered. Preserve the distinction when telemetry is absent.
+    run.reported_model = (
+        result.capture.model_ids[0] if result.capture.model_ids else None
+    ) if profile.family == "agy" else model
 
 
 def _record_violations(run: _Run, result: TurnResult) -> None:
@@ -831,11 +979,31 @@ def _finalize_review(run: _Run, workspace: Path, result: TurnResult) -> TaskStat
     return _settle(run, TaskState.COMPLETED, "review recorded", response=result.text)
 
 
+def _agy_control_changes(workspace: Path, base_sha: str) -> list[str]:
+    """Controls created in new directories must never enter an AGY candidate."""
+    from .agy_cli_policy import CONTROL_DIRS, CONTROL_FILES
+
+    changed = repos.run_git(
+        ["diff", "--name-only", "--no-renames", "-z", base_sha], cwd=workspace,
+    ).stdout
+    untracked = repos.run_git(
+        ["ls-files", "--others", "--exclude-standard", "-z"], cwd=workspace,
+    ).stdout
+    protected = CONTROL_DIRS | CONTROL_FILES | {".git"}
+    paths = {raw.decode("utf-8", "surrogateescape") for raw in (changed + untracked).split(b"\0") if raw}
+    return sorted(path for path in paths if any(part in protected for part in Path(path).parts))
+
+
 async def _finalize_implement(run: _Run, workspace: Path, result: TurnResult) -> TaskState:
     task = run.task
     identity = _identity(workspace)
     revision = task.candidate_revision + 1
     try:
+        if task.provider_family == "agy":
+            forbidden = _agy_control_changes(workspace, task.base_head or "HEAD")
+            if forbidden:
+                run.warn("AGY_CONTROL_PATH_VIOLATION", EventKind.WARNING, {"paths": forbidden})
+                raise _Failure("AGY_CONTROL_PATH_VIOLATION", "AGY changed protected agent control paths")
         candidate = worktrees.collapse_candidate(
             identity,
             workspace,
@@ -1007,6 +1175,8 @@ def _settle(run: _Run, state: TaskState, reason: str, **fields: Any) -> TaskStat
     transcript = _write_transcript(run)
     if transcript is not None:
         fields["transcript_path"] = str(transcript)
+    if run.result is not None:
+        fields.setdefault("response", run.result.text)
     fields["warnings"] = run.warnings or None
     if run.reported_model:
         fields.setdefault("reported_model", run.reported_model)
@@ -1067,7 +1237,10 @@ def _complete_turn(run: _Run) -> None:
             attribution={
                 "provider": run.task.provider,
                 "profile": profile.id if profile else None,
+                "provider_family": profile.family if profile else None,
                 "model": profile.model if profile else None,
+                "resolved_model": run.task.resolved_model,
+                "resolved_effort": run.task.resolved_effort,
                 "reported_model": run.reported_model,
                 "auth": profile.auth if profile else None,
                 "gateway_host": profile.gateway_host if profile else None,
@@ -1102,6 +1275,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_dir=resolved.runtime_dir,
             home=Path(os.environ.get("HOME", "")),
             state_dir=resolved.state_dir,
+            data_dir=resolved.data_dir,
         )
         state = asyncio.run(
             run_worker(store, args.task, profiles=profiles, paths=resolved)

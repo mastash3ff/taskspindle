@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import stat
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -113,7 +114,8 @@ def test_claude_profile_points_at_the_pinned_adapter(tmp_path: Path) -> None:
 def test_child_env_for_claude_leaks_nothing(tmp_path: Path) -> None:
     claude = _builtins(tmp_path)["claude"]
 
-    env = build_child_env(claude, LEAKY_PARENT, task_tmp=tmp_path / "tasktmp")
+    parent = {**LEAKY_PARENT, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"}
+    env = build_child_env(claude, parent, task_tmp=tmp_path / "tasktmp")
 
     for leaked in ("ANTHROPIC_API_KEY", "XAI_API_KEY", "HTTPS_PROXY", "SSH_AUTH_SOCK", "OPENAI_BASE_URL"):
         assert leaked not in env
@@ -123,6 +125,7 @@ def test_child_env_for_claude_leaks_nothing(tmp_path: Path) -> None:
     assert env["TMPDIR"] == str(tmp_path / "tasktmp")
     assert env["CI"] == "1"
     assert env["HOME"] == "/home/tester"
+    assert env["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1000/bus"
     assert "sk-ant-secret" not in "".join(env.values())
 
 
@@ -375,6 +378,36 @@ def test_opposite_and_independence(tmp_path: Path) -> None:
 
     assert reviewer_independent(builtins["claude"], builtins["grok"]) is True
     assert reviewer_independent(builtins["claude"], builtins["claude"]) is False
+
+
+@pytest.mark.parametrize("family", ["claude", "grok", "agy"])
+def test_aliases_cannot_review_the_same_family(family: str) -> None:
+    builtin = Profile(id=family, auth="oauth", command=("adapter",), first_class=True)
+    alias = replace(
+        builtin, id="alias", base=family, first_class=False, command=("other",), model="other"
+    )
+    other_alias = replace(alias, id="other-alias", command=("third",), model="third")
+
+    assert reviewer_independent(builtin, alias) is False
+    assert reviewer_independent(alias, builtin) is False
+    assert reviewer_independent(alias, other_alias) is False
+
+
+def test_second_class_review_rules_keep_the_command_or_model_distinction() -> None:
+    author = Profile(id="custom-author", auth="oauth", command=("adapter",))
+    reviewer = replace(author, id="custom-reviewer")
+
+    assert reviewer_independent(author, reviewer) is False
+    assert reviewer_independent(author, replace(reviewer, command=("other-adapter",))) is True
+    assert reviewer_independent(author, replace(reviewer, model="other-model")) is True
+
+
+def test_builtin_author_requires_a_builtin_reviewer() -> None:
+    author = Profile(id="claude", auth="oauth", command=("claude",), first_class=True)
+    reviewer = Profile(id="custom-grok", base="grok", auth="oauth", command=("grok",))
+
+    assert reviewer_independent(author, reviewer) is False
+    assert reviewer_independent(reviewer, author) is True
 
 
 # -- session options -----------------------------------------------------------------------------

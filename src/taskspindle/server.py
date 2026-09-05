@@ -437,6 +437,7 @@ def build_orchestrator(
         runtime_dir=resolved.runtime_dir,
         home=Path(env.get("HOME", "")),
         state_dir=resolved.state_dir,
+        data_dir=resolved.data_dir,
     )
     orchestrator = Orchestrator(
         store=store,

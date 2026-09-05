@@ -50,6 +50,8 @@ TARGET_MOVED = "TARGET_MOVED"
 INVALID_REQUEST = "INVALID_REQUEST"
 METERED_NOT_ALLOWED = "METERED_NOT_ALLOWED"
 REVIEWER_NOT_INDEPENDENT = "REVIEWER_NOT_INDEPENDENT"
+PROVIDER_FAMILY_UNKNOWN = "PROVIDER_FAMILY_UNKNOWN"
+PROVIDER_FAMILY_CHANGED = "PROVIDER_FAMILY_CHANGED"
 MANUAL_RECOVERY_REQUIRED = "MANUAL_RECOVERY_REQUIRED"
 RESUME_UNAVAILABLE = "RESUME_UNAVAILABLE"
 ROOT_MUTATION = "ROOT_MUTATION"
@@ -325,6 +327,7 @@ def create_task(
     *,
     repository_id: str | None,
     auth_mode: AuthMode,
+    provider_family: str | None = None,
 ) -> TaskRecord:
     """Insert a new task in PREPARING with its TASK_CREATED event."""
     stamp = now()
@@ -335,6 +338,7 @@ def create_task(
         cleanup_state=CleanupState.RETAINED,
         repository_id=repository_id,
         provider=request.provider,
+        provider_family=provider_family,
         auth_mode=auth_mode,
         mode=request.mode,
         prompt=request.prompt,
@@ -359,12 +363,41 @@ def create_task(
             EventKind.TASK_CREATED,
             {
                 "provider": record.provider,
+                "provider_family": record.provider_family,
                 "mode": record.mode.value,
                 "auth_mode": record.auth_mode.value,
                 "repository_id": record.repository_id,
             },
         )
     return record
+
+
+def task_provider_family(record: TaskRecord) -> str:
+    """Read immutable provenance; only old reserved built-in IDs have a safe fallback."""
+    if record.provider_family:
+        return record.provider_family
+    if record.provider in {"claude", "grok"}:
+        return record.provider
+    raise TaskSpindleError(
+        PROVIDER_FAMILY_UNKNOWN,
+        f"task {record.id} has no recorded provider family; start a new task and independent review "
+        "with the intended providers. Current alias settings cannot establish historical provenance",
+        details={"task_id": record.id, "provider": record.provider},
+    )
+
+
+def require_task_profile(record: TaskRecord, profile: Profile | None) -> str:
+    """The task's original family must still be the family its profile would run."""
+    family = task_provider_family(record)
+    if profile is None or profile.id != record.provider or profile.family != family:
+        raise TaskSpindleError(
+            PROVIDER_FAMILY_CHANGED,
+            f"task {record.id} is bound to provider family {family!r}; restore that profile "
+            "or start a new task and independent review with the intended providers",
+            details={"task_id": record.id, "provider": record.provider, "provider_family": family,
+                     "current_family": profile.family if profile else None},
+        )
+    return family
 
 
 # -- diff receipts ------------------------------------------------------------------
@@ -643,6 +676,7 @@ def task_view(record: TaskRecord) -> TaskView:
         state_version=record.state_version,
         cleanup_state=record.cleanup_state,
         provider=record.provider,
+        provider_family=record.provider_family,
         auth_mode=record.auth_mode,
         mode=record.mode,
         repository_id=record.repository_id,
@@ -652,6 +686,8 @@ def task_view(record: TaskRecord) -> TaskView:
         worktree_path=record.worktree_path,
         session_id=record.session_id,
         requested_model=record.requested_model,
+        resolved_model=record.resolved_model,
+        resolved_effort=record.resolved_effort,
         reported_model=record.reported_model,
         oauth_evidence=record.oauth_evidence or {},
         candidate_sha=record.candidate_sha,
@@ -688,8 +724,11 @@ def task_result(store: Store, task_id: str) -> TaskResult:
         checks=checks,
         attribution={
             "provider": record.provider,
+            "provider_family": record.provider_family,
             "auth_mode": record.auth_mode.value,
             "requested_model": record.requested_model,
+            "resolved_model": record.resolved_model,
+            "resolved_effort": record.resolved_effort,
             "reported_model": record.reported_model or latest.get("reported_model"),
             "gateway_host": latest.get("gateway_host"),
             "agent": latest.get("agent"),

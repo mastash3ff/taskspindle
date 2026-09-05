@@ -200,7 +200,7 @@ def from_prompt_response(
         reasoning_tokens=_int(usage.get("thought_tokens")),
         model_calls=None,
         duration_ms=duration_ms,
-        source=SOURCE_PROMPT_RESPONSE,
+        source="agy_cli_result" if "_agy_cli_cumulative" in usage else SOURCE_PROMPT_RESPONSE,
         raw=usage,
         price=price,
     )
@@ -371,7 +371,7 @@ def collect(
         usage = from_turn_completed(capture.turn_completed, model=model, duration_ms=duration_ms)
         if usage is not None and model is None:
             model = usage.model
-    if model is None:
+    if model is None and profile.family != "agy":
         model = profile.model
         if usage is not None:
             # Update attribution without repricing the unpriced turn_completed record.

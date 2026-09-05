@@ -1,7 +1,7 @@
 # TaskSpindle configuration.
 #
-# Every key is optional. With no configuration at all TaskSpindle offers the two first-class
-# providers -- `claude` and `grok` -- both OAuth-only, and that is the supported setup.
+# Every key is optional. Built-in providers are `claude`, `grok`, and `agy`, all OAuth-only.
+# AGY uses a separately pinned native CLI and its existing personal login; see docs/antigravity.md.
 #
 # A [providers.<id>] table adds a second-class profile. Second-class is a rule, not a label:
 # such a profile is never a default, never a fallback, and never chosen as a reviewer on its
@@ -9,7 +9,7 @@
 # id, and `auth = "api_key"` additionally requires start_task(allow_metered = true).
 #
 # Keys:
-#   base        "claude" or "grok" -- inherit that built-in's launch command and quirks.
+#   base        "claude", "grok", or "agy" -- inherit its launch command and quirks.
 #   auth        "oauth" or "api_key". Required.
 #   command     argv of an ACP stdio agent. Required unless `base` supplies one.
 #   env         plain environment names and values passed to the agent.

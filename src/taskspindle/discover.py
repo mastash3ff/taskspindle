@@ -6,7 +6,7 @@ out which binary names to look for on this machine. An agent that is found gets 
 ``[providers.<id>]`` block for ``config.toml``. Nothing is downloaded, nothing is run, and the
 configuration file is never written: the proposal is printed for a person to read and paste.
 
-The two first-class providers are skipped, since they are not configured this way.
+First-class providers are recognized separately, since they are not configured this way.
 """
 
 from __future__ import annotations
@@ -45,7 +45,10 @@ DEFAULT_REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/r
 _USER_AGENT = f"taskspindle/{taskspindle.__version__} (+https://github.com/mastash3ff/taskspindle)"
 
 #: Registry ids that map onto TaskSpindle's own first-class providers.
-_FIRST_CLASS_REGISTRY_IDS: dict[str, str] = {"claude-acp": "claude", "grok-build": "grok"}
+_FIRST_CLASS_REGISTRY_IDS: dict[str, str] = {
+    "claude-acp": "claude", "grok-build": "grok", "antigravity-acp": "agy",
+    "antigravity-cli": "agy",
+}
 
 #: Suffixes an npm package's bare name commonly drops in its installed bin name. ``-acp`` is not
 #: among them on purpose: an ``<x>-acp`` package is an adapter whose bin keeps the suffix, and the
@@ -260,6 +263,17 @@ def detect(
             if path is not None:
                 found.append(DiscoveredAgent(agent=agent, path=path, args=args))
                 break
+    native_agy = _resolve("agy", environment)
+    if native_agy is not None:
+        # Native AGY is a built-in outside the ACP registry. Prefer one clear discovery
+        # row over proposing a second ACP alias for the same provider family.
+        found = [item for item in found if first_class_match(item.agent) != "agy"]
+        found.append(DiscoveredAgent(
+            agent=RegistryAgent(
+                id="antigravity-cli", name="Antigravity CLI",
+                description="TaskSpindle native OAuth provider", candidates=(("agy", ()),),
+            ), path=native_agy, args=(),
+        ))
     return found
 
 
@@ -280,6 +294,8 @@ def first_class_match(agent: RegistryAgent) -> str | None:
 def proposal(found: DiscoveredAgent) -> str:
     """A ``config.toml`` block for one discovered agent, for a person to read and paste."""
     agent = found.agent
+    if first_class_match(agent) == "agy":
+        return "# Antigravity is built in as agy; run taskspindle setup --provider agy.\n"
     command = ", ".join(json.dumps(part) for part in found.command)
     description = f" -- {agent.description}" if agent.description else ""
     return (

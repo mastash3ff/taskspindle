@@ -1,9 +1,10 @@
 """Provider profiles, the child environment allowlist, and OAuth evidence.
 
 A *profile* is everything TaskSpindle needs to launch one ACP agent: the argv, the environment it
-is allowed to see, how it authenticates, and which task modes it may serve. Two profiles are
+is allowed to see, how it authenticates, and which task modes it may serve. Three profiles are
 built in and first class -- ``claude`` (the pinned ``claude-agent-acp`` adapter) and ``grok`` (the
-native ``grok agent ... stdio`` endpoint), both OAuth-only. Anything else is a configured,
+native ``grok agent ... stdio`` endpoint), plus Google's pinned native Antigravity CLI (``agy``),
+all OAuth-only. Anything else is a configured,
 second-class profile from ``[providers.<id>]`` in ``config.toml``.
 
 The child environment is built by *allowlist*, never by filtering the parent: a name reaches the
@@ -21,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
+
+import taskspindle
 
 __all__ = [
     "ALL_MODES",
@@ -46,8 +49,8 @@ __all__ = [
     "write_grok_overlay",
 ]
 
-#: The two providers TaskSpindle ships with. Their ids are reserved.
-FIRST_CLASS: tuple[str, ...] = ("claude", "grok")
+#: The providers TaskSpindle ships with. Their ids are reserved.
+FIRST_CLASS: tuple[str, ...] = ("claude", "grok", "agy")
 
 #: Every task mode. A profile serves all three unless its config narrows the set.
 ALL_MODES = frozenset({"consult", "review", "implement"})
@@ -62,6 +65,7 @@ ENV_ALLOWLIST: tuple[str, ...] = (
     "USER",
     "LOGNAME",
     "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
     "NO_COLOR",
 )
 
@@ -217,13 +221,17 @@ def _grok_command(model: str, effort: str) -> tuple[str, ...]:
     )
 
 
-def builtin_profiles(runtime_dir: Path, *, home: Path, state_dir: Path) -> dict[str, Profile]:
-    """The two first-class OAuth profiles.
+def builtin_profiles(
+    runtime_dir: Path, *, home: Path, state_dir: Path, data_dir: Path | None = None,
+) -> dict[str, Profile]:
+    """The built-in OAuth profiles.
 
     ``state_dir`` is required (beyond the brief's signature) because the ``grok`` profile's
     ``GROK_CONFIG`` must point at the overlay that disables hooks, skills, MCPs and subagents;
     the path is derived here, and :func:`write_grok_overlay` puts the file there.
     """
+    from .agy_cli_adapter import adapter_command
+
     claude_env = {"CLAUDE_CONFIG_DIR": str(home / ".claude")}
     grok_env = {
         "GROK_DISABLE_API_KEY_AUTH": "true",
@@ -249,6 +257,11 @@ def builtin_profiles(runtime_dir: Path, *, home: Path, state_dir: Path) -> dict[
             model=_GROK_DEFAULT_MODEL,
             effort=_GROK_DEFAULT_EFFORT,
             modes=ALL_MODES,
+            first_class=True,
+        ),
+        "agy": Profile(
+            id="agy", auth="oauth", command=adapter_command(runtime_dir),
+            env={},
             first_class=True,
         ),
     }
@@ -304,6 +317,8 @@ def _configured_profile(
     base_id = _optional_str(profile_id, table, "base")
     if base_id is not None and base_id not in FIRST_CLASS:
         raise _invalid(profile_id, f"base must be one of {', '.join(FIRST_CLASS)}")
+    if base_id == "agy" and table.get("auth") != "oauth":
+        raise _invalid(profile_id, "Antigravity profiles require personal OAuth")
     base = builtins[base_id] if base_id is not None else None
 
     auth = table.get("auth")
@@ -339,6 +354,10 @@ def _configured_profile(
 
     env = dict(base.env) if base else {}
     env.update(_str_map(profile_id, table, "env"))
+    if base_id == "agy" and base is not None and (command != base.command or env):
+        raise _invalid(
+            profile_id, "Antigravity aliases must retain the pinned native command and environment",
+        )
 
     return Profile(
         id=profile_id,
@@ -361,10 +380,11 @@ def load_profiles(
     runtime_dir: Path,
     home: Path,
     state_dir: Path,
+    data_dir: Path | None = None,
 ) -> dict[str, Profile]:
     """Built-in profiles plus every ``[providers.<id>]`` table in ``config``."""
     write_grok_overlay(state_dir)
-    profiles = builtin_profiles(runtime_dir, home=home, state_dir=state_dir)
+    profiles = builtin_profiles(runtime_dir, home=home, state_dir=state_dir, data_dir=data_dir)
     providers = config.get("providers") or {}
     if not isinstance(providers, dict):
         raise ProfileError("PROFILE_INVALID", "providers must be a table")
@@ -419,7 +439,7 @@ def session_mode(profile: Profile, mode: str) -> str | None:
 
 
 def opposite_provider(profile_id: str) -> str | None:
-    """The other first-class provider, for a default independent reviewer."""
+    """The legacy Claude/Grok status suggestion, never a review eligibility rule."""
     if profile_id == "claude":
         return "grok"
     if profile_id == "grok":
@@ -428,10 +448,31 @@ def opposite_provider(profile_id: str) -> str | None:
 
 
 def reviewer_independent(author: Profile, reviewer: Profile) -> bool:
-    """Whether ``reviewer`` is a genuinely different agent from ``author``."""
-    if author.id == reviewer.id:
+    """Whether ``reviewer`` can independently review this author's candidate.
+
+    Built-in authors require a different built-in provider. Profiles derived from the same
+    family cannot review each other, even with different commands or models. Other configured
+    authors retain the existing command/model distinction for second-class reviews.
+    """
+    if author.id == reviewer.id or author.family == reviewer.family:
         return False
+    if author.first_class:
+        return reviewer.first_class
     return author.command != reviewer.command or author.model != reviewer.model
+
+
+def adapter_metadata(profile: Profile) -> dict[str, str | None]:
+    """Pinned adapter identity, distinct from a model reported by a task's provider."""
+    if profile.family == "agy":
+        from .agy_cli_adapter import ADAPTER_ID, ADAPTER_VERSION, PROTOCOL
+
+        return {"protocol": PROTOCOL, "package": ADAPTER_ID, "version": ADAPTER_VERSION}
+    if profile.family == "claude":
+        return {
+            "protocol": "acp", "package": taskspindle.ADAPTER_PACKAGE,
+            "version": taskspindle.ADAPTER_VERSION,
+        }
+    return {"protocol": "acp", "package": None, "version": None}
 
 
 def pinned_node(runtime_dir: Path) -> Path | None:

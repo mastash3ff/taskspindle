@@ -1,7 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
+- **Native Antigravity.** Reserved OAuth provider `agy` uses a separately pinned native CLI
+  1.1.26 and the existing personal Google login. `setup --provider agy` installs code only;
+  `auth agy` checks cached authentication without another ACP browser sign-in. Private CLI
+  state, masked inherited controls and filesystem isolation enforce consult/review read-only
+  access and declared implementation scopes. Shell commands run only through TaskSpindle's
+  external verification step. New tasks select the newest advertised Gemini release, preferring
+  Flash and Medium effort, and retain that exact selection and conversation on continuation.
+  Observed tool violations stop the worker; cancellation and failures retain partial results.
+  Native cumulative usage is converted to per-turn deltas without replaying prior charges.
+- **Review independence rechecked.** Any different built-in provider can review a candidate;
+  aliases of the author's family are refused. Each new task records an immutable provider family.
+  Review, acceptance, manual integration and continuation compare that history with current
+  configuration. Old reserved Claude/Grok IDs remain usable; historical configured tasks with
+  unknown family fail closed instead of treating today's alias settings as historical evidence.
+- **Partial ACP failures retained.** Cancellation, timeouts and failed turns retain partial
+  responses, usage and session identifiers. A failed continuation never creates a replacement
+  conversation. Database schema 3 adds resolved model, effort and provider family; retain a
+  consistent schema-2 backup before activating this code for rollback to an older runtime.
 - **Grok model attribution.** New turns prefer the wire model ID, then the backend `modelUsage`
   key, then the profile model; attribution and usage agree while raw telemetry stays intact.
 - **Usage by repository.** `repository_id` grouping is available in MCP, the CLI and dashboard,

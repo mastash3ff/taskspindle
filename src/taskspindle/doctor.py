@@ -32,6 +32,7 @@ import taskspindle
 
 from . import limits, providers
 from .acp_client import AcpWorker, InitInfo, PermissionPolicy
+from .agy_policy import AgyPermissionPolicy
 from .config import Paths
 from .providers import Profile
 from .setup import ADAPTER_BIN
@@ -164,6 +165,10 @@ class _Doctor:
         self.adapter()
         self.grok_cli()
         self.claude_oauth()
+        if "agy" in self.profiles:
+            self.agy_cli()
+            if self.live_probes:
+                self.agy_oauth()
         self.checks.extend(live)
         self.child_envs()
         self.codex_registration()
@@ -334,6 +339,18 @@ class _Doctor:
         for profile_id, profile in sorted(self.profiles.items()):
             if profile.first_class:
                 continue
+            if profile.family == "agy":
+                from .agy_cli_adapter import agy_oauth_evidence
+
+                try:
+                    await asyncio.to_thread(
+                        agy_oauth_evidence, profile, self.parent_env, runner=self.runner,
+                    )
+                except Exception as exc:
+                    checks.append(Check(f"cli_{profile_id}", False, f"{type(exc).__name__}: {exc}"))
+                else:
+                    checks.append(Check(f"cli_{profile_id}", True, "native CLI cached catalog available"))
+                continue
             name = f"acp_{profile_id}"
             missing = self._missing_secrets(profile)
             if missing:
@@ -351,6 +368,59 @@ class _Doctor:
             checks.append(Check(name, True, f"configured: {agent} answered initialize"))
         return checks
 
+    def agy_cli(self) -> None:
+        from .agy_cli_adapter import validate_cli_profile, verify_cli_version
+
+        @self.check("agy_cli")
+        def binary_probe() -> str:
+            binary = validate_cli_profile(self.profiles["agy"])
+            version = verify_cli_version(binary, runner=self.runner, parent_env=self.parent_env)
+            return f"pinned native Antigravity CLI {version}"
+
+        @self.check("agy_sandbox")
+        def sandbox_probe() -> str:
+            binary = shutil.which("bwrap", path=self.parent_env.get("PATH"))
+            if binary is None:
+                raise RuntimeError("bubblewrap is required for native Antigravity workers")
+            result = self.run([binary, "--version"])
+            if result.returncode != 0:
+                raise RuntimeError("bubblewrap could not be started")
+            return "bubblewrap is installed; task startup validates its isolated launch"
+
+    def agy_oauth(self) -> None:
+        from .agy_cli_adapter import agy_oauth_evidence
+
+        @self.check("agy_oauth")
+        def probe() -> str:
+            evidence = agy_oauth_evidence(self.profiles["agy"], self.parent_env, runner=self.runner)
+            return f"native CLI cached login works; {evidence['model_count']} Gemini models advertised"
+
+    def agy_acp_oauth(self) -> None:
+        """Legacy ACP cache evidence; not used for the native built-in provider."""
+        from .agy_adapter import agy_oauth_evidence
+
+        @self.check("agy_acp_oauth")
+        def probe() -> str:
+            agy_oauth_evidence(self.profiles["agy"])
+            return "private oauth-personal cache exists; validity is checked by session creation"
+
+    async def _agy_acp(self) -> Check:
+        """Initialize only: this probe never authenticates or creates a model session."""
+        from .agy_adapter import ADAPTER_VERSION, AUTH_METHOD, validate_agy_home
+
+        profile = self.profiles["agy"]
+        try:
+            validate_agy_home(profile)
+            with tempfile.TemporaryDirectory(prefix="taskspindle-doctor-") as raw:
+                init = await self._init_probe(profile, Path(raw))
+            if init is None or not init.load_session or AUTH_METHOD not in init.auth_method_ids:
+                raise RuntimeError("Antigravity must advertise load_session and oauth-personal")
+            if init.agent_info.get("version") not in (ADAPTER_VERSION, f"agy_acp_server_{ADAPTER_VERSION}"):
+                raise RuntimeError(f"Antigravity did not report pinned ACP version {ADAPTER_VERSION}")
+        except Exception as exc:
+            return Check("agy_acp", False, f"{type(exc).__name__}: {exc}")
+        return Check("agy_acp", True, f"Antigravity ACP {ADAPTER_VERSION}: load_session and oauth-personal")
+
     def _missing_secrets(self, profile: Profile) -> list[str]:
         """The secrets an ``api_key`` profile declares that this environment does not have."""
         if profile.auth != "api_key":
@@ -366,7 +436,10 @@ class _Doctor:
             env=env,
             cwd=workspace,
             stderr_path=workspace / "agent.stderr",
-            policy=PermissionPolicy(allow_writes=False),
+            policy=(
+                AgyPermissionPolicy(allow_writes=False, workspace=workspace)
+                if profile.family == "agy" else PermissionPolicy(allow_writes=False)
+            ),
             handshake_timeout=_TIMEOUT,
         )
         async with worker as agent:

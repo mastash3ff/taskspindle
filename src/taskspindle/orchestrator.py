@@ -71,6 +71,7 @@ from .service import (
     require_independent_review,
     require_provider_available,
     require_task,
+    require_task_profile,
     task_result,
     task_view,
     transition,
@@ -318,6 +319,7 @@ class Orchestrator:
                     "auth": profile.auth,
                     "modes": sorted(profile.modes),
                     "model": profile.model,
+                    "adapter": providers.adapter_metadata(profile),
                     "gateway_host": profile.gateway_host,
                     "availability": provider_availability(self.store, profile, now=now),
                     "windows": self.store.latest_provider_windows(limits_key(profile)),
@@ -520,6 +522,7 @@ class Orchestrator:
                 request,
                 repository_id=placement.repository_id,
                 auth_mode=AuthMode(profile.auth),
+                provider_family=profile.family,
             )
             self._prepare(record, request, placement)
             self.dispatch_queued()
@@ -576,7 +579,7 @@ class Orchestrator:
                         "actual": subject.candidate_sha,
                     },
                 )
-            self._require_independent(subject.provider, request.provider)
+            self._require_independent(subject, request.provider)
             identity = self._identity_for(subject.repository_id)
             repository_id = self._granted(identity, request.provider, Mode.REVIEW)
             return _Placement(
@@ -597,8 +600,11 @@ class Orchestrator:
             raise TaskSpindleError(code, str(exc), details={"code": exc.code}) from exc
         return _Placement(identity=identity, repository_id=repository_id, base=sha)
 
-    def _require_independent(self, author_id: str, reviewer_id: str) -> None:
+    def _require_independent(
+        self, author_task: TaskRecord, reviewer_id: str, reviewer_task: TaskRecord | None = None,
+    ) -> None:
         """A reviewer must be a genuinely different agent from the author."""
+        author_id = author_task.provider
         author = self.profiles.get(author_id)
         reviewer = self.profiles.get(reviewer_id)
         if author is None or reviewer is None:
@@ -607,16 +613,15 @@ class Orchestrator:
                 "independence cannot be established: one of the profiles is not configured",
                 details={"author": author_id, "reviewer": reviewer_id},
             )
-        if author.first_class:
-            independent = reviewer.id == providers.opposite_provider(author.id)
-        else:
-            independent = providers.reviewer_independent(author, reviewer)
-        if not independent:
+        if not providers.reviewer_independent(author, reviewer):
             raise TaskSpindleError(
                 REVIEWER_NOT_INDEPENDENT,
                 f"{reviewer_id} is not an independent reviewer of {author_id}",
                 details={"author": author_id, "reviewer": reviewer_id},
             )
+        require_task_profile(author_task, author)
+        if reviewer_task is not None:
+            require_task_profile(reviewer_task, reviewer)
 
     def _granted(self, identity: RepositoryIdentity, provider: str, mode: Mode) -> str:
         row = self.store.find_repository(str(identity.common_dir), identity.root_commit)
@@ -793,6 +798,11 @@ class Orchestrator:
 
     def _start_worker(self, task: TaskRecord) -> bool:
         """Take the provider lease and run the task's pending turn as a transient unit."""
+        try:
+            require_task_profile(task, self.profiles.get(task.provider))
+        except TaskSpindleError as exc:
+            self._fail(task.id, exc.code, exc.message, exc.details, reason="dispatch failed")
+            return False
         unit = units.worker_unit_name(task.id)
         if not self.store.acquire_lease(task.provider, task.id, unit, None, self.boot):
             return False
@@ -976,6 +986,7 @@ class Orchestrator:
                     f"a {record.mode.value} task in {record.state.value} cannot be continued",
                     details={"task_id": task_id, "from": record.state.value},
                 )
+            require_task_profile(record, self.profiles.get(record.provider))
             if kind is TurnKind.RESUME and not record.session_id:
                 raise TaskSpindleError(
                     RESUME_UNAVAILABLE,
@@ -1036,6 +1047,13 @@ class Orchestrator:
             unit = units.accept_unit_name(request.task_id)
             with self.store.transaction():
                 record = check_acceptance(self.store, request)
+                # The bound review may predate a profile change or the family-level rule.
+                # Recheck before writing the journal or changing the candidate's state.
+                review = self.store.get_review_for(request.review_task_id)
+                assert review is not None  # check_acceptance established this in this transaction.
+                self._require_independent(
+                    record, review["provider"], require_task(self.store, request.review_task_id),
+                )
                 _accept_gates(self.store, record)
                 self.store.write_journal(
                     record.id,
@@ -1123,7 +1141,10 @@ class Orchestrator:
                     details={"task_id": record.id, "from": record.state.value},
                 )
             require_diff_retrieved(self.store, record)
-            require_independent_review(self.store, record)
+            review = require_independent_review(self.store, record)
+            self._require_independent(
+                record, review["provider"], require_task(self.store, review["review_task_id"]),
+            )
             _accept_gates(self.store, record, require_checks=False)
             head = self._resolve_head(record, request.resulting_head)
             payload["resulting_head"] = head

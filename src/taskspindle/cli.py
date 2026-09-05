@@ -1,9 +1,9 @@
 """The ``taskspindle`` command line.
 
-Eight subcommands, and none of them is the interesting part: the MCP server is what a Codex
+The MCP server is what a Codex
 session talks to, and ``worker`` and ``accept`` exist so that the two detached entry points the
 systemd units run can also be run by hand when something has gone wrong. ``setup``, ``doctor``,
-``discover``, ``usage`` and ``web`` are the ones a person actually types.
+``auth``, ``discover``, ``usage`` and ``web`` are the ones a person actually types.
 
 Nothing here decides anything. Each subcommand resolves the paths, hands off to the module that
 owns the work, and turns whatever comes back into an exit code and a line of output. Failures are
@@ -62,6 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup", help="install the pinned adapter runtime and lay out the dirs")
     setup.add_argument("--runtime-dir", help="install into this directory instead of the default")
     setup.add_argument("--npm", default="npm", help="the npm executable to use (default: npm)")
+    setup.add_argument("--provider", choices=("claude", "agy"), default="claude",
+                       help="adapter to install (default: claude)")
+
+    auth = sub.add_parser("auth", help="check the existing native provider login")
+    auth.add_argument("provider", choices=("agy",))
+    auth.add_argument("--runtime-dir", help="use an explicitly installed adapter runtime directory")
 
     doctor = sub.add_parser("doctor", help="check everything TaskSpindle needs before it runs")
     doctor.add_argument(
@@ -120,7 +126,9 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     if args.command == "setup":
-        return _setup(args.runtime_dir, args.npm)
+        return _setup(args.runtime_dir, args.npm, args.provider)
+    if args.command == "auth":
+        return _auth_agy(args.runtime_dir)
     if args.command == "doctor":
         return _doctor(live_probes=not args.no_live, as_json=args.json)
     if args.command == "mcp":
@@ -139,19 +147,47 @@ def main(argv: list[str] | None = None) -> int:
 # -- setup ---------------------------------------------------------------------------
 
 
-def _setup(runtime_dir: str | None, npm: str) -> int:
-    from .setup import SetupError, install_runtime
+def _setup(runtime_dir: str | None, npm: str, provider: str = "claude") -> int:
+    from .setup import SetupError, install_agy_runtime, install_runtime
 
     paths = resolve_paths(runtime_dir)
     try:
-        report = install_runtime(paths, npm=npm)
+        report = install_agy_runtime(paths) if provider == "agy" else install_runtime(paths, npm=npm)
     except SetupError as exc:
         print(f"taskspindle setup: {exc}", file=sys.stderr)
         return 1
-    print(f"adapter {taskspindle.ADAPTER_PACKAGE} {report['adapter_version']}")
+    package = report.get("adapter_package", taskspindle.ADAPTER_PACKAGE)
+    print(f"adapter {package} {report['adapter_version']}")
     print(f"runtime {report['runtime_dir']}")
-    print(f"node    {report['node']}")
+    if "node" in report:
+        print(f"node    {report['node']}")
+    if provider == "agy":
+        print("check the existing CLI login with taskspindle auth agy")
     print(f"config  {report['config_file']} ({'written' if report['created_config'] else 'kept'})")
+    return 0
+
+
+def _auth_agy(runtime_dir: str | None = None) -> int:
+    """Check native CLI login without opening the task store or starting browser OAuth."""
+    from . import providers
+    from .agy_cli_adapter import agy_oauth_evidence
+    from .config import load_config
+
+    paths = resolve_paths(runtime_dir)
+    try:
+        profiles = providers.load_profiles(
+            load_config(paths.config_file), runtime_dir=paths.runtime_dir,
+            home=Path(os.environ.get("HOME", "")), state_dir=paths.state_dir, data_dir=paths.data_dir,
+        )
+        profile = profiles["agy"]
+        evidence = agy_oauth_evidence(profile, os.environ)
+    except (ConfigError, providers.ProfileError, OSError) as exc:
+        print(f"taskspindle auth agy: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("taskspindle auth agy: sign-in cancelled", file=sys.stderr)
+        return 130
+    print(f"Antigravity CLI cached login works; {evidence['model_count']} Gemini models advertised.")
     return 0
 
 
@@ -171,6 +207,7 @@ def _doctor(*, live_probes: bool, as_json: bool) -> int:
             runtime_dir=paths.runtime_dir,
             home=Path(os.environ.get("HOME", "")),
             state_dir=paths.state_dir,
+            data_dir=paths.data_dir,
         )
     except (ConfigError, providers.ProfileError, OSError) as exc:
         return _report({"ok": False, "checks": [_check("config", str(exc))]}, as_json=as_json)
@@ -209,6 +246,7 @@ def _profiles(paths: Paths) -> dict[str, Any]:
         runtime_dir=paths.runtime_dir,
         home=Path(os.environ.get("HOME", "")),
         state_dir=paths.state_dir,
+        data_dir=paths.data_dir,
     )
 
 

@@ -47,6 +47,7 @@ from acp.helpers import start_tool_call, update_agent_message_text
 from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
+    AuthenticateResponse,
     AuthMethodAgent,
     Implementation,
     InitializeResponse,
@@ -54,6 +55,7 @@ from acp.schema import (
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
+    SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     ToolCallUpdate,
     Usage,
@@ -119,11 +121,13 @@ class FakeAgent:
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_capabilities=AgentCapabilities(load_session=bool(self.script.get("load_session", False))),
-            auth_methods=[AuthMethodAgent(id="cached_token", name="Cached token")],
+            auth_methods=[AuthMethodAgent(id=method, name=method)
+                          for method in self.script.get("auth_methods", ["cached_token"])],
             agent_info=_AGENT_INFO,
         )
 
     async def new_session(self, cwd: str, **kwargs: Any) -> NewSessionResponse:
+        await self._session_operation("new")
         session_id = str(self.script.get("session_id", "fake-session-1"))
         self._cwds[session_id] = Path(cwd)
         capture_meta_to = self.script.get("capture_meta_to")
@@ -138,10 +142,36 @@ class FakeAgent:
         return NewSessionResponse(session_id=session_id, config_options=self.script.get("config_options"))
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> LoadSessionResponse:
+        await self._session_operation("load")
         self._cwds[session_id] = Path(cwd)
         for index in range(int(self.script.get("replay_count", 0))):
             await self._emit(session_id, f"replayed {index}")
         return LoadSessionResponse(config_options=self.script.get("config_options"))
+
+    async def _session_operation(self, operation: str) -> None:
+        await asyncio.sleep(float(self.script.get(f"{operation}_delay", 0)))
+        if self.script.get(f"{operation}_fail"):
+            raise RequestError.auth_required({"reason": "scripted refusal"})
+
+    async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse:
+        await self._session_operation("auth")
+        if capture := self.script.get("capture_auth_to"):
+            Path(capture).write_text(method_id)
+        return AuthenticateResponse()
+
+    async def set_config_option(
+        self, session_id: str, config_id: str, value: str, **kwargs: Any
+    ) -> SetSessionConfigOptionResponse:
+        await self._session_operation("config")
+        options = self.script.get("config_options", [])
+        if not self.script.get("unconfirmed_config"):
+            options = [dict(option, currentValue=value) if option.get("id") == config_id else option
+                       for option in options]
+        resets = self.script.get("reset_config_on_set", {}).get(config_id, {})
+        options = [dict(option, currentValue=resets[option["id"]]) if option["id"] in resets
+                   else option for option in options]
+        self.script["config_options"] = options
+        return SetSessionConfigOptionResponse(config_options=options)
 
     async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> SetSessionModeResponse:
         if self.script.get("refuse_mode"):
@@ -165,6 +195,12 @@ class FakeAgent:
             raise FAILURES[str(fail_kind)]
 
         block_seconds = script.get("block_seconds")
+        if early_text := script.get("early_text"):
+            await self._emit(session_id, early_text)
+        for update in script.get("prompt_updates", []):
+            await self.conn._conn.send_notification(
+                "session/update", {"sessionId": session_id, "update": update},
+            )
         if block_seconds and await self._blocked(session_id, float(block_seconds)):
             if script.get("fail_on_cancel"):
                 # An agent that falls over when asked to stop, instead of reporting "cancelled".
@@ -199,6 +235,8 @@ class FakeAgent:
         text = "not json" if script.get("malformed_review") else str(script.get("response", "OK"))
         for chunk in _two_chunks(text):
             await self._emit(session_id, chunk)
+        if script.get("fail_after_response"):
+            raise RequestError.internal_error({"details": "failed after partial response"})
 
         turn_completed = script.get("turn_completed")
         if turn_completed and script.get("late_turn_completed"):

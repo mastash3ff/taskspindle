@@ -113,6 +113,7 @@ async def test_a_claude_review_runs_in_plan_mode_and_an_implement_in_default(
         store,
         paths,
         mode=Mode.REVIEW,
+        provider_family="claude",
         repo=make_repo(),
         review_target={"kind": "candidate", "task_id": subject.id, "candidate_sha": subject.candidate_sha},
     )
@@ -124,7 +125,9 @@ async def test_a_claude_review_runs_in_plan_mode_and_an_implement_in_default(
     assert state is TaskState.COMPLETED
     assert mode_file.read_text() == "plan"
 
-    implement = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=make_repo("other"))
+    implement = seed_task(
+        store, paths, mode=Mode.IMPLEMENT, repo=make_repo("other"), provider_family="claude",
+    )
     mode_file = tmp_path / "mode-implement.txt"
     state = await run_as_claude(
         store,
@@ -145,7 +148,7 @@ async def test_a_claude_review_runs_in_plan_mode_and_an_implement_in_default(
 async def test_an_agent_that_refuses_the_mode_fails_the_turn_rather_than_running_unguarded(
     store, paths, script
 ) -> None:
-    task = seed_task(store, paths, mode=Mode.CONSULT)
+    task = seed_task(store, paths, mode=Mode.CONSULT, provider_family="claude")
 
     state = await run_as_claude(store, paths, task, script({"response": "never", "refuse_mode": True}))
 
@@ -154,7 +157,7 @@ async def test_an_agent_that_refuses_the_mode_fails_the_turn_rather_than_running
 
 
 async def test_asking_to_leave_plan_mode_is_a_recorded_violation(store, paths, script) -> None:
-    task = seed_task(store, paths, mode=Mode.CONSULT)
+    task = seed_task(store, paths, mode=Mode.CONSULT, provider_family="claude")
 
     state = await run_as_claude(store, paths, task, script({"response": "ok", "ask_switch_mode": True}))
 

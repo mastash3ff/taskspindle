@@ -421,6 +421,67 @@ def test_a_reviewer_that_is_not_independent_is_refused(harness: Harness, make_re
     assert excinfo.value.code == service.REVIEWER_NOT_INDEPENDENT
 
 
+@pytest.mark.parametrize(
+    ("author_id", "reviewer_id"),
+    [
+        ("claude", "grok"),
+        ("claude", "agy"),
+        ("grok", "claude"),
+        ("grok", "agy"),
+        ("agy", "claude"),
+        ("agy", "grok"),
+        ("claude", "claude"),
+        ("grok", "grok"),
+        ("agy", "agy"),
+    ],
+)
+def test_builtin_candidate_review_pairings(
+    harness: Harness, make_repo, author_id: str, reviewer_id: str
+) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    original_head = repos.current_head(repo)
+    # Reuse the fake worker's real candidate in a new record with declared provenance,
+    # exercising dispatch without a vendor authentication endpoint or live adapter.
+    source = harness.orchestrator.store.get_task(task_id)
+    task_id = service.new_task_id()
+    harness.orchestrator.store.insert_task(source.model_copy(update={
+        "id": task_id, "provider": author_id, "provider_family": author_id,
+    }))
+    for provider_id in {author_id, reviewer_id}:
+        harness.orchestrator.profiles[provider_id] = Profile(
+            id=provider_id, auth="oauth", command=("adapter",), first_class=True
+        )
+    harness.orchestrator.authorize_repository(str(repo), [reviewer_id], [Mode.REVIEW.value])
+    harness.defer()
+    status = harness.orchestrator.task_status(task_id)
+    request = StartTaskRequest(
+        provider=reviewer_id,
+        mode=Mode.REVIEW,
+        prompt="review the candidate",
+        review_target=ReviewTarget(
+            kind="candidate", task_id=task_id, candidate_sha=status["candidate_sha"]
+        ),
+    )
+
+    if author_id == reviewer_id:
+        with pytest.raises(TaskSpindleError) as excinfo:
+            harness.orchestrator.start_task(request)
+        assert excinfo.value.code == service.REVIEWER_NOT_INDEPENDENT
+        assert harness.pending == []
+    else:
+        started = harness.orchestrator.start_task(request)
+        assert started["state"] == TaskState.QUEUED.value
+        assert harness.pending == [started["task_id"]]
+        review = harness.orchestrator.store.get_task(started["task_id"])
+        assert review is not None
+        assert review.provider == reviewer_id
+        assert request.review_target is not None
+        assert review.review_target == request.review_target.model_dump(mode="json")
+    assert repos.current_head(repo) == original_head
+    assert harness.orchestrator.task_status(task_id)["state"] == TaskState.RESULT_READY.value
+
+
 def test_a_scope_violation_blocks_acceptance(harness: Harness, make_repo, script) -> None:
     repo = make_repo()
     harness.orchestrator.profiles[AUTHOR] = fake_profile(

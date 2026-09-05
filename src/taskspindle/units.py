@@ -61,7 +61,7 @@ WORKER_PROPERTIES: dict[str, str] = {
 COMMAND_TIMEOUT = 30.0
 
 #: Names copied into a unit's environment, plus every ``XDG_*`` name the parent has.
-_UNIT_ENV_NAMES = ("PATH", "HOME", "LANG")
+_UNIT_ENV_NAMES = ("PATH", "HOME", "LANG", "DBUS_SESSION_BUS_ADDRESS")
 
 UnitKind = Literal["active", "success", "oom", "signal", "exit", "not_found", "unknown"]
 

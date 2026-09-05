@@ -300,6 +300,12 @@ class AcpWorker:
         self.mode: str | None = None
         #: A canonical Claude model from the session configuration, when the adapter supplies one.
         self.session_model: str | None = None
+        #: Exact advertised configuration, kept independently of model attribution.
+        self.session_config_options: list[dict[str, Any]] = []
+        self._expected_config: dict[str, str] = {}
+        self._config_violation = False
+        #: The last prompt's capture, including a prompt that raised or was cancelled.
+        self.last_result: TurnResult | None = None
 
     # -- lifecycle ---------------------------------------------------------------------------
 
@@ -366,6 +372,8 @@ class AcpWorker:
         update = params.get("update") if isinstance(params, dict) else None
         if not _is_session_update(event.message.get("method"), update):
             return
+        if isinstance(update, dict):
+            self._observe_configuration(update)
         capture = self._capture
         if capture is None:
             return
@@ -402,6 +410,43 @@ class AcpWorker:
         elif kind == "turn_completed":
             capture.turn_completed = dict(update)
 
+    def _observe_configuration(self, update: dict[str, Any]) -> None:
+        """Protect selected values even between configuration requests and turns."""
+        if not self._expected_config:
+            return
+        kind = update.get("sessionUpdate")
+        changed = False
+        if kind == "current_mode_update" and "mode" in self._expected_config:
+            changed = update.get("currentModeId") != self._expected_config["mode"]
+        elif kind == "config_option_update":
+            options = update.get("configOptions")
+            if not isinstance(options, list):
+                changed = True
+            else:
+                for option in options:
+                    if not isinstance(option, dict) or not isinstance(option.get("id"), str):
+                        changed = True
+                    elif option["id"] in self._expected_config:
+                        changed |= option.get("currentValue") != self._expected_config[option["id"]]
+        if changed and not self._config_violation:
+            self._config_violation = True
+            if self._capture is not None:
+                self._capture.violations.append(MODE_SWITCH_ATTEMPT)
+            else:
+                self.last_result = TurnResult(
+                    stop_reason="error", text="",
+                    capture=TurnCapture(violations=[MODE_SWITCH_ATTEMPT]),
+                )
+            # Stop a host that changed a protected option without client approval.
+            # The worker unit's control-group teardown also stops its descendants.
+            if self._process is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    self._process.terminate()
+
+    def _require_configuration_intact(self) -> None:
+        if self._config_violation:
+            raise AcpError(MODE_SWITCH_ATTEMPT, "agent changed a protected session configuration value")
+
     def _record_permission(
         self,
         tool_call: ToolCallUpdate,
@@ -425,12 +470,42 @@ class AcpWorker:
 
     # -- sessions ----------------------------------------------------------------------------
 
+    async def authenticate(self, method_id: str, *, timeout: float = 60.0) -> None:
+        """Run an explicitly requested authentication operation with a bounded lifetime.
+
+        Background workers must check cached authentication instead of using this to start a
+        browser login. The interactive CLI is the caller for personal OAuth sign-in.
+        """
+        if self.init is None or method_id not in self.init.auth_method_ids:
+            raise AcpError("ACP_AUTH_FAILED", f"agent does not offer authentication method {method_id!r}")
+        try:
+            await asyncio.wait_for(self._connection().authenticate(method_id=method_id), timeout=timeout)
+        except Exception as exc:
+            raise AcpError(
+                "ACP_AUTH_FAILED", f"authentication failed: {exc}", cause=error_cause(exc)
+            ) from exc
+
+    def _remember_session_configuration(self, response: Any) -> None:
+        self.session_model = _claude_config_model(response)
+        self.session_config_options = _config_options(response)
+
     async def new_session(self, **session_kwargs: Any) -> str:
         """Create a session in the worker's cwd. Extra kwargs travel as the request's ``_meta``."""
-        response = await self._connection().new_session(cwd=str(self._cwd), **session_kwargs)
-        self.session_model = _claude_config_model(response)
-        self._sessions.append(response.session_id)
-        return response.session_id
+        try:
+            response = await asyncio.wait_for(
+                self._connection().new_session(cwd=str(self._cwd), **session_kwargs),
+                timeout=self._handshake_timeout,
+            )
+        except Exception as exc:
+            raise AcpError(
+                "ACP_SESSION_FAILED", f"session/new failed: {exc}", cause=error_cause(exc)
+            ) from exc
+        session_id = getattr(response, "session_id", None)
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise AcpError("ACP_SESSION_FAILED", "session/new returned no usable session identifier")
+        self._remember_session_configuration(response)
+        self._sessions.append(session_id)
+        return session_id
 
     async def load_session(self, session_id: str, **session_kwargs: Any) -> None:
         """Resume a prior session, discarding whatever the agent replays.
@@ -443,10 +518,15 @@ class AcpWorker:
         replay = TurnCapture()
         self._capture = replay
         try:
-            response = await self._connection().load_session(
-                cwd=str(self._cwd), session_id=session_id, **session_kwargs
+            response = await asyncio.wait_for(
+                self._connection().load_session(cwd=str(self._cwd), session_id=session_id, **session_kwargs),
+                timeout=self._handshake_timeout,
             )
-            self.session_model = _claude_config_model(response)
+            self._remember_session_configuration(response)
+        except Exception as exc:
+            raise AcpError(
+                "RESUME_UNAVAILABLE", f"session/load failed: {exc}", cause=error_cause(exc)
+            ) from exc
         finally:
             self._capture = None
         self.replay_update_count = replay.raw_update_count
@@ -455,7 +535,10 @@ class AcpWorker:
     async def set_mode(self, session_id: str, mode_id: str) -> None:
         """Put the session in ``mode_id`` (ACP ``session/set_mode``); the agent must offer it."""
         try:
-            await self._connection().set_session_mode(session_id=session_id, mode_id=mode_id)
+            await asyncio.wait_for(
+                self._connection().set_session_mode(session_id=session_id, mode_id=mode_id),
+                timeout=self._handshake_timeout,
+            )
         except Exception as exc:
             raise AcpError(
                 "MODE_UNAVAILABLE",
@@ -464,35 +547,76 @@ class AcpWorker:
             ) from exc
         self.mode = mode_id
 
+    async def set_config_option(self, session_id: str, config_id: str, value: str) -> None:
+        """Confirm the selection and preserve every previously selected protected value."""
+        self._require_configuration_intact()
+        previous = self._expected_config
+        # A server can publish the approved selection before returning its response.
+        self._expected_config = {**previous, config_id: value}
+        try:
+            response = await asyncio.wait_for(
+                self._connection().set_config_option(session_id=session_id, config_id=config_id, value=value),
+                timeout=self._handshake_timeout,
+            )
+            self._require_configuration_intact()
+            options = _config_options(response)
+            self._observe_configuration({"sessionUpdate": "config_option_update", "configOptions": options})
+            self._require_configuration_intact()
+            for key, expected in self._expected_config.items():
+                selected = [option for option in options if option.get("id") == key]
+                if len(selected) != 1 or selected[0].get("currentValue") != expected:
+                    raise ValueError(f"agent did not confirm protected configuration value {key!r}")
+        except BaseException as exc:
+            self._expected_config = previous
+            if not isinstance(exc, Exception):
+                raise
+            raise AcpError(
+                "CONFIG_UNAVAILABLE", f"agent refused {config_id!r} = {value!r}: {exc}",
+                cause=error_cause(exc),
+            ) from exc
+        self.session_config_options = options
+
     async def prompt(self, session_id: str, text: str, *, timeout: float) -> TurnResult:
         """Send one turn and capture everything it produced."""
         capture = TurnCapture()
+        self.last_result = None
         self._capture = capture
+        stop_reason = "error"
+        response = None
         try:
+            self._require_configuration_intact()
             response = await asyncio.wait_for(
                 self._connection().prompt(session_id=session_id, prompt=[text_block(text)]),
                 timeout=timeout,
             )
+            stop_reason = response.stop_reason
+            await self._await_late_updates(capture)
+            self._require_configuration_intact()
         except TimeoutError as exc:
+            self._require_configuration_intact()
+            stop_reason = "timeout"
             await self.cancel(session_id)
             raise AcpError("TURN_TIMEOUT", f"turn exceeded {timeout}s") from exc
         except Exception as exc:
+            self._require_configuration_intact()
             raise AcpError(
                 "ACP_TURN_ERROR", f"session/prompt failed: {exc}", cause=error_cause(exc)
             ) from exc
         except BaseException:
-            self._capture = None
+            stop_reason = "cancelled"
+            await self.cancel(session_id)
             raise
-        try:
-            await self._await_late_updates(capture)
         finally:
+            if self._config_violation:
+                stop_reason = "error"
+                if MODE_SWITCH_ATTEMPT not in capture.violations:
+                    capture.violations.append(MODE_SWITCH_ATTEMPT)
+            self.last_result = TurnResult(
+                stop_reason=stop_reason, text="".join(capture.text), capture=capture,
+                usage=_usage_data(getattr(response, "usage", None)),
+            )
             self._capture = None
-        return TurnResult(
-            stop_reason=response.stop_reason,
-            text="".join(capture.text),
-            capture=capture,
-            usage=_usage_data(getattr(response, "usage", None)),
-        )
+        return self.last_result
 
     async def _await_late_updates(self, capture: TurnCapture) -> None:
         """Keep the capture open a little after the response, until the turn summary lands."""
@@ -500,6 +624,8 @@ class AcpWorker:
             return
         deadline = asyncio.get_running_loop().time() + self._late_update_grace
         while capture.turn_completed is None:
+            if self._config_violation:
+                return
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return
@@ -565,6 +691,20 @@ def _claude_config_model(response: Any) -> str | None:
                 ):
                     return description
     return None
+
+
+def _config_options(response: Any) -> list[dict[str, Any]]:
+    """Keep only well-shaped select/boolean options; callers validate their required options."""
+    raw = getattr(response, "config_options", None)
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for option in raw:
+        if hasattr(option, "model_dump"):
+            option = option.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if isinstance(option, dict) and isinstance(option.get("id"), str):
+            result.append(dict(option))
+    return result
 
 
 def _usage_data(usage: Any) -> dict[str, Any] | None:
