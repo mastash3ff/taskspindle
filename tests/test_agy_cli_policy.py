@@ -59,6 +59,13 @@ def test_policy_is_private_and_does_not_copy_auth(layout) -> None:
     assert metadata["verification_commands_external"] == 1
 
 
+def test_native_namespace_forces_auto_updates_off_after_environment_reset(layout) -> None:
+    argv = launch(layout)
+    result = _run_inside(argv, "import json, os; print(json.dumps({'value': "
+                         "os.environ.get('AGY_CLI_DISABLE_AUTO_UPDATE')}))")
+    assert result["value"] == "true"
+
+
 def test_consult_settings_deny_writes_execution_and_extensions(layout) -> None:
     _, _, task = layout
     launch(layout)

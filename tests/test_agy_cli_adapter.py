@@ -1,6 +1,7 @@
 """Native CLI provisioning and cached-login checks with no real account or model turn."""
 
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -78,6 +79,30 @@ def test_builtin_uses_native_pin_and_existing_home_with_no_secrets(paths, enviro
     assert providers.adapter_metadata(profile) == {
         "protocol": "agy-cli", "package": "antigravity-cli", "version": "1.1.26",
     }
+
+
+@pytest.mark.parametrize("provider", ["agy", "agy-alias"])
+def test_native_child_environment_forces_the_qualified_build_to_skip_updates(
+    paths, environment, tmp_path, provider,
+):
+    profile = native_profile(paths)
+    if provider != "agy":
+        profile = replace(profile, id=provider, base="agy", first_class=False)
+    environment["AGY_CLI_DISABLE_AUTO_UPDATE"] = "false"
+    env = providers.build_child_env(profile, environment, task_tmp=tmp_path)
+    assert env["AGY_CLI_DISABLE_AUTO_UPDATE"] == "true"
+
+
+def test_version_probe_does_not_allow_a_native_updater_to_replace_the_pin(paths, environment):
+    binary = Path(native_profile(paths).command[0])
+    body = (f"#!{sys.executable}\n"
+            "import os\nfrom pathlib import Path\n"
+            "if os.environ.get('AGY_CLI_DISABLE_AUTO_UPDATE') != 'true':\n"
+            "    Path(__file__).write_text('self-updated binary')\n"
+            "print('1.1.26')\n").encode()
+    executable(binary, body)
+    assert adapter.verify_cli_version(binary, parent_env=environment) == "1.1.26"
+    assert binary.read_bytes() == body
 
 
 def test_setup_copies_only_code_and_reuses_pin_after_daily_cli_changes(paths, environment):

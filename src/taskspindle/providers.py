@@ -100,6 +100,10 @@ GROK_COMPAT_ENV: dict[str, str] = {
     for source in ("SKILLS", "RULES", "AGENTS", "MCPS", "HOOKS", "SESSIONS")
 }
 
+#: Native CLI 1.1.26 checks this exact value before spawning its background updater. Version
+#: and catalog probes run outside the worker mount namespace, so every AGY child needs it.
+AGY_PIN_ENV: dict[str, str] = {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
+
 _GROK_DEFAULT_MODEL = "grok-4.6"
 _GROK_DEFAULT_EFFORT = "medium"
 
@@ -558,6 +562,8 @@ def build_child_env(
     env["TMPDIR"] = str(task_tmp)
 
     env.update(profile.env)
+    if profile.family == "agy":
+        env.update(AGY_PIN_ENV)
 
     if profile.auth == "api_key":
         for name in profile.secret_env:

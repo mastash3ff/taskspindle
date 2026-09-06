@@ -106,7 +106,7 @@ def prepare_launch(
     No shell is used to interpret any argument.
     """
     from .agy_cli_adapter import require_cached_token
-    from .providers import ProfileError
+    from .providers import AGY_PIN_ENV, ProfileError
 
     if mode not in {"consult", "review", "implement"}:
         raise ValueError(f"unsupported native AGY mode: {mode}")
@@ -208,6 +208,8 @@ def prepare_launch(
     argv.extend(("--clearenv", "--setenv", "HOME", str(home), "--setenv", "USER",
                  pwd.getpwuid(os.getuid()).pw_name, "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
                  "--setenv", "LANG", "C.UTF-8"))
+    for name, value in AGY_PIN_ENV.items():
+        argv.extend(("--setenv", name, value))
     for name in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"):
         if os.environ.get(name):
             argv.extend(("--setenv", name, os.environ[name]))

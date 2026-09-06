@@ -16,10 +16,21 @@ taskspindle auth agy
 ```
 
 Setup pins CLI 1.1.26 and its installed companion binaries in TaskSpindle's versioned
-runtime. Workers launch the pinned executable directly. Daily terminal updates do
-not replace that copy. Authentication checks query the catalog with cached native
+runtime. Workers launch the pinned executable directly. TaskSpindle forces
+`AGY_CLI_DISABLE_AUTO_UPDATE=true` for version/catalog checks and inside each worker
+namespace, preventing the CLI's own background updater from replacing the pin.
+The separately installed daily terminal CLI keeps its existing update behavior.
+Authentication checks query the catalog with cached native
 credentials; they never open the task database or submit a model prompt. If the
 cache is unavailable, run interactive `agy` in the same WSL account to sign in.
+
+Older TaskSpindle installations did not disable native self-update during startup
+checks. A version mismatch must remain a failure; the versioned directory name alone
+does not prove the executable's version. Preserve the mismatched binary and any
+timestamped `.old` file before repair, verify the retained executable reports the
+qualified version with updates disabled, and stage that verified code through setup
+into a separate reviewed runtime. Do not change the version constant to accept drift,
+copy credentials, or replace the user's separately installed daily CLI.
 
 Credentials remain at their original native path and are mounted read-only into
 private worker state. No tokens are copied into TaskSpindle, no API key is
