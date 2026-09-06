@@ -431,8 +431,9 @@ The reviewer is given the change itself: a candidate review's prompt carries the
 recorded diff, and a snapshot review's carries `git diff <expected_head> <snapshot>`, cut at 96 KiB
 with a note when it is longer. The worktree is checked out at the subject as well, so files can be
 read in full, but a reviewer never needs to run git — which matters, because it cannot: a Claude
-review runs in the adapter's `plan` session mode and a Grok review inside Grok's strict sandbox,
-where a write or a shell command becomes a permission request TaskSpindle refuses.
+review runs in the adapter's `plan` session mode, where a write or a shell command becomes a
+permission request TaskSpindle refuses, and a Grok review inside Grok's `read-only` sandbox, where
+the kernel refuses the write itself.
 
 ```json
 {"verdict": "PASS",

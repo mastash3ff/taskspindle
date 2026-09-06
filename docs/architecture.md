@@ -218,10 +218,14 @@ Two things make the permission gate real rather than advisory, one per first-cla
   and `default` for an implement, where each one is sent to TaskSpindle's permission policy to
   decide. An agent that refuses the mode fails the turn with `MODE_UNAVAILABLE` rather than running
   unguarded.
-- **Grok read-only turns run in its strict sandbox.** `grok --sandbox strict` is what turns a file
-  write into a permission request on Grok's ACP endpoint (its `--permission-mode` and `--deny` flags
-  did nothing there, verified on 1.0.13); a consult or review is launched with it, an implement is
-  not.
+- **Grok read-only turns run in its `read-only` sandbox.** `grok --sandbox read-only` makes the
+  kernel (Landlock) refuse every write outside `~/.grok` and the temp dirs, the worktree included:
+  a file write or a shell redirect fails with `Permission denied` and the agent reports the block
+  (its `--permission-mode` and `--deny` flags did nothing on the ACP endpoint, verified on 1.0.13).
+  A consult or review is launched with it, an implement is not. The earlier `strict` profile was
+  wrong twice over: it allows writes inside the cwd, and on WSL its read set omits `/mnt/wsl`, the
+  target of the `/etc/resolv.conf` symlink, so the sandboxed agent's DNS fell back to `127.0.0.1`
+  and a resumed session's first model request failed about half the time.
 
 **That is containment by construction, not an OS security sandbox.** The agent runs as your user
 with your filesystem permissions. It can read anything you can read, and it can write outside its

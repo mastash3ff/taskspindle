@@ -51,13 +51,13 @@ def test_grok_is_sandboxed_only_for_turns_that_must_not_write(tmp_path: Path) ->
     grok = providers.builtin_profiles(tmp_path, home=tmp_path, state_dir=tmp_path)["grok"]
 
     review = providers.launch_command(grok, "review")
-    assert review[:4] == ("grok", "--no-subagents", "--sandbox", "strict")
+    assert review[:4] == ("grok", "--no-subagents", "--sandbox", "read-only")
     assert review[4:] == grok.command[2:]
     assert providers.launch_command(grok, "consult") == review
     assert providers.launch_command(grok, "implement") == grok.command
 
     derived = Profile(id="grok-fast", auth="oauth", command=grok.command, base="grok")
-    assert providers.launch_command(derived, "review")[2:4] == ("--sandbox", "strict")
+    assert providers.launch_command(derived, "review")[2:4] == ("--sandbox", "read-only")
     other = Profile(id="opencode", auth="api_key", command=("opencode", "acp"))
     assert providers.launch_command(other, "review") == ("opencode", "acp")
 

@@ -108,9 +108,16 @@ _GROK_DEFAULT_MODEL = "grok-4.6"
 _GROK_DEFAULT_EFFORT = "medium"
 
 #: Top-level Grok flags added for a turn that must not write. Verified against Grok 1.0.13's ACP
-#: endpoint: ``--sandbox strict`` is the one that makes a write go through ``session/request_permission``
-#: (where TaskSpindle refuses it); ``--permission-mode plan`` and ``--deny`` had no effect there.
-GROK_READ_ONLY_FLAGS: tuple[str, ...] = ("--sandbox", "strict")
+#: endpoint. ``--sandbox read-only`` lets the agent read everywhere and kernel-denies (Landlock)
+#: every write outside ``~/.grok`` and the temp dirs, the worktree included: a file write or a
+#: shell redirect fails with ``Permission denied`` and the agent reports the block. ``strict`` was
+#: used before, and turned out wrong on two counts: it *allows* writes inside the cwd (the
+#: worktree), and its read set omits the target of a symlinked ``/etc/resolv.conf`` -- on WSL that
+#: is ``/mnt/wsl/resolv.conf`` -- so name resolution inside the sandbox falls back to
+#: ``127.0.0.1`` and every request to the model endpoint fails once the lookup runs on a Landlock-
+#: restricted thread (startup settings/catalog fetches always did; a resumed session's first
+#: prompt did about half the time). ``--permission-mode plan`` and ``--deny`` had no effect.
+GROK_READ_ONLY_FLAGS: tuple[str, ...] = ("--sandbox", "read-only")
 
 #: The ACP session mode a Claude-family worker is put in, per task mode. ``plan`` refuses every
 #: write and execution; ``default`` sends each one through ``session/request_permission`` so the
@@ -446,9 +453,9 @@ def profile_for_task(
 def launch_command(profile: Profile, mode: str) -> tuple[str, ...]:
     """The argv a worker launches ``profile`` with for a task in ``mode``.
 
-    A Grok-family profile that must not write is launched inside Grok's strict sandbox, which is
-    what turns its file writes into permission requests. Every other case is the profile's own
-    command, unchanged.
+    A Grok-family profile that must not write is launched inside Grok's ``read-only`` sandbox,
+    where the kernel refuses its file writes and shell writes (see :data:`GROK_READ_ONLY_FLAGS`).
+    Every other case is the profile's own command, unchanged.
     """
     command = profile.command
     if profile.family != "grok" or mode == "implement" or not command:

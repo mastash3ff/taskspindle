@@ -2,6 +2,15 @@
 
 ## 0.2.0
 
+- **Grok read-only turns use the `read-only` sandbox.** `strict` allowed writes inside the
+  worktree and, on WSL, denied the `/etc/resolv.conf` symlink target so the sandboxed agent's
+  DNS fell back to `127.0.0.1`: startup settings/catalog fetches always failed (about 45 s of
+  startup) and a resumed session's first model request failed about half the time with
+  `TURN_TIMEOUT`. `read-only` reads everywhere and kernel-denies every write outside `~/.grok`
+  and the temp dirs, the worktree included.
+- **Timed-out turns report transport retries.** Grok's `retry_state` updates are kept as a
+  bounded, sanitized summary; a `TURN_TIMEOUT` carries the retry count and the last retry's
+  attempt, kind and reason so a transport stall is distinguishable from a slow model.
 - **Native Antigravity.** Reserved OAuth provider `agy` uses a separately pinned native CLI
   1.1.26 and the existing personal Google login. `setup --provider agy` installs code only;
   `auth agy` checks cached authentication without another ACP browser sign-in. Private CLI
