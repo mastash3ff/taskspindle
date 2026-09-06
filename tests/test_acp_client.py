@@ -230,6 +230,30 @@ async def test_a_turn_that_overruns_its_budget_times_out(tmp_path: Path) -> None
     assert excinfo.value.code == "TURN_TIMEOUT"
 
 
+async def test_a_timed_out_turn_reports_the_transport_retries_it_saw(tmp_path: Path) -> None:
+    retry = {
+        "sessionUpdate": "retry_state", "type": "retrying", "attempt": 2, "max_retries": 15,
+        "kind": "http", "reason": "request error: error sending request for url (https://example)",
+    }
+    script = {"block_seconds": 30, "response": "never", "prompt_updates": [dict(retry, attempt=1), retry]}
+    async with running_agent(tmp_path, script) as worker:
+        session_id = await worker.new_session()
+        with pytest.raises(AcpError) as excinfo:
+            await worker.prompt(session_id, "go", timeout=0.5)
+
+    assert excinfo.value.code == "TURN_TIMEOUT"
+    assert excinfo.value.cause == {
+        "retries": 2,
+        "last_retry": {
+            "attempt": 2, "max_retries": 15, "kind": "http", "type": "retrying",
+            "reason": "request error: error sending request for url (https://example)",
+        },
+    }
+    assert worker.last_result is not None
+    assert worker.last_result.stop_reason == "timeout"
+    assert [entry["attempt"] for entry in worker.last_result.capture.retries] == [1, 2]
+
+
 async def test_a_failing_turn_is_an_acp_turn_error(tmp_path: Path) -> None:
     async with running_agent(tmp_path, {"fail": True}) as worker:
         session_id = await worker.new_session()

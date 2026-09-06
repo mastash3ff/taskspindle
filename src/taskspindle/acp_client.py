@@ -186,6 +186,9 @@ class TurnCapture:
     turn_completed: dict[str, Any] | None = None
     #: Model ids seen in any update's ``_meta.modelId``, in the order they appeared.
     model_ids: list[str] = field(default_factory=list)
+    #: Grok's non-standard ``retry_state`` updates: one bounded, sanitized summary per transport
+    #: retry, so a turn that times out can say how it spent the budget.
+    retries: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -409,6 +412,8 @@ class AcpWorker:
                 capture.rate_limits.append(dict(rate_limit))
         elif kind == "turn_completed":
             capture.turn_completed = dict(update)
+        elif kind == "retry_state":
+            capture.retries.append(_retry_summary(update))
 
     def _observe_configuration(self, update: dict[str, Any]) -> None:
         """Protect selected values even between configuration requests and turns."""
@@ -596,7 +601,9 @@ class AcpWorker:
             self._require_configuration_intact()
             stop_reason = "timeout"
             await self.cancel(session_id)
-            raise AcpError("TURN_TIMEOUT", f"turn exceeded {timeout}s") from exc
+            raise AcpError(
+                "TURN_TIMEOUT", f"turn exceeded {timeout}s", cause=_retry_cause(capture)
+            ) from exc
         except Exception as exc:
             self._require_configuration_intact()
             raise AcpError(
@@ -643,6 +650,30 @@ class AcpWorker:
         if self._conn is None:
             raise AcpError("ACP_TURN_ERROR", "worker is not running")
         return self._conn
+
+
+_RETRY_REASON_LIMIT = 200
+
+
+def _retry_summary(update: Mapping[str, Any]) -> dict[str, Any]:
+    """The diagnostic fields of one ``retry_state`` update, bounded and without free text."""
+    reason = update.get("reason")
+    summary: dict[str, Any] = {
+        "attempt": update.get("attempt"),
+        "max_retries": update.get("max_retries"),
+        "kind": update.get("kind"),
+        "type": update.get("type"),
+    }
+    if isinstance(reason, str):
+        summary["reason"] = reason[:_RETRY_REASON_LIMIT]
+    return summary
+
+
+def _retry_cause(capture: TurnCapture) -> dict[str, Any]:
+    """What a timed-out turn was doing: transport retries, if the agent reported any."""
+    if not capture.retries:
+        return {}
+    return {"retries": len(capture.retries), "last_retry": capture.retries[-1]}
 
 
 def _is_session_update(method: Any, update: Any) -> bool:

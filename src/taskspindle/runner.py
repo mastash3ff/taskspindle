@@ -542,6 +542,8 @@ async def _run_turn(
                 "reset_at": verdict.reset_at,
                 "acp_code": exc.code,
                 "rpc_data": exc.cause.get("rpc_data"),
+                "transport_retries": exc.cause.get("retries"),
+                "last_retry": exc.cause.get("last_retry"),
             },
         ) from exc
 
