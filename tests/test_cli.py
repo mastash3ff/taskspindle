@@ -218,3 +218,27 @@ def test_repository_usage_prints_the_repository_label(home: Path, capsys) -> Non
     assert "repository_id" in output
     assert "repo-example" in output
     assert "123" in output
+
+
+def test_concurrency_rollback_cli_is_explicit_and_preserves_records(home, capsys):
+    from taskspindle.models import TaskState
+    from taskspindle.store import Store
+    from tests.test_store import make_task
+
+    database = home / "fixture.sqlite3"
+    with Store.open(database) as store:
+        task = make_task(store)
+        assert cli.main(["rollback-concurrency", "--database", str(database)]) == 1
+        assert store.schema_version() == 4
+        store.update_task(task.id, None, state=TaskState.CANCELLED)
+    assert cli.main(["rollback-concurrency", "--database", str(database)]) == 0
+    with Store(database) as store:
+        assert store.schema_version() == 3
+        assert store.get_task(task.id).state == TaskState.CANCELLED
+    assert "history and grants preserved" in capsys.readouterr().out
+
+
+def test_concurrency_rollback_does_not_create_missing_database(home):
+    path = home / "absent.sqlite3"
+    assert cli.main(["rollback-concurrency", "--database", str(path)]) == 1
+    assert not path.exists()

@@ -33,7 +33,7 @@ __all__ = [
     "reconcile",
 ]
 
-#: How long a task may sit in PREPARING or QUEUED without a unit before it is declared dead.
+#: How long a task may sit in PREPARING without a unit before it is declared dead.
 NEVER_STARTED_AFTER_S = 600
 
 #: How long a cancelled task's unit may keep running after the SIGTERM before it is stopped.
@@ -165,7 +165,42 @@ def reconcile(
                 action = _strand(store, task, f"{_RECONCILE_FAILED}:{exc.code}")
             if action is not None:
                 actions.append(action)
+    _release_finished_leases(store, backend, boot=boot, moment=moment, stale_after_s=stale_after_s)
     return actions
+
+
+def _release_finished_leases(
+    store: Store, backend: UnitBackend, *, boot: str, moment: datetime, stale_after_s: int,
+) -> None:
+    """Recover a lease left after finalization but before a killed worker's finally block.
+
+    The still-running sibling or finalizing worker retains its capacity. An unknown recent
+    process remains unresolved; a different boot or a dead unit establishes safe release.
+    """
+    for lease in store.list_leases():
+        task = store.get_task(lease["task_id"])
+        if task is None or task.state in ACTIVE_STATES or task.state == TaskState.RECOVERY_AMBIGUOUS:
+            continue
+        try:
+            unit = backend.show(lease["unit_name"] or worker_unit_name(task.id))
+        except UnitError:
+            continue
+        if lease["boot_id"] == boot and (
+            unit.kind == "active" or (unit.kind == "not_found" and not _older_than(
+                lease["heartbeat_at"], moment, stale_after_s
+            ))
+        ):
+            continue
+        if lease["boot_id"] == boot and unit.kind not in {*_BY_KIND, "not_found"}:
+            continue
+        with store.transaction():
+            fresh = store.get_task(task.id)
+            current = store.get_lease(task.provider, task.id)
+            if fresh is not None and fresh.state == task.state and current == lease:
+                store.release_lease(task.provider, task.id)
+                store.append_event(task.id, EventKind.RECOVERY, {
+                    "reason": "finalized_worker_lease_released", "unit": lease["unit_name"],
+                })
 
 
 def _reconcile_task(
@@ -179,10 +214,21 @@ def _reconcile_task(
     accept_recover: Callable[[TaskRecord], AcceptOutcome] | None,
 ) -> ReconcileAction | None:
     unit_state: UnitState | None = None
+    lease = store.get_lease(task.provider, task.id)
+    if (
+        lease and lease["pid"] is None and lease["boot_id"] == boot
+        and task.state in {TaskState.QUEUED, TaskState.REPAIRING, TaskState.RESUMING}
+        and not _older_than(lease["heartbeat_at"], moment, stale_after_s)
+    ):
+        # The scheduler published a reservation and has not finished starting systemd yet.
+        return None
     if task.boot_id and task.boot_id != boot:
         reason, target = _BOOT_CHANGED, TaskState.INTERRUPTED
+    elif not task.unit_name and task.state == TaskState.QUEUED and lease is None:
+        # Capacity or provider availability may keep a legitimate queue waiting indefinitely.
+        return None
     elif not task.unit_name and task.state in (TaskState.PREPARING, TaskState.QUEUED):
-        # Nothing was ever started: the only question is whether it ever will be.
+        # Preparation or an abandoned reservation must still be recoverable.
         if _older_than(task.created_at, moment, NEVER_STARTED_AFTER_S):
             return _apply(store, task, TaskState.FAILED, _NEVER_STARTED, error=_never_started())
         return None
@@ -395,7 +441,7 @@ def _apply(
         EventKind.RECOVERY,
         {"reason": reason, "from": task.state.value, "to": to_state.value},
     )
-    lease = store.get_lease(task.provider)
+    lease = store.get_lease(task.provider, task.id)
     if lease is not None and lease["task_id"] == task.id:
         store.release_lease(task.provider, task.id)
     return ReconcileAction(

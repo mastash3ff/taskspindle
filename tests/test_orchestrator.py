@@ -904,6 +904,7 @@ def test_an_ambiguous_recovery_asks_for_a_person(harness: Harness, make_repo) ->
     task_id = harness.orchestrator.start_task(implement_request(repo))["task_id"]
     # The unit is gone but the worker was alive a moment ago: nothing may be assumed.
     harness.orchestrator.store.heartbeat(task_id)
+    harness.orchestrator.store.bind_lease(AUTHOR, task_id, pid=4242)
     harness.backend.states.pop(f"taskspindle-worker-{task_id}")
 
     status = harness.orchestrator.task_status(task_id)
@@ -925,6 +926,7 @@ def make_ambiguous(harness: Harness, repo: Path) -> str:
     harness.defer()
     task_id = harness.orchestrator.start_task(implement_request(repo))["task_id"]
     harness.orchestrator.store.heartbeat(task_id)
+    harness.orchestrator.store.bind_lease(AUTHOR, task_id, pid=4242)
     harness.backend.states.pop(f"taskspindle-worker-{task_id}")
     assert harness.orchestrator.task_status(task_id)["state"] == (
         TaskState.RECOVERY_AMBIGUOUS.value
@@ -1210,3 +1212,114 @@ def test_an_accept_that_cannot_be_undone_waits_for_a_person(
     # Nothing was touched, and the journal is kept for whoever looks at it.
     assert (repo / "README.md").read_text() == "the operator was working too\n"
     assert harness.orchestrator.store.read_journal(task_id)["phase"] == "staged"
+
+
+def test_capacity_dispatches_four_then_refills_only_one(harness, make_repo):
+    harness.orchestrator.concurrency = {AUTHOR: 4, REVIEWER: 1}
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    ids = [harness.orchestrator.start_task(implement_request(repo))["task_id"] for _ in range(6)]
+    assert harness.pending == ids[:4]
+    capacity = harness.orchestrator.capabilities()["providers"][0]["capacity"]
+    assert capacity == {"limit": 4, "active": 4, "available": 0}
+    harness._run(harness.pending.pop(1))
+    assert harness.orchestrator.dispatch_queued() == [ids[4]]
+    assert len(harness.orchestrator.store.list_leases(AUTHOR)) == 4
+    assert harness.orchestrator.store.get_lease(AUTHOR, ids[0]) is not None
+    assert harness.orchestrator.store.get_lease(AUTHOR, ids[2]) is not None
+    assert harness.orchestrator.store.get_lease(AUTHOR, ids[5]) is None
+    assert harness.orchestrator.dispatch_queued() == []
+
+
+def test_queued_dispatch_rechecks_new_throttle(harness, make_repo):
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    first = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    second = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    harness._run(harness.pending.pop(0))
+    harness.orchestrator.store.set_provider_status(
+        AUTHOR, "throttled", source="acp_error", reset_at="2999-01-01T00:00:00Z"
+    )
+    assert harness.orchestrator.dispatch_queued() == []
+    assert harness.orchestrator.store.get_task(second).state == TaskState.QUEUED
+    assert harness.orchestrator.store.get_lease(AUTHOR, first) is None
+    harness.orchestrator.store.set_provider_status(AUTHOR, "ok", source="successful_turn")
+    assert harness.orchestrator.dispatch_queued() == [second]
+
+
+def test_stale_dispatch_snapshot_cannot_restart_finished_task(harness, make_repo):
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    task = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    stale = harness.orchestrator.store.get_task(task)
+    harness._run(harness.pending.pop(0))
+    before = list(harness.backend.started)
+    assert harness.orchestrator._start_worker(stale) is False
+    assert harness.backend.started == before
+
+
+def test_capacity_reports_execution_namespace_and_conservative_default(harness):
+    harness.orchestrator.concurrency = {AUTHOR: 4, REVIEWER: 2}
+    capabilities = harness.orchestrator.capabilities()
+    assert capabilities["limits"]["concurrent_turns_per_provider"] == 2
+    assert capabilities["execution"]["platform"] == "linux"
+    assert capabilities["execution"]["path_namespace"] == "posix"
+
+
+def test_cancel_running_slot_preserves_siblings_and_refills(harness, make_repo):
+    from tests.fakes.units import SIGNALLED
+    harness.orchestrator.concurrency = {AUTHOR: 4, REVIEWER: 1}
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    ids = [harness.orchestrator.start_task(implement_request(repo))["task_id"] for _ in range(5)]
+    record = harness.orchestrator.store.get_task(ids[1])
+    cancelled = harness.orchestrator.cancel_task(record.id, record.state_version)
+    assert cancelled["state"] == TaskState.CANCELLING.value
+    harness.backend.set(record.unit_name, SIGNALLED)
+    harness.orchestrator.reconcile()
+    assert harness.orchestrator.dispatch_queued() == [ids[4]]
+    assert harness.orchestrator.store.get_task(ids[1]).state == TaskState.CANCELLED
+    held = {lease["task_id"] for lease in harness.orchestrator.store.list_leases(AUTHOR)}
+    assert held == set(ids) - {ids[1]}
+
+
+def test_four_slot_continuation_queues_and_refills_without_duplicate(harness, make_repo):
+    harness.orchestrator.concurrency = {AUTHOR: 4, REVIEWER: 1}
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    ids = [harness.orchestrator.start_task(implement_request(repo))["task_id"] for _ in range(5)]
+    harness._run(harness.pending.pop(0))
+    assert harness.orchestrator.dispatch_queued() == [ids[4]]
+    first = harness.orchestrator.store.get_task(ids[0])
+    response = harness.orchestrator.continue_task(first.id, first.state_version, "check again")
+    assert response["state"] == TaskState.REPAIRING.value
+    assert harness.orchestrator.store.get_lease(AUTHOR, first.id) is None
+    harness._run(harness.pending.pop(0))
+    assert harness.orchestrator.dispatch_queued() == [first.id]
+    assert harness.orchestrator.dispatch_queued() == []
+    assert len(harness.orchestrator.store.list_turns(first.id)) == 2
+    assert len(harness.orchestrator.store.list_leases(AUTHOR)) == 4
+
+
+def test_failed_continuation_transition_does_not_leave_extra_pending_turn(harness, make_repo, monkeypatch):
+    import taskspindle.orchestrator as module
+
+    task_id = build_candidate(harness, make_repo())
+    record = harness.orchestrator.store.get_task(task_id)
+    before = harness.orchestrator.store.list_turns(task_id)
+    real_transition = module.transition
+
+    def concurrent_change(*args, **kwargs):
+        if kwargs.get("reason") == "repair turn requested":
+            raise TaskSpindleError(service.STALE_STATE_VERSION, "another coordinator changed the task")
+        return real_transition(*args, **kwargs)
+
+    monkeypatch.setattr(module, "transition", concurrent_change)
+    with pytest.raises(TaskSpindleError):
+        harness.orchestrator.continue_task(task_id, record.state_version, "more checks")
+    assert harness.orchestrator.store.list_turns(task_id) == before

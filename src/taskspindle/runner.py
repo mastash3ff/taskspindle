@@ -620,7 +620,7 @@ def _permission_policy(profile: Profile, task: TaskRecord, workspace: Path) -> P
 
 def _check_lease(run: _Run, *, boot: str) -> None:
     """The server takes the lease before starting the unit; the worker only signs it."""
-    lease = run.store.get_lease(run.task.provider)
+    lease = run.store.get_lease(run.task.provider, run.task_id)
     if lease is None or lease["task_id"] != run.task_id:
         holder = lease["task_id"] if lease else None
         raise _Failure(

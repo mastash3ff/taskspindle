@@ -203,7 +203,7 @@ def test_health_reports_schema_and_db_state(tmp_path: Path) -> None:
     _seed(paths)
     present = client.get("/api/health").json()
     assert present["db_exists"] is True
-    assert present["schema_version"] == 3
+    assert present["schema_version"] == 4
     assert present["db_path"] == str(paths.state_dir / "taskspindle.sqlite3")
 
 

@@ -24,7 +24,7 @@ from typing import Any
 import taskspindle
 
 from . import integration, providers, recovery, repos, units, usage, worktrees
-from .config import Paths
+from .config import Paths, concurrency_limits
 from .integration import Journal
 from .models import (
     ACTIVE_STATES,
@@ -109,7 +109,7 @@ USAGE_GROUP_BY: tuple[str, ...] = ("provider", "day", "provider_day", "model", "
 #: Inclusive bounds on a task's own timeout, mirroring ``StartTaskRequest``.
 TIMEOUT_BOUNDS = (60, 14400)
 
-#: How many turns one provider may have in flight; the lease enforces it.
+#: Default number of turns one provider may have in flight when no limit is configured.
 CONCURRENT_TURNS_PER_PROVIDER = 1
 
 #: What ``capabilities`` says about isolation, so a caller is never misled about it.
@@ -195,10 +195,12 @@ class Orchestrator:
         boot: str,
         parent_env: Mapping[str, str],
         clock: Callable[[], datetime] = utcnow,
+        concurrency: Mapping[str, int] | None = None,
     ) -> None:
         self.store = store
         self.paths = paths
         self.profiles = dict(profiles)
+        self.concurrency = concurrency_limits({"concurrency": dict(concurrency or {})}, profiles)
         self.units = units
         self.boot = boot
         self.parent_env = dict(parent_env)
@@ -310,7 +312,17 @@ class Orchestrator:
         other first-class provider named, so the caller can choose; nothing is chosen for it.
         """
         now = self.clock()
+        active: dict[str, int] = {}
+        for lease in self.store.list_leases():
+            active[lease["provider"]] = active.get(lease["provider"], 0) + 1
         return {
+            "execution": {
+                "platform": "linux",
+                "path_namespace": "posix",
+                "state_dir": str(self.paths.state_dir.resolve()),
+                "config_file": str(self.paths.config_file.resolve()),
+                "wsl_distribution": self.parent_env.get("WSL_DISTRO_NAME"),
+            },
             "providers": [
                 {
                     "id": profile.id,
@@ -322,6 +334,11 @@ class Orchestrator:
                     "adapter": providers.adapter_metadata(profile),
                     "gateway_host": profile.gateway_host,
                     "availability": provider_availability(self.store, profile, now=now),
+                    "capacity": {
+                        "limit": self.concurrency.get(profile.id, 1),
+                        "active": active.get(profile.id, 0),
+                        "available": max(0, self.concurrency.get(profile.id, 1) - active.get(profile.id, 0)),
+                    },
                     "windows": self.store.latest_provider_windows(limits_key(profile)),
                 }
                 for profile in sorted(self.profiles.values(), key=lambda item: item.id)
@@ -339,7 +356,7 @@ class Orchestrator:
                 "timeout_s": list(TIMEOUT_BOUNDS),
                 "diff_page_bytes": DIFF_PAGE_BYTES,
                 "diff_page_max_bytes": DIFF_PAGE_MAX_BYTES,
-                "concurrent_turns_per_provider": CONCURRENT_TURNS_PER_PROVIDER,
+                "concurrent_turns_per_provider": min(self.concurrency.values(), default=1),
             },
             "states": [state.value for state in TaskState],
             "cleanup_states": [state.value for state in CleanupState],
@@ -524,6 +541,11 @@ class Orchestrator:
                 auth_mode=AuthMode(profile.auth),
                 provider_family=profile.family,
             )
+            if request.ignore_provider_status:
+                self.store.append_event(record.id, EventKind.WARNING, {
+                    "code": "PROVIDER_STATUS_OVERRIDE",
+                    "status": self.store.get_provider_status(limits_key(profile)),
+                })
             self._prepare(record, request, placement)
             self.dispatch_queued()
             final = require_task(self.store, record.id)
@@ -780,7 +802,7 @@ class Orchestrator:
     # -- dispatch ---------------------------------------------------------------------
 
     def dispatch_queued(self) -> list[str]:
-        """Start a worker unit for every runnable task whose provider lease is free.
+        """Start a worker unit for every runnable task whose provider has capacity.
 
         The lease is taken *before* the unit, so a task that is already running holds it and is
         skipped here; the runner signs the lease with its own pid once it is up. A REPAIRING or
@@ -796,15 +818,42 @@ class Orchestrator:
                 started.append(task.id)
         return started
 
+    def _initial_status_override(self, task: TaskRecord, profile: Profile) -> bool:
+        """An explicit override covers only the initial turn and the status it observed."""
+        if len(self.store.list_turns(task.id)) != 1:
+            return False
+        status = self.store.get_provider_status(limits_key(profile))
+        return any(
+            event["kind"] == EventKind.WARNING.value
+            and event["payload"].get("code") == "PROVIDER_STATUS_OVERRIDE"
+            and event["payload"].get("status") == status
+            for event in self.store.list_events(task.id)
+        )
+
     def _start_worker(self, task: TaskRecord) -> bool:
-        """Take the provider lease and run the task's pending turn as a transient unit."""
+        """Claim capacity and publish task identity before starting its unit outside the lock."""
+        unit = units.worker_unit_name(task.id)
         try:
-            require_task_profile(task, self.profiles.get(task.provider))
+            with self.store.transaction():
+                fresh = self.store.get_task(task.id)
+                if fresh is None or fresh.state not in DISPATCHABLE_STATES:
+                    return False
+                task = fresh
+                profile = self.profiles.get(task.provider)
+                require_task_profile(task, profile)
+                assert profile is not None
+                availability = provider_availability(self.store, profile, now=self.clock())
+                if (availability["state"] not in ("ok", "unknown")
+                        and not self._initial_status_override(task, profile)):
+                    return False
+                if not self.store.acquire_lease(
+                    task.provider, task.id, unit, None, self.boot,
+                    limit=self.concurrency.get(task.provider, 1),
+                ):
+                    return False
+                self.store.update_task(task.id, None, unit_name=unit, boot_id=self.boot)
         except TaskSpindleError as exc:
             self._fail(task.id, exc.code, exc.message, exc.details, reason="dispatch failed")
-            return False
-        unit = units.worker_unit_name(task.id)
-        if not self.store.acquire_lease(task.provider, task.id, unit, None, self.boot):
             return False
         try:
             self.units.start(
@@ -824,9 +873,6 @@ class Orchestrator:
                 reason="dispatch failed",
             )
             return False
-        current = self.store.get_task(task.id)
-        if current is not None and current.unit_name != unit:
-            self.store.update_task(task.id, None, unit_name=unit)
         return True
 
     # -- reading ----------------------------------------------------------------------
@@ -1002,17 +1048,18 @@ class Orchestrator:
                 if kind is TurnKind.REPAIR
                 else len(self.store.list_turns(task_id)) + 1
             )
-            self.store.insert_turn(task_id, revision, kind.value, prompt=text)
-            # The unit the *previous* turn ran in is gone; clearing it is what tells recovery
-            # that this task is waiting for a lease rather than for a worker that vanished.
-            updated = transition(
-                self.store,
-                task_id,
-                target,
-                reason=f"{kind.value} turn requested",
-                expected_state_version=record.state_version,
-                **_AWAITING_DISPATCH,
-            )
+            with self.store.transaction():
+                self.store.insert_turn(task_id, revision, kind.value, prompt=text)
+                # The unit the *previous* turn ran in is gone; clearing it is what tells recovery
+                # that this task is waiting for a lease rather than for a worker that vanished.
+                updated = transition(
+                    self.store,
+                    task_id,
+                    target,
+                    reason=f"{kind.value} turn requested",
+                    expected_state_version=record.state_version,
+                    **_AWAITING_DISPATCH,
+                )
             self._start_worker(updated)
             final = require_task(self.store, task_id)
         return _acknowledge(final)

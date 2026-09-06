@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import (
+    ACTIVE_STATES,
     TASK_BOOL_COLUMNS,
     TASK_COLUMNS,
     TASK_JSON_COLUMNS,
@@ -261,7 +262,7 @@ CREATE TABLE reviews (
 CREATE INDEX reviews_subject_idx ON reviews(subject_task_id, candidate_sha);
 
 CREATE TABLE integration_journal (
-    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     phase TEXT NOT NULL,
     target_head TEXT,
     candidate_sha TEXT,
@@ -334,7 +335,25 @@ BEGIN
 END;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3)]
+_MIGRATION_4 = """
+ALTER TABLE leases RENAME TO leases_single_flight;
+CREATE TABLE leases (
+    provider TEXT NOT NULL,
+    task_id TEXT NOT NULL PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    unit_name TEXT,
+    pid INTEGER,
+    boot_id TEXT,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT
+);
+INSERT INTO leases SELECT * FROM leases_single_flight;
+DROP TABLE leases_single_flight;
+CREATE INDEX leases_provider_idx ON leases(provider);
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [
+    (1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3), (4, _MIGRATION_4),
+]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
 TURN_USAGE_FIELDS: tuple[str, ...] = (
@@ -494,6 +513,30 @@ class Store:
     def schema_version(self) -> int:
         row = self._conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
         return int(row[0]) if row and row[0] is not None else 0
+
+    def rollback_concurrency_schema(self) -> None:
+        """Reverse only schema 4 after operators stop MCP servers and drain worker jobs.
+
+        History and grants are untouched. Use ``Store(path)`` rather than ``Store.open`` for
+        this maintenance operation, since open intentionally migrates forward.
+        """
+        with self._guard(), self.transaction() as conn:
+            if self.schema_version() != 4:
+                raise StoreError("concurrency rollback requires schema 4")
+            states = (*(state.value for state in ACTIVE_STATES), "RECOVERY_AMBIGUOUS")
+            placeholders = ",".join("?" for _ in states)
+            if conn.execute("SELECT 1 FROM leases LIMIT 1").fetchone() or conn.execute(
+                f"SELECT 1 FROM tasks WHERE state IN ({placeholders}) LIMIT 1", states
+            ).fetchone() or conn.execute("SELECT 1 FROM integration_journal LIMIT 1").fetchone():
+                raise StoreError("drain all active/queued jobs, leases and accepts before rollback")
+            conn.execute("DROP TABLE leases")
+            conn.execute("""CREATE TABLE leases (
+                provider TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                unit_name TEXT, pid INTEGER, boot_id TEXT,
+                acquired_at TEXT NOT NULL, heartbeat_at TEXT
+            )""")
+            conn.execute("DELETE FROM schema_migrations WHERE version = 4")
 
     # -- repositories ---------------------------------------------------------------
 
@@ -844,11 +887,25 @@ class Store:
     # -- leases ---------------------------------------------------------------------
 
     def acquire_lease(
-        self, provider: str, task_id: str, unit_name: str, pid: int | None, boot_id: str
+        self, provider: str, task_id: str, unit_name: str, pid: int | None, boot_id: str,
+        *, limit: int = 1,
     ) -> bool:
-        """Atomically take the single-flight lease for ``provider``; False if it is held."""
+        """Atomically claim one provider slot, with at most one lease per task.
+
+        The capacity read and insert share a SQLite write transaction across all processes.
+        Lowering a limit does not evict existing workers; it prevents further acquisitions.
+        """
+        if type(limit) is not int or limit < 1:
+            raise StoreError("lease limit must be a positive integer")
         stamp = now()
         with self._guard(), self.transaction() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM leases WHERE provider = ?", (provider,)
+            ).fetchone()[0]
+            if count >= limit or conn.execute(
+                "SELECT 1 FROM leases WHERE task_id = ?", (task_id,)
+            ).fetchone():
+                return False
             cur = conn.execute(
                 "INSERT OR IGNORE INTO leases"
                 "(provider, task_id, unit_name, pid, boot_id, acquired_at, heartbeat_at) "
@@ -864,11 +921,24 @@ class Store:
             )
             return cur.rowcount == 1
 
-    def get_lease(self, provider: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM leases WHERE provider = ?", (provider,)
-        ).fetchone()
+    def get_lease(self, provider: str, task_id: str | None = None) -> dict[str, Any] | None:
+        """Read the exact task lease, or the oldest lease for legacy single-flight callers."""
+        if task_id is not None:
+            row = self._conn.execute(
+                "SELECT * FROM leases WHERE provider = ? AND task_id = ?", (provider, task_id)
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT * FROM leases WHERE provider = ? ORDER BY acquired_at, task_id LIMIT 1",
+                (provider,),
+            ).fetchone()
         return dict(row) if row else None
+
+    def list_leases(self, provider: str | None = None) -> list[dict[str, Any]]:
+        where, args = (" WHERE provider = ?", (provider,)) if provider else ("", ())
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM leases" + where + " ORDER BY acquired_at, task_id", args
+        )]
 
     def bind_lease(
         self,
@@ -894,7 +964,7 @@ class Store:
             return cur.rowcount == 1
 
     def touch_lease(self, task_id: str, at: str | None = None) -> bool:
-        """Refresh the lease heartbeat of whichever provider lease this task holds."""
+        """Refresh only this task's lease heartbeat."""
         with self._guard(), self.transaction() as conn:
             cur = conn.execute(
                 "UPDATE leases SET heartbeat_at = ? WHERE task_id = ?", (at or now(), task_id)

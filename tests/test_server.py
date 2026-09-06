@@ -320,3 +320,15 @@ async def test_url_only_client_keeps_the_recovery_error(server, monkeypatch) -> 
     assert asked is False
     assert result.data["error"]["code"] == MANUAL_RECOVERY_REQUIRED
     assert result.data["error"]["details"] == {"evidence": "worker"}
+
+
+def test_build_orchestrator_loads_configured_capacity(paths, monkeypatch):
+    from taskspindle.server import build_orchestrator
+
+    paths.config_file.write_text("[concurrency]\nclaude = 4\ngrok = 4\nagy = 4\n")
+    orchestrator, store = build_orchestrator(paths=paths, parent_env={"HOME": str(paths.state_dir)})
+    try:
+        assert orchestrator.concurrency == {"claude": 4, "grok": 4, "agy": 4}
+        assert orchestrator.capabilities()["limits"]["concurrent_turns_per_provider"] == 4
+    finally:
+        store.close()

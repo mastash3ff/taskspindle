@@ -410,3 +410,43 @@ def test_a_cancel_still_within_the_grace_period_is_left_alone(store: Store) -> N
     assert run(store, backend) == []
     assert backend.stopped == []
     assert store.get_task(task.id).state is TaskState.CANCELLING
+
+
+def test_old_queue_without_lease_waits_for_capacity(store):
+    task = make_task(store, state=TaskState.QUEUED, unit=None, boot_id=None,
+                     lease=False, created_offset_s=-36000)
+    assert run(store, FakeUnitBackend()) == []
+    assert store.get_task(task.id).state == TaskState.QUEUED
+
+
+def test_expired_worker_lease_does_not_release_healthy_sibling(store):
+    first = make_task(store, state=TaskState.RUNNING, lease=False)
+    sibling = make_task(store, state=TaskState.RUNNING, lease=False)
+    for task in (first, sibling):
+        assert store.acquire_lease(PROVIDER, task.id, worker_unit_name(task.id), 4242, BOOT, limit=4)
+    backend = FakeUnitBackend({worker_unit_name(first.id): EXITED, worker_unit_name(sibling.id): ACTIVE})
+    actions = run(store, backend)
+    assert [action.task_id for action in actions] == [first.id]
+    assert store.get_lease(PROVIDER, first.id) is None
+    assert store.get_lease(PROVIDER, sibling.id) is not None
+    assert store.get_task(sibling.id).state == TaskState.RUNNING
+
+
+def test_finalized_worker_stale_lease_is_recovered_only_when_unit_dead(store):
+    dead = make_task(store, state=TaskState.RESULT_READY, lease=False)
+    alive = make_task(store, state=TaskState.RESULT_READY, lease=False)
+    for task in (dead, alive):
+        store.acquire_lease(PROVIDER, task.id, worker_unit_name(task.id), 4242, BOOT, limit=4)
+    backend = FakeUnitBackend({worker_unit_name(dead.id): SUCCESS, worker_unit_name(alive.id): ACTIVE})
+    run(store, backend)
+    assert store.get_lease(PROVIDER, dead.id) is None
+    assert store.get_lease(PROVIDER, alive.id) is not None
+    assert store.get_task(dead.id).state == TaskState.RESULT_READY
+
+
+def test_newly_reserved_unit_gets_startup_grace(store):
+    task = make_task(store, state=TaskState.QUEUED, unit="worker", lease=False)
+    store.acquire_lease(PROVIDER, task.id, worker_unit_name(task.id), None, BOOT, limit=4)
+    store.touch_lease(task.id, stamp(-1))
+    assert run(store, FakeUnitBackend()) == []
+    assert store.get_task(task.id).state == TaskState.QUEUED

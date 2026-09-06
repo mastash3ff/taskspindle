@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import taskspindle
 
-__all__ = ["ConfigError", "Paths", "load_config", "paths"]
+__all__ = ["ConfigError", "Paths", "concurrency_limits", "load_config", "paths"]
 
 
 class ConfigError(Exception):
@@ -74,3 +74,18 @@ def load_config(path: Path) -> dict[str, Any]:
         return tomllib.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"could not parse {path}: {exc}") from exc
+
+
+def concurrency_limits(settings: Mapping[str, Any], providers: Iterable[str]) -> dict[str, int]:
+    """Validated per-profile limits; an omitted profile remains single flight."""
+    configured = settings.get("concurrency", {})
+    if not isinstance(configured, dict):
+        raise ConfigError("concurrency must be a table of provider limits")
+    names = set(providers)
+    unknown = set(configured) - names
+    if unknown:
+        raise ConfigError(f"concurrency contains unknown provider(s): {', '.join(sorted(unknown))}")
+    for provider, limit in configured.items():
+        if type(limit) is not int or limit < 1:
+            raise ConfigError(f"concurrency.{provider} must be a positive integer")
+    return {provider: configured.get(provider, 1) for provider in sorted(names)}
