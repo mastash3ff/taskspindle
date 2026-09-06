@@ -3,6 +3,14 @@
 # Every key is optional. Built-in providers are `claude`, `grok`, and `agy`, all OAuth-only.
 # AGY uses a separately pinned native CLI and its existing personal login; see docs/antigravity.md.
 #
+# Concurrent turns per provider default to one when omitted. Uncomment only after qualifying
+# useful overlapping jobs on this host. All MCP clients sharing the state database share these
+# limits; four each permits at most twelve external turns, not twelve per client.
+#[concurrency]
+#claude = 4
+#grok = 4
+#agy = 4
+#
 # A [providers.<id>] table adds a second-class profile. Second-class is a rule, not a label:
 # such a profile is never a default, never a fallback, and never chosen as a reviewer on its
 # own. A task uses it only when start_task names it and the repository grant lists that exact

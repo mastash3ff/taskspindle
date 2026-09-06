@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,7 @@ import pytest
 from acp.schema import NewSessionRequest
 from acp.utils import serialize_params
 
+from taskspindle import providers
 from taskspindle.providers import (
     Profile,
     ProfileError,
@@ -96,6 +99,61 @@ def test_grok_overlay_is_private_and_backs_up_the_subagent_flag(tmp_path: Path) 
     assert "[subagents]\nenabled = false" in first
     # Grok ignores [compat.*] keys in a GROK_CONFIG overlay; they live in the environment instead.
     assert "[compat." not in first
+
+
+def test_grok_overlay_unchanged_content_preserves_inode_and_timestamps(tmp_path: Path) -> None:
+    path = write_grok_overlay(tmp_path)
+    os.utime(path, ns=(1_000_000_000, 2_000_000_000))
+    before = path.stat()
+    write_grok_overlay(tmp_path)
+    after = path.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_grok_overlay_repairs_permissions_without_rewriting_content(tmp_path: Path) -> None:
+    path = write_grok_overlay(tmp_path)
+    before = path.stat()
+    path.chmod(0o644)
+    write_grok_overlay(tmp_path)
+    after = path.stat()
+    assert stat.S_IMODE(after.st_mode) == 0o600
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+
+def test_grok_overlay_refuses_symlink_without_touching_its_target(tmp_path: Path) -> None:
+    target = tmp_path / "unrelated.toml"
+    target.write_text("preserve me\n")
+    path = tmp_path / "grok-overlay.toml"
+    path.symlink_to(target)
+    with pytest.raises((OSError, ProfileError)):
+        write_grok_overlay(tmp_path)
+    assert path.is_symlink()
+    assert target.read_text() == "preserve me\n"
+
+
+def test_grok_overlay_replacement_keeps_existing_readers_on_complete_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "grok-overlay.toml"
+    old = "# previous complete overlay\n"
+    path.write_text(old)
+    replace = os.replace
+    replacements = []
+
+    def inspect_replace(source, destination):
+        assert Path(source).read_text() == providers.GROK_OVERLAY_TOML
+        assert stat.S_IMODE(Path(source).stat().st_mode) == 0o600
+        assert path.read_text() in (old, providers.GROK_OVERLAY_TOML)
+        replacements.append(source)
+        replace(source, destination)
+
+    monkeypatch.setattr(providers.os, "replace", inspect_replace)
+    with path.open() as reader, ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(lambda _: write_grok_overlay(tmp_path), range(12))) == [path] * 12
+        assert reader.read() == old
+    assert replacements
+    assert path.read_text() == providers.GROK_OVERLAY_TOML
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_claude_profile_points_at_the_pinned_adapter(tmp_path: Path) -> None:

@@ -617,6 +617,17 @@ async def test_an_agent_that_errors_out_when_cancelled_is_still_cancelled(
     assert store.get_lease(PROVIDER) is None
 
 
+async def test_cancelled_turn_is_not_evidence_that_a_previous_throttle_cleared(
+    store: Store, paths: Paths, script,
+) -> None:
+    store.set_provider_status(PROVIDER, "throttled", source="earlier_failure")
+    observed = store.get_provider_status(PROVIDER)
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    state = await cancel_mid_turn(store, paths, task, script({"block_seconds": 30}))
+    assert state is TaskState.CANCELLED
+    assert store.get_provider_status(PROVIDER) == observed
+
+
 # -- provider limits and usage ------------------------------------------------------------------
 
 
@@ -693,6 +704,51 @@ async def test_a_turn_that_runs_clears_the_throttle_and_records_its_usage(
     assert recorded["duration_ms"] is not None
     # The fake profile is neither a Claude seat nor an API key, so nothing is priced.
     assert recorded["cost_estimate_usd"] is None
+
+
+@pytest.mark.parametrize("failure", ["throttled", "auth_expired"])
+async def test_older_success_preserves_new_sibling_failure(
+    store: Store, paths: Paths, script, failure: str,
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    marker = paths.state_dir / "prompt-started.json"
+    worker = asyncio.create_task(run_task(store, paths, task, script({
+        "response": "completed useful work", "capture_env_to": str(marker), "block_seconds": 0.5,
+    })))
+    try:
+        async with asyncio.timeout(10):
+            while not marker.exists():
+                assert not worker.done()
+                await asyncio.sleep(0.01)
+        sibling_store = Store.open(store.path)
+        try:
+            sibling_store.set_provider_status(PROVIDER, failure, source="sibling_failure")
+            failed_status = sibling_store.get_provider_status(PROVIDER)
+        finally:
+            sibling_store.close()
+        assert await worker is TaskState.COMPLETED
+        assert store.get_provider_status(PROVIDER) == failed_status
+    finally:
+        if not worker.done():
+            runner.request_cancel(task.id)
+            await worker
+
+
+async def test_rejected_window_is_not_misattributed_to_a_later_allowed_window(
+    store: Store, paths: Paths, script,
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    rejected = {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1893456000}
+    state = await run_task(store, paths, task, script({
+        "prompt_updates": [{"sessionUpdate": "usage_update", "used": 1, "size": 10,
+                            "_meta": {"_claude/rateLimit": rejected}}],
+        "rate_limit": {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.1},
+    }))
+    assert state is TaskState.COMPLETED
+    status = store.get_provider_status(PROVIDER)
+    assert status["state"] == "throttled"
+    assert status["window"] == "five_hour"
+    assert status["reset_at"] == "2030-01-01T00:00:00Z"
 
 
 async def test_a_grok_style_turn_completed_update_is_recorded_with_its_model(

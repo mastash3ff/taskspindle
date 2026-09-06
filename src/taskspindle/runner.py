@@ -262,6 +262,8 @@ class _Run:
     usage: usage.TurnUsage | None = None
     prompt_started_at: str | None = None
     prompt_ended_at: str | None = None
+    #: Account state before provider startup; successful completion may clear only this observation.
+    provider_status_at_start: dict[str, Any] | None = None
 
     @property
     def task_id(self) -> str:
@@ -465,6 +467,7 @@ async def _run_turn(
     _check_lease(run, boot=boot)
     profile = _resolve_profile(run, profiles)
     run.profile = profile
+    run.provider_status_at_start = run.store.get_provider_status(limits.status_key(profile))
 
     task_tmp = run.dir / "tmp"
     task_tmp.mkdir(parents=True, exist_ok=True)
@@ -847,9 +850,9 @@ def _record_provider_limit(run: _Run, profile: Profile, verdict: limits.Classifi
 
 
 def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> None:
-    """A turn that ran records the windows it saw and clears any throttle on its provider."""
+    """Record observed windows without clearing a sibling's newer quota or auth failure."""
     key = limits.status_key(profile)
-    rejected = False
+    rejected = None
     for info in result.capture.rate_limits:
         window = limits.rate_limit_window(info)
         run.store.insert_provider_window(
@@ -861,22 +864,23 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
             task_id=run.task_id,
             source="rate_limit_event",
         )
-        rejected = rejected or window["status"] == "rejected"
-    current = run.store.get_provider_status(key)
-    if rejected:
-        latest = limits.rate_limit_window(result.capture.rate_limits[-1])
+        if window["status"] == "rejected":
+            rejected = window
+    if rejected is not None:
         run.store.set_provider_status(
             key,
             "throttled",
             code=limits.PROVIDER_THROTTLED,
-            window=latest["window"],
+            window=rejected["window"],
             reason="the agent reported its usage window as rejected",
-            reset_at=latest["resets_at"],
+            reset_at=rejected["resets_at"],
             task_id=run.task_id,
             source="rate_limit_event",
         )
-    elif current is None or current["state"] != "ok":
-        run.store.set_provider_status(key, "ok", task_id=run.task_id, source="turn_ok")
+    elif not run.cancelled and result.stop_reason != "cancelled":
+        run.store.mark_provider_healthy(
+            key, expected=run.provider_status_at_start, task_id=run.task_id,
+        )
 
 
 #: How long, and how often, to wait for Claude Code to write the session record that names the

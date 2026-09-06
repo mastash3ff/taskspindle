@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -191,17 +193,40 @@ def grok_overlay_path(state_dir: Path) -> Path:
 
 
 def write_grok_overlay(state_dir: Path) -> Path:
-    """Write (or rewrite) the Grok overlay at mode 0o600 and return its path.
+    """Publish the fixed, private overlay without truncating a concurrent reader's file.
 
-    Idempotent: the content is fixed, so a rewrite is a no-op in effect. The file is created
-    0o600 from the start and re-chmodded in case it already existed with looser bits.
+    Identical content is left in place. Changed content is written privately beside the target
+    and atomically replaced, so every provider process sees a complete old or new overlay.
+    Never follow a target symlink or open a special file for writing.
     """
     path = grok_overlay_path(state_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(GROK_OVERLAY_TOML)
-    path.chmod(0o600)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    content = GROK_OVERLAY_TOML.encode("utf-8")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        pass
+    else:
+        with os.fdopen(fd, "rb") as handle:
+            existing = os.fstat(handle.fileno())
+            if not stat.S_ISREG(existing.st_mode):
+                raise ProfileError("PROFILE_INVALID", f"Grok overlay is not a regular file: {path}")
+            if handle.read(len(content) + 1) == content:
+                if stat.S_IMODE(existing.st_mode) != 0o600:
+                    os.fchmod(handle.fileno(), 0o600)
+                return path
+
+    fd, temporary = tempfile.mkstemp(prefix=".grok-overlay-", suffix=".toml", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise ProfileError("PROFILE_INVALID", f"Grok overlay is a symlink: {path}")
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
     return path
 
 

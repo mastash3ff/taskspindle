@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum
@@ -1103,6 +1103,35 @@ class Store:
             "SELECT * FROM provider_status WHERE provider = ?", (provider,)
         ).fetchone()
         return dict(row) if row else None
+
+    def mark_provider_healthy(
+        self,
+        provider: str,
+        *,
+        expected: Mapping[str, Any] | None,
+        task_id: str | None = None,
+    ) -> bool:
+        """Clear only the status observed before this successful provider turn began.
+
+        Comparing and writing inside one immediate transaction protects against other worker
+        processes. A sibling failure after that observation must survive this completion; the
+        full observation also avoids treating matching timestamps as matching status records.
+        """
+        with self._guard(), self.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM provider_status WHERE provider = ?", (provider,)
+            ).fetchone()
+            current = dict(row) if row else None
+            if current != expected or (current is not None and current["state"] == "ok"):
+                return False
+            conn.execute(
+                "INSERT INTO provider_status(provider, state, observed_at, task_id, source) "
+                "VALUES (?, 'ok', ?, ?, 'turn_ok') ON CONFLICT(provider) DO UPDATE SET "
+                "state = 'ok', code = NULL, window = NULL, reason = NULL, reset_at = NULL, "
+                "observed_at = excluded.observed_at, task_id = excluded.task_id, source = 'turn_ok'",
+                (provider, now(), task_id),
+            )
+            return True
 
     def list_provider_status(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
