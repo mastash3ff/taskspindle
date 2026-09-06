@@ -14,6 +14,8 @@ Script keys::
      "delegate": true,                     # asks permission for an "Agent: spawn subagent" call
      "block_seconds": 30,                  # sleep before responding; cancel -> "cancelled"
      "fail_on_cancel": true,               # ... unless this is set: cancel -> RequestError
+     "initialize_delay": 30,               # block the ACP handshake before answering
+     "started_initialize_to": "/path/pid", # record child PID when handshake starts
      "fail": true,                         # raise a RequestError from prompt
      "malformed_review": true,             # respond with "not json"
      "capture_env_to": "/path/file.json",  # dump os.environ on prompt
@@ -118,6 +120,7 @@ class FakeAgent:
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        await self._session_operation("initialize")
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_capabilities=AgentCapabilities(load_session=bool(self.script.get("load_session", False))),
@@ -149,6 +152,8 @@ class FakeAgent:
         return LoadSessionResponse(config_options=self.script.get("config_options"))
 
     async def _session_operation(self, operation: str) -> None:
+        if started := self.script.get(f"started_{operation}_to"):
+            Path(started).write_text(str(os.getpid()), encoding="utf-8")
         await asyncio.sleep(float(self.script.get(f"{operation}_delay", 0)))
         if self.script.get(f"{operation}_fail"):
             raise RequestError.auth_required({"reason": "scripted refusal"})

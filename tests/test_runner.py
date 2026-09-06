@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import signal
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -113,6 +115,7 @@ def seed_task(
     kind: TurnKind = TurnKind.INITIAL,
     session_id: str | None = None,
     provider_family: str = PROVIDER,
+    lease_limit: int = 1,
 ) -> TaskRecord:
     """Set a task up exactly the way the server will before it starts a worker unit.
 
@@ -179,7 +182,7 @@ def seed_task(
     task = store.get_task(record.id)
     assert task is not None
     store.insert_turn(task.id, 1, kind.value, prompt=runner.compose_prompt(task, kind))
-    store.acquire_lease(PROVIDER, task.id, units.worker_unit_name(task.id), 0, BOOT)
+    store.acquire_lease(PROVIDER, task.id, units.worker_unit_name(task.id), 0, BOOT, limit=lease_limit)
 
     if identity is not None:
         record_root_snapshot(store, paths, task.id, identity.toplevel, revision=1)
@@ -626,6 +629,55 @@ async def test_cancelled_turn_is_not_evidence_that_a_previous_throttle_cleared(
     state = await cancel_mid_turn(store, paths, task, script({"block_seconds": 30}))
     assert state is TaskState.CANCELLED
     assert store.get_provider_status(PROVIDER) == observed
+
+
+@pytest.mark.parametrize("operation", ["initialize", "new"])
+@pytest.mark.parametrize("cancel_requested", [False, True])
+async def test_transport_close_during_startup_honors_only_requested_cancellation(
+    store: Store, paths: Paths, script, operation: str, cancel_requested: bool,
+) -> None:
+    victim = seed_task(store, paths, mode=Mode.CONSULT, lease_limit=2)
+    sibling = seed_task(store, paths, mode=Mode.CONSULT, lease_limit=2)
+    started = paths.state_dir / "startup-child.pid"
+    victim_turn = asyncio.create_task(run_task(store, paths, victim, script({
+        f"{operation}_delay": 30, f"started_{operation}_to": str(started),
+    })))
+    sibling_turn = asyncio.create_task(run_task(store, paths, sibling, script({
+        "block_seconds": 1, "response": "independent sibling finished",
+    })))
+    try:
+        async with asyncio.timeout(10):
+            while not started.exists():
+                await asyncio.sleep(0.01)
+        assert store.get_task(victim.id).state is TaskState.RUNNING
+        assert store.get_task(victim.id).session_id is None
+        if cancel_requested:
+            service.transition(store, victim.id, TaskState.CANCELLING, reason="cancel requested")
+        # systemd cancels the entire worker unit: the ACP child can lose its
+        # transport before the runner reaches _prompt's cancellation watcher.
+        os.kill(int(started.read_text()), signal.SIGTERM)
+        victim_state, sibling_state = await asyncio.wait_for(
+            asyncio.gather(victim_turn, sibling_turn), timeout=15,
+        )
+    finally:
+        for turn in (victim_turn, sibling_turn):
+            if not turn.done():
+                turn.cancel()
+        await asyncio.gather(victim_turn, sibling_turn, return_exceptions=True)
+
+    final = store.get_task(victim.id)
+    if cancel_requested:
+        assert victim_state is TaskState.CANCELLED
+        assert final.error is None
+    else:
+        assert victim_state is TaskState.FAILED
+        expected = "ACP_HANDSHAKE_FAILED" if operation == "initialize" else "ACP_SESSION_FAILED"
+        assert final.error["code"] == expected
+    assert store.list_turns(victim.id)[0]["ended_at"] is not None
+    assert sibling_state is TaskState.COMPLETED
+    assert store.get_task(sibling.id).response == "independent sibling finished"
+    assert store.get_task(sibling.id).error is None
+    assert store.list_leases() == []
 
 
 # -- provider limits and usage ------------------------------------------------------------------

@@ -515,9 +515,15 @@ async def _run_turn(
         if run.result is not None:
             await _record_usage(run, profile, workspace, run.result)
             _record_violations(run, run.result)
-        if run.cancelled:
+        current = run.store.get_task(run.task_id)
+        if (
+            run.cancelled or cancel_event.is_set()
+            or (current is not None and current.state is TaskState.CANCELLING)
+        ):
             # An agent that errors out because it was cancelled was still cancelled: the outcome
-            # the operator asked for is the one to record.
+            # the operator asked for is the one to record. A unit-wide SIGTERM can close
+            # the ACP transport during initialize/session setup, before _prompt watches
+            # cancel_event and sets run.cancelled; the stored request is authoritative.
             run.log.write(f"cancel raised {exc.code}")
             return _settle_cancelled(run)
         if exc.code == "RESUME_UNAVAILABLE":
