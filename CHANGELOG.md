@@ -1,9 +1,21 @@
 # Changelog
 
-## 0.2.0
 ## v0.2.0
 
-Prepared release candidate, not published. Publication and activation remain on hold.
+Adds subscription visibility, subscription-aware worker eligibility, native Antigravity support,
+and broader task inspection while keeping provider choice and task ownership explicit.
+
+- **Subscription tracking.** The dashboard can connect a selected normal Chrome profile through
+  the Playwright extension and record normalized, account-bound billing observations for ChatGPT,
+  Claude, Grok, and Google AI. Credentials, payment details, raw provider payloads, and raw account
+  identities are not stored. Unsupported billing channels and unverified dates remain explicit.
+- **Lightweight billing follow-up.** Scheduled collection is opt-in and disabled by default.
+  Manual Connect and Refresh remain available; fresh confirmed access-end observations expose
+  normalized seven-day and one-day warnings without changing worker routing.
+- **Subscription-aware worker eligibility.** Account and model refusals, authentication expiry,
+  access denial, and elapsed quota resets are projected consistently for coordinators. Successful
+  use and stale evidence are recorded without clearing newer sibling failures. TaskSpindle does not
+  migrate an existing task or infer CLI eligibility from browser billing dates.
 
 - **Search and compare.** Dashboard search matches literal task ID/prompt text, including
   Unicode case folding. Candidate diffs sit alongside their reviews, finding links retain focus
@@ -15,7 +27,6 @@ Prepared release candidate, not published. Publication and activation remain on 
   probe does not prevent the remaining probes from running.
 - **Known limitation.** Grok continuation succeeded with per-turn usage in the recorded
   three-turn verification, but an intermittent direct ACP reload timeout remains unexplained.
-  Publication and activation are held until that reliability issue is resolved.
 
 - **Grok read-only turns use the `read-only` sandbox.** `strict` allowed writes inside the
   worktree and, on WSL, denied the `/etc/resolv.conf` symlink target so the sandboxed agent's

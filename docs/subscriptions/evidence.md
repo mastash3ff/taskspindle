@@ -1,14 +1,14 @@
 # Collector verification evidence
 
 Current candidate evidence was collected on 2026-09-07 using the installed Windows Node,
-normal Chrome `Default` profile, and the privately paired Playwright extension 0.4.0.
+a selected normal Chrome profile, and a privately paired Playwright extension 0.4.0.
 The installed MCP runtime and dashboard on port 8765 remain unchanged.
 
 | Provider | Acquisition | Verified result |
 | --- | --- | --- |
-| ChatGPT | Exact `/backend-api/subscriptions` fields `plan_type`, `active_until`, `will_renew`, `is_processor_stripe`; account email from `client-bootstrap`, hashed in the page | Packaged API Connect and Refresh succeeded, including refresh after collector restart. The current personal Pro plan and renewal boundary were verified. |
-| Claude | Exact organization bootstrap `account.email_address` and `/subscription_details`; current plan from the isolated Billing dialog | Packaged API Connect and Refresh succeeded, including refresh after collector restart. The current Max plan and `next_charge_at` were verified. |
-| Grok | Exact `/api/auth/session` identity and the isolated Billing dialog | Packaged API Connect and Refresh succeeded, including refresh after collector restart. SuperGrok and its date-only renewal boundary were verified. |
+| ChatGPT | Exact `/backend-api/subscriptions` fields `plan_type`, `active_until`, `will_renew`, `is_processor_stripe`; account email from `client-bootstrap`, hashed in the page | Packaged API Connect and Refresh succeeded, including refresh after collector restart. A recognized active personal plan and renewal boundary were verified. |
+| Claude | Exact organization bootstrap `account.email_address` and `/subscription_details`; current plan from the isolated Billing dialog | Packaged API Connect and Refresh succeeded, including refresh after collector restart. A recognized active personal plan and next-charge boundary were verified. |
+| Grok | Exact `/api/auth/session` identity and the isolated Billing dialog | Packaged API Connect and Refresh succeeded, including refresh after collector restart. A recognized active paid plan and date-only renewal boundary were verified. |
 | Google AI | Google One settings, followed by an account-bound Google Play subscription lookup when settings have no date | The exact Google One product row was identified automatically. The candidate reports Unsupported billing channel. Direct-web Google AI date collection remains unverified; purchase-channel clarification is pending. |
 
 The candidate's SQLite store contains successful observations for the three verified providers.
@@ -71,7 +71,7 @@ Live cancellation and expired/free/no-subscription transitions for supported dir
 remain unverified. Their regression fixtures use synthetic identities and shifted dates.
 No subscription was cancelled or modified for testing. No credentials, raw provider payloads,
 payment details, real account identifiers, or real billing dates are included in these docs or
-regression fixtures. Installed-runtime activation and publication require separate approval.
+regression fixtures. At the time of this evidence capture, activation and publication had not occurred.
 
 ## Opt-in scheduling and warning follow-up
 
@@ -94,8 +94,8 @@ whitespace checks passed. Coverage includes personal Claude Pro/Max authenticati
 account/model refusals, quota-reset eligibility, stale/unknown observations, concurrent status
 updates, startup refusal checks, and read-only access to the existing task database format.
 
-Noninteractive native checks on this host reported cached Claude Max authentication and an
-AGY catalog containing 11 Gemini models. These checks establish neither current entitlement
+Noninteractive native checks on the validation host reported cached eligible Claude personal-plan
+authentication and a nonempty AGY Gemini catalog. These checks establish neither current entitlement
 nor browser/CLI account identity. Grok has no supported noninteractive native status check;
 its availability still uses observed task outcomes. No synthetic inference requests were sent.
 
@@ -114,5 +114,5 @@ read-only against schema 4, and the installed MCP runtime and installed work-poo
 The exact build ledger, full test output, normalized native-check results, Windows screenshots,
 and browser verification script are retained in the local delivery directory
 `~/.local/state/taskspindle-subscription-implementation/20260907/worker-selection/`.
-Candidate task-database schema 5 is tested but has not been activated in the installed runtime.
-Activation of the runtime and revised work-pool guidance, and publication, require separate approval.
+At the time of this evidence capture, candidate task-database schema 5 had been tested but had not
+been activated in the installed runtime, and the revised work-pool guidance was not installed.

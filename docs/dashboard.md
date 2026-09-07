@@ -85,7 +85,7 @@ explicit POST exceptions. Errors are JSON, never a traceback.
 | `/api/tasks?state&provider&mode&limit` | `{tasks: [...]}`, newest first, `limit` default 100, max 1000 |
 | `/api/tasks/{id}` | task, events, turns (with usage and transcript), checks, review, repository, worker log tail; `404` `TASK_NOT_FOUND` |
 | `/api/tasks/{id}/diff?revision=N` | the candidate diff as `text/plain`, defaulting to the candidate revision; `404` if none |
-| `/api/providers` | per-profile availability and windows, raw provider status rows, the cached doctor report |
+| `/api/providers` | per-profile availability and windows, sanitized provider status, the cached doctor report |
 | `/api/doctor?live=1` | the doctor report, live probes included |
 | `/api/usage?since&provider&group_by` | the same shape as `taskspindle usage --json`; `400` on a bad `since` or `group_by` |
 | `/api/subscriptions` | cached subscription records, collector health, and local CSRF token |

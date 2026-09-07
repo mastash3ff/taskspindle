@@ -100,7 +100,7 @@ Observed 2026-09-07:
 
 Verification includes sanitized adapter tests for owned-tab lifecycle, account mismatch,
 expired auth, unavailable setup/browser, safe exceptions, cancellation, receipt isolation,
-and the pinned extension factory. Extension 0.4.0 is privately paired in normal Chrome.
+and the pinned extension factory. The validation profile used a privately paired extension 0.4.0.
 
 The current packaged candidate has passed live Connect, Refresh, and refresh after collector
 restart for ChatGPT, Claude, and Grok. Each operation opens and closes its own billing tab;
@@ -110,7 +110,7 @@ whole-Chrome shutdown/restart was not performed because existing user windows re
 - Claude captures account identity and billing dates from its scoped organization endpoints;
   cancellation ending fields have source-backed synthetic coverage, with a narrowly labeled
   DOM fallback. Scheduled downgrades do not replace the current plan.
-- Grok uses session identity and the Billing dialog, retaining the user-provided Usage Connect link.
+- Grok uses session identity and the Billing dialog, retaining the configured Usage Connect link.
 - Google One settings has no observed billing date. The account-bound Google Play lookup
   classifies the exact Google One product as an unsupported billing channel. App-store tracking
   remains excluded while the purchase channel is clarified.

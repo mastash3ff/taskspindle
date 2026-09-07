@@ -7,14 +7,15 @@ unit, so most of the requirements are things it launches rather than things it b
 
 - **Linux with a systemd user manager**, or **WSL2 with systemd enabled**. `systemctl --user
   is-system-running` must answer `running` or `degraded`. macOS and Windows are not supported in
-  v0.1.0; see [platforms.md](platforms.md).
+  v0.2.0; see [platforms.md](platforms.md).
 - **Python 3.12 or newer.**
 - **Node 22 or newer**, with `npm`. The Claude adapter is a Node program.
 - **git 2.38 or newer.** Acceptance probes a merge with `git merge-tree --write-tree`, which needs
   that version to behave the way TaskSpindle relies on.
 - **Codex CLI**, which is what talks to the MCP server.
-- **Claude Code, logged in to a Max subscription.** `claude auth status` must report
-  `loggedIn: true`, `authMethod: claude.ai`, `subscriptionType: max` and `apiProvider: firstParty`.
+- **Claude Code, logged in to a Pro or Max subscription.** `claude auth status` must report
+  `loggedIn: true`, `authMethod: claude.ai`, `subscriptionType: pro` or `max`, and
+  `apiProvider: firstParty`.
   TaskSpindle reads those four fields and nothing else out of the payload.
 - **Grok CLI 1.0.13**, logged in at grok.com, with `~/.grok/auth.json` present. The version is
   pinned to a prefix because the ACP endpoint and config keys were verified against that build.
@@ -25,7 +26,7 @@ sessions; TaskSpindle only asks them whether they have one.
 ## Install
 
 ```sh
-uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.1.0"
+uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.2.0"
 taskspindle setup
 taskspindle doctor
 ```
@@ -78,7 +79,7 @@ and the detached units alike.
 ## Upgrading
 
 ```sh
-uv tool upgrade taskspindle    # or: uv tool install --force "git+...@v0.1.1"
+uv tool upgrade taskspindle    # or: uv tool install --force "git+...@v0.2.0"
 taskspindle setup
 taskspindle doctor
 ```
