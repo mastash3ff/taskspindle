@@ -231,7 +231,7 @@ def test_normal_connect_opens_regular_chrome_then_reports_missing_extension_toke
     launch_script = base64.b64decode(calls[1][-1]).decode("utf-16-le")
     assert "Start-Process" in launch_script
     assert "--profile-directory=Default" in launch_script
-    assert "https://chatgpt.com/#settings/billing" in launch_script
+    assert "https://chatgpt.com/#settings/Billing" in launch_script
     assert "user-data-dir" not in launch_script
     assert "remote-debug" not in launch_script
 

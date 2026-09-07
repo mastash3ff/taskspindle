@@ -18,7 +18,7 @@ with warnings.catch_warnings():
 
 from taskspindle.config import Paths
 from taskspindle.store import Store
-from taskspindle.subscriptions.models import validate_result
+from taskspindle.subscriptions.models import PROVIDERS, validate_result
 from taskspindle.subscriptions.service import SubscriptionService
 from taskspindle.web.app import build_app
 
@@ -91,7 +91,7 @@ def test_packaged_javascript_observations_satisfy_python_contract() -> None:
         pytest.skip("Node is required for the packaged browser contract check")
     extractor = resources.files("taskspindle").joinpath("_subscription_browser", "extractors.mjs")
     script = """
-      const {normalize} = await import(process.argv[1]);
+      const {normalize, URLS} = await import(process.argv[1]);
       const base = {account_id: 'a'.repeat(64), account_label: 'a***@e***.test',
         billing_channel: 'provider_web'};
       const rows = [
@@ -104,13 +104,17 @@ def test_packaged_javascript_observations_satisfy_python_contract() -> None:
         normalize('grok', {...base, plan:'SuperGrok',
           billing:{status:'expired'}}, null, 'UTC'),
       ];
-      process.stdout.write(JSON.stringify(rows));
+      process.stdout.write(JSON.stringify({rows, urls: URLS}));
     """
     completed = subprocess.run(
         [node, "--input-type=module", "-e", script, Path(str(extractor)).as_uri()],
         capture_output=True, text=True, timeout=15, check=True,
     )
-    rows = json.loads(completed.stdout)
+    payload = json.loads(completed.stdout)
+    # Connect's Python launcher and the authenticated JavaScript collector must
+    # agree exactly: ChatGPT's settings tab identifier is case-sensitive.
+    assert payload["urls"] == {provider: details["billing_url"] for provider, details in PROVIDERS.items()}
+    rows = payload["rows"]
     assert len(rows) == 4
     for result in rows:
         assert result["ok"] is True

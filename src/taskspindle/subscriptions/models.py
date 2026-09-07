@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, mo
 PROVIDERS: dict[str, dict[str, str]] = {
     "chatgpt": {
         "label": "ChatGPT",
-        "billing_url": "https://chatgpt.com/#settings/billing",
+        "billing_url": "https://chatgpt.com/#settings/Billing",
     },
     "claude": {
         "label": "Claude",
