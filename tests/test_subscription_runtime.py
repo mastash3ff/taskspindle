@@ -303,6 +303,24 @@ def test_normal_helper_receives_only_private_extension_token_as_credential(
     assert "extension-token-123" not in helper.input
 
 
+def test_normal_helper_forwards_only_allowlisted_wsl_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = normal_paths(tmp_path, token="extension-token-123")
+    settings = runtime._load_settings(configured)
+    monkeypatch.setenv(
+        "WSLENV",
+        "TZ/u:PATH/l:OPENAI_API_KEY/u:PLAYWRIGHT_MCP_EXTENSION_TOKEN/u",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+
+    env = runtime._normal_helper_env(settings, "synthetic-token")
+
+    assert env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] == "synthetic-token"
+    assert env["WSLENV"] == "TZ/u:PATH/l:PLAYWRIGHT_MCP_EXTENSION_TOKEN/w"
+    assert "OPENAI_API_KEY" not in env
+
+
 @pytest.mark.parametrize(
     "profile",
     ["", "Profile 0", "Profile 01", "Profile -1", "../Default", r"Default\\Other", "$(id)"],

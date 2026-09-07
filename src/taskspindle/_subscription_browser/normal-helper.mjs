@@ -7,13 +7,21 @@ import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { validateRequest } from './helper.mjs';
 import { acquireProfileLock, releaseProfileLock } from './ownership.mjs';
-import { URLS, failure, normalize } from './extractors.mjs';
-import { installCapture, readEvidence } from './page.mjs';
+import { COLLECTION_URLS, failure, normalize } from './extractors.mjs';
+import { installCapture } from './page.mjs';
+import { installClaudeCapture } from './claude.mjs';
+import { collectEvidence, GOOGLE_PLAY_SUBSCRIPTIONS_URL, readGoogleOneScope } from './collection.mjs';
 
 export const EXTENSION_ID = 'mmlmfjhmonkocbjadbfplnigmagldckm';
 const exec = promisify(execFile);
 const require = createRequire(import.meta.url);
 const codedError = code => Object.assign(new Error(code), { code });
+const RELAY_CONNECT_TIMEOUT_MS = 30_000;
+const RELAY_CONNECT_MARGIN_MS = 2_000;
+// Pinned Playwright 1.63.0's extension relay uses this exact, non-sensitive
+// pairing failure. Keep it bounded so arbitrary provider/browser text never
+// changes the public error classification.
+const RELAY_PAIRING_TIMEOUT = /^Playwright extension did not connect within \d+(?:\.\d+)?s after opening the connect page\. Make sure the extension is installed in the Chrome profile(?: "[^"\r\n]{1,128}")? and PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token\.$/;
 
 export function validateNormalRequest(request) {
   return validateRequest(request) && typeof request.chrome_profile === 'string' && /^(?:Default|Profile [1-9]\d*)$/.test(request.chrome_profile) &&
@@ -66,11 +74,16 @@ export async function connectExtension(request) {
   catch (error) {
     // Invalid/rotated tokens never fall back to consent in the official extension.
     // They leave its handshake unfulfilled; only the safe setup code leaves here.
-    if (/Extension (?:connection timeout|not found)/i.test(error.message || '')) throw codedError('SETUP_REQUIRED');
-    throw codedError('BROWSER_UNAVAILABLE');
+    throw codedError(extensionFailureCode(error));
   }
   if (connection.ownership !== 'attached') throw codedError('BROWSER_UNAVAILABLE');
   return connection.browser;
+}
+
+export function extensionFailureCode(error) {
+  const message = typeof error?.message === 'string' ? error.message : '';
+  return RELAY_PAIRING_TIMEOUT.test(message) || /Extension not found/i.test(message)
+    ? 'SETUP_REQUIRED' : 'BROWSER_UNAVAILABLE';
 }
 
 export function bounded(operation, signal, timeout) {
@@ -86,6 +99,12 @@ export function bounded(operation, signal, timeout) {
     signal?.addEventListener('abort', abort, { once: true });
     timer = setTimeout(() => finish(reject, codedError('TIMEOUT')), timeout);
   });
+}
+
+export function extensionConnectBudget(remainingMs) {
+  // Give the pinned relay a small scheduling margin beyond its own 30-second
+  // handshake timeout, but never exceed the operation's remaining deadline.
+  return Math.min(remainingMs, RELAY_CONNECT_TIMEOUT_MS + RELAY_CONNECT_MARGIN_MS);
 }
 
 export async function runNormal(request, dependencies = {}) {
@@ -123,7 +142,7 @@ export async function runNormal(request, dependencies = {}) {
     const deadline = Date.now() + request.timeout_s * 1000;
     deadlineTimer = setTimeout(stop, request.timeout_s * 1000);
     const remaining = () => Math.max(1, deadline - Date.now());
-    const browser = await bounded((dependencies.connect || connectExtension)(request), controller.signal, Math.min(30000, remaining()));
+    const browser = await bounded((dependencies.connect || connectExtension)(request), controller.signal, extensionConnectBudget(remaining()));
     const context = browser.contexts()[0];
     if (!context) throw codedError('BROWSER_UNAVAILABLE');
     // Never enumerate, navigate, change scripts in, or close preexisting pages.
@@ -134,12 +153,33 @@ export async function runNormal(request, dependencies = {}) {
     });
     ownedPage = await bounded(pendingOwnedPage, controller.signal, remaining());
     await bounded(ownedPage.addInitScript(installCapture), controller.signal, remaining());
-    await bounded(ownedPage.goto(URLS[request.provider], { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }), controller.signal, remaining()).catch(error => { if (controller.signal.aborted) throw error; });
+    if (request.provider === 'claude') await bounded(ownedPage.addInitScript(installClaudeCapture), controller.signal, remaining());
+    await bounded(ownedPage.goto(COLLECTION_URLS[request.provider], { waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()) }), controller.signal, remaining()).catch(error => { if (controller.signal.aborted) throw error; });
     result = failure('PARSE_CHANGED');
+    let googlePlayAttempted = false;
+    let googleOneAccountId = null;
     while (!controller.signal.aborted && remaining() > 1) {
-      const evidence = await bounded(ownedPage.evaluate(readEvidence, request.provider), controller.signal, Math.min(5000, remaining())).catch(error => { if (controller.signal.aborted) throw error; return null; });
-      result = normalize(request.provider, evidence, request.expected_account_id, request.timezone);
+      const evidence = await bounded(collectEvidence(ownedPage, request.provider), controller.signal, Math.min(5000, remaining())).catch(error => { if (controller.signal.aborted) throw error; return null; });
+      result = normalize(request.provider, evidence, request.expected_account_id || googleOneAccountId, request.timezone);
       if (result.ok || ['ACCOUNT_MISMATCH', 'UNSUPPORTED_BILLING_CHANNEL'].includes(result.error.code)) break;
+      if (request.provider === 'google_ai' && !googlePlayAttempted &&
+          result.error.code === 'PARSE_CHANGED') {
+        const scope = await bounded(
+          ownedPage.evaluate(readGoogleOneScope), controller.signal, Math.min(5000, remaining()),
+        ).catch(error => { if (controller.signal.aborted) throw error; return null; });
+        if (/^[a-f0-9]{64}$/.test(scope?.account_id || '')) {
+          googlePlayAttempted = true;
+          googleOneAccountId = scope.account_id;
+          if (request.expected_account_id && request.expected_account_id !== googleOneAccountId) {
+            result = failure('ACCOUNT_MISMATCH');
+            break;
+          }
+          await bounded(ownedPage.goto(GOOGLE_PLAY_SUBSCRIPTIONS_URL, {
+            waitUntil: 'domcontentloaded', timeout: Math.min(30000, remaining()),
+          }), controller.signal, remaining()).catch(error => { if (controller.signal.aborted) throw error; });
+          continue;
+        }
+      }
       if (request.action === 'refresh' && result.error.code === 'AUTH_REQUIRED') break;
       if (ownedPage.isClosed()) break;
       await bounded(new Promise(resolve => setTimeout(resolve, 250)), controller.signal, remaining());

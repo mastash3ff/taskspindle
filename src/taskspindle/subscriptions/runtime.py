@@ -46,6 +46,9 @@ _CANCEL_REQUESTED = threading.Event()
 _ASSET_NAMES = (
     "helper.mjs",
     "normal-helper.mjs",
+    "collection.mjs",
+    "claude.mjs",
+    "google.mjs",
     "extractors.mjs",
     "page.mjs",
     "ownership.mjs",
@@ -426,7 +429,21 @@ def _node_env(settings: _Settings) -> dict[str, str]:
 
 def _normal_helper_env(settings: _Settings, token: str) -> dict[str, str]:
     env = _node_env(settings)
-    env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = token
+    token_name = "PLAYWRIGHT_MCP_EXTENSION_TOKEN"
+    env[token_name] = token
+    inherited = env.get("WSLENV", "")
+    allowed = {name.casefold() for name in env if name != "WSLENV"}
+    entries: list[str] = []
+    for entry in inherited.split(":"):
+        name = entry.split("/", 1)[0]
+        if (
+            name
+            and name.casefold() in allowed
+            and name.casefold() != token_name.casefold()
+        ):
+            entries.append(entry)
+    entries.append(f"{token_name}/w")
+    env["WSLENV"] = ":".join(entries)
     return env
 
 

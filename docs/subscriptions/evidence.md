@@ -1,93 +1,74 @@
 # Collector verification evidence
 
-This file records evidence for the subscription-tracking candidate. No provider is marked
-live-verified merely because a parser or browser helper exists.
+Current candidate evidence was collected on 2026-09-07 using the installed Windows Node,
+normal Chrome `Default` profile, and the privately paired Playwright extension 0.4.0.
+The installed MCP runtime and dashboard on port 8765 remain unchanged.
 
-| Provider | Acquisition design | Live verification |
+| Provider | Acquisition | Verified result |
 | --- | --- | --- |
-| ChatGPT | Authenticated billing response: `active_until` and `will_renew`; CodexBar reference | Earlier dedicated Connect did not confirm billing. Normal-profile extension connection, billing extraction, and reconnect/refresh remain pending. |
-| Claude | Authenticated billing page, verified account and explicit renewal/access-end wording | Pending normal-profile extension connection and observed page contract |
-| Google AI | Google One billing page; one record for shared Gemini/AGY benefits | Pending normal-profile extension connection and observed page contract |
-| Grok | Direct SuperGrok billing page; X/app-store billing excluded | Pending normal-profile extension connection and observed page contract |
+| ChatGPT | Exact `/backend-api/subscriptions` fields `plan_type`, `active_until`, `will_renew`, `is_processor_stripe`; account email from `client-bootstrap`, hashed in the page | Packaged API Connect and Refresh succeeded, including refresh after collector restart. The current personal Pro plan and renewal boundary were verified. |
+| Claude | Exact organization bootstrap `account.email_address` and `/subscription_details`; current plan from the isolated Billing dialog | Packaged API Connect and Refresh succeeded, including refresh after collector restart. The current Max plan and `next_charge_at` were verified. |
+| Grok | Exact `/api/auth/session` identity and the isolated Billing dialog | Packaged API Connect and Refresh succeeded, including refresh after collector restart. SuperGrok and its date-only renewal boundary were verified. |
+| Google AI | Google One settings, followed by an account-bound Google Play subscription lookup when settings have no date | The exact Google One product row was identified automatically. The candidate reports Unsupported billing channel. Direct-web Google AI date collection remains unverified; purchase-channel clarification is pending. |
 
-ChatGPT source reference:
-[CodexBar subscription capture](https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/OpenAIWeb/OpenAISubscriptionMetadata.swift).
-The collector must preserve attribution for adapted MIT-licensed code.
+The candidate's SQLite store contains successful observations for the three verified providers.
+No fake snapshots were inserted to establish these results. Manual requests coalesced, account
+identifiers remained stable, and the user service resumed successful collection after restart.
+Each operation reattached through the extension and closed only its own billing tab. The user's
+whole Chrome browser was not shut down, so whole-browser restart validation remains open.
+Normal-mode background checks require Chrome to be running in the selected profile.
 
-OAuth token expiry and quota resets are not evidence of subscription expiry. Unknown
-provider schemas must yield a visible verification error rather than invented dates.
-Live cancellation behavior must remain explicitly unverified unless observed on an existing
-cancelled subscription. Never cancel a subscription for validation.
+## Source and interpretation boundaries
 
-## Previous dedicated-mode integration evidence (2026-09-07)
+ChatGPT collection adapts the MIT-licensed
+[CodexBar subscription approach](https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/OpenAIWeb/OpenAISubscriptionMetadata.swift).
+Attribution is retained in the packaged NOTICE. Only recognized personal plans and typed billing
+fields are projected; account email is hashed and masked inside the provider page.
 
-The following checks describe the earlier dedicated-profile build (`0e1849a`). They do not
-establish successful normal-profile collection through the newly selected extension bridge.
+Claude bootstrap capture permits only the observed query keys `statsig_hashing_algorithm`,
+`growthbook_format`, `cache_bust`, and `include_system_prompts`. Billing permits `cached`.
+Values and unrelated response contents are never retained. Renewing requires active status,
+explicitly null ending fields, and a valid next charge. Pending cancellation from a non-null
+`plan_ending_at` or `plan_ending_before` follows the independent
+[Aliax implementation](https://github.com/LandonDev/aliax/blob/df34e2771d7e3fe82aba11e39c9b57cbeab93003/src/main/adapters/claude.ts#L161-L205)
+and [ClaudeTuner implementation](https://github.com/chaehyun2/claudetuner/blob/064b53d7440fb56dfbbb5888d14007eabafa0ac1/bg/plan.js#L36-L60).
+This mapping has synthetic regression coverage, not live cancellation proof or a published
+Anthropic schema. Conflicting ending fields fail closed. A positively labeled scoped DOM
+cancellation/end date can supply the fallback after captured account identity is verified.
+Scheduled downgrades do not replace the current plan in the snapshot.
 
-- Windows Node `v24.14.0`, installed Windows Chrome, and pinned `playwright-core 1.63.0`
-  successfully provisioned and launched the dedicated collector runtime.
-- A real systemd user unit successfully discovered and executed Windows Node without a
-  manually supplied `WSL_INTEROP` socket.
-- Windows Chrome rendered the isolated dashboard at desktop and mobile widths. Synthetic
-  API fixtures showed all four providers and renewal, cancellation, stale, reconnect, and
-  unsupported-channel states without JavaScript errors or horizontal overflow.
-- The actual Python API, queue, worker, and store were exercised together: duplicate requests
-  coalesced, a cancelled observation produced a calendar-day countdown, and a subsequent
-  authentication failure retained the prior result while task-database bytes stayed unchanged.
-- Packaged JavaScript results are checked against Python validation to detect schema drift.
-- The final wheel passed **860 Python tests**, with one existing opt-in real task-unit test
-  skipped. The browser helper passed **23 Node tests**. Ruff, JavaScript syntax, wheel-asset
-  inspection, and the generated systemd service definition also passed validation.
-- A separate disposable Windows profile passed a real collector stop/restart check: SIGTERM
-  stopped the owned browser tree, a restart recovered the stale ownership record, and no
-  matching Node/Chrome process or collector lock remained. This tested process lifecycle,
-  not authenticated billing collection.
+Grok's user-provided Connect link remains `?_s=usage`. Collection uses `?_s=billing` because
+Usage contains credit information rather than the subscription boundary. Credit expiry and
+quota resets never supply billing dates.
 
-These are infrastructure and fixture checks, not proof of a provider's authenticated billing
-contract. Claude, Google AI, and Grok DOM fixtures are explicitly synthetic; their selectors and
-wording still need verification on the user's signed-in billing pages. No provider has passed
-the required successful billing collection followed by browser close/reopen and refresh.
+Google One remains one record for shared Gemini/Antigravity personal benefits. Its settings
+page exposed no date. A Google Play Google One card visibly showed cancellation and a future
+access end, but app-store billing remains outside this version. The classifier identifies only
+the exact Google One product row, verifies the same account across both Google origins, and
+returns the unsupported-channel status without projecting that date. Other expired app rows
+are ignored. Apple and X Premium-derived billing also remain unsupported.
 
-The first ChatGPT attempt used the initial helper and returned `PARSE_CHANGED`; later hardening
-added stricter settings-container isolation and explicit logged-out navigation detection. No
-credentials, raw billing responses, payment details, or screenshots of authenticated billing
-pages were saved as fixtures. Existing-cancelled-subscription live proof remains outstanding.
+## Validation
 
-## Normal Chrome change
+- **105 Python tests passed** across subscriptions, existing read-only web APIs, and configuration.
+- **86 browser tests passed on Linux and Windows Node v24.14.0**. Windows ran each test module
+  through a file-URL import because Node's test discovery did not resolve the UNC source paths.
+- The packaged preview rejected invalid CSRF tokens and foreign origins; duplicate Connect
+  and Refresh calls returned the same queued job identifiers.
+- Real Connect, Refresh, and refresh after a collector restart succeeded for ChatGPT, Claude,
+  and Grok. Google returned the expected unsupported-channel result.
+- The Windows dashboard renders the three verified renewal states and the Google limitation;
+  it exposes three usable Refresh controls, masked account labels, and no JavaScript errors.
+- Packaged source and installed files are compared byte-for-byte, and Windows helper assets
+  are checked against the wheel. Build hashes and local evidence paths live in the candidate ledger.
 
-The user requested Connect use normal Chrome with its Google profile and saved passwords.
-The default browser mode now uses the official Playwright Chrome extension; the previous
-dedicated helper remains opt-in. A read-only check found one signed-in Windows Chrome
-profile, `Default`, and no installed Playwright extension. No Chrome password or cookie
-database was read. Extension installation and the private connection token are prerequisites
-for live automatic collection. Opening a normal billing tab without them is not a successful
-subscription connection.
+The earlier implementation also passed 860 Python tests (one pre-existing opt-in task-unit test
+skipped), desktop/mobile fixture rendering, stale-result retention, countdown boundaries,
+provider/account changes, queue concurrency, and task-database read-only checks. These historical
+checks complement the focused current suite; they are not represented as a new full-suite run.
 
-Normal-mode source checks passed: **99 Python tests** across subscriptions and the existing
-web API, and **35 Node tests** on both Linux Node and actual Windows Node. These cover the
-private token handoff, regular Chrome launch arguments, preserved task read-only behavior,
-account mismatch/authentication failure, only-owned-tab cleanup, late tab creation during
-cancellation, and the pinned Playwright extension factory. They do not replace an authenticated
-live extension connection. Ruff, JavaScript syntax, and diff checks also passed.
-
-The supported existing-profile mechanism and per-profile connection token are documented in
-the [official extension guide](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md).
-Chrome restricts debugging switches against its ordinary profile; changing the persistent
-context's profile path alone cannot supply this behavior.
-
-## Candidate boundary
-
-The user supplied Claude's `https://claude.ai/new#settings/billing` and Grok's
-`https://grok.com/?_s=usage` as settings destinations. Both the Chrome launcher and
-collector now use those routes; the extractors also recognize their previous billing
-routes. Claude's normalized source strips the settings fragment and preserves `/new`;
-historical `/settings/billing` observations remain valid. Grok's Usage dialog must still
-provide identity, plan, direct-web evidence, and an explicit billing boundary. Route
-acceptance and quota-date rejection have synthetic regression coverage, not live
-subscription-date proof. Google One settings remains the shared Gemini/Antigravity
-personal subscription destination, confirmed by current official Google documentation.
-
-Exact build checksums and current verification results are recorded outside the wheel in the
-local candidate build ledger. The preview uses the candidate wheel and its own state/configuration.
-The installed MCP runtime and the existing dashboard on port 8765 have not been activated from
-this candidate. Activation/publication approval follows successful live provider verification.
+Live cancellation and expired/free/no-subscription transitions for supported direct-web accounts
+remain unverified. Their regression fixtures use synthetic identities and shifted dates.
+No subscription was cancelled or modified for testing. No credentials, raw provider payloads,
+payment details, real account identifiers, or real billing dates are included in these docs or
+regression fixtures. Installed-runtime activation and publication require separate approval.

@@ -5,17 +5,22 @@ export function installCapture() {
   const state = window.__taskspindleCapture = { subscription: null, authRequired: false };
   const original = window.fetch.bind(window);
   let latest = 0;
+  let latestGrokSession = 0;
   window.fetch = async (...args) => {
     let subscription = false;
+    let grokSession = false;
     try {
       const url = new URL(args[0]?.url || String(args[0]), location.href);
       subscription = location.origin === 'https://chatgpt.com' && url.origin === location.origin && url.pathname === '/backend-api/subscriptions';
+      grokSession = location.origin === 'https://grok.com' && url.origin === location.origin && url.pathname === '/api/auth/session';
     } catch { /* unrecognized request */ }
     const generation = subscription ? ++latest : 0;
+    const sessionGeneration = grokSession ? ++latestGrokSession : 0;
     if (subscription) state.subscription = null;
+    if (grokSession) state.grokIdentity = null;
     const response = await original(...args);
     if (subscription) {
-      if (response.status === 401) state.authRequired = true;
+      if (response.status === 401 && generation === latest) state.authRequired = true;
       if (response.ok) response.clone().json().then(payload => {
         if (generation !== latest) return;
         const has = key => Object.hasOwn(payload || {}, key);
@@ -23,9 +28,33 @@ export function installCapture() {
         const renew = has('will_renew') ? payload.will_renew : payload?.willRenew;
         if ((has('active_until') || has('activeUntil')) && (has('will_renew') || has('willRenew')) &&
             (until === null || typeof until === 'string') && (renew === null || typeof renew === 'boolean')) {
-          state.subscription = { active_until: until, will_renew: renew };
+          // Root fields observed on the provider's billing response. Never retain
+          // unknown plan strings, account identifiers, or payment details.
+          const plan = typeof payload.plan_type === 'string' && /^(?:free|go|plus|pro)$/.test(payload.plan_type) ? payload.plan_type : null;
+          state.subscription = { active_until: until, will_renew: renew,
+            plan_type: plan, plan_type_unrecognized: has('plan_type') && plan === null,
+            is_processor_stripe: typeof payload.is_processor_stripe === 'boolean' ? payload.is_processor_stripe : null };
           state.authRequired = false;
         }
+      }).catch(() => {});
+    }
+    if (grokSession) {
+      if (response.status === 401 && sessionGeneration === latestGrokSession) state.authRequired = true;
+      if (response.ok) response.clone().json().then(async payload => {
+        if (sessionGeneration !== latestGrokSession) return;
+        // This exact field was observed in Grok's own session response. Hash it
+        // here; no session object, raw email, user ID, or token is retained.
+        const value = payload?.session?.email;
+        if (typeof value !== 'string' || !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(value.trim())) return;
+        const email = value.trim().toLowerCase();
+        const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`taskspindle:subscription:v1:grok:${email}`));
+        if (sessionGeneration !== latestGrokSession) return;
+        const [local, domain] = email.split('@');
+        state.grokIdentity = {
+          account_id: [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join(''),
+          account_label: `${local[0]}***@${domain[0]}***.${domain.split('.').at(-1)}`,
+        };
+        state.authRequired = false;
       }).catch(() => {});
     }
     return response;
@@ -86,7 +115,9 @@ export async function readEvidence(provider) {
   const controls = [...root.querySelectorAll('input[type="email"], button[aria-label], a[aria-label], button[data-testid*="account"], button[data-testid*="profile"]'), ...document.querySelectorAll('header button[aria-label], header a[aria-label], nav button[aria-label], nav a[aria-label], aside button[aria-label], aside a[aria-label]')];
   const identityTexts = controls.filter(el => visible(el) && !el.closest(conversation))
     .flatMap(el => {
-      if (el.matches('input[type="email"]')) return [el.value];
+      // ChatGPT's billing panel can contain an editable billing email, which
+      // does not establish the signed-in account.
+      if (el.matches('input[type="email"]')) return provider === 'chatgpt' ? [] : [el.value];
       const label = el.getAttribute('aria-label') || '';
       if (/account|profile|google account/i.test(label)) return [label, el.innerText || ''];
       if (/account|profile/i.test(el.getAttribute('data-testid') || '')) return [el.innerText || '', label];
@@ -94,13 +125,35 @@ export async function readEvidence(provider) {
     });
   for (let i = 0; i < lines.length - 1; i++) if (/^(?:Email|Email address|Account email)$/i.test(lines[i])) identityTexts.push(lines[i + 1]);
   const emails = [...new Set(identityTexts.flatMap(value => value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map(value => value.toLowerCase()))];
+  if (provider === 'chatgpt') {
+    // Exact provider bootstrap paths observed live and used by CodexBar.
+    // Projection remains in-page; no session object or token leaves the page.
+    try {
+      const script = document.querySelector('script#client-bootstrap[type="application/json"]');
+      const bootstrap = script && !script.closest(conversation) ? JSON.parse(script.textContent || '') : null;
+      for (const value of [bootstrap?.session?.user?.email, bootstrap?.user?.email]) {
+        if (typeof value !== 'string' || !/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(value.trim())) continue;
+        const email = value.trim().toLowerCase();
+        if (!emails.includes(email)) emails.push(email);
+      }
+    } catch { /* unavailable bootstrap; eligible account controls still apply */ }
+  }
   let account_id = null;
   let account_label = null;
+  const grokIdentity = capture.grokIdentity;
   if (emails.length === 1) {
     const bytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`taskspindle:subscription:v1:${provider}:${emails[0]}`));
     account_id = [...new Uint8Array(bytes)].map(value => value.toString(16).padStart(2, '0')).join('');
     const [local, domain] = emails[0].split('@');
     account_label = `${local[0]}***@${domain[0]}***.${domain.split('.').at(-1)}`;
+  }
+  if (provider === 'grok' && capture.authRequired) return { auth_required: true };
+  if (provider === 'grok' && grokIdentity !== capture.grokIdentity) return {};
+  if (provider === 'grok' && grokIdentity) {
+    if (emails.length > 1 ||
+        (account_id && account_id !== grokIdentity.account_id)) return {};
+    account_id = grokIdentity.account_id;
+    account_label = grokIdentity.account_label;
   }
 
   let channel = 'unknown';
@@ -109,6 +162,7 @@ export async function readEvidence(provider) {
   else if (provider === 'grok' && /(?:subscribed|subscription|purchased|billed|managed|manage)[^\n]{0,100}X Premium/i.test(text)) channel = 'x_premium';
   // Card-management controls provide positive evidence of direct-web billing.
   else if (/\b(?:Payment method|Payment details|Billing details|Invoices)\b/i.test(text)) channel = 'provider_web';
+  else if (provider === 'chatgpt' && capture.subscription?.is_processor_stripe === true) channel = 'provider_web';
   const plans = {
     chatgpt: /^(?:ChatGPT )?(?:Plus|Pro|Go|Free)$/i,
     claude: /^(?:Claude )?(?:Pro|Max(?:\s*\((?:5x|20x)\))?|Free)(?: plan)?$/i,
@@ -119,6 +173,13 @@ export async function readEvidence(provider) {
   const canonicalPlans = new Map(planCandidates.map(line => [line.replace(/^(?:ChatGPT|Claude) /i,'').replace(/ plan$/i,'').toLowerCase(), line]));
   const planMatches = [...canonicalPlans.values()];
   let plan = planMatches.length === 1 ? planMatches[0] : null;
+  if (provider === 'chatgpt') {
+    // A billing panel can advertise other plans. The observed subscription's
+    // exact plan is authoritative over those DOM offers.
+    const known = { free: 'Free', go: 'Go', plus: 'Plus', pro: 'Pro' };
+    if (Object.hasOwn(known, capture.subscription?.plan_type)) plan = known[capture.subscription.plan_type];
+    else if (capture.subscription?.plan_type_unrecognized) plan = null;
+  }
   // These exact labeled status values are synthetic contract coverage until
   // authenticated provider wording is recorded. Never derive status from dates.
   const states = new Set();
@@ -134,7 +195,8 @@ export async function readEvidence(provider) {
   const explicitStatus = states.size === 1 ? [...states][0] : null;
   // An explicit no-subscription status has no paid plan; "None" represents the
   // observed absence, not a plan inferred from missing API fields.
-  if (explicitStatus === 'none' && planMatches.length === 0) plan = 'None';
+  if (explicitStatus === 'none' && planMatches.length === 0 &&
+      !(provider === 'chatgpt' && (capture.subscription?.plan_type || capture.subscription?.plan_type_unrecognized))) plan = 'None';
   const date = value => {
     const raw = value.trim().replace(/\.$/, '');
     if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;

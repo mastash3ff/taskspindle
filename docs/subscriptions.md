@@ -19,8 +19,12 @@ Personal Antigravity benefits are included in Google AI Pro/Ultra; this is the s
 membership used by Gemini, managed through Google One. See the official
 [Antigravity plans](https://antigravity.google/pricing) and
 [Google AI subscription management](https://support.google.com/googleone/answer/16476748?hl=en).
-Grok's usage page must display an explicit subscription billing date for collection to
-succeed. Usage/quota reset dates never become renewal or access-end dates.
+Grok collection requires an explicit subscription date from its Billing dialog. The currently
+observed Usage UI displays credits, so the collector opens
+`https://grok.com/?_s=billing` internally while preserving the user-provided Usage page as the
+visible Connect link. It reads account identity only from the exact same-origin
+`/api/auth/session` response. Usage, credit, and quota-reset dates never become renewal or
+access-end dates.
 
 Only subscriptions purchased directly from provider websites are in scope. Apple, Google
 Play, and X Premium-derived subscriptions are reported as unsupported billing channels.
@@ -90,6 +94,12 @@ The current extension may focus Chrome or briefly show a billing tab during a sc
 refresh. Refresh does not wait for sign-in or a connection-approval prompt; unavailable
 authentication is reported for reconnection.
 
+The proved normal-profile transport uses Playwright Chrome extension **0.4.0**, paired in the
+selected Windows Chrome profile with a private token. On WSL, candidate runtime code forwards
+only the named token through a bounded `WSLENV` entry to Windows Node. The token is never placed
+in request JSON, command arguments, logs, the subscription database, or this documentation.
+Pairing alone is not a completed provider checkpoint or restart test.
+
 Optional settings in the normal TaskSpindle config:
 
 ```toml
@@ -128,6 +138,29 @@ passes before successful verification, the UI requests verification instead of c
 the subscription expired. **Expired** requires provider evidence. A valid empty/free
 subscription observation can clear old dates; a malformed response cannot.
 
+Current live source boundaries are deliberately narrow:
+
+- ChatGPT requires a recognized `plan_type`, `active_until`, `will_renew`,
+  `is_processor_stripe`, and identity from `client-bootstrap`.
+- Claude uses its organization bootstrap email and structured subscription response with
+  `next_charge_at`. Its automated live diagnostic passed with the current Max plan. The
+  collector tracks the current plan only; a scheduled downgrade shown elsewhere in the UI is
+  not projected into the current snapshot.
+- Grok uses `/api/auth/session` identity and the Billing dialog's actual subscription date;
+  its Usage display is credit information.
+- The current Google One settings page exposed no subscription date. A Google Play Google One
+  card showed cancellation and a future access end, but its purchase channel remains unresolved,
+  so app-store billing is still unsupported.
+
+The Google Play observation is documented without its real date; fixtures use shifted dates.
+Live cancelled-subscription cases for the other providers remain a stated evidence gap. Never
+cancel a subscription merely to fill that gap.
+
+Packaged Connect and Refresh now pass for ChatGPT, Grok, and Claude, including refresh after
+restarting the collector. Google returns the unsupported-channel result. Whole-Chrome restart
+and live cancellation-state transitions for supported direct-web accounts remain unverified.
+See [verification evidence](subscriptions/evidence.md) for the exact scope.
+
 ## Storage and service activation
 
 The task execution database remains read-only to the dashboard. Collection writes only the
@@ -144,12 +177,17 @@ This prints a systemd user service using the current interpreter, configuration,
 locations. It does not write or enable a service. After reviewing and approving the exact
 installed build, save the generated unit as `taskspindle-subscriptions.service` in the user
 systemd directory and enable it. Collection then continues while the dashboard is closed,
-whenever the host and its user services are running. No external notifications are sent.
+whenever the host and its user services are running. Normal-profile collection additionally
+requires Chrome to be running in the selected profile. No external notifications are sent.
+The installed runtime remains unchanged until the user approves activation of the reviewed
+candidate. Extension pairing and provider inspection do not grant that approval.
 
 ## Verification
 
 Run the Python subscription tests and the packaged helper's `npm test`. Live verification
-must read each connected provider and refresh after reconnecting to its normal Chrome profile.
+must read each connected provider, record its checkpoint, and refresh after closing/reopening
+the normal Chrome path. Do not describe provider checkpoint or restart proof as complete until
+the controller records that readback.
 Do not close unrelated Chrome windows or tabs to run a test.
 Use an already-cancelled subscription when available; fixture tests cover cancellation
 without cancelling a subscription for testing. Report fixture and live evidence separately.

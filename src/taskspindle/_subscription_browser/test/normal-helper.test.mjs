@@ -4,9 +4,11 @@ import { mkdtemp, mkdir, rm, access, writeFile, readFile } from 'node:fs/promise
 import path from 'node:path';
 import os from 'node:os';
 import { createRequire } from 'node:module';
-import { runNormal, validateNormalRequest, cancelFile, validToken, bounded } from '../normal-helper.mjs';
+import { runNormal, validateNormalRequest, cancelFile, validToken, bounded, extensionFailureCode, extensionConnectBudget } from '../normal-helper.mjs';
 import { URLS } from '../extractors.mjs';
 import { installCapture, readEvidence } from '../page.mjs';
+import { readGooglePlayEvidence } from '../google.mjs';
+import { GOOGLE_PLAY_SUBSCRIPTIONS_URL, readGoogleOneScope } from '../collection.mjs';
 const require = createRequire(import.meta.url);
 const token = 'synthetic-pairing-token-for-tests';
 const account = 'a'.repeat(64);
@@ -46,6 +48,15 @@ test('pairing token matches the runtime printable ASCII length contract', () => 
   assert.equal(validToken('x'.repeat(512)),true);
   for (const token of ['', 'x'.repeat(513),'contains space','newline\n','nonascii-é']) assert.equal(validToken(token),false);
 });
+test('pinned relay pairing timeout maps safely while unrelated errors remain unavailable', async () => {
+  const exact = 'Playwright extension did not connect within 30s after opening the connect page. Make sure the extension is installed in the Chrome profile "Default" and PLAYWRIGHT_MCP_EXTENSION_TOKEN matches its token.';
+  assert.equal(extensionFailureCode(new Error(exact)),'SETUP_REQUIRED');
+  const unrelated = new Error('untrusted provider failure');
+  assert.equal(extensionFailureCode(unrelated),'BROWSER_UNAVAILABLE');
+  assert.equal(JSON.stringify({error:'The dedicated subscription browser could not start.'}).includes(unrelated.message),false);
+  assert.equal(extensionConnectBudget(60_000),32_000);
+  assert.equal(extensionConnectBudget(30_000),30_000);
+});
 test('normal collection creates, reads and closes only its own tab', async () => {
   const f = await fixture();
   try {
@@ -79,6 +90,91 @@ test('wrong account closes owned tab and fails closed', async () => {
   f.request.expected_account_id = 'b'.repeat(64);
   try {assert.equal((await runNormal(f.request,f.dependencies)).error.code,'ACCOUNT_MISMATCH');assert.equal(f.calls.at(-1),'close-owned');}
   finally {await f.cleanup();}
+});
+test('missing Google One details trigger one scoped fallback on the owned tab', async () => {
+  const f = await fixture();
+  f.request.provider = 'google_ai';
+  f.request.profile_dir = path.join(f.base,'profiles','google_ai');
+  let location = 'one';
+  const play = {account_id:account,account_label:'a***@e***.com',billing_channel:'google_play',plan:'Google AI Pro',billing:null};
+  f.page.goto = async url => {
+    f.calls.push(url === GOOGLE_PLAY_SUBSCRIPTIONS_URL ? 'goto-play' : 'goto-one');
+    location = url === GOOGLE_PLAY_SUBSCRIPTIONS_URL ? 'play' : 'one';
+  };
+  f.page.evaluate = async (fn, provider) => {
+    if (fn === readEvidence) {
+      assert.equal(provider,'google_ai');
+      f.calls.push(`read-${location}`);
+      return location === 'one'
+        ? {account_id:account,account_label:'a***@e***.com',billing_channel:'unknown',plan:null,billing:null}
+        : {};
+    }
+    if (fn === readGooglePlayEvidence) {
+      f.calls.push(`read-play-${location}`);
+      return location === 'play' ? play : {};
+    }
+    assert.equal(fn,readGoogleOneScope);
+    f.calls.push('scope-one');
+    return location === 'one' ? {account_id:account} : {};
+  };
+  try {
+    const result = await runNormal(f.request,f.dependencies);
+    assert.equal(result.error.code,'UNSUPPORTED_BILLING_CHANNEL');
+    assert.deepEqual(f.calls,[
+      'connect','create-owned','init','goto-one','read-one','read-play-one',
+      'scope-one','goto-play','read-play','read-play-play','close-owned',
+    ]);
+  } finally {await f.cleanup();}
+});
+test('Google auth-required evidence never triggers Play fallback', async () => {
+  const f = await fixture();
+  f.request.provider = 'google_ai';
+  f.request.profile_dir = path.join(f.base,'profiles','google_ai');
+  f.page.isClosed = () => true;
+  f.page.evaluate = async fn => {
+    if (fn === readEvidence) return {auth_required:true};
+    assert.equal(fn,readGooglePlayEvidence);
+    return {};
+  };
+  try {
+    const result = await runNormal(f.request,f.dependencies);
+    assert.equal(result.error.code,'AUTH_REQUIRED');
+    assert.equal(f.calls.includes('scope-one'),false);
+    assert.equal(f.calls.includes('goto-play'),false);
+  } finally {await f.cleanup();}
+});
+test('recognized Google One billing never navigates to Play', async () => {
+  const f = await fixture();
+  f.request.provider = 'google_ai';
+  f.request.profile_dir = path.join(f.base,'profiles','google_ai');
+  const google = {account_id:account,account_label:'a***@e***.com',billing_channel:'provider_web',plan:'Google AI Pro',billing:{status:'renewing',renews_at:'2026-10-09',access_ends_at:null}};
+  f.page.evaluate = async (fn, provider) => {
+    if (fn === readEvidence) {assert.equal(provider,'google_ai');return google;}
+    assert.equal(fn,readGooglePlayEvidence);
+    return {};
+  };
+  try {
+    assert.equal((await runNormal(f.request,f.dependencies)).ok,true);
+    assert.equal(f.calls.includes('goto-play'),false);
+  } finally {await f.cleanup();}
+});
+test('Google fallback preserves account identity across the provider origins', async () => {
+  const f = await fixture();
+  f.request.provider = 'google_ai';
+  f.request.profile_dir = path.join(f.base,'profiles','google_ai');
+  let onPlay = false;
+  f.page.goto = async url => {onPlay = url === GOOGLE_PLAY_SUBSCRIPTIONS_URL;};
+  f.page.evaluate = async (fn, provider) => {
+    if (fn === readEvidence) return onPlay ? {} : {account_id:account,account_label:'a***@e***.com',billing_channel:'unknown',plan:null,billing:null};
+    if (fn === readGooglePlayEvidence) return onPlay
+      ? {account_id:'b'.repeat(64),account_label:'b***@e***.com',billing_channel:'google_play',plan:'Google AI Pro',billing:null}
+      : {};
+    assert.equal(fn,readGoogleOneScope);
+    return {account_id:account};
+  };
+  try {
+    assert.equal((await runNormal(f.request,f.dependencies)).error.code,'ACCOUNT_MISMATCH');
+  } finally {await f.cleanup();}
 });
 test('invocation cancel sentinel interrupts page work and removes only owned receipt', async () => {
   const f = await fixture('refresh');

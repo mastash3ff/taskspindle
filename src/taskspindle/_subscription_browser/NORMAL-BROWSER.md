@@ -21,6 +21,13 @@ spaces. Missing pairing returns `SETUP_REQUIRED` before attachment. The runtime
 opens normal Chrome for Connect; the paired helper creates the sole billing tab.
 Unpaired Connect can open the provider page directly and report setup required.
 
+The selected Windows Chrome profile has been privately paired with Playwright extension
+**0.4.0**. The token value is never evidence and must not be recorded. The candidate Python
+runtime constructs a bounded `WSLENV` entry that forwards the named token to Windows Node;
+the token remains outside command arguments and request JSON. This fixes the observed
+WSL-to-Windows environment boundary in candidate code. A completed provider checkpoint and
+post-restart readback still require controller verification.
+
 Preflight checks only extension directory metadata and Chrome process presence.
 It does not open Cookies, Login Data, Local State, Preferences, or CLI stores.
 Connect retries briefly for runtime-initiated Chrome startup. Refresh requires
@@ -91,16 +98,29 @@ Observed 2026-09-07:
   these factory exports, selected-profile option, attached ownership, and the
   absence of BrowserBackend construction from this direct factory.
 
-Verification includes sanitized adapter tests for owned-tab lifecycle, account
-mismatch, expired auth, unavailable setup/browser, safe exceptions, cancellation,
-receipt isolation, and real pinned-module smoke checks. Live extension pairing,
-provider collection and actual normal-Chrome cleanup remain unverified until the
-user installs/pairs the extension and the controller runs those checks.
+Verification includes sanitized adapter tests for owned-tab lifecycle, account mismatch,
+expired auth, unavailable setup/browser, safe exceptions, cancellation, receipt isolation,
+and the pinned extension factory. Extension 0.4.0 is privately paired in normal Chrome.
 
-Final observed tests: **35/35 passed on native Linux Node**, and **35/35 passed on
-native Windows Node v24.14.0**. Windows ran copied helper/test/pinned-core assets
-in a separate temporary directory because Node's test discovery did not resolve
-the UNC source paths. Tests include actual Windows process-identity/stale-lock
-recovery, factory export/config smoke checks, already-aborted promise rejection
-handling, and cancellation before delayed tab creation finishes. Browser tabs in
-these tests are sanitized adapter fixtures; they are not live extension proof.
+The current packaged candidate has passed live Connect, Refresh, and refresh after collector
+restart for ChatGPT, Claude, and Grok. Each operation opens and closes its own billing tab;
+whole-Chrome shutdown/restart was not performed because existing user windows remain open.
+
+- ChatGPT projects typed subscription plan/renewal fields and hashes bootstrap account identity.
+- Claude captures account identity and billing dates from its scoped organization endpoints;
+  cancellation ending fields have source-backed synthetic coverage, with a narrowly labeled
+  DOM fallback. Scheduled downgrades do not replace the current plan.
+- Grok uses session identity and the Billing dialog, retaining the user-provided Usage Connect link.
+- Google One settings has no observed billing date. The account-bound Google Play lookup
+  classifies the exact Google One product as an unsupported billing channel. App-store tracking
+  remains excluded while the purchase channel is clarified.
+
+Current browser tests pass **86/86 on Linux and Windows Node v24.14.0**. Windows invokes each
+module through a file-URL import because Node test discovery does not resolve UNC paths.
+These fixture checks are separate from the live packaged-provider checks above. The current
+Python subscription/web/configuration suite passes 105 tests. Exact build hashes and current
+limitations are recorded in the candidate ledger and `docs/subscriptions/evidence.md`.
+
+Live cancelled/expired/free/no-subscription transitions for direct-web providers remain an
+evidence gap. Never cancel a subscription for testing. Fixtures use synthetic identities and
+shifted dates, and exclude credentials, payment details, and raw response bodies.

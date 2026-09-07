@@ -11,6 +11,10 @@ export const URLS = Object.freeze({
   google_ai: 'https://one.google.com/settings',
   grok: 'https://grok.com/?_s=usage',
 });
+export const COLLECTION_URLS = Object.freeze({
+  ...URLS,
+  grok: 'https://grok.com/?_s=billing',
+});
 export const MESSAGES = Object.freeze({
   SETUP_REQUIRED: 'Install and pair the Playwright extension in the selected Chrome profile.',
   AUTH_REQUIRED: 'Sign in using the dedicated subscription browser.',

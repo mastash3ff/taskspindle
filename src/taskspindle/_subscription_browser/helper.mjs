@@ -1,8 +1,10 @@
 import { mkdir, open, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { URLS, failure, normalize } from './extractors.mjs';
-import { installCapture, readEvidence } from './page.mjs';
+import { COLLECTION_URLS, URLS, failure, normalize } from './extractors.mjs';
+import { installCapture } from './page.mjs';
+import { installClaudeCapture } from './claude.mjs';
+import { collectEvidence, GOOGLE_PLAY_SUBSCRIPTIONS_URL, readGoogleOneScope } from './collection.mjs';
 import { acquireProfileLock, releaseProfileLock } from './ownership.mjs';
 
 export function validateRequest(request) {
@@ -44,21 +46,39 @@ export async function run(request) {
     });
     timer = setTimeout(() => { timedOut = true; void context.close().catch(() => {}); }, Math.max(1, deadline - Date.now()));
     await context.addInitScript(installCapture);
+    if (request.provider === 'claude') await context.addInitScript(installClaudeCapture);
     const page = context.pages()[0] || await context.newPage();
-    await page.goto(URLS[request.provider], { waitUntil: 'domcontentloaded', timeout: Math.min(30000, request.timeout_s * 1000) }).catch(() => {});
+    await page.goto(COLLECTION_URLS[request.provider], { waitUntil: 'domcontentloaded', timeout: Math.min(30000, request.timeout_s * 1000) }).catch(() => {});
     let last = failure('PARSE_CHANGED');
+    let googlePlayAttempted = false;
+    let googleOneAccountId = null;
     while (Date.now() < deadline) {
       let iteration = failure('PARSE_CHANGED');
       let hasIdentity = false;
       for (const candidate of context.pages()) {
-        const evidence = await candidate.evaluate(readEvidence, request.provider).catch(() => null);
+        const evidence = await collectEvidence(candidate, request.provider).catch(() => null);
         if (!evidence) continue;
-        const result = normalize(request.provider, evidence, request.expected_account_id, request.timezone);
+        const result = normalize(request.provider, evidence, request.expected_account_id || googleOneAccountId, request.timezone);
         if (result.ok || ['ACCOUNT_MISMATCH', 'UNSUPPORTED_BILLING_CHANNEL'].includes(result.error.code)) return result;
         if (evidence.account_id) { hasIdentity = true; iteration = result; }
         else if (!hasIdentity && result.error.code === 'AUTH_REQUIRED') iteration = result;
       }
       last = iteration;
+      if (request.provider === 'google_ai' && !googlePlayAttempted &&
+          last.error.code === 'PARSE_CHANGED' && !page.isClosed()) {
+        const scope = await page.evaluate(readGoogleOneScope).catch(() => null);
+        if (/^[a-f0-9]{64}$/.test(scope?.account_id || '')) {
+          googlePlayAttempted = true;
+          googleOneAccountId = scope.account_id;
+          if (request.expected_account_id && request.expected_account_id !== googleOneAccountId) {
+            return failure('ACCOUNT_MISMATCH');
+          }
+          await page.goto(GOOGLE_PLAY_SUBSCRIPTIONS_URL, {
+            waitUntil: 'domcontentloaded', timeout: Math.min(30000, Math.max(1, deadline - Date.now())),
+          }).catch(() => {});
+          continue;
+        }
+      }
       if (request.action === 'refresh' && last.error.code === 'AUTH_REQUIRED') return last;
       if (context.pages().length === 0) return last;
       await new Promise(resolve => setTimeout(resolve, 500));
