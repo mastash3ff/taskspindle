@@ -238,6 +238,35 @@ class ReadOnlyStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None:
+        """Read v5 model evidence; a schema-4 database has none."""
+        if self._conn is None:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM provider_model_status WHERE provider = ? AND model = ?",
+                (provider, model),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return None
+            raise
+        return dict(row) if row else None
+
+    def list_provider_model_status(self, provider: str) -> list[dict[str, Any]]:
+        """List v5 model evidence; a schema-4 database has none."""
+        if self._conn is None:
+            return []
+        try:
+            rows = self._conn.execute(
+                "SELECT * FROM provider_model_status WHERE provider = ? ORDER BY model", (provider,)
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            raise
+        return [dict(row) for row in rows]
+
     def list_provider_status(self) -> list[dict[str, Any]]:
         if self._conn is None:
             return []

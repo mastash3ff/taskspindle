@@ -34,6 +34,10 @@ class ProviderStatusReader(Protocol):
 
     def get_provider_status(self, provider: str) -> dict[str, Any] | None: ...
 
+    def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None: ...
+
+    def list_provider_model_status(self, provider: str) -> list[dict[str, Any]]: ...
+
 
 class UsageReader(ProviderStatusReader, Protocol):
     """The store reads needed by usage and window reports."""
@@ -353,8 +357,26 @@ DROP TABLE leases_single_flight;
 CREATE INDEX leases_provider_idx ON leases(provider);
 """
 
+_MIGRATION_5 = """
+ALTER TABLE provider_status ADD COLUMN last_success_at TEXT;
+
+CREATE TABLE provider_model_status (
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    state TEXT NOT NULL,
+    code TEXT,
+    reason TEXT,
+    observed_at TEXT NOT NULL,
+    task_id TEXT REFERENCES tasks(id),
+    source TEXT NOT NULL,
+    last_success_at TEXT,
+    PRIMARY KEY (provider, model)
+);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3), (4, _MIGRATION_4),
+    (5, _MIGRATION_5),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1100,11 +1122,48 @@ class Store:
                 ),
             )
 
+    def set_provider_model_status(
+        self,
+        provider: str,
+        model: str,
+        state: str,
+        *,
+        source: str,
+        code: str | None = None,
+        reason: str | None = None,
+        task_id: str | None = None,
+        observed_at: str | None = None,
+    ) -> None:
+        """Record a refusal that applies only to one provider model."""
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO provider_model_status(provider, model, state, code, reason, "
+                "observed_at, task_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(provider, model) DO UPDATE SET state = excluded.state, "
+                "code = excluded.code, reason = excluded.reason, "
+                "observed_at = excluded.observed_at, task_id = excluded.task_id, "
+                "source = excluded.source",
+                (provider, model, state, code, reason, observed_at or now(), task_id, source),
+            )
+
     def get_provider_status(self, provider: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM provider_status WHERE provider = ?", (provider,)
         ).fetchone()
         return dict(row) if row else None
+
+    def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_model_status WHERE provider = ? AND model = ?",
+            (provider, model),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_provider_model_status(self, provider: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM provider_model_status WHERE provider = ? ORDER BY model", (provider,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def mark_provider_healthy(
         self,
@@ -1112,28 +1171,75 @@ class Store:
         *,
         expected: Mapping[str, Any] | None,
         task_id: str | None = None,
+        model: str | None = None,
+        expected_model: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Clear only the status observed before this successful provider turn began.
+        """Record success and clear only statuses observed before this provider turn began.
 
         Comparing and writing inside one immediate transaction protects against other worker
         processes. A sibling failure after that observation must survive this completion; the
-        full observation also avoids treating matching timestamps as matching status records.
+        comparison ignores ``last_success_at`` so another success cannot prevent a safe clear.
         """
         with self._guard(), self.transaction() as conn:
+            stamp = now()
             row = conn.execute(
                 "SELECT * FROM provider_status WHERE provider = ?", (provider,)
             ).fetchone()
             current = dict(row) if row else None
-            if current != expected or (current is not None and current["state"] == "ok"):
-                return False
-            conn.execute(
-                "INSERT INTO provider_status(provider, state, observed_at, task_id, source) "
-                "VALUES (?, 'ok', ?, ?, 'turn_ok') ON CONFLICT(provider) DO UPDATE SET "
-                "state = 'ok', code = NULL, window = NULL, reason = NULL, reset_at = NULL, "
-                "observed_at = excluded.observed_at, task_id = excluded.task_id, source = 'turn_ok'",
-                (provider, now(), task_id),
-            )
-            return True
+            def comparable(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+                if value is None:
+                    return None
+                return {key: item for key, item in value.items() if key != "last_success_at"}
+            clear_account = comparable(current) == comparable(expected)
+            if current is None:
+                conn.execute(
+                    "INSERT INTO provider_status(provider, state, observed_at, task_id, source, "
+                    "last_success_at) VALUES (?, 'ok', ?, ?, 'turn_ok', ?)",
+                    (provider, stamp, task_id, stamp),
+                )
+            elif clear_account:
+                conn.execute(
+                    "UPDATE provider_status SET state = 'ok', code = NULL, window = NULL, "
+                    "reason = NULL, reset_at = NULL, observed_at = ?, task_id = ?, "
+                    "source = 'turn_ok', last_success_at = ? WHERE provider = ?",
+                    (stamp, task_id, stamp, provider),
+                )
+            else:
+                conn.execute(
+                    "UPDATE provider_status SET last_success_at = ? WHERE provider = ? "
+                    "AND (last_success_at IS NULL OR last_success_at < ?)",
+                    (stamp, provider, stamp),
+                )
+
+            clear_model = False
+            if model:
+                model_row = conn.execute(
+                    "SELECT * FROM provider_model_status WHERE provider = ? AND model = ?",
+                    (provider, model),
+                ).fetchone()
+                current_model = dict(model_row) if model_row else None
+                clear_model = comparable(current_model) == comparable(expected_model)
+                if current_model is None:
+                    conn.execute(
+                        "INSERT INTO provider_model_status(provider, model, state, observed_at, "
+                        "task_id, source, last_success_at) VALUES (?, ?, 'ok', ?, ?, 'turn_ok', ?)",
+                        (provider, model, stamp, task_id, stamp),
+                    )
+                elif clear_model:
+                    conn.execute(
+                        "UPDATE provider_model_status SET state = 'ok', code = NULL, reason = NULL, "
+                        "observed_at = ?, task_id = ?, source = 'turn_ok', last_success_at = ? "
+                        "WHERE provider = ? AND model = ?",
+                        (stamp, task_id, stamp, provider, model),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE provider_model_status SET last_success_at = ? "
+                        "WHERE provider = ? AND model = ? "
+                        "AND (last_success_at IS NULL OR last_success_at < ?)",
+                        (stamp, provider, model, stamp),
+                    )
+            return clear_account and (not model or clear_model)
 
     def list_provider_status(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()

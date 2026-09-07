@@ -8,7 +8,7 @@ those rules into tool behaviour -- git, systemd, the filesystem -- lives in
 from __future__ import annotations
 
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from . import limits
@@ -265,36 +265,135 @@ def require_task(store: Store, task_id: str) -> TaskRecord:
 # -- task creation ------------------------------------------------------------------
 
 
+_AVAILABILITY_ACTIONS: dict[str, tuple[str, bool]] = {
+    "ok": ("start", True),
+    "unknown": ("retry", True),
+    "throttled": ("wait", False),
+    "auth_expired": ("sign_in", False),
+    "access_denied": ("review_access", False),
+    "model_unavailable": ("choose_model", False),
+}
+
+_AVAILABILITY_FRESH_FOR = timedelta(hours=24)
+
+
+def _observation_stale(row: dict[str, Any] | None, current: datetime) -> bool:
+    if row is None:
+        return False
+    raw = row.get("observed_at")
+    if not isinstance(raw, str) or not raw:
+        return True
+    try:
+        observed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if observed.tzinfo is None or observed.utcoffset() is None:
+        return True
+    age = current.astimezone(UTC) - observed.astimezone(UTC)
+    return age < timedelta(0) or age >= _AVAILABILITY_FRESH_FOR
+
+
+def _last_success_at(row: dict[str, Any] | None) -> str | None:
+    """Read v5 success metadata, with the exact equivalent from a schema-4 success row."""
+    if row is None:
+        return None
+    value = row.get("last_success_at")
+    if isinstance(value, str) and value:
+        return value
+    if row.get("state") == "ok" and row.get("source") == "turn_ok":
+        observed = row.get("observed_at")
+        return observed if isinstance(observed, str) and observed else None
+    return None
+
+
 def provider_availability(
-    store: ProviderStatusReader, profile: Profile, *, now: datetime
+    store: ProviderStatusReader, profile: Profile, *, now: datetime, model: str | None = None,
 ) -> dict[str, Any]:
     """What TaskSpindle currently believes about a provider's willingness to take a turn."""
     key = limits.status_key(profile)
-    row = store.get_provider_status(key)
-    state = limits.effective_state(row, now)
+    account_row = store.get_provider_status(key)
+    account_state = limits.effective_state(account_row, now)
+    model_row = store.get_provider_model_status(key, model) if model else None
+    selected = account_row
+    state = account_state
+    scope = "account" if account_row is not None else None
+    affected_model = None
+    if account_state in ("ok", "unknown") and model_row is not None:
+        model_state = limits.effective_state(model_row, now)
+        if model_state == "model_unavailable":
+            selected = model_row
+            state = model_state
+            scope = "model"
+            affected_model = model
+    stale = _observation_stale(selected, now) or bool(
+        selected is not None
+        and selected.get("state") == "throttled"
+        and state == "unknown"
+    )
+    next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
+    stored_state = selected.get("state") if selected else None
     return {
         "state": state,
         "status_key": key,
-        "code": row.get("code") if row and state != "ok" else None,
-        "window": row.get("window") if row and state != "ok" else None,
-        "reset_at": row.get("reset_at") if row and state != "ok" else None,
-        "reason": row.get("reason") if row and state != "ok" else None,
-        "observed_at": row.get("observed_at") if row else None,
+        "code": selected.get("code") if selected and state != "ok" else None,
+        "window": selected.get("window") if selected and state != "ok" else None,
+        "reset_at": selected.get("reset_at") if selected and state != "ok" else None,
+        "reason": limits.safe_provider_reason(stored_state) if state != "ok" else None,
+        "observed_at": selected.get("observed_at") if selected else None,
         "suggested_alternative": (
-            limits.suggested_alternative(profile.id) if state not in ("ok", "unknown") else None
+            limits.suggested_alternative(profile.id)
+            if scope == "account" and state not in ("ok", "unknown") else None
         ),
+        "last_success_at": _last_success_at(selected),
+        "source": limits.safe_provider_source(selected.get("source")) if selected else None,
+        "scope": scope,
+        "affected_model": affected_model,
+        "stale": stale,
+        "next_action": next_action,
+        "retry_eligible": retry_eligible,
     }
 
 
+def model_availability(
+    store: ProviderStatusReader, profile: Profile, *, now: datetime,
+) -> list[dict[str, Any]]:
+    """Safe model-scoped observations a caller can use before choosing an override."""
+    key = limits.status_key(profile)
+    result: list[dict[str, Any]] = []
+    for row in store.list_provider_model_status(key):
+        state = limits.effective_state(row, now)
+        next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
+        model = str(row["model"])
+        result.append({
+            "state": state,
+            "status_key": key,
+            "code": row.get("code") if state != "ok" else None,
+            "window": None,
+            "reset_at": None,
+            "reason": limits.safe_provider_reason(row.get("state")) if state != "ok" else None,
+            "observed_at": row.get("observed_at"),
+            "suggested_alternative": None,
+            "last_success_at": _last_success_at(row),
+            "source": limits.safe_provider_source(row.get("source")),
+            "scope": "model",
+            "affected_model": model,
+            "stale": _observation_stale(row, now),
+            "next_action": next_action,
+            "retry_eligible": retry_eligible,
+        })
+    return result
+
+
 def require_provider_available(
-    store: Store, profile: Profile, *, now: datetime, ignore: bool = False
+    store: Store, profile: Profile, *, now: datetime, ignore: bool = False,
+    model: str | None = None,
 ) -> None:
     """Refuse to start on a provider the last turn found throttled or logged out.
 
     This is the whole of the fallback policy: the refusal names the reset time and the other
     first-class provider, and the caller decides. ``ignore`` starts the task anyway.
     """
-    availability = provider_availability(store, profile, now=now)
+    availability = provider_availability(store, profile, now=now, model=model)
     if ignore or availability["state"] in ("ok", "unknown"):
         return
     raise TaskSpindleError(

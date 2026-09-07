@@ -17,6 +17,7 @@ with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     from starlette.testclient import TestClient
 
+import taskspindle
 from taskspindle import service, usage
 from taskspindle.config import Paths
 from taskspindle.models import (
@@ -205,7 +206,7 @@ def test_health_reports_schema_and_db_state(tmp_path: Path) -> None:
     _seed(paths)
     present = client.get("/api/health").json()
     assert present["db_exists"] is True
-    assert present["schema_version"] == 4
+    assert present["schema_version"] == taskspindle.SCHEMA_VERSION
     assert present["db_path"] == str(paths.state_dir / "taskspindle.sqlite3")
 
 

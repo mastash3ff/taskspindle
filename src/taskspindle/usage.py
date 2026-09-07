@@ -564,7 +564,7 @@ def windows_report(
                 "state": limits.effective_state(status, now),
                 "observable": family == "claude",
                 "note": _WINDOW_NOTES.get(family, "no window telemetry is documented for this agent"),
-                "status": status,
+                "status": limits.safe_status_row(status),
                 "windows": store.latest_provider_windows(key),
             }
         )

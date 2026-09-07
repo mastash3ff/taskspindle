@@ -521,13 +521,14 @@ GOOD_STATUS = {
 }
 
 
-def test_claude_oauth_evidence_is_redacted() -> None:
-    evidence = claude_oauth_evidence(lambda _command: _completed(GOOD_STATUS))
+@pytest.mark.parametrize("plan", ["pro", "max"])
+def test_claude_oauth_evidence_is_redacted(plan: str) -> None:
+    evidence = claude_oauth_evidence(lambda _command: _completed({**GOOD_STATUS, "subscriptionType": plan}))
 
     assert evidence == {
         "loggedIn": True,
         "authMethod": "claude.ai",
-        "subscriptionType": "max",
+        "subscriptionType": plan,
         "apiProvider": "firstParty",
     }
     assert "tester@example.com" not in json.dumps(evidence)
@@ -538,7 +539,10 @@ def test_claude_oauth_evidence_is_redacted() -> None:
     ("field_name", "value"),
     [
         ("apiProvider", "bedrock"),
-        ("subscriptionType", "pro"),
+        ("subscriptionType", "free"),
+        ("subscriptionType", "team"),
+        ("subscriptionType", None),
+        ("subscriptionType", {"token": "must-not-leak"}),
         ("authMethod", "apiKey"),
         ("loggedIn", False),
     ],
@@ -560,6 +564,16 @@ def test_claude_oauth_evidence_rejects_non_json() -> None:
         claude_oauth_evidence(lambda _command: broken)
 
     assert excinfo.value.code == "OAUTH_REJECTED"
+
+
+@pytest.mark.parametrize("error", [OSError("secret-token"), subprocess.TimeoutExpired("secret-token", 1)])
+def test_claude_oauth_evidence_does_not_expose_process_errors(error: Exception) -> None:
+    def fail(_command: list[str]) -> subprocess.CompletedProcess[str]:
+        raise error
+
+    with pytest.raises(ProfileError) as excinfo:
+        claude_oauth_evidence(fail)
+    assert "secret-token" not in str(excinfo.value)
 
 
 def test_grok_oauth_evidence_requires_a_cached_token_and_auth_file(tmp_path: Path) -> None:

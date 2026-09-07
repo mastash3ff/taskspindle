@@ -71,6 +71,7 @@ class _Settings:
     refresh_timeout_s: int
     browser_mode: str = "normal"
     chrome_profile: str = "Default"
+    scheduled_refresh: bool = False
 
 
 @dataclass(frozen=True)
@@ -133,11 +134,13 @@ def _load_settings(paths: Paths) -> _Settings:
     browser_mode = values.get("browser_mode", "normal")
     chrome_profile = values.get("chrome_profile", "Default")
     timezone = values.get("timezone") or _local_timezone()
+    scheduled_refresh = values.get("scheduled_refresh", False)
     if (
         mode not in {"auto", "windows", "native"}
         or browser_mode not in {"normal", "dedicated"}
         or not isinstance(timezone, str)
         or not _valid_chrome_profile(chrome_profile)
+        or type(scheduled_refresh) is not bool
     ):
         raise _RuntimeError("CONFIG_INVALID")
     try:
@@ -167,7 +170,17 @@ def _load_settings(paths: Paths) -> _Settings:
         refresh_timeout_s=timeout("refresh_timeout_s", 180),
         browser_mode=browser_mode,
         chrome_profile=chrome_profile,
+        scheduled_refresh=scheduled_refresh,
     )
+
+
+def scheduled_refresh_enabled(paths: Paths) -> bool:
+    """Read the opt-in scheduling flag without exposing configuration details."""
+
+    try:
+        return _load_settings(paths).scheduled_refresh
+    except _RuntimeError as exc:
+        raise ValueError("invalid subscription configuration") from exc
 
 
 def _valid_chrome_profile(value: object) -> bool:

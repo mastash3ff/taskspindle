@@ -30,7 +30,13 @@ def test_empty_status_is_read_only_and_contains_native_chatgpt(
         "chatgpt", "claude", "google_ai", "grok",
     }
     assert result["collector_running"] is False
+    assert result["scheduled_refresh_enabled"] is False
     assert not list(isolated.iterdir())
+
+
+def test_plain_status_reports_scheduling_default(isolated: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["subscriptions", "status"]) == 0
+    assert "Scheduled refresh: disabled" in capsys.readouterr().out
 
 
 def test_connect_only_queues_and_refresh_all_skips_unconnected(

@@ -321,6 +321,23 @@ def test_normal_helper_forwards_only_allowlisted_wsl_environment(
     assert "OPENAI_API_KEY" not in env
 
 
+def test_scheduled_refresh_config_defaults_off_and_accepts_only_boolean(tmp_path: Path) -> None:
+    configured = normal_paths(tmp_path)
+    assert runtime.scheduled_refresh_enabled(configured) is False
+
+    configured.config_file.write_text(
+        configured.config_file.read_text(encoding="utf-8") + "\nscheduled_refresh = true\n",
+        encoding="utf-8",
+    )
+    assert runtime.scheduled_refresh_enabled(configured) is True
+
+    configured.config_file.write_text(
+        '[subscriptions]\nscheduled_refresh = "true"\n', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="invalid subscription configuration"):
+        runtime.scheduled_refresh_enabled(configured)
+
+
 @pytest.mark.parametrize(
     "profile",
     ["", "Profile 0", "Profile 01", "Profile -1", "../Default", r"Default\\Other", "$(id)"],

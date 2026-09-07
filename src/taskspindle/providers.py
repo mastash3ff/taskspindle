@@ -614,24 +614,24 @@ def _rejected(field_name: str, detail: str) -> ProfileError:
 def claude_oauth_evidence(
     run: Callable[[list[str]], subprocess.CompletedProcess[str]] = default_runner,
 ) -> dict[str, Any]:
-    """Prove the local ``claude`` CLI holds a first-party Max subscription seat.
+    """Read the local CLI's claim of a personal first-party Pro or Max OAuth seat.
 
-    Returns exactly the four fields that make that claim. Identity -- email, org id -- is never
-    read out of the payload, so it cannot reach a log or a task record.
+    This cached authentication claim is not a live entitlement check. Returns only the four
+    allowed fields; identity, credentials, and provider output never reach the result or errors.
     """
     try:
         completed = run(["claude", "auth", "status"])
     except OSError as exc:
-        raise ProfileError("OAUTH_REJECTED", f"could not run claude auth status: {exc}") from exc
+        raise ProfileError("OAUTH_REJECTED", "could not run claude auth status") from exc
     except subprocess.SubprocessError as exc:
-        raise ProfileError("OAUTH_REJECTED", f"claude auth status failed: {exc}") from exc
+        raise ProfileError("OAUTH_REJECTED", "claude auth status failed") from exc
 
     if completed.returncode != 0:
         raise ProfileError("OAUTH_REJECTED", f"claude auth status exited {completed.returncode}")
     try:
         payload = json.loads(completed.stdout or "")
     except ValueError as exc:
-        raise ProfileError("OAUTH_REJECTED", f"claude auth status did not return JSON: {exc}") from exc
+        raise ProfileError("OAUTH_REJECTED", "claude auth status did not return JSON") from exc
     if not isinstance(payload, dict):
         raise ProfileError("OAUTH_REJECTED", "claude auth status did not return a JSON object")
 
@@ -639,15 +639,17 @@ def claude_oauth_evidence(
         raise _rejected("loggedIn", "is not true")
     for name, expected in (
         ("authMethod", "claude.ai"),
-        ("subscriptionType", "max"),
         ("apiProvider", "firstParty"),
     ):
         if payload.get(name) != expected:
             raise _rejected(name, f"is not {expected!r}")
+    plan = payload.get("subscriptionType")
+    if plan not in ("pro", "max"):
+        raise _rejected("subscriptionType", "is not a supported personal Pro or Max plan")
     return {
         "loggedIn": True,
         "authMethod": "claude.ai",
-        "subscriptionType": "max",
+        "subscriptionType": plan,
         "apiProvider": "firstParty",
     }
 

@@ -20,6 +20,7 @@
   var subscriptionCsrf = null;
   var pendingSubscriptionActions = {};
   var usageFilters = { since: "7d", group_by: "provider", provider: "" };
+  var SUBSCRIPTION_WORKERS = { claude: "claude", grok: "grok", google_ai: "agy" };
 
   // -- small DOM helpers ------------------------------------------------------------
 
@@ -692,11 +693,16 @@
     return {
       action: operation.action,
       status: String(operation.status || "queued").toLowerCase(),
+      origin: operation.origin || "manual",
     };
   }
 
   function operationMessage(operation) {
     if (operation.status === "requesting") return "Submitting the request…";
+    if (operation.origin === "scheduled") {
+      return operation.status === "running" ?
+        "A scheduled subscription check is running." : "A scheduled subscription check is queued.";
+    }
     if (operation.action === "connect") {
       if (operation.status === "running") {
         return "Chrome verification is running. Connection state updates only after verification succeeds.";
@@ -704,6 +710,144 @@
       return "Connect queued — your normal Chrome profile will open for verification.";
     }
     return operation.status === "running" ? "Subscription refresh is running." : "Refresh queued.";
+  }
+
+  function workerState(availability) {
+    var states = {
+      ok: { text: "Available", className: "ok" },
+      unknown: { text: "Not verified", className: "unknown" },
+      throttled: { text: "Rate limited", className: "warn" },
+      auth_expired: { text: "Sign-in required", className: "fail" },
+      access_denied: { text: "Access denied", className: "fail" },
+      model_unavailable: { text: "Model unavailable", className: "warn" },
+    };
+    return states[availability && availability.state] || states.unknown;
+  }
+
+  function workerSource(source) {
+    var sources = {
+      task_success: "Successful worker task",
+      turn_ok: "Successful worker task",
+      native_auth_check: "Native CLI authentication check",
+      rate_limit_event: "Provider quota report",
+      acp_prompt_response: "Worker response",
+      acp_error: "Worker refusal",
+      worker_error: "Worker refusal",
+    };
+    return sources[source] || (source ? "Worker status record" : "No worker evidence");
+  }
+
+  function workerVerification(availability) {
+    if (!availability) return "Unavailable";
+    if (availability.stale) return "Stale observation";
+    if (availability.state === "ok") return "Confirmed by a successful worker task";
+    if (availability.state === "unknown") return "No current evidence";
+    return "Current refusal";
+  }
+
+  function workerScope(availability, worker) {
+    if (!availability || !availability.scope) return "No active refusal";
+    if (["ok", "unknown"].includes(availability.state) && !availability.stale) {
+      return "No active refusal";
+    }
+    if (availability.scope === "account") return "Worker profile/account";
+    if (availability.scope === "model") {
+      return "Model · " + textOrDash(availability.affected_model || worker.model || "selected model");
+    }
+    return "Provider";
+  }
+
+  function workerNextAction(availability, worker) {
+    var action = availability && availability.next_action;
+    if (action === "start") return "Eligible for a new task.";
+    if (action === "retry") return "Retry a worker task to verify access.";
+    if (action === "wait") {
+      return availability.reset_at ?
+        "Wait until " + friendlyBillingDate(availability.reset_at, "datetime") + ", then retry." :
+        "Wait for the provider limit to reset, then retry.";
+    }
+    if (action === "sign_in") return "Sign in to the " + worker.id + " worker CLI, then retry a task.";
+    if (action === "review_access") return "Review this worker profile's access, then retry a task.";
+    if (action === "choose_model") return "Choose another model for this worker profile, then retry.";
+    return "Run a worker task to establish current access.";
+  }
+
+  function renderModelAvailability(worker, availability) {
+    var selectedModel = availability.scope === "model" ? availability.affected_model : null;
+    var observations = (worker.model_availability || []).filter(function (observation) {
+      return observation && observation.affected_model && observation.affected_model !== selectedModel;
+    });
+    if (!observations.length) return null;
+    var wrap = h("div", { class: "model-availability" });
+    wrap.appendChild(h("h4", null, "Model-specific status"));
+    observations.forEach(function (observation) {
+      var state = workerState(observation);
+      var row = h("div", { class: "model-status-row" },
+        h("div", { class: "worker-heading" },
+          h("strong", null, observation.affected_model), badge(state.text, state.className)
+        ),
+        h("p", { class: "muted" },
+          workerSource(observation.source), " · observed ",
+          friendlyBillingDate(observation.observed_at, "datetime")
+        ),
+        h("p", null, workerNextAction(observation, worker))
+      );
+      wrap.appendChild(row);
+    });
+    return wrap;
+  }
+
+  function renderWorkerAccess(row, providerData) {
+    var section = h("section", { class: "worker-access" });
+    section.appendChild(h("h3", null, "Worker access"));
+    if (row.provider === "chatgpt") {
+      section.appendChild(h("div", { class: "worker-heading" },
+        badge("Coordinator only", "unknown")
+      ));
+      section.appendChild(h("p", { class: "muted" },
+        "ChatGPT is used by the Codex coordinator. It has no TaskSpindle worker profile."
+      ));
+      return section;
+    }
+
+    var workerId = SUBSCRIPTION_WORKERS[row.provider];
+    var providers = providerData && providerData.providers || [];
+    var worker = providers.find(function (candidate) { return candidate.id === workerId; });
+    if (!worker) {
+      section.appendChild(badge(providerData ? "Not configured" : "Status unavailable", "unknown"));
+      section.appendChild(h("p", { class: "muted" }, providerData ?
+        "The associated worker profile is not configured." :
+        "Worker status could not be loaded. Subscription details remain independent."
+      ));
+      return section;
+    }
+
+    var availability = worker.availability || {};
+    var state = workerState(availability);
+    section.appendChild(h("div", { class: "worker-heading" },
+      h("strong", null, worker.id), badge(state.text, state.className)
+    ));
+    section.appendChild(kv([
+      ["Profile", worker.id],
+      ["Model", worker.model || "Provider default"],
+      ["Refusal scope", workerScope(availability, worker)],
+      ["Verification", workerVerification(availability)],
+      ["Last worker success", friendlyBillingDate(availability.last_success_at, "datetime")],
+      ["Status observed", friendlyBillingDate(availability.observed_at, "datetime")],
+      ["Source", workerSource(availability.source)],
+    ]));
+    section.appendChild(h("p", { class: "worker-next-action" }, workerNextAction(availability, worker)));
+    var modelStatus = renderModelAvailability(worker, availability);
+    if (modelStatus) section.appendChild(modelStatus);
+    if (row.provider === "google_ai") {
+      section.appendChild(h("p", { class: "muted" },
+        "Product association only: the agy worker is shown with Google AI. Its account is not bound to the browser subscription account."
+      ));
+    }
+    section.appendChild(h("p", { class: "muted" },
+      "Browser subscription and worker CLI accounts are not assumed to match."
+    ));
+    return section;
   }
 
   function subscriptionActionButton(row, action, operation) {
@@ -730,7 +874,7 @@
     return button;
   }
 
-  function renderSubscriptionCard(row) {
+  function renderSubscriptionCard(row, providerData) {
     var state = subscriptionState(row);
     var operation = operationState(row);
     var card = h("section", { class: "panel subscription-card" });
@@ -738,6 +882,7 @@
       h("h2", null, row.label || row.provider),
       badge(state.text, state.className)
     ));
+    card.appendChild(h("h3", { class: "card-section-title" }, "Subscription"));
     var billingLabels = {
       provider_web: "Provider website",
       apple: "Apple App Store",
@@ -757,6 +902,18 @@
     activity.appendChild(h("p", null,
       h("span", { class: "muted" }, "Last verified: "),
       row.last_success_at ? friendlyBillingDate(row.last_success_at, "datetime") : "-"
+    ));
+    activity.appendChild(h("p", null,
+      h("span", { class: "muted" }, "Last attempt: "),
+      row.last_attempt_at ? friendlyBillingDate(row.last_attempt_at, "datetime") : "-"
+    ));
+    activity.appendChild(h("p", null,
+      h("span", { class: "muted" }, "Source: "), "Browser subscription check"
+    ));
+    activity.appendChild(h("p", null,
+      h("span", { class: "muted" }, "Verification: "),
+      row.freshness === "fresh" ? "Current" :
+        (row.freshness === "stale" ? "Stale" : "Not yet verified")
     ));
     if (row.error) {
       if (row.error.code === "SETUP_REQUIRED") {
@@ -783,7 +940,15 @@
     }
     if (row.end_passed_unverified) {
       activity.appendChild(h("p", { class: "warning" },
-        "The recorded access end has passed. Refresh before treating this subscription as expired."
+        "Verification needed — the recorded access end has passed. Refresh before treating this subscription as expired."
+      ));
+    } else if (row.upcoming_end_warning === "within_1_day") {
+      activity.appendChild(h("p", { class: "warning" },
+        "Access is scheduled to end within one day. Refresh now to confirm the deadline."
+      ));
+    } else if (row.upcoming_end_warning === "within_7_days") {
+      activity.appendChild(h("p", { class: "warning" },
+        "Access is scheduled to end within seven days. Refresh now to confirm the deadline."
       ));
     }
     if (operation) {
@@ -792,6 +957,7 @@
       ));
     }
     card.appendChild(activity);
+    card.appendChild(renderWorkerAccess(row, providerData));
 
     var actions = h("div", { class: "subscription-actions" });
     actions.appendChild(subscriptionActionButton(row, "connect", operation));
@@ -824,7 +990,10 @@
   function renderSubscriptions() {
     var request = ++subscriptionRequest;
     var focused = focusedSubscriptionControl();
-    return getJSON("/api/subscriptions").then(function (data) {
+    var providerRequest = getJSON("/api/providers").catch(function () { return null; });
+    return Promise.all([getJSON("/api/subscriptions"), providerRequest]).then(function (responses) {
+      var data = responses[0];
+      var providerData = responses[1];
       if (request !== subscriptionRequest || parseRoute().name !== "subscriptions") return;
       subscriptionCsrf = data.csrf_token;
       clearNode(APP);
@@ -850,9 +1019,16 @@
         collector += " · last seen " + friendlyBillingDate(data.collector_last_seen_at, "datetime");
       }
       heading.appendChild(h("p", { class: data.collector_running ? "muted" : "error" }, collector));
+      heading.appendChild(h("p", { class: "schedule-state" },
+        data.scheduled_refresh_enabled === true ?
+          "Scheduled browser checks: On" : "Scheduled browser checks: Off (default)"
+      ));
+      heading.appendChild(h("p", { class: "muted" },
+        "Use Connect or Refresh now to check billing."
+      ));
       APP.appendChild(heading);
       var grid = h("div", { class: "subscription-grid" });
-      data.subscriptions.forEach(function (row) { grid.appendChild(renderSubscriptionCard(row)); });
+      data.subscriptions.forEach(function (row) { grid.appendChild(renderSubscriptionCard(row, providerData)); });
       APP.appendChild(grid);
       restoreSubscriptionFocus(focused);
       setRefreshed();

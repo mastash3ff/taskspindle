@@ -11,6 +11,8 @@ stored row and returns plain data, so it can be tested without an agent.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,8 +23,12 @@ from .acp_client import AcpError
 from .providers import Profile, opposite_provider
 
 __all__ = [
+    "ACCESS_ERROR_KINDS",
     "AUTH_ERROR_KINDS",
+    "MODEL_ERROR_KINDS",
+    "PROVIDER_ACCESS_DENIED",
     "PROVIDER_AUTH_EXPIRED",
+    "PROVIDER_MODEL_UNAVAILABLE",
     "PROVIDER_THROTTLED",
     "PROVIDER_UNAVAILABLE",
     "THROTTLE_ERROR_KINDS",
@@ -33,7 +39,13 @@ __all__ = [
     "epoch_to_iso",
     "parse_claude_limit_text",
     "rate_limit_window",
+    "safe_provider_reason",
+    "safe_provider_source",
+    "safe_rpc_data",
+    "safe_status_row",
+    "status_fingerprint",
     "status_key",
+    "status_override_matches",
     "suggested_alternative",
 ]
 
@@ -41,6 +53,10 @@ __all__ = [
 PROVIDER_THROTTLED = "PROVIDER_THROTTLED"
 #: The turn was refused because the seat is logged out or not allowed.
 PROVIDER_AUTH_EXPIRED = "PROVIDER_AUTH_EXPIRED"
+#: The provider explicitly refused access, without claiming the login itself is invalid.
+PROVIDER_ACCESS_DENIED = "PROVIDER_ACCESS_DENIED"
+#: The requested model, rather than the account, is unavailable.
+PROVIDER_MODEL_UNAVAILABLE = "PROVIDER_MODEL_UNAVAILABLE"
 #: ``start_task`` refused because the provider is currently believed to be in one of the above.
 PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 
@@ -48,8 +64,15 @@ PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
 #: ``@anthropic-ai/claude-agent-sdk`` ``sdk.d.ts``) that mean the seat cannot be used.
 AUTH_ERROR_KINDS: frozenset[str] = frozenset({"authentication_failed", "oauth_org_not_allowed"})
 
+#: An SDK billing refusal does not prove a subscription lapsed.  It does prove that this account
+#: may not take the requested turn until a person reviews its access or billing state.
+ACCESS_ERROR_KINDS: frozenset[str] = frozenset({"billing_error"})
+
+#: Only the SDK's explicit model-scoped refusal is allowed to disable one model.
+MODEL_ERROR_KINDS: frozenset[str] = frozenset({"model_unavailable"})
+
 #: ``errorKind`` values that mean a limit was reached.
-THROTTLE_ERROR_KINDS: frozenset[str] = frozenset({"rate_limit", "billing_error"})
+THROTTLE_ERROR_KINDS: frozenset[str] = frozenset({"rate_limit"})
 
 #: Message prefixes the Claude Agent SDK uses when a limit was genuinely reached
 #: (``USAGE_LIMIT_ERROR_PREFIXES`` in ``sdk.d.ts``, adapter 0.70.0), plus the older sentinel.
@@ -92,9 +115,6 @@ _KNOWN_WINDOWS = frozenset(
     }
 )
 
-_REASON_LIMIT = 200
-
-
 @dataclass(frozen=True)
 class Classification:
     """What a failed turn means for the provider that produced it."""
@@ -111,6 +131,9 @@ class Classification:
     #: One line for a person, cut short and free of anything but the provider's own words.
     reason: str
     source: str = "acp_error"
+    #: ``account`` refusals apply to the OAuth family/API profile; ``model`` to one model only.
+    scope: str = "account"
+    affected_model: str | None = None
 
 
 def epoch_to_iso(value: Any) -> str | None:
@@ -148,12 +171,105 @@ def _is_usage_limit_text(text: str) -> bool:
     return any(prefix in text for prefix in USAGE_LIMIT_PREFIXES)
 
 
-def _reason(exc: AcpError) -> str:
-    message = str(exc.cause.get("rpc_message") or exc)
-    return message.splitlines()[0][:_REASON_LIMIT]
+_SAFE_REASONS = {
+    "auth_expired": "Provider authentication is required.",
+    "throttled": "The provider reported a usage limit.",
+    "access_denied": "The provider denied account access.",
+    "model_unavailable": "The requested model is unavailable.",
+}
+
+_SAFE_SOURCES = frozenset({"acp_error", "rate_limit_event", "turn_ok", "native_auth_check"})
 
 
-def classify_acp_error(exc: AcpError, *, family: str) -> Classification:
+def safe_provider_reason(state: Any) -> str | None:
+    """A fixed display reason for a provider availability state."""
+    return _SAFE_REASONS.get(state) if isinstance(state, str) else None
+
+
+def safe_provider_source(source: Any) -> str | None:
+    """Expose only provenance labels emitted by the availability implementation."""
+    if not isinstance(source, str):
+        return None
+    return source if source in _SAFE_SOURCES else "legacy"
+
+
+def safe_status_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Preserve a legacy status row's shape while replacing provider-controlled prose."""
+    if row is None:
+        return None
+    result = dict(row)
+    result["reason"] = safe_provider_reason(row.get("state"))
+    result["source"] = safe_provider_source(row.get("source"))
+    return result
+
+
+_STATUS_IDENTITY_FIELDS = (
+    "provider", "model", "state", "code", "window", "reset_at", "observed_at", "task_id", "source",
+)
+
+
+def status_fingerprint(row: Mapping[str, Any] | None) -> str | None:
+    """Opaque identity for one availability observation, excluding prose and success metadata."""
+    if row is None:
+        return None
+    identity = {field: row.get(field) for field in _STATUS_IDENTITY_FIELDS}
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def status_override_matches(
+    payload: Mapping[str, Any], *, status_key_value: str, model: str | None,
+    account_status: Mapping[str, Any] | None, model_status: Mapping[str, Any] | None,
+) -> bool:
+    """Whether a warning still describes the exact evidence a first prompt will use.
+
+    An override created before the agent resolves its default model may follow that resolution only
+    while no refusal exists for the resolved model. Explicitly requested models always match exactly.
+    """
+    if (
+        payload.get("code") != "PROVIDER_STATUS_OVERRIDE"
+        or payload.get("status_key") != status_key_value
+        or payload.get("account_status_fingerprint") != status_fingerprint(account_status)
+    ):
+        return False
+    captured_model = payload.get("model")
+    if captured_model is None:
+        return (
+            payload.get("model_status_fingerprint") is None
+            and (model_status is None or model_status.get("state") == "ok")
+        )
+    return (
+        captured_model == model
+        and payload.get("model_status_fingerprint") == status_fingerprint(model_status)
+    )
+
+
+def _model(value: Any) -> str | None:
+    """A bounded model identifier safe to persist and display."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or len(value) > 128 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+/@-]*", value) is None:
+        return None
+    return value
+
+
+def safe_rpc_data(value: Any) -> dict[str, str]:
+    """Return only bounded classifier fields from provider-controlled RPC data."""
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, str] = {}
+    kind = value.get("errorKind")
+    known_kinds = AUTH_ERROR_KINDS | ACCESS_ERROR_KINDS | MODEL_ERROR_KINDS | THROTTLE_ERROR_KINDS
+    if isinstance(kind, str) and kind in known_kinds:
+        result["errorKind"] = kind
+    model = _model(value.get("model") or value.get("modelId") or value.get("model_id"))
+    if model is not None:
+        result["model"] = model
+    return result
+
+
+def classify_acp_error(exc: AcpError, *, family: str, model: str | None = None) -> Classification:
     """Decide what an ``AcpError`` means, from its wire cause, in a fixed order of evidence.
 
     1. JSON-RPC ``-32000`` is the ACP "authentication required" code.
@@ -170,30 +286,48 @@ def classify_acp_error(exc: AcpError, *, family: str) -> Classification:
 
     if rpc_code == -32000 or error_kind in AUTH_ERROR_KINDS:
         return Classification(
-            PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False, _reason(exc)
+            PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False,
+            _SAFE_REASONS["auth_expired"],
+        )
+    if error_kind in ACCESS_ERROR_KINDS:
+        return Classification(
+            PROVIDER_ACCESS_DENIED, "access_denied", None, None, False,
+            _SAFE_REASONS["access_denied"],
+        )
+    if error_kind in MODEL_ERROR_KINDS:
+        # Bind the refusal to the model this task actually selected. Provider-controlled metadata
+        # may name a fallback or stale model and must never disable a different requested model.
+        affected = _model(model)
+        return Classification(
+            PROVIDER_MODEL_UNAVAILABLE, "model_unavailable", None, None, False,
+            _SAFE_REASONS["model_unavailable"], scope="model", affected_model=affected,
         )
     if error_kind in THROTTLE_ERROR_KINDS:
         window, reset_at = parse_claude_limit_text(text)
         return Classification(
-            PROVIDER_THROTTLED, "throttled", window or "unknown", reset_at, True, _reason(exc)
+            PROVIDER_THROTTLED, "throttled", window or "unknown", reset_at, True,
+            _SAFE_REASONS["throttled"],
         )
     if _is_usage_limit_text(text):
         window, reset_at = parse_claude_limit_text(text)
         return Classification(
-            PROVIDER_THROTTLED, "throttled", window or "unknown", reset_at, True, _reason(exc)
+            PROVIDER_THROTTLED, "throttled", window or "unknown", reset_at, True,
+            _SAFE_REASONS["throttled"],
         )
     if family != "claude":
         lowered = text.lower()
         if any(mark in lowered for mark in _GROK_THROTTLE_MARKS):
             return Classification(
-                PROVIDER_THROTTLED, "throttled", "unknown", None, True, _reason(exc)
+                PROVIDER_THROTTLED, "throttled", "unknown", None, True,
+                _SAFE_REASONS["throttled"],
             )
         if any(mark in lowered for mark in _GROK_AUTH_MARKS):
             return Classification(
-                PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False, _reason(exc)
+                PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False,
+                _SAFE_REASONS["auth_expired"],
             )
     return Classification(
-        exc.code, None, None, None, exc.code != "TURN_TIMEOUT", _reason(exc)
+        exc.code, None, None, None, exc.code != "TURN_TIMEOUT", "The provider turn failed."
     )
 
 
@@ -219,8 +353,8 @@ def _parse_iso(value: Any) -> datetime | None:
 def effective_state(row: Mapping[str, Any] | None, now: datetime) -> str:
     """What a stored ``provider_status`` row means right now.
 
-    ``unknown`` when nothing was ever recorded; a throttle whose ``reset_at`` has passed reads as
-    ``ok`` again, because the provider said so; everything else is what the row says.
+    ``unknown`` when nothing was ever recorded; a throttle whose ``reset_at`` has passed is stale
+    and retryable, but is not evidence of a successful turn.  Everything else is what the row says.
     """
     if row is None:
         return "unknown"
@@ -228,7 +362,7 @@ def effective_state(row: Mapping[str, Any] | None, now: datetime) -> str:
     if state == "throttled":
         reset_at = _parse_iso(row.get("reset_at"))
         if reset_at is not None and reset_at <= now:
-            return "ok"
+            return "unknown"
     return state
 
 

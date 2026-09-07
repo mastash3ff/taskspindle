@@ -9,11 +9,12 @@ import os
 import signal
 import sys
 from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from taskspindle import repos, runner, service, units, worktrees
+from taskspindle import limits, repos, runner, service, units, worktrees
 from taskspindle.config import Paths
 from taskspindle.models import (
     AuthMode,
@@ -90,11 +91,14 @@ def profile_for(script_path: Path, provider: str = PROVIDER) -> Profile:
     )
 
 
-async def run_task(store: Store, paths: Paths, task: TaskRecord, script_path: Path) -> TaskState:
+async def run_task(
+    store: Store, paths: Paths, task: TaskRecord, script_path: Path,
+    *, profile: Profile | None = None,
+) -> TaskState:
     return await runner.run_worker(
         store,
         task.id,
-        profiles={task.provider: profile_for(script_path, task.provider)},
+        profiles={task.provider: profile or profile_for(script_path, task.provider)},
         paths=paths,
         boot=BOOT,
         signals=False,
@@ -116,6 +120,7 @@ def seed_task(
     session_id: str | None = None,
     provider_family: str = PROVIDER,
     lease_limit: int = 1,
+    model: str | None = None,
 ) -> TaskRecord:
     """Set a task up exactly the way the server will before it starts a worker unit.
 
@@ -128,6 +133,8 @@ def seed_task(
         "prompt": prompt,
         "timeout_s": 60,
     }
+    if model is not None:
+        fields["model"] = model
     if mode is Mode.IMPLEMENT:
         fields.update(
             repository=str(repo),
@@ -187,6 +194,19 @@ def seed_task(
     if identity is not None:
         record_root_snapshot(store, paths, task.id, identity.toplevel, revision=1)
     return task
+
+
+def append_status_override(store: Store, task: TaskRecord, *, model: str | None = None) -> None:
+    key = task.provider_family or task.provider
+    store.append_event(task.id, EventKind.WARNING, {
+        "code": "PROVIDER_STATUS_OVERRIDE",
+        "status_key": key,
+        "model": model,
+        "account_status_fingerprint": limits.status_fingerprint(store.get_provider_status(key)),
+        "model_status_fingerprint": limits.status_fingerprint(
+            store.get_provider_model_status(key, model) if model else None
+        ),
+    })
 
 
 def record_root_snapshot(
@@ -626,6 +646,7 @@ async def test_cancelled_turn_is_not_evidence_that_a_previous_throttle_cleared(
     store.set_provider_status(PROVIDER, "throttled", source="earlier_failure")
     observed = store.get_provider_status(PROVIDER)
     task = seed_task(store, paths, mode=Mode.CONSULT)
+    append_status_override(store, task)
     state = await cancel_mid_turn(store, paths, task, script({"block_seconds": 30}))
     assert state is TaskState.CANCELLED
     assert store.get_provider_status(PROVIDER) == observed
@@ -683,6 +704,87 @@ async def test_transport_close_during_startup_honors_only_requested_cancellation
 # -- provider limits and usage ------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("scope", ["account", "model"])
+async def test_new_refusal_before_first_prompt_blocks_the_turn(
+    store: Store, paths: Paths, script, scope: str,
+) -> None:
+    task = seed_task(
+        store, paths, mode=Mode.CONSULT, model="model-a" if scope == "model" else None,
+    )
+    marker = paths.state_dir / f"{scope}-session-started.pid"
+    script_path = script({
+        "new_delay": 0.5,
+        "started_new_to": str(marker),
+        "response": "must not run",
+        "config_options": [{
+            "id": "model", "name": "Model", "type": "select", "currentValue": "model-a",
+            "options": [{"value": "model-a", "name": "Model A"}],
+        }],
+    })
+    worker = asyncio.create_task(run_task(
+        store, paths, task, script_path,
+        profile=replace(profile_for(script_path), model="model-a"),
+    ))
+    try:
+        async with asyncio.timeout(10):
+            while not marker.exists():
+                assert not worker.done()
+                await asyncio.sleep(0.01)
+        if scope == "account":
+            store.set_provider_status(PROVIDER, "auth_expired", source="acp_error")
+        else:
+            store.set_provider_model_status(
+                PROVIDER, "model-a", "model_unavailable", source="acp_error",
+            )
+        assert await worker is TaskState.FAILED
+    finally:
+        if not worker.done():
+            runner.request_cancel(task.id)
+            await worker
+
+    final = store.get_task(task.id)
+    assert final.error["code"] == service.PROVIDER_UNAVAILABLE
+    assert final.response is None
+
+
+@pytest.mark.parametrize("new_model_refusal", [False, True])
+async def test_account_override_follows_default_model_resolution_only_without_model_refusal(
+    store: Store, paths: Paths, script, new_model_refusal: bool,
+) -> None:
+    store.set_provider_status(PROVIDER, "auth_expired", source="acp_error")
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    append_status_override(store, task)
+    marker = paths.state_dir / "default-model-session-started.pid"
+    script_path = script({
+        "new_delay": 0.5,
+        "started_new_to": str(marker),
+        "response": "allowed explicit retry",
+        "config_options": [{
+            "id": "model", "name": "Model", "type": "select", "currentValue": "model-a",
+            "options": [{"value": "model-a", "name": "Model A"}],
+        }],
+    })
+    worker = asyncio.create_task(run_task(
+        store, paths, task, script_path,
+        profile=replace(profile_for(script_path), model="model-a"),
+    ))
+    try:
+        async with asyncio.timeout(10):
+            while not marker.exists():
+                assert not worker.done()
+                await asyncio.sleep(0.01)
+        if new_model_refusal:
+            store.set_provider_model_status(
+                PROVIDER, "model-a", "model_unavailable", source="acp_error",
+            )
+        expected = TaskState.FAILED if new_model_refusal else TaskState.COMPLETED
+        assert await worker is expected
+    finally:
+        if not worker.done():
+            runner.request_cancel(task.id)
+            await worker
+
+
 async def test_a_usage_limit_refusal_marks_the_provider_throttled(
     store: Store, paths: Paths, script
 ) -> None:
@@ -722,11 +824,30 @@ async def test_an_auth_refusal_is_recorded_and_not_retryable(
     assert store.get_provider_status(PROVIDER)["state"] == "auth_expired"
 
 
+async def test_native_auth_failure_records_its_source_without_provider_output(
+    store: Store, paths: Paths, script, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+
+    def refuse(*_args):
+        raise runner._Failure("OAUTH_REJECTED", "private-provider-output")
+
+    monkeypatch.setattr(runner, "_pre_spawn_evidence", refuse)
+    assert await run_task(store, paths, task, script({})) is TaskState.FAILED
+    status = store.get_provider_status(PROVIDER)
+    assert status["source"] == "native_auth_check"
+    assert status["state"] == "auth_expired"
+    final = store.get_task(task.id)
+    assert "private-provider-output" not in json.dumps(final.error)
+    assert "private-provider-output" not in json.dumps(store.list_events(task.id))
+
+
 async def test_a_turn_that_runs_clears_the_throttle_and_records_its_usage(
     store: Store, paths: Paths, script
 ) -> None:
     store.set_provider_status(PROVIDER, "throttled", code="PROVIDER_THROTTLED", source="acp_error")
     task = seed_task(store, paths, mode=Mode.CONSULT)
+    append_status_override(store, task)
     script_path = script(
         {
             "response": "fine now",
@@ -779,7 +900,11 @@ async def test_older_success_preserves_new_sibling_failure(
         finally:
             sibling_store.close()
         assert await worker is TaskState.COMPLETED
-        assert store.get_provider_status(PROVIDER) == failed_status
+        final_status = store.get_provider_status(PROVIDER)
+        assert {key: value for key, value in final_status.items() if key != "last_success_at"} == {
+            key: value for key, value in failed_status.items() if key != "last_success_at"
+        }
+        assert final_status["last_success_at"] is not None
     finally:
         if not worker.done():
             runner.request_cancel(task.id)

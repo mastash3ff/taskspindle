@@ -56,6 +56,7 @@ def test_connect_refresh_and_failed_verification_preserve_task_database(tmp_path
     client = TestClient(app, base_url=origin, client=("127.0.0.1", 52000))
     initial = client.get("/api/subscriptions").json()
     assert [row["label"] for row in initial["subscriptions"]] == ["ChatGPT", "Claude", "Google AI", "Grok"]
+    assert initial["scheduled_refresh_enabled"] is False
     assert not service.database.exists()
     headers = {"Origin": origin, "X-TaskSpindle-CSRF": initial["csrf_token"]}
 
@@ -67,6 +68,7 @@ def test_connect_refresh_and_failed_verification_preserve_task_database(tmp_path
     row = client.get("/api/subscriptions").json()["subscriptions"][0]
     assert row["connected"] and row["plan"] == "ChatGPT Plus"
     assert row["status"] == "cancelled" and row["days_remaining"] == 3
+    assert row["upcoming_end_warning"] == "within_7_days"
     assert row["operation"] is None and row["error"] is None
     success_at = row["last_success_at"]
 
@@ -78,6 +80,7 @@ def test_connect_refresh_and_failed_verification_preserve_task_database(tmp_path
     assert row["status"] == "cancelled" and row["access_ends_at"] == "2030-01-05"
     assert row["last_success_at"] == success_at and row["freshness"] == "stale"
     assert row["end_passed_unverified"] is True
+    assert row["upcoming_end_warning"] is None
     assert row["error"]["code"] == "AUTH_REQUIRED"
     assert "secret-cookie-value" not in failed.text
     assert calls == [("chatgpt", "connect", None), ("chatgpt", "refresh", "a" * 64)]

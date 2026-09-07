@@ -34,7 +34,7 @@ from .. import limits, usage
 from ..config import Paths
 from ..doctor import run_doctor_async
 from ..providers import Profile
-from ..service import provider_availability, task_view
+from ..service import model_availability, provider_availability, task_view
 from .db import ReadOnlyStore
 
 __all__ = ["build_app"]
@@ -341,6 +341,7 @@ def build_app(
     async def providers_endpoint(request: Request) -> Response:
         with _store() as store:
             providers_out = []
+            observed_now = clock()
             for profile in sorted(profiles.values(), key=lambda item: item.id):
                 providers_out.append(
                     {
@@ -352,11 +353,20 @@ def build_app(
                         "gateway_host": profile.gateway_host,
                         "family": profile.family,
                         "command_name": os.path.basename(profile.command[0]) if profile.command else None,
-                        "availability": provider_availability(store, profile, now=clock()),
+                        "availability": provider_availability(
+                            store, profile, now=observed_now, model=profile.model
+                        ),
+                        "model_availability": model_availability(
+                            store, profile, now=observed_now
+                        ),
                         "windows": store.latest_provider_windows(limits.status_key(profile)),
                     }
                 )
-            status = store.list_provider_status()
+            status = [
+                safe
+                for row in store.list_provider_status()
+                if (safe := limits.safe_status_row(row)) is not None
+            ]
         doctor_result = await _doctor(request.app.state, live=False)
         return JSONResponse({"providers": providers_out, "status": status, "doctor": doctor_result})
 

@@ -213,6 +213,27 @@ def test_report_rolls_up_tokens_outcomes_and_timings(tmp_path: Path) -> None:
     store.close()
 
 
+def test_windows_report_never_exposes_a_legacy_provider_reason(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    try:
+        store.set_provider_status(
+            "claude",
+            "auth_expired",
+            source="acp_error",
+            reason="oauth_token=legacy-secret-value",
+        )
+        result = usage.windows_report(
+            store,
+            {"claude": Profile(id="claude", auth="oauth", command=("c",), first_class=True)},
+            NOW,
+        )
+    finally:
+        store.close()
+
+    assert result[0]["status"]["reason"] == "Provider authentication is required."
+    assert "legacy-secret-value" not in json.dumps(result)
+
+
 def test_repository_rollup_matches_read_only_store_and_preserves_filters(tmp_path: Path) -> None:
     from taskspindle.web.db import ReadOnlyStore
 

@@ -95,6 +95,48 @@ def test_doctor_marks_each_check_and_fails_on_a_real_failure(
     ]
 
 
+def test_providers_reads_cached_status_without_creating_task_database(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    import subprocess
+
+    def forbidden(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("cached provider status must not start a process")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    assert cli.main(["providers", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert {row["id"] for row in report["providers"]} == {"claude", "grok", "agy"}
+    assert all(row["availability"]["state"] == "unknown" for row in report["providers"])
+    assert all("native_check" not in row for row in report["providers"])
+    assert not (home / "state/taskspindle/taskspindle.sqlite3").exists()
+
+
+def test_provider_check_does_not_clear_recorded_refusal(
+    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from taskspindle import access_checks
+    from taskspindle.store import Store
+
+    database = home / "state/taskspindle/taskspindle.sqlite3"
+    database.parent.mkdir(parents=True)
+    with Store.open(database) as store:
+        store.set_provider_status("claude", "auth_expired", source="acp_error", reason="private-value")
+        before = store.get_provider_status("claude")
+    monkeypatch.setattr(access_checks, "check_native_access", lambda *_: {
+        "state": "cached_auth", "detail": "cached claim only", "account_binding": "unverified",
+    })
+    assert cli.main(["providers", "--check", "--json"]) == 0
+    output = capsys.readouterr().out
+    report = json.loads(output)
+    claude = next(row for row in report["providers"] if row["id"] == "claude")
+    assert claude["availability"]["state"] == "auth_expired"
+    assert claude["native_check"]["state"] == "cached_auth"
+    assert "private-value" not in output
+    with Store.open(database) as store:
+        assert store.get_provider_status("claude") == before
+
+
 def test_usage_prints_the_report_as_json_or_as_tables(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -221,12 +263,15 @@ def test_repository_usage_prints_the_repository_label(home: Path, capsys, displa
     assert "123" in output
 
 
-def test_concurrency_rollback_cli_is_explicit_and_preserves_records(home, capsys):
+def test_concurrency_rollback_cli_is_explicit_and_preserves_records(home, capsys, monkeypatch):
+    from taskspindle import store as store_module
     from taskspindle.models import TaskState
     from taskspindle.store import Store
     from tests.test_store import make_task
 
     database = home / "fixture.sqlite3"
+    # This maintenance command is deliberately specific to the old v4 lease layout.
+    monkeypatch.setattr(store_module, "MIGRATIONS", [m for m in store_module.MIGRATIONS if m[0] <= 4])
     with Store.open(database) as store:
         task = make_task(store)
         assert cli.main(["rollback-concurrency", "--database", str(database)]) == 1
@@ -237,6 +282,17 @@ def test_concurrency_rollback_cli_is_explicit_and_preserves_records(home, capsys
         assert store.schema_version() == 3
         assert store.get_task(task.id).state == TaskState.CANCELLED
     assert "history and grants preserved" in capsys.readouterr().out
+
+
+def test_concurrency_rollback_refuses_newer_schema_without_mutation(home):
+    from taskspindle.store import Store
+
+    database = home / "fixture.sqlite3"
+    with Store.open(database) as store:
+        version = store.schema_version()
+        assert version > 4
+        assert cli.main(["rollback-concurrency", "--database", str(database)]) == 1
+        assert store.schema_version() == version
 
 
 def test_concurrency_rollback_does_not_create_missing_database(home):

@@ -22,7 +22,7 @@ import signal
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +46,14 @@ from .models import (
 from .providers import Profile, ProfileError
 from .repos import GitError, RepositoryIdentity, RootSnapshot
 from .review import ReviewParseError, parse_review_output
-from .service import LEASE_BUSY, TaskSpindleError, require_task_profile, transition
+from .service import (
+    LEASE_BUSY,
+    PROVIDER_UNAVAILABLE,
+    TaskSpindleError,
+    provider_availability,
+    require_task_profile,
+    transition,
+)
 from .store import Store, StoreError, now
 
 __all__ = [
@@ -264,6 +271,8 @@ class _Run:
     prompt_ended_at: str | None = None
     #: Account state before provider startup; successful completion may clear only this observation.
     provider_status_at_start: dict[str, Any] | None = None
+    provider_model_at_start: str | None = None
+    provider_model_status_at_start: dict[str, Any] | None = None
 
     @property
     def task_id(self) -> str:
@@ -468,6 +477,11 @@ async def _run_turn(
     profile = _resolve_profile(run, profiles)
     run.profile = profile
     run.provider_status_at_start = run.store.get_provider_status(limits.status_key(profile))
+    run.provider_model_at_start = _effective_model(run, profile)
+    if run.provider_model_at_start:
+        run.provider_model_status_at_start = run.store.get_provider_model_status(
+            limits.status_key(profile), run.provider_model_at_start,
+        )
 
     task_tmp = run.dir / "tmp"
     task_tmp.mkdir(parents=True, exist_ok=True)
@@ -476,7 +490,20 @@ async def _run_turn(
     except ProfileError as exc:
         raise _Failure(exc.code, str(exc)) from exc
 
-    evidence = _pre_spawn_evidence(profile, oauth_runner)
+    try:
+        evidence = _pre_spawn_evidence(profile, oauth_runner)
+    except _Failure as failure:
+        state = "access_denied" if failure.code == limits.PROVIDER_ACCESS_DENIED else "auth_expired"
+        safe = {
+            "access_denied": "The provider denied account access.",
+            "auth_expired": "Provider authentication is required.",
+        }[state]
+        _record_provider_limit(
+            run,
+            profile,
+            limits.Classification(failure.code, state, None, None, False, safe, source="native_auth_check"),
+        )
+        raise _Failure(failure.code, safe, retryable=False, details=failure.details) from failure
     workspace = _workspace(run)
 
     stderr_path = run.dir / f"agent-{run.revision}.stderr"
@@ -500,6 +527,7 @@ async def _run_turn(
                 evidence = {"auth": "oauth", "auth_method_id": "cached_native_cli",
                             "source": "authenticated_model_catalog"}
                 run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
+                _capture_model_status_at_start(run, profile)
                 result = await _prompt(run, agent, cancel_event, native=True)
             else:
                 run.agent_info = dict(agent.init.agent_info) if agent.init else {}
@@ -507,6 +535,7 @@ async def _run_turn(
                     evidence = _post_init_evidence(profile, agent)
                 run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
                 await _open_session(run, agent)
+                _capture_model_status_at_start(run, profile)
                 result = await _prompt(run, agent, cancel_event)
     except AcpError as exc:
         # The client retains updates even when prompt/cancel/timeout raises. Capture
@@ -528,7 +557,9 @@ async def _run_turn(
             return _settle_cancelled(run)
         if exc.code == "RESUME_UNAVAILABLE":
             raise _Interrupted("RESUME_UNAVAILABLE", str(exc)) from exc
-        verdict = limits.classify_acp_error(exc, family=profile.family)
+        verdict = limits.classify_acp_error(
+            exc, family=profile.family, model=_effective_model(run, profile),
+        )
         if verdict.provider_state is not None:
             _record_provider_limit(run, profile, verdict)
         raise _Failure(
@@ -541,7 +572,7 @@ async def _run_turn(
                 "window": verdict.window,
                 "reset_at": verdict.reset_at,
                 "acp_code": exc.code,
-                "rpc_data": exc.cause.get("rpc_data"),
+                "rpc_data": limits.safe_rpc_data(exc.cause.get("rpc_data")),
                 "transport_retries": exc.cause.get("retries"),
                 "last_retry": exc.cause.get("last_retry"),
             },
@@ -662,6 +693,48 @@ def _resolve_profile(run: _Run, profiles: Mapping[str, Profile]) -> Profile:
         raise _Failure(exc.code, str(exc)) from exc
     except TaskSpindleError as exc:
         raise _Failure(exc.code, exc.message, details=exc.details) from exc
+
+
+def _effective_model(run: _Run, profile: Profile) -> str | None:
+    """The most specific model identity known for this turn."""
+    return (
+        run.task.resolved_model
+        or run.session_model
+        or run.task.requested_model
+        or profile.model
+    )
+
+
+def _capture_model_status_at_start(run: _Run, profile: Profile) -> None:
+    """Snapshot and gate the exact resolved model immediately before its prompt starts."""
+    key = limits.status_key(profile)
+    model = _effective_model(run, profile)
+    run.provider_status_at_start = run.store.get_provider_status(key)
+    run.provider_model_at_start = model
+    run.provider_model_status_at_start = (
+        run.store.get_provider_model_status(key, model) if model else None
+    )
+    # Availability selection applies to a newly launched managed task. Existing tasks keep their
+    # established continuation/recovery behavior while still recording real provider outcomes.
+    if run.revision != 1:
+        return
+    availability = provider_availability(run.store, profile, now=datetime.now(UTC), model=model)
+    overridden = any(
+        event["kind"] == EventKind.WARNING.value
+        and limits.status_override_matches(
+            event["payload"], status_key_value=key, model=model,
+            account_status=run.provider_status_at_start,
+            model_status=run.provider_model_status_at_start,
+        )
+        for event in run.store.list_events(run.task_id)
+    )
+    if availability["state"] not in ("ok", "unknown") and not overridden:
+        raise _Failure(
+            PROVIDER_UNAVAILABLE,
+            f"Provider is {availability['state']}: {availability['reason']}",
+            retryable=True,
+            details={"provider": profile.id, **availability},
+        )
 
 
 def _pre_spawn_evidence(
@@ -829,18 +902,32 @@ def _record_provider_limit(run: _Run, profile: Profile, verdict: limits.Classifi
         "observed_at": observed,
         "source": verdict.source,
         "message": verdict.reason,
+        "scope": verdict.scope,
+        "affected_model": verdict.affected_model,
     }
-    run.store.set_provider_status(
-        key,
-        verdict.provider_state or "ok",
-        code=verdict.code,
-        window=verdict.window,
-        reason=verdict.reason,
-        reset_at=verdict.reset_at,
-        task_id=run.task_id,
-        source=verdict.source,
-        observed_at=observed,
-    )
+    if verdict.scope == "model" and verdict.affected_model:
+        run.store.set_provider_model_status(
+            key,
+            verdict.affected_model,
+            verdict.provider_state or "model_unavailable",
+            code=verdict.code,
+            reason=verdict.reason,
+            task_id=run.task_id,
+            source=verdict.source,
+            observed_at=observed,
+        )
+    elif verdict.scope != "model":
+        run.store.set_provider_status(
+            key,
+            verdict.provider_state or "ok",
+            code=verdict.code,
+            window=verdict.window,
+            reason=verdict.reason,
+            reset_at=verdict.reset_at,
+            task_id=run.task_id,
+            source=verdict.source,
+            observed_at=observed,
+        )
     run.store.append_event(run.task_id, EventKind.PROVIDER_LIMIT, payload)
     run.store.append_event(None, EventKind.PROVIDER_STATUS, payload)
     if verdict.provider_state == "throttled":
@@ -886,8 +973,17 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
             source="rate_limit_event",
         )
     elif not run.cancelled and result.stop_reason != "cancelled":
+        model = _effective_model(run, profile)
+        expected_model = (
+            run.provider_model_status_at_start
+            if model == run.provider_model_at_start else None
+        )
         run.store.mark_provider_healthy(
-            key, expected=run.provider_status_at_start, task_id=run.task_id,
+            key,
+            expected=run.provider_status_at_start,
+            task_id=run.task_id,
+            model=model,
+            expected_model=expected_model,
         )
 
 

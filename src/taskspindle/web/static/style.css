@@ -57,6 +57,12 @@ a { color: var(--accent); }
 
 .refreshed { color: var(--muted); font-size: 0.8em; }
 
+@media (max-width: 600px) {
+  .topbar { flex-wrap: wrap; gap: 0.5rem; }
+  .tabs { order: 3; flex-basis: 100%; flex-wrap: wrap; gap: 0.5rem; }
+  .refreshed { margin-left: auto; }
+}
+
 main { padding: 1rem; max-width: 1200px; margin: 0 auto; }
 
 .panel {
@@ -126,8 +132,23 @@ button:disabled { cursor: not-allowed; opacity: 0.65; }
 }
 .subscription-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
 .subscription-heading h2 { margin-bottom: 0.5rem; }
+.card-section-title { color: var(--muted); font-size: 0.8rem; letter-spacing: 0.06em;
+  margin: 0.35rem 0 0.55rem; text-transform: uppercase; }
 .subscription-activity { margin-top: 1rem; }
 .subscription-activity p { margin: 0.3rem 0; overflow-wrap: anywhere; }
+.worker-access { border-top: 1px solid var(--border); margin-top: 1rem; padding-top: 1rem; }
+.worker-access h3 { margin-bottom: 0.6rem; }
+.worker-heading { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 1rem; margin-bottom: 0.6rem; }
+.worker-access p { margin: 0.5rem 0 0; overflow-wrap: anywhere; }
+.worker-next-action { font-weight: 600; }
+.model-availability { border-top: 1px dashed var(--border); margin-top: 0.8rem; padding-top: 0.8rem; }
+.model-availability h4 { margin: 0 0 0.5rem; }
+.model-status-row { background: var(--code-bg); border-radius: 6px; padding: 0.6rem; }
+.model-status-row + .model-status-row { margin-top: 0.5rem; }
+.model-status-row .worker-heading { margin-bottom: 0.2rem; }
+.model-status-row p { margin-top: 0.2rem; }
+.schedule-state { font-weight: 600; margin-bottom: 0.2rem; }
 .subscription-actions { display: flex; gap: 0.6rem; margin-top: 1rem; }
 .operation { color: var(--accent); }
 

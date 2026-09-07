@@ -23,7 +23,11 @@ def test_health_compare_and_set_preserves_a_newer_failure_from_another_connectio
         second.set_provider_status("grok", failure, source="newer_sibling")
         newer = second.get_provider_status("grok")
         assert not first.mark_provider_healthy("grok", expected=observed)
-        assert first.get_provider_status("grok") == newer
+        final = first.get_provider_status("grok")
+        assert {key: value for key, value in final.items() if key != "last_success_at"} == {
+            key: value for key, value in newer.items() if key != "last_success_at"
+        }
+        assert final["last_success_at"] is not None
     finally:
         second.close()
         first.close()
@@ -40,6 +44,7 @@ def test_health_observed_after_failure_can_clear_that_unchanged_failure(
         observed = store.get_provider_status("grok")
         assert store.mark_provider_healthy("grok", expected=observed)
         assert store.get_provider_status("grok")["state"] == "ok"
+        assert store.get_provider_status("grok")["last_success_at"] is not None
     finally:
         store.close()
 
@@ -75,5 +80,31 @@ def test_competing_writers_preserve_failure_whichever_transaction_wins(tmp_path:
     store = Store.open(path)
     try:
         assert store.get_provider_status("grok")["state"] == "throttled"
+        assert store.get_provider_status("grok")["last_success_at"] is not None
     finally:
         store.close()
+
+
+def test_model_success_preserves_a_newer_model_refusal_and_records_success(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    first = Store.open(path)
+    second = Store.open(path)
+    try:
+        observed_account = first.get_provider_status("claude")
+        observed_model = first.get_provider_model_status("claude", "opus")
+        second.set_provider_model_status(
+            "claude", "opus", "model_unavailable", source="newer_sibling",
+        )
+        assert not first.mark_provider_healthy(
+            "claude",
+            expected=observed_account,
+            model="opus",
+            expected_model=observed_model,
+        )
+        row = first.get_provider_model_status("claude", "opus")
+        assert row["state"] == "model_unavailable"
+        assert row["source"] == "newer_sibling"
+        assert row["last_success_at"] is not None
+    finally:
+        second.close()
+        first.close()

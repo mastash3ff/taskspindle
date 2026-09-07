@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -305,6 +307,7 @@ def test_due_queue_uses_six_hour_attempt_clock_and_blocking_failures_wait(
         assert store.enqueue_due(at(5, 59)) == []
         due = store.enqueue_due(at(6))
         assert [job["provider"] for job in due] == ["chatgpt"]
+        assert due[0]["origin"] == "scheduled"
         assert store.enqueue_due(at(7)) == []  # active work coalesces
 
         claimed = store.claim_next(at(6), "worker")
@@ -381,3 +384,140 @@ def test_past_access_end_stays_unverified_until_expired_is_directly_observed(
         assert store.list_subscriptions(after_end + timedelta(minutes=1))[0][
             "end_passed_unverified"
         ] is False
+
+
+def test_manual_request_promotes_scheduled_work_and_disabled_schedule_is_skipped(
+    tmp_path: Path,
+) -> None:
+    with SubscriptionStore(tmp_path / "subscriptions.sqlite3") as store:
+        finish_connect(store)
+        scheduled = store.enqueue_due(at(6))[0]
+        promoted = store.enqueue("chatgpt", "refresh", at(6, 1))
+        assert promoted["id"] == scheduled["id"]
+        assert promoted["origin"] == "manual"
+        assert store.skip_automatic_jobs(at(6, 2), scheduled_refresh_enabled=False) == 0
+        assert store.claim_next(at(6, 2), "worker", include_scheduled=False) is not None
+
+
+def test_disabling_schedule_skips_queued_and_claimed_jobs_without_changing_snapshot(
+    tmp_path: Path,
+) -> None:
+    with SubscriptionStore(tmp_path / "subscriptions.sqlite3") as store:
+        finish_connect(store)
+        manual = store.enqueue("chatgpt", "refresh", at(0, 1))
+        assert store.claim_next(at(0, 1), "worker", include_scheduled=False) is not None
+        assert store.finish(
+            manual["id"],
+            "worker",
+            {"ok": False, "error": {"code": "PARSE_CHANGED"}},
+            at(0, 2),
+        )
+        failed = store.list_subscriptions(at(0, 2))[0]
+        scheduled = store.enqueue_due(at(6, 2))[0]
+        assert store.claim_next(at(6, 2), "scheduler", include_scheduled=True) is not None
+        assert store.skip_automatic_jobs(at(6, 3), scheduled_refresh_enabled=False) == 0
+        active = store._conn.execute(
+            "SELECT status, owner FROM subscription_jobs WHERE id = ?", (scheduled["id"],)
+        ).fetchone()
+        assert (active["status"], active["owner"]) == ("running", "scheduler")
+        assert store.claim_next(at(6, 3), "other", include_scheduled=False) is None
+        assert store.skip_automatic_jobs(at(6, 8), scheduled_refresh_enabled=False) == 1
+        job = store._conn.execute(
+            "SELECT status, error FROM subscription_jobs WHERE id = ?", (scheduled["id"],)
+        ).fetchone()
+        assert job["status"] == "skipped"
+        assert json.loads(job["error"])["code"] == "SCHEDULE_DISABLED"
+        row = store.list_subscriptions(at(6, 8))[0]
+        assert row["connected"] is True
+        assert row["error"] == failed["error"]
+        assert row["last_attempt_at"] == failed["last_attempt_at"]
+        assert row["last_success_at"] == failed["last_success_at"]
+        assert row["operation"] is None
+        assert len(store.observation_history("chatgpt")) == 1
+
+
+def test_legacy_refresh_origin_fails_closed_but_legacy_connect_remains_manual(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "subscriptions.sqlite3"
+    with sqlite3.connect(database) as conn:
+        conn.execute(
+            """CREATE TABLE subscription_jobs (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL,
+                   action TEXT NOT NULL, status TEXT NOT NULL, expected_account_id TEXT,
+                   created_at TEXT NOT NULL, claimed_at TEXT, heartbeat_at TEXT,
+                   lease_expires_at TEXT, owner TEXT, finished_at TEXT, error TEXT
+               )"""
+        )
+        conn.executemany(
+            """INSERT INTO subscription_jobs(provider, action, status, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                ("chatgpt", "connect", "queued", "2026-01-10T00:00:00.000000Z"),
+                ("claude", "refresh", "queued", "2026-01-10T00:00:00.000000Z"),
+                ("grok", "refresh", "running", "2026-01-10T00:00:00.000000Z"),
+            ),
+        )
+
+    with SubscriptionStore(database) as store:
+        jobs = store._conn.execute("SELECT * FROM subscription_jobs ORDER BY id").fetchall()
+        assert [job["origin"] for job in jobs] == ["manual", "legacy", "legacy"]
+        assert store.claim_next(at(), "worker", include_scheduled=False)["action"] == "connect"
+        assert store.skip_automatic_jobs(at(), scheduled_refresh_enabled=True) == 2
+        legacy = store._conn.execute(
+            "SELECT status, error FROM subscription_jobs WHERE provider = 'claude'"
+        ).fetchone()
+        assert legacy["status"] == "skipped"
+        assert json.loads(legacy["error"])["code"] == "LEGACY_JOB_UNCERTAIN"
+        legacy_without_lease = store._conn.execute(
+            "SELECT status FROM subscription_jobs WHERE provider = 'grok'"
+        ).fetchone()
+        assert legacy_without_lease["status"] == "skipped"
+
+
+def test_upcoming_access_end_warning_uses_precision_and_suppresses_stale_or_passed(
+    tmp_path: Path,
+) -> None:
+    with SubscriptionStore(tmp_path / "subscriptions.sqlite3") as store:
+        finish_connect(
+            store,
+            when=at(),
+            status="cancelled",
+            renews_at=None,
+            access_ends_at="2026-01-16",
+        )
+        assert store.list_subscriptions(at())[0]["upcoming_end_warning"] == "within_7_days"
+        assert store.list_subscriptions(at() + timedelta(days=6))[0][
+            "upcoming_end_warning"
+        ] is None  # stale observations do not raise a fresh warning
+
+    with SubscriptionStore(tmp_path / "datetime.sqlite3") as store:
+        finish_connect(
+            store,
+            when=at(),
+            status="cancelled",
+            renews_at=None,
+            access_ends_at="2026-01-10T23:00:00Z",
+            date_precision="datetime",
+        )
+        assert store.list_subscriptions(at())[0]["upcoming_end_warning"] == "within_1_day"
+        passed = store.list_subscriptions(at(23, 1))[0]
+        assert passed["upcoming_end_warning"] is None
+        assert passed["end_passed_unverified"] is True
+
+
+def test_datetime_access_end_at_exact_cutoff_requires_verification_without_warning(
+    tmp_path: Path,
+) -> None:
+    with SubscriptionStore(tmp_path / "subscriptions.sqlite3") as store:
+        finish_connect(
+            store,
+            status="cancelled",
+            renews_at=None,
+            access_ends_at="2026-01-10T00:00:00Z",
+            date_precision="datetime",
+        )
+        row = store.list_subscriptions(at())[0]
+        assert row["days_remaining"] == 0
+        assert row["end_passed_unverified"] is True
+        assert row["upcoming_end_warning"] is None

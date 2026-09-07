@@ -206,8 +206,15 @@ class _Doctor:
             def probe(row: Mapping[str, Any] | None = row) -> str:
                 state = limits.effective_state(row, self.now)
                 if state in ("ok", "unknown"):
-                    return "no limit recorded" if state == "unknown" else "ok"
-                detail = f"{state}: {row.get('reason') or row.get('code')}" if row else state
+                    if row and row.get("state") == "throttled":
+                        return "reported reset passed; a new attempt is allowed, access is unverified"
+                    return "no limit recorded" if state == "unknown" else "last task succeeded"
+                detail = {
+                    "throttled": "throttled: wait for the reported reset or choose another eligible worker",
+                    "auth_expired": "auth_expired: sign in again with the native provider CLI",
+                    "access_denied": "access_denied: verify access to the required model",
+                    "model_unavailable": "model_unavailable: choose an eligible model",
+                }.get(state, "provider access is unverified")
                 if row and row.get("reset_at"):
                     detail += f" (resets {row['reset_at']})"
                 raise RuntimeError(detail)
@@ -324,7 +331,7 @@ class _Doctor:
             )
             return (
                 f"{evidence['authMethod']} / {evidence['subscriptionType']} / "
-                f"{evidence['apiProvider']}"
+                f"{evidence['apiProvider']} (cached authentication claim; entitlement unverified)"
             )
 
     async def _grok_acp(self) -> Check:
@@ -415,7 +422,8 @@ class _Doctor:
         @self.check("agy_oauth")
         def probe() -> str:
             evidence = agy_oauth_evidence(self.profiles["agy"], self.parent_env, runner=self.runner)
-            return f"native CLI cached login works; {evidence['model_count']} Gemini models advertised"
+            return (f"cached catalog available; {evidence['model_count']} Gemini models advertised; "
+                    "entitlement unverified")
 
     def agy_acp_oauth(self) -> None:
         """Legacy ACP cache evidence; not used for the native built-in provider."""

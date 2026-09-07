@@ -26,6 +26,7 @@ import taskspindle
 from . import integration, providers, recovery, repos, units, usage, worktrees
 from .config import Paths, concurrency_limits
 from .integration import Journal
+from .limits import status_fingerprint, status_override_matches
 from .models import (
     ACTIVE_STATES,
     TERMINAL_STATES,
@@ -64,6 +65,7 @@ from .service import (
     apply_acceptance,
     check_acceptance,
     create_task,
+    model_availability,
     provider_availability,
     record_diff_receipt,
     require_diff_retrieved,
@@ -333,7 +335,10 @@ class Orchestrator:
                     "model": profile.model,
                     "adapter": providers.adapter_metadata(profile),
                     "gateway_host": profile.gateway_host,
-                    "availability": provider_availability(self.store, profile, now=now),
+                    "availability": provider_availability(
+                        self.store, profile, now=now, model=profile.model,
+                    ),
+                    "model_availability": model_availability(self.store, profile, now=now),
                     "capacity": {
                         "limit": self.concurrency.get(profile.id, 1),
                         "active": active.get(profile.id, 0),
@@ -531,7 +536,8 @@ class Orchestrator:
         with self._cycle():
             profile = self._profile_for(request)
             require_provider_available(
-                self.store, profile, now=self.clock(), ignore=request.ignore_provider_status
+                self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
+                model=request.model or profile.model,
             )
             placement = self._placement(request)
             record = create_task(
@@ -542,9 +548,18 @@ class Orchestrator:
                 provider_family=profile.family,
             )
             if request.ignore_provider_status:
+                key = limits_key(profile)
+                model = request.model or profile.model
                 self.store.append_event(record.id, EventKind.WARNING, {
                     "code": "PROVIDER_STATUS_OVERRIDE",
-                    "status": self.store.get_provider_status(limits_key(profile)),
+                    "status_key": key,
+                    "model": model,
+                    "account_status_fingerprint": status_fingerprint(
+                        self.store.get_provider_status(key)
+                    ),
+                    "model_status_fingerprint": status_fingerprint(
+                        self.store.get_provider_model_status(key, model) if model else None
+                    ),
                 })
             self._prepare(record, request, placement)
             self.dispatch_queued()
@@ -822,11 +837,16 @@ class Orchestrator:
         """An explicit override covers only the initial turn and the status it observed."""
         if len(self.store.list_turns(task.id)) != 1:
             return False
-        status = self.store.get_provider_status(limits_key(profile))
+        key = limits_key(profile)
+        model = task.resolved_model or task.requested_model or profile.model
+        account_status = self.store.get_provider_status(key)
+        model_status = self.store.get_provider_model_status(key, model) if model else None
         return any(
             event["kind"] == EventKind.WARNING.value
-            and event["payload"].get("code") == "PROVIDER_STATUS_OVERRIDE"
-            and event["payload"].get("status") == status
+            and status_override_matches(
+                event["payload"], status_key_value=key, model=model,
+                account_status=account_status, model_status=model_status,
+            )
             for event in self.store.list_events(task.id)
         )
 
@@ -842,7 +862,12 @@ class Orchestrator:
                 profile = self.profiles.get(task.provider)
                 require_task_profile(task, profile)
                 assert profile is not None
-                availability = provider_availability(self.store, profile, now=self.clock())
+                availability = provider_availability(
+                    self.store,
+                    profile,
+                    now=self.clock(),
+                    model=task.resolved_model or task.requested_model or profile.model,
+                )
                 if (availability["state"] not in ("ok", "unknown")
                         and not self._initial_status_override(task, profile)):
                     return False

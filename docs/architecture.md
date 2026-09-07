@@ -177,34 +177,55 @@ Four things a task can do that TaskSpindle records rather than hides.
 
 ## Provider availability
 
-A provider can refuse a turn for reasons that have nothing to do with the task: a usage window is
-exhausted, credits are gone, the seat is logged out. TaskSpindle records that fact and reports it;
-it does not act on it.
+A provider can refuse a turn because a usage window is exhausted, login expired, access was
+denied, or the selected model is unavailable. TaskSpindle records those observations for the
+coordinator to consult before assigning new work. Billing observations remain separate and do
+not gate workers: a browser account is not assumed to be the CLI account.
 
 **Classifying.** `acp_client.py` stays thin: it keeps what the wire said — the JSON-RPC code,
 message and data of the agent's error — on the `AcpError` it raises, and interprets none of it.
 `limits.py` does the interpreting, in a fixed order of evidence: the ACP "authentication required"
 code; the Claude adapter's `errorKind` (`authentication_failed`, `oauth_org_not_allowed`,
-`rate_limit`, `billing_error`); the Claude Agent SDK's own usage-limit message prefixes, and the
+`rate_limit`, `billing_error`, `model_unavailable`); the Claude Agent SDK's own usage-limit message prefixes, and the
 older `usage limit reached|<epoch>` sentinel, which also gives the reset time; and, for any other
 agent, a few conservative substrings, because Grok documents no limit telemetry. Anything else is
-the failure it always was.
+the failure it always was. A billing refusal is an access denial, not proof of subscription
+expiry. Model refusals bind to the task's selected model, not an unrelated ID in provider output.
+Persisted access reasons and diagnostic fields are sanitized.
 
 **Recording.** The runner writes a classified refusal in three places: the task's `error` (code
-`PROVIDER_THROTTLED` or `PROVIDER_AUTH_EXPIRED`, with the window and reset time in `details`), a
+`PROVIDER_THROTTLED`, `PROVIDER_AUTH_EXPIRED`, `PROVIDER_ACCESS_DENIED`, or
+`PROVIDER_MODEL_UNAVAILABLE`, with the relevant scope and reset time in `details`), a
 `PROVIDER_LIMIT` event on the task, and the provider's row in `provider_status`, keyed by the
 seat — an OAuth profile derived from `claude` shares `claude`'s seat and therefore its throttle;
 an `api_key` profile is keyed by its own id. A throttle also writes a `provider_windows` row at
 100% for the window it named. A turn that runs writes the windows the agent reported along the way
-(the Claude adapter forwards the SDK's rate-limit events) and sets the provider's row back to `ok`.
+(the Claude adapter forwards the SDK's rate-limit events). Model-scoped evidence is stored
+separately so it cannot disable other models. Successful use advances `last_success_at`, but
+clears a refusal only when it matches the observation taken before the turn; a sibling's newer
+failure survives. Schema 5 adds this evidence without changing task ownership or provider binding.
 
-**Reporting, and nothing more.** `capabilities` shows each provider's availability, with the
-reset time and the other first-class provider named; `doctor` has an advisory check per provider;
-`start_task` on a throttled or logged-out provider is refused with `PROVIDER_UNAVAILABLE` unless
-the request says `ignore_provider_status`. That refusal is the entire fallback policy. Nothing is
-re-queued on another provider, nothing waits for a reset, and a continuation of an existing task is
-not gated at all, because its provider is fixed. The rule in [configuration.md](configuration.md)
-— never a fallback — is about who decides, and the answer is still the caller, now with the facts.
+**Selection before task creation.** MCP `capabilities`, `GET /api/providers`, and
+`taskspindle providers --json` share the availability projection: scope, source, observation time,
+last successful use, staleness, reset time, retry eligibility, and a suggested next action.
+`model_availability` lists known model observations even when a profile has no fixed default.
+A passed reset means `unknown` and eligible for an ordinary attempt, not proven healthy.
+Unresolved refusals remain blocking even when their observations become stale.
+
+The Codex coordinator selects a compatible subscription worker before calling `start_task`,
+preserving explicit provider/model requirements, repository grants, capacity, and review
+independence. Unknown access permits ordinary needed work; it never justifies synthetic probes.
+TaskSpindle receives an explicit provider and does not migrate, retry, or change that task's
+provider. When none is eligible the coordinator reports the constraint and next action.
+An explicit `ignore_provider_status` retry remains bounded to the observation it overrides;
+native cached-login checks alone do not clear a refusal. Metered workers still require separate
+explicit opt-in and are never selected automatically by the work pool.
+
+`taskspindle providers --check --json` optionally reads supported native cached-login/catalog
+evidence without browser login or inference. These checks are separate from task outcomes and
+never establish billing dates, active entitlement, or browser-account identity. Claude personal
+Pro and Max claims are accepted. Other unsupported checks are labeled rather than guessed.
+The dashboard reads old and new task schemas without running migrations.
 
 ## What isolation is, and is not
 

@@ -20,7 +20,12 @@ from typing import Any
 from taskspindle.config import Paths
 
 from .models import parse_timestamp, safe_error, validate_action, validate_provider, validate_result
-from .runtime import _request_browser_stop, _reset_browser_stop, run_browser
+from .runtime import (
+    _request_browser_stop,
+    _reset_browser_stop,
+    run_browser,
+    scheduled_refresh_enabled,
+)
 from .store import SubscriptionStore
 
 __all__ = ["SubscriptionService"]
@@ -67,6 +72,7 @@ class SubscriptionService:
     def status(self) -> dict[str, Any]:
         """Return subscription rows and read-only collector liveness."""
         now = self._now()
+        scheduling_enabled = scheduled_refresh_enabled(self.paths)
         with SubscriptionStore(self.database, read_only=True) as store:
             subscriptions = store.list_subscriptions(now)
             heartbeat = store.collector_heartbeat()
@@ -79,6 +85,7 @@ class SubscriptionService:
             "subscriptions": subscriptions,
             "collector_running": running,
             "collector_last_seen_at": heartbeat,
+            "scheduled_refresh_enabled": scheduling_enabled,
         }
 
     def request(self, provider: str, action: str) -> dict[str, Any]:
@@ -86,7 +93,7 @@ class SubscriptionService:
         provider = validate_provider(provider)
         action = validate_action(action)
         with SubscriptionStore(self.database) as store:
-            return store.enqueue(provider, action, self._now())
+            return store.enqueue(provider, action, self._now(), origin="manual")
 
     def _heartbeat_job(self, job_id: int, stop: threading.Event) -> None:
         """Keep one claimed job owned while its bounded browser runner is active."""
@@ -105,11 +112,21 @@ class SubscriptionService:
     def run_once(self) -> dict[str, Any] | None:
         """Claim and perform at most one job, returning its normalized result."""
         now = self._now()
+        scheduling_enabled = scheduled_refresh_enabled(self.paths)
+        if not self.database.exists():
+            return None
         with SubscriptionStore(self.database) as store:
             if self._watching:
                 store.set_collector_heartbeat(now)
-            store.enqueue_due(now)
-            job = store.claim_next(now, self.owner, LEASE_SECONDS)
+            store.skip_automatic_jobs(now, scheduled_refresh_enabled=scheduling_enabled)
+            if scheduling_enabled:
+                store.enqueue_due(now)
+            job = store.claim_next(
+                now,
+                self.owner,
+                LEASE_SECONDS,
+                include_scheduled=scheduling_enabled,
+            )
         if job is None:
             return None
 

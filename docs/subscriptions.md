@@ -6,6 +6,10 @@ Google AI appears once for a subscription shared by Gemini/AGY. Initial connecti
 one personal account per provider. Account changes require verification and cannot overwrite
 another account's saved subscription silently.
 
+Subscription collection is informational and separate from native worker availability.
+A missing, stale, unsupported, or expiring subscription record never enables, disables, or
+gates a coding provider.
+
 The Connect destinations are:
 
 | Record | Provider settings |
@@ -61,15 +65,46 @@ The browser must read billing data and verify the account before the connection 
 Without extension setup, Connect still opens the billing page and reports **Setup required**;
 opening a page alone never marks the account connected. Reconnect verifies the same account.
 
-Refresh never opens an interactive login prompt. The collector refreshes connected accounts
-after six hours and handles explicitly requested refreshes immediately when it is available.
+Refresh never opens an interactive login prompt. Explicit Connect and Refresh requests are
+always queued immediately. Automatic six-hour refresh is disabled by default and runs only
+when `[subscriptions] scheduled_refresh = true` is explicitly configured.
 Duplicate requests coalesce; collection operations cannot drive the same account concurrently. Authentication
 and account-mismatch failures wait for explicit action. `watch --once` processes at most one
 queued or due job, prints its normalized result, and returns a nonzero exit status when
 collection fails. With no work queued or due, it exits successfully without starting a browser.
+Turning scheduling off marks queued automatic work as skipped. An inherited claimed schedule is
+skipped after its ownership lease expires, without removing successful observations or provider errors. An
+unclassified Refresh job migrated from an older candidate also fails closed; a new explicit
+Refresh records manual intent and runs normally. Pending explicit jobs continue to run whether
+or not scheduling is enabled.
 
 No model request is used to collect billing information. No collector may cancel a plan,
 change billing details, purchase credits, or alter TaskSpindle provider availability.
+
+## Worker access before assignment
+
+The subscription cards also display the associated worker's access evidence from the task
+database. Billing and worker observations retain separate sources and verification times;
+browser and CLI accounts are not assumed to match. ChatGPT is the coordinator, not a worker.
+Google AI is associated with the `agy` product without claiming an account binding.
+
+```sh
+taskspindle providers --json         # cached worker observations; no provider processes
+taskspindle providers --check --json # optional cached login/catalog checks; no inference or browser login
+```
+
+The optional checks support Claude's personal Pro/Max OAuth claim and the pinned Antigravity
+model catalog. Grok is explicitly unsupported for this separate diagnostic; its real task
+outcomes still supply access evidence. A native check cannot verify a billing deadline or clear
+an unresolved task refusal. After restoring access, an explicitly authorized ordinary-task
+retry can use the existing `ignore_provider_status` mechanism; no synthetic prompt is needed.
+
+Before creating new work, the Codex coordinator reads `capabilities` and selects a compatible
+subscription worker using its availability and `model_availability`. Explicit provider/model
+requirements, grants, capacity, and independent review rules still apply. A passed quota reset
+or unknown status permits a real needed attempt; neither proves access. Billing expiry, stale
+dates, or an unsupported billing channel do not automatically disable a worker. No existing
+task is moved to a different provider, and paid worker fallback stays disabled.
 
 ## Browser runtime and configuration
 
@@ -107,6 +142,7 @@ Optional settings in the normal TaskSpindle config:
 platform = "auto" # auto, windows, or native
 browser_mode = "normal" # default; "dedicated" retains the previous separate-profile collector
 chrome_profile = "Default" # Chrome profile directory, e.g. "Default" or "Profile 1"
+scheduled_refresh = false # opt in to automatic six-hour browser collection
 timezone = "America/Chicago"
 connect_timeout_s = 600
 refresh_timeout_s = 180
@@ -118,6 +154,9 @@ refresh_timeout_s = 180
 The timezone is used for date-only billing information. Without an override, local timezone
 discovery falls back to UTC. Executable overrides must be absolute. Browser runtime setup
 and persistent collector service activation are separate operations.
+`subscriptions status --json` reports `scheduled_refresh_enabled` even before a subscription
+database exists. The collector service remains useful with scheduling disabled because it can
+process explicit Connect and Refresh jobs.
 Use the profile directory shown at `chrome://version`, not your Google account name.
 Modern Chrome does not support launching its ordinary profile with Playwright's persistent
 context debugging flags; the extension provides the supported connection to that profile.
@@ -137,6 +176,10 @@ verification time. Observations older than 24 hours are stale. If a recorded acc
 passes before successful verification, the UI requests verification instead of claiming
 the subscription expired. **Expired** requires provider evidence. A valid empty/free
 subscription observation can clear old dates; a malformed response cannot.
+Fresh confirmed access ends within seven days expose `upcoming_end_warning: "within_7_days"`;
+the final day uses `"within_1_day"`. Renewal dates never produce this warning. Stale,
+already-passed, expired, missing, and unsupported observations suppress it while retaining the
+existing stale or verification-needed presentation.
 
 Current live source boundaries are deliberately narrow:
 

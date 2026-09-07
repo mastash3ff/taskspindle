@@ -72,3 +72,47 @@ remain unverified. Their regression fixtures use synthetic identities and shifte
 No subscription was cancelled or modified for testing. No credentials, raw provider payloads,
 payment details, real account identifiers, or real billing dates are included in these docs or
 regression fixtures. Installed-runtime activation and publication require separate approval.
+
+## Opt-in scheduling and warning follow-up
+
+The lightweight follow-up makes scheduled browser collection opt-in through the strict boolean
+`[subscriptions] scheduled_refresh` setting, defaulting to false. Manual Connect and Refresh
+remain available. Queue origin is persisted as manual or scheduled; older unclassified Refresh
+jobs fail closed until a new manual request, and disabling scheduling skips outstanding automatic
+work without changing current snapshots, history, or provider errors.
+
+Fresh confirmed access-end observations add normalized seven-day and one-day warning values.
+Date-only warnings use the provider timezone. Renewal, stale, passed, expired, missing, and
+unsupported records cannot produce an upcoming-end warning, and subscription state remains
+separate from native worker availability.
+
+## Subscription-aware worker selection verification
+
+The worker-selection candidate passed **936 Python tests**, with one optional real-systemd
+worker-unit test skipped because `TASKSPINDLE_REAL_SYSTEMD` was not enabled. Ruff and diff
+whitespace checks passed. Coverage includes personal Claude Pro/Max authentication, scoped
+account/model refusals, quota-reset eligibility, stale/unknown observations, concurrent status
+updates, startup refusal checks, and read-only access to the existing task database format.
+
+Noninteractive native checks on this host reported cached Claude Max authentication and an
+AGY catalog containing 11 Gemini models. These checks establish neither current entitlement
+nor browser/CLI account identity. Grok has no supported noninteractive native status check;
+its availability still uses observed task outcomes. No synthetic inference requests were sent.
+
+The rebuilt isolated dashboard passed desktop and mobile rendering checks in headless Windows
+Chrome with no page errors, horizontal overflow, or mutation requests. Clearly labeled browser
+fixtures verified the one-day/seven-day warnings, expired authentication, and elapsed quota
+reset display. This follow-up did not open extension connection tabs or refresh provider billing.
+Cancellation and other subscription transitions retain fixture coverage rather than new live proof.
+
+The packaged preview has scheduled collection disabled, no active collection jobs, and preserves
+the earlier confirmed subscription snapshots and observation history. Its isolated task database
+is absent, so worker availability correctly displays unknown. Source, wheel, and installed preview
+files were compared byte-for-byte across 65 packaged files. The production dashboard remains
+read-only against schema 4, and the installed MCP runtime and installed work-pool skill are unchanged.
+
+The exact build ledger, full test output, normalized native-check results, Windows screenshots,
+and browser verification script are retained in the local delivery directory
+`~/.local/state/taskspindle-subscription-implementation/20260907/worker-selection/`.
+Candidate task-database schema 5 is tested but has not been activated in the installed runtime.
+Activation of the runtime and revised work-pool guidance, and publication, require separate approval.

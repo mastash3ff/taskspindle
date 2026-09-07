@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS subscription_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     provider TEXT NOT NULL,
     action TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK(origin IN ('manual', 'scheduled', 'legacy')),
     status TEXT NOT NULL,
     expected_account_id TEXT,
     created_at TEXT NOT NULL,
@@ -123,12 +124,25 @@ class SubscriptionStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         if not read_only:
             self._conn.executescript(_SCHEMA)
+            self._migrate_job_origins(self._conn)
             self._conn.executemany(
                 "INSERT OR IGNORE INTO subscription_provider_state(provider) VALUES (?)",
                 ((provider,) for provider in PROVIDERS),
             )
             self._conn.commit()
             os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _migrate_job_origins(conn: sqlite3.Connection) -> None:
+        """Add origin classification without guessing whether old refreshes were manual."""
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(subscription_jobs)")}
+        if "origin" not in columns:
+            conn.execute(
+                "ALTER TABLE subscription_jobs ADD COLUMN origin TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            # Connect has never been scheduled, so this classification is certain.
+            conn.execute("UPDATE subscription_jobs SET origin = 'manual' WHERE action = 'connect'")
 
     def __enter__(self) -> SubscriptionStore:
         return self
@@ -169,11 +183,19 @@ class SubscriptionStore:
         ).fetchone()
 
     @staticmethod
+    def _job_origin(row: sqlite3.Row) -> str:
+        try:
+            return row["origin"]
+        except IndexError:
+            return "manual" if row["action"] == "connect" else "legacy"
+
+    @staticmethod
     def _job_dict(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["id"],
             "provider": row["provider"],
             "action": row["action"],
+            "origin": SubscriptionStore._job_origin(row),
             "status": row["status"],
             "expected_account_id": row["expected_account_id"],
             "created_at": row["created_at"],
@@ -253,15 +275,28 @@ class SubscriptionStore:
             result.append(row)
         return result
 
-    def enqueue(self, provider: str, action: str, now: object) -> dict[str, Any]:
+    def enqueue(
+        self, provider: str, action: str, now: object, *, origin: str = "manual"
+    ) -> dict[str, Any]:
         """Queue one provider operation, coalescing with existing active work."""
 
         provider = validate_provider(provider)
         action = validate_action(action)
+        if origin not in {"manual", "scheduled"}:
+            raise ValueError("unsupported subscription job origin")
         now_stamp = timestamp(now)
         with self._write() as conn:
             existing = self._active_job(conn, provider)
             if existing is not None:
+                if origin == "manual" and self._job_origin(existing) != "manual":
+                    conn.execute(
+                        "UPDATE subscription_jobs SET origin = 'manual' WHERE id = ?",
+                        (existing["id"],),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM subscription_jobs WHERE id = ?", (existing["id"],)
+                    ).fetchone()
+                    assert existing is not None
                 return self._job_dict(existing)
             snapshot = conn.execute(
                 """SELECT state.selected_account_id, snapshot.observation
@@ -278,9 +313,9 @@ class SubscriptionStore:
             expected_account_id = observation["account_id"] if observation is not None else None
             cursor = conn.execute(
                 """INSERT INTO subscription_jobs(
-                       provider, action, status, expected_account_id, created_at
-                   ) VALUES (?, ?, 'queued', ?, ?)""",
-                (provider, action, expected_account_id, now_stamp),
+                       provider, action, origin, status, expected_account_id, created_at
+                   ) VALUES (?, ?, ?, 'queued', ?, ?)""",
+                (provider, action, origin, expected_account_id, now_stamp),
             )
             row = conn.execute(
                 "SELECT * FROM subscription_jobs WHERE id = ?", (cursor.lastrowid,)
@@ -289,7 +324,12 @@ class SubscriptionStore:
             return self._job_dict(row)
 
     def claim_next(
-        self, now: object, owner: str, lease_seconds: int = 300
+        self,
+        now: object,
+        owner: str,
+        lease_seconds: int = 300,
+        *,
+        include_scheduled: bool = True,
     ) -> dict[str, Any] | None:
         """Atomically claim the oldest queued or expired job."""
 
@@ -297,15 +337,18 @@ class SubscriptionStore:
             raise ValueError("owner must be a bounded non-empty value")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if type(include_scheduled) is not bool:
+            raise ValueError("include_scheduled must be a boolean")
         now_stamp = timestamp(now)
         expires = timestamp(parse_timestamp(now_stamp) + timedelta(seconds=lease_seconds))
         with self._write() as conn:
             row = conn.execute(
                 """SELECT * FROM subscription_jobs
-                   WHERE status = 'queued'
-                      OR (status = 'running' AND lease_expires_at <= ?)
+                   WHERE (status = 'queued'
+                      OR (status = 'running' AND lease_expires_at <= ?))
+                     AND (origin = 'manual' OR (? AND origin = 'scheduled'))
                    ORDER BY id LIMIT 1""",
-                (now_stamp,),
+                (now_stamp, include_scheduled),
             ).fetchone()
             if row is None:
                 return None
@@ -445,8 +488,8 @@ class SubscriptionStore:
                 observation = _loads(snapshot["observation"])
                 cursor = conn.execute(
                     """INSERT INTO subscription_jobs(
-                           provider, action, status, expected_account_id, created_at
-                       ) VALUES (?, 'refresh', 'queued', ?, ?)""",
+                           provider, action, origin, status, expected_account_id, created_at
+                       ) VALUES (?, 'refresh', 'scheduled', 'queued', ?, ?)""",
                     (snapshot["provider"], observation["account_id"], now_stamp),
                 )
                 row = conn.execute(
@@ -455,6 +498,32 @@ class SubscriptionStore:
                 assert row is not None
                 enqueued.append(self._job_dict(row))
         return enqueued
+
+    def skip_automatic_jobs(self, now: object, *, scheduled_refresh_enabled: bool) -> int:
+        """Fail closed old uncertain work and schedules disabled before browser claim."""
+
+        if type(scheduled_refresh_enabled) is not bool:
+            raise ValueError("scheduled_refresh_enabled must be a boolean")
+        now_stamp = timestamp(now)
+        with self._write() as conn:
+            rows = conn.execute(
+                """SELECT id, origin FROM subscription_jobs
+                   WHERE (status = 'queued'
+                      OR (status = 'running'
+                          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)))
+                     AND (origin = 'legacy' OR (? = 0 AND origin = 'scheduled'))""",
+                (now_stamp, scheduled_refresh_enabled),
+            ).fetchall()
+            for row in rows:
+                code = "LEGACY_JOB_UNCERTAIN" if row["origin"] == "legacy" else "SCHEDULE_DISABLED"
+                conn.execute(
+                    """UPDATE subscription_jobs
+                       SET status = 'skipped', finished_at = ?, error = ?, owner = NULL,
+                           lease_expires_at = NULL
+                       WHERE id = ?""",
+                    (now_stamp, _dumps(safe_error({"code": code})), row["id"]),
+                )
+            return len(rows)
 
     def set_collector_heartbeat(self, now: object) -> None:
         """Record liveness independently from billing attempts and successes."""

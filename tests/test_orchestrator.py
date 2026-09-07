@@ -699,7 +699,51 @@ def test_a_throttled_provider_is_refused_until_its_reset_unless_overridden(
         REVIEWER, "throttled", code="PROVIDER_THROTTLED", reset_at="2000-01-01T00:00:00Z",
         source="acp_error",
     )
-    assert harness.orchestrator.capabilities()["providers"][1]["availability"]["state"] == "ok"
+    elapsed = harness.orchestrator.capabilities()["providers"][1]["availability"]
+    assert elapsed["state"] == "unknown"
+    assert elapsed["stale"] is True
+    assert elapsed["retry_eligible"] is True
+
+
+def test_initial_override_is_bound_to_exact_account_and_model_observations(
+    harness: Harness, make_repo,
+) -> None:
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    store = harness.orchestrator.store
+    store.set_provider_status(
+        AUTHOR, "auth_expired", source="acp_error", reason="legacy-secret-account-value",
+    )
+    task_id = harness.orchestrator.start_task(implement_request(
+        repo, model="model-a", ignore_provider_status=True,
+    ))["task_id"]
+    task = store.get_task(task_id)
+    profile = harness.orchestrator.profiles[AUTHOR]
+    assert task is not None
+    assert harness.orchestrator._initial_status_override(task, profile)
+    event_text = json.dumps(store.list_events(task_id))
+    assert "legacy-secret" not in event_text
+
+    store.set_provider_status(AUTHOR, "access_denied", source="acp_error")
+    assert not harness.orchestrator._initial_status_override(task, profile)
+
+    store.set_provider_model_status(
+        REVIEWER, "model-a", "model_unavailable", source="acp_error",
+        reason="legacy-secret-model-value",
+    )
+    model_task_id = harness.orchestrator.start_task(implement_request(
+        repo, provider=REVIEWER, model="model-a", ignore_provider_status=True,
+    ))["task_id"]
+    model_task = store.get_task(model_task_id)
+    model_profile = harness.orchestrator.profiles[REVIEWER]
+    assert model_task is not None
+    assert harness.orchestrator._initial_status_override(model_task, model_profile)
+    store.set_provider_model_status(
+        REVIEWER, "model-a", "model_unavailable", source="rate_limit_event",
+    )
+    assert not harness.orchestrator._initial_status_override(model_task, model_profile)
+    assert "legacy-secret" not in json.dumps(store.list_events(model_task_id))
 
 
 def test_usage_report_rolls_the_finished_tasks_up(harness: Harness, make_repo) -> None:

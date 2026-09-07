@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -74,6 +74,8 @@ ERROR_MESSAGES: dict[str, str] = {
     "RUNTIME_UNAVAILABLE": "The subscription collector runtime is unavailable.",
     "COLLECTOR_PROTOCOL_ERROR": "The subscription collector returned an invalid response.",
     "COLLECTOR_FAILED": "The subscription check failed.",
+    "SCHEDULE_DISABLED": "The queued scheduled refresh was skipped because scheduling is disabled.",
+    "LEGACY_JOB_UNCERTAIN": "The queued refresh requires a new explicit refresh request.",
 }
 BLOCKING_ERROR_CODES = frozenset(
     {"AUTH_REQUIRED", "ACCOUNT_MISMATCH", "UNSUPPORTED_BILLING_CHANNEL"}
@@ -314,6 +316,7 @@ def presentation_values(
 
     days_remaining: int | None = None
     end_passed_unverified = False
+    upcoming_end_warning: Literal["within_7_days", "within_1_day"] | None = None
     if observation is not None and observation.get("date_precision"):
         precision = observation["date_precision"]
         timezone = observation["timezone"]
@@ -326,11 +329,24 @@ def presentation_values(
                 end_passed = current.astimezone(zone).date() > end_date
             else:
                 end_instant = _billing_instant(access_end)
-                end_passed = current.astimezone(UTC) > end_instant
+                end_passed = current.astimezone(UTC) >= end_instant
             end_passed_unverified = end_passed and observation.get("status") != "expired"
+            if freshness == "fresh" and not end_passed and observation.get("status") != "expired":
+                if precision == "date":
+                    if 0 <= days_remaining <= 1:
+                        upcoming_end_warning = "within_1_day"
+                    elif days_remaining <= 7:
+                        upcoming_end_warning = "within_7_days"
+                else:
+                    remaining = _billing_instant(access_end) - current.astimezone(UTC)
+                    if timedelta(0) < remaining <= timedelta(days=1):
+                        upcoming_end_warning = "within_1_day"
+                    elif timedelta(0) < remaining <= timedelta(days=7):
+                        upcoming_end_warning = "within_7_days"
 
     return {
         "freshness": freshness,
         "days_remaining": days_remaining,
         "end_passed_unverified": end_passed_unverified,
+        "upcoming_end_warning": upcoming_end_warning,
     }

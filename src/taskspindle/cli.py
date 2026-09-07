@@ -3,7 +3,7 @@
 The MCP server is what a Codex
 session talks to, and ``worker`` and ``accept`` exist so that the two detached entry points the
 systemd units run can also be run by hand when something has gone wrong. ``setup``, ``doctor``,
-``auth``, ``discover``, ``usage``, ``subscriptions`` and ``web`` are the ones a person types.
+``auth``, ``discover``, ``usage``, ``providers``, ``subscriptions`` and ``web`` are the ones a person types.
 
 Nothing here decides anything. Each subcommand resolves the paths, hands off to the module that
 owns the work, and turns whatever comes back into an exit code and a line of output. Failures are
@@ -79,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument("--json", action="store_true", help="print the report as JSON")
 
+    provider_status = sub.add_parser(
+        "providers", help="show cached worker availability without starting work",
+    )
+    provider_status.add_argument("--json", action="store_true", help="print the report as JSON")
+    provider_status.add_argument(
+        "--check", action="store_true",
+        help="also check supported native cached logins/catalogs without browser login or inference",
+    )
+
     sub.add_parser("mcp", help="run the stdio MCP server (what Codex launches)")
 
     worker = sub.add_parser("worker", help="run one turn of a task by hand")
@@ -148,6 +157,8 @@ def main(argv: list[str] | None = None) -> int:
         return _auth_agy(args.runtime_dir)
     if args.command == "doctor":
         return _doctor(live_probes=not args.no_live, as_json=args.json)
+    if args.command == "providers":
+        return _providers_status(check=args.check, as_json=args.json)
     if args.command == "mcp":
         return _mcp()
     if args.command == "worker":
@@ -261,16 +272,73 @@ def _doctor(*, live_probes: bool, as_json: bool) -> int:
 
 def _provider_status(paths: Paths) -> list[dict[str, Any]]:
     """The provider rows, when a store exists; a machine that never ran a task has none."""
-    from .store import Store, StoreError
+    import sqlite3
+
+    from .web.db import ReadOnlyStore
 
     database = paths.state_dir / "taskspindle.sqlite3"
     if not database.exists():
         return []
     try:
-        with Store.open(database) as store:
+        with ReadOnlyStore(database) as store:
             return store.list_provider_status()
-    except (StoreError, OSError):
+    except (sqlite3.Error, OSError):
         return []
+
+
+def _providers_status(*, check: bool, as_json: bool) -> int:
+    """Project the same availability as MCP/web; native checks never clear task evidence."""
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from .providers import ProfileError
+    from .service import model_availability, provider_availability
+    from .web.db import ReadOnlyStore
+
+    paths = resolve_paths()
+    try:
+        profiles = _profiles(paths)
+        rows = []
+        with ReadOnlyStore(paths.state_dir / "taskspindle.sqlite3") as store:
+            for profile in sorted(profiles.values(), key=lambda item: item.id):
+                checked_at = datetime.now(UTC)
+                row = {
+                    "id": profile.id, "family": profile.family,
+                    "auth": profile.auth, "model": profile.model,
+                    "availability": provider_availability(
+                        store, profile, now=checked_at, model=profile.model,
+                    ),
+                    "model_availability": model_availability(store, profile, now=checked_at),
+                }
+                if check:
+                    from .access_checks import check_native_access
+
+                    row["native_check"] = check_native_access(profile, os.environ)
+                rows.append(row)
+    except (ConfigError, ProfileError, OSError, sqlite3.Error):
+        if as_json:
+            print(json.dumps({"error": "PROVIDER_STATUS_UNAVAILABLE"}))
+        else:
+            print(
+                "taskspindle providers: configuration or provider status could not be read", file=sys.stderr,
+            )
+        return 1
+    if as_json:
+        print(json.dumps({"providers": rows}, indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            availability = row["availability"]
+            print(f"{row['id']}: {availability['state']} — {availability.get('next_action', 'verify')}")
+            print(f"  Last successful use: {availability.get('last_success_at') or 'not observed'}")
+            if availability.get("reset_at"):
+                print(f"  Reported quota reset: {availability['reset_at']}")
+            for model in row["model_availability"]:
+                if model["affected_model"] != availability.get("affected_model"):
+                    print(f"  Model {model['affected_model']}: {model['state']} — {model['next_action']}")
+            if check:
+                native = row["native_check"]
+                print(f"  Native check: {native['state']} — {native['detail']}")
+    return 0
 
 
 def _profiles(paths: Paths) -> dict[str, Any]:

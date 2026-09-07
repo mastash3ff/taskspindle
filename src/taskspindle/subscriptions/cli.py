@@ -116,11 +116,17 @@ def service_unit(paths: Paths, *, env: Mapping[str, str] | None = None) -> str:
 def _print_status(payload: dict[str, Any]) -> None:
     running = "running" if payload.get("collector_running") else "not running"
     print(f"Subscription collector: {running}")
+    scheduling = "enabled" if payload.get("scheduled_refresh_enabled") else "disabled"
+    print(f"Scheduled refresh: {scheduling}")
     for row in payload.get("subscriptions", []):
         label = row.get("label") or row.get("provider") or "Unknown provider"
         state = row.get("status") or "unknown"
         if row.get("end_passed_unverified"):
             state = "recorded access end passed; verification needed"
+        elif row.get("upcoming_end_warning") == "within_1_day":
+            state += "; access ends within one day"
+        elif row.get("upcoming_end_warning") == "within_7_days":
+            state += "; access ends within seven days"
         error = row.get("error")
         if error:
             state += f"; {error.get('message', 'verification failed')}"

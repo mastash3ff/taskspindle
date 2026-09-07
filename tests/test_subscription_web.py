@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import sqlite3
 import warnings
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,7 @@ def _row(provider: str, **updates: Any) -> dict[str, Any]:
         "freshness": "fresh",
         "days_remaining": 10,
         "end_passed_unverified": False,
+        "upcoming_end_warning": None,
         "operation": None,
     }
     row.update(updates)
@@ -137,6 +139,7 @@ class StubSubscriptionService:
             ],
             "collector_running": True,
             "collector_last_seen_at": "2030-01-02T11:59:00Z",
+            "scheduled_refresh_enabled": False,
         }
 
     def status(self) -> dict[str, Any]:
@@ -215,6 +218,8 @@ def test_subscription_status_returns_cached_rows_and_ephemeral_csrf_without_writ
         "grok",
     ]
     assert body["collector_running"] is True
+    assert body["scheduled_refresh_enabled"] is False
+    assert all("upcoming_end_warning" in row for row in body["subscriptions"])
     assert isinstance(body["csrf_token"], str) and len(body["csrf_token"]) >= 32
     assert before == after == []
 
@@ -514,3 +519,168 @@ def test_subscription_page_exposes_navigation_and_local_assets(tmp_path: Path) -
     assert 'href="#/subscriptions"' in page.text
     assert 'data-route="subscriptions"' in page.text
     assert script.status_code == 200
+
+
+def test_provider_status_for_subscription_view_is_read_only_and_uses_shared_projection(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    client = _client(paths, StubSubscriptionService())
+
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    response = client.get("/api/providers")
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    assert response.status_code == 200
+    availability = response.json()["providers"][0]["availability"]
+    assert {
+        "state",
+        "last_success_at",
+        "source",
+        "scope",
+        "affected_model",
+        "stale",
+        "next_action",
+        "retry_eligible",
+    } <= availability.keys()
+    assert response.json()["providers"][0]["model_availability"] == []
+    assert before == after == []
+
+
+def test_provider_api_sanitizes_legacy_status_reason_and_source_in_entire_response(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    reason_secret = "PRIVATE legacy CLI refusal with bearer credential"
+    source_secret = "PRIVATE /home/account/oauth.json"
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        store.set_provider_status(
+            "claude",
+            "access_denied",
+            code="PROVIDER_ACCESS_DENIED",
+            reason=reason_secret,
+            source=source_secret,
+            observed_at="2030-01-02T12:00:00Z",
+        )
+    response = _client(paths, StubSubscriptionService()).get("/api/providers")
+
+    assert response.status_code == 200
+    assert reason_secret not in response.text
+    assert source_secret not in response.text
+    status = response.json()["status"][0]
+    assert status["provider"] == "claude"
+    assert status["state"] == "access_denied"
+    assert status["code"] == "PROVIDER_ACCESS_DENIED"
+    assert status["reason"] == "The provider denied account access."
+    assert status["source"] == "legacy"
+
+
+def test_provider_api_requests_model_scoped_shared_availability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str, str | None]] = []
+    projection = {
+        "state": "model_unavailable",
+        "status_key": "agy",
+        "code": "MODEL_UNAVAILABLE",
+        "window": None,
+        "reset_at": None,
+        "reason": "The selected model is unavailable.",
+        "observed_at": "2030-01-02T12:00:00Z",
+        "suggested_alternative": None,
+        "last_success_at": "2030-01-02T11:00:00Z",
+        "source": "worker_error",
+        "scope": "model",
+        "affected_model": "gemini-test",
+        "stale": False,
+        "next_action": "choose_model",
+        "retry_eligible": False,
+    }
+
+    def fake_availability(
+        store: Any, profile: Profile, *, now: Any, model: str | None = None
+    ) -> dict[str, Any]:
+        del store, now
+        seen.append((profile.id, model))
+        return projection
+
+    monkeypatch.setattr("taskspindle.web.app.provider_availability", fake_availability)
+    model_projection = [
+        {
+            **projection,
+            "affected_model": "gemini-other",
+            "observed_at": "2030-01-02T10:00:00Z",
+        }
+    ]
+    monkeypatch.setattr(
+        "taskspindle.web.app.model_availability",
+        lambda store, profile, *, now: model_projection,
+    )
+    profile = Profile(
+        id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
+    )
+    app = build_app(
+        _paths(tmp_path), {"agy": profile}, subscription_service=StubSubscriptionService()
+    )
+    response = TestClient(app).get("/api/providers")
+
+    assert response.status_code == 200
+    assert response.json()["providers"][0]["availability"] == projection
+    assert response.json()["providers"][0]["model_availability"] == model_projection
+    assert seen == [("agy", "gemini-test")]
+
+
+def test_provider_api_reads_a_pre_model_status_database_without_migrating_it(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    db_path = paths.state_dir / "taskspindle.sqlite3"
+    with Store.open(db_path):
+        pass
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE provider_model_status")
+    before = db_path.read_bytes()
+    profile = Profile(
+        id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
+    )
+    client = TestClient(
+        build_app(paths, {"agy": profile}, subscription_service=StubSubscriptionService())
+    )
+
+    response = client.get("/api/providers")
+
+    assert response.status_code == 200
+    assert response.json()["providers"][0]["availability"]["state"] == "unknown"
+    assert db_path.read_bytes() == before
+
+
+def test_subscription_script_separates_worker_access_and_never_posts_while_rendering(
+    tmp_path: Path,
+) -> None:
+    script = _client(_paths(tmp_path), StubSubscriptionService()).get("/static/app.js").text
+    render = script.split("function renderSubscriptions()", 1)[1].split(
+        "function markSubscriptionPending", 1
+    )[0]
+
+    assert 'getJSON("/api/subscriptions")' in render
+    assert 'getJSON("/api/providers")' in render
+    assert "fetch(" not in render
+    assert "availability.reason" not in script
+    assert "command_name" not in render
+    assert "gateway_host" not in render
+    for text in [
+        "Subscription",
+        "Worker access",
+        "Coordinator only",
+        "ChatGPT is used by the Codex coordinator.",
+        "Product association only",
+        "Scheduled browser checks: Off (default)",
+        "Browser subscription and worker CLI accounts are not assumed to match",
+        "Access is scheduled to end within one day",
+        "Access is scheduled to end within seven days",
+        "Verification needed — the recorded access end has passed",
+        "Model · ",
+        "Model-specific status",
+        "Use Connect or Refresh now to check billing.",
+    ]:
+        assert text in script
