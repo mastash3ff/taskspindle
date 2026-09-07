@@ -77,6 +77,16 @@ context's profile path alone cannot supply this behavior.
 
 ## Candidate boundary
 
+The user supplied Claude's `https://claude.ai/new#settings/billing` and Grok's
+`https://grok.com/?_s=usage` as settings destinations. Both the Chrome launcher and
+collector now use those routes; the extractors also recognize their previous billing
+routes. Claude's normalized source strips the settings fragment and preserves `/new`;
+historical `/settings/billing` observations remain valid. Grok's Usage dialog must still
+provide identity, plan, direct-web evidence, and an explicit billing boundary. Route
+acceptance and quota-date rejection have synthetic regression coverage, not live
+subscription-date proof. Google One settings remains the shared Gemini/Antigravity
+personal subscription destination, confirmed by current official Google documentation.
+
 Exact build checksums and current verification results are recorded outside the wheel in the
 local candidate build ledger. The preview uses the candidate wheel and its own state/configuration.
 The installed MCP runtime and the existing dashboard on port 8765 have not been activated from

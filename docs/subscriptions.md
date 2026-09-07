@@ -6,6 +6,22 @@ Google AI appears once for a subscription shared by Gemini/AGY. Initial connecti
 one personal account per provider. Account changes require verification and cannot overwrite
 another account's saved subscription silently.
 
+The Connect destinations are:
+
+| Record | Provider settings |
+| --- | --- |
+| ChatGPT | <https://chatgpt.com/#settings/Billing> |
+| Claude | <https://claude.ai/new#settings/billing> |
+| Grok | <https://grok.com/?_s=usage> |
+| Google AI (Gemini and Antigravity) | <https://one.google.com/settings> |
+
+Personal Antigravity benefits are included in Google AI Pro/Ultra; this is the same
+membership used by Gemini, managed through Google One. See the official
+[Antigravity plans](https://antigravity.google/pricing) and
+[Google AI subscription management](https://support.google.com/googleone/answer/16476748?hl=en).
+Grok's usage page must display an explicit subscription billing date for collection to
+succeed. Usage/quota reset dates never become renewal or access-end dates.
+
 Only subscriptions purchased directly from provider websites are in scope. Apple, Google
 Play, and X Premium-derived subscriptions are reported as unsupported billing channels.
 An adapter being installed does not prove that a live provider's billing data was readable.

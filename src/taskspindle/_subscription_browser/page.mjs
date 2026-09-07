@@ -49,8 +49,9 @@ export async function readEvidence(provider) {
   if (location.hostname !== allowedHosts[provider]) return {};
 
   const billingRoute = provider === 'chatgpt' ? /settings\/billing/i.test(location.hash)
-    : provider === 'claude' ? /^\/settings\/billing\/?$/.test(location.pathname)
-    : provider === 'grok' ? new URLSearchParams(location.search).get('_s') === 'billing'
+    : provider === 'claude' ? (/^\/settings\/billing\/?$/.test(location.pathname) ||
+      (/^\/new\/?$/.test(location.pathname) && /^#settings\/billing\/?$/.test(location.hash)))
+    : provider === 'grok' ? location.pathname === '/' && ['billing', 'usage'].includes(new URLSearchParams(location.search).get('_s'))
     : /^\/settings\/?$/.test(location.pathname);
   if (!billingRoute && !(provider === 'chatgpt' && location.pathname === '/')) return {};
   const conversation = '[data-message-author-role], [data-testid*="conversation"], [data-testid*="chat-message"], [data-testid*="message"], [role="log"], [contenteditable="true"]';
@@ -61,7 +62,8 @@ export async function readEvidence(provider) {
   const roots = [...document.querySelectorAll(rootSelector)].filter(el => {
     if (!visible(el) || el.closest(conversation) || el.querySelector(conversation)) return false;
     const names = [el.getAttribute('aria-label') || '', ...[...el.querySelectorAll('h1, h2, h3, [role="heading"]')].filter(visible).map(heading => heading.innerText || '')];
-    return names.some(name => /^(?:Settings|Billing|Subscription|Manage (?:subscription|membership)|Google One settings)$/i.test(name.trim()));
+    return names.some(name => /^(?:Settings|Billing|Subscription|Manage (?:subscription|membership)|Google One settings)$/i.test(name.trim()) ||
+      (provider === 'grok' && /^Usage$/i.test(name.trim())));
   });
   const innermost = roots.filter(root => !roots.some(other => other !== root && root.contains(other)));
   if (innermost.length !== 1) {

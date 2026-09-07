@@ -23,7 +23,7 @@ PROVIDERS: dict[str, dict[str, str]] = {
     },
     "claude": {
         "label": "Claude",
-        "billing_url": "https://claude.ai/settings/billing",
+        "billing_url": "https://claude.ai/new#settings/billing",
     },
     "google_ai": {
         "label": "Google AI",
@@ -31,7 +31,7 @@ PROVIDERS: dict[str, dict[str, str]] = {
     },
     "grok": {
         "label": "Grok",
-        "billing_url": "https://grok.com/?_s=billing",
+        "billing_url": "https://grok.com/?_s=usage",
     },
 }
 PROVIDER_IDS = tuple(PROVIDERS)
@@ -202,7 +202,7 @@ class SubscriptionObservation(BaseModel):
     def _dates_match_precision(self) -> SubscriptionObservation:
         expected_sources = {
             "chatgpt": ("chatgpt.com", frozenset({"/"})),
-            "claude": ("claude.ai", frozenset({"/settings/billing"})),
+            "claude": ("claude.ai", frozenset({"/new", "/settings/billing"})),
             "google_ai": ("one.google.com", frozenset({"/settings"})),
             "grok": ("grok.com", frozenset({"/"})),
         }

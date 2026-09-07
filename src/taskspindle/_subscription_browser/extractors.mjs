@@ -7,9 +7,9 @@ export const PLANS = Object.freeze({
 });
 export const URLS = Object.freeze({
   chatgpt: 'https://chatgpt.com/#settings/Billing',
-  claude: 'https://claude.ai/settings/billing',
+  claude: 'https://claude.ai/new#settings/billing',
   google_ai: 'https://one.google.com/settings',
-  grok: 'https://grok.com/?_s=billing',
+  grok: 'https://grok.com/?_s=usage',
 });
 export const MESSAGES = Object.freeze({
   SETUP_REQUIRED: 'Install and pair the Playwright extension in the selected Chrome profile.',

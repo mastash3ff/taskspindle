@@ -51,12 +51,12 @@ test('request rejects normal Chrome profiles and refresh without account binding
 // Synthetic contract examples, NOT snapshots of signed-in vendor pages. They
 // exercise the narrowly labeled DOM fallback without implying live validation.
 async function dom(provider, text, extra = {}) {
-  const urls = {chatgpt:'https://chatgpt.com/#settings/Billing',claude:'https://claude.ai/settings/billing',google_ai:'https://one.google.com/settings',grok:'https://grok.com/?_s=billing'};
+  const urls = {chatgpt:'https://chatgpt.com/#settings/Billing',claude:'https://claude.ai/new#settings/billing',google_ai:'https://one.google.com/settings',grok:'https://grok.com/?_s=usage'};
   globalThis.window = {};
   globalThis.location = new URL(extra.pageURL || urls[provider]);
   const root = {
     innerText: text, getClientRects:()=>[{}], closest:()=>null, contains:()=>false,
-    getAttribute:name=>name === 'aria-label' ? 'Billing' : null,
+    getAttribute:name=>name === 'aria-label' ? (extra.rootName || 'Billing') : null,
     querySelector:()=>null, querySelectorAll:()=>[],
   };
   globalThis.document = {body:{innerText:text},title:'',querySelector:()=>null,querySelectorAll:selector=>selector.includes('dialog')?[root]:[],...extra};
@@ -71,6 +71,30 @@ test('Claude labeled renewal preserves date-only precision and ignores usage res
   assert.equal(result.observation.date_precision,'date');
   assert.equal(result.observation.account_label,'a***@e***.com');
   assert.equal(JSON.stringify(result).includes('alice@example.com'),false);
+});
+test('Claude accepts the supplied settings overlay and legacy billing route only', async () => {
+  const text = 'Email\nalice@example.com\nPro\nPayment method\nNext billing date\nOctober 9, 2026';
+  for (const pageURL of ['https://claude.ai/new#settings/billing','https://claude.ai/settings/billing']) {
+    const result = normalize('claude',await dom('claude',text,{pageURL}),null,'UTC');
+    assert.equal(result.ok,true);
+    assert.equal(result.observation.source_url,'https://claude.ai/new');
+  }
+  for (const pageURL of ['https://claude.ai/new','https://claude.ai/new#settings/general','https://claude.ai/new#settings/billing-other','https://claude.ai/chat/example#settings/billing']) {
+    assert.equal(normalize('claude',await dom('claude',text,{pageURL}),null,'UTC').error.code,'PARSE_CHANGED');
+  }
+  assert.equal(normalize('claude',await dom('claude',text,{querySelectorAll:()=>[]}),null,'UTC').error.code,'PARSE_CHANGED');
+});
+test('Grok usage accepts explicit subscription dates and never uses quota reset dates', async () => {
+  const text = 'Email\nalice@example.com\nSuperGrok\nBilling details\nUsage resets September 10, 2026';
+  for (const pageURL of ['https://grok.com/?_s=usage','https://grok.com/?_s=billing']) {
+    const result = normalize('grok',await dom('grok',text+'\nRenews on October 9, 2026',{pageURL,rootName:'Usage'}),null,'UTC');
+    assert.equal(result.ok,true);
+    assert.equal(result.observation.renews_at,'2026-10-09');
+  }
+  assert.equal(normalize('grok',await dom('grok',text,{rootName:'Usage'}),null,'UTC').error.code,'PARSE_CHANGED');
+  assert.equal(normalize('grok',await dom('grok',text+'\nRenews on October 9, 2026',{pageURL:'https://grok.com/?_s=general',rootName:'Usage'}),null,'UTC').error.code,'PARSE_CHANGED');
+  const root = {getClientRects:()=>[{}],closest:()=>null,querySelector:()=>({})};
+  assert.equal(normalize('grok',await dom('grok',text,{querySelectorAll:selector=>selector.includes('dialog')?[root]:[]}),null,'UTC').error.code,'PARSE_CHANGED');
 });
 test('Google AI canceled fixture and Grok renewing fixture stay product scoped', async () => {
   const google = await dom('google_ai','Email\nalice@example.com\nGoogle AI Pro\nPayment method\nCancelled\nAccess ends on October 9, 2026');
