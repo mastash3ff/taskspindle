@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -95,12 +96,27 @@ def claude_like(script_path: Path) -> Profile:
 
 
 async def run_as_claude(store, paths, task, script_path: Path) -> TaskState:
+    def cached_oauth(command: list[str]) -> subprocess.CompletedProcess[str]:
+        assert command == ["claude", "auth", "status"]
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "subscriptionType": "pro",
+                "apiProvider": "firstParty",
+            }),
+            stderr="",
+        )
+
     return await runner.run_worker(
         store,
         task.id,
         profiles={task.provider: claude_like(script_path)},
         paths=paths,
         boot="boot-under-test",
+        oauth_runner=cached_oauth,
         signals=False,
     )
 
