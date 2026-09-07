@@ -27,6 +27,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends bubblewrap
+      - name: Enable and verify sandbox namespaces on the disposable runner
+        run: |
+          # Ubuntu 24.04 restricts the capabilities needed for bubblewrap's UID map.
+          # This one-boot setting applies only to the GitHub-hosted test VM.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --ro-bind / / --proc /proc --dev /dev /bin/true
       - run: uv sync --frozen
       - run: uv run pytest -q
       - run: uv run ruff check .
