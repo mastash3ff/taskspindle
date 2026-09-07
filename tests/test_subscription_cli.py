@@ -79,3 +79,55 @@ def test_service_unit_quotes_paths_and_rejects_line_injection(tmp_path: Path) ->
     assert 'with space%%/config.toml"' in result
     with pytest.raises(ValueError, match="line breaks"):
         service_unit(paths, env={"TZ": "UTC\nExecStart=/bin/false"})
+
+
+def test_extension_token_uses_hidden_input_private_storage_and_no_database(
+    isolated: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from taskspindle.subscriptions import cli as subscription_cli
+
+    monkeypatch.setattr(subscription_cli.sys.stdin, "isatty", lambda: True)
+    secret = "test-only-extension-connection-secret"
+    monkeypatch.setattr(subscription_cli.getpass, "getpass", lambda prompt: secret)
+    assert cli.main(["subscriptions", "setup-extension"]) == 0
+    token = isolated / "data" / "taskspindle" / "subscriptions" / "extension-token"
+    assert token.read_text() == secret
+    assert token.stat().st_mode & 0o777 == 0o600
+    assert token.parent.stat().st_mode & 0o777 == 0o700
+    output = capsys.readouterr()
+    assert secret not in output.out + output.err
+    assert not list(isolated.rglob("*.sqlite3"))
+    assert not list(token.parent.glob(".extension-token-*"))
+
+
+def test_extension_setup_refuses_noninteractive_input_and_symlink(
+    isolated: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from taskspindle.subscriptions import cli as subscription_cli
+
+    monkeypatch.setattr(subscription_cli.sys.stdin, "isatty", lambda: False)
+    assert cli.main(["subscriptions", "setup-extension"]) == 1
+    assert not list(isolated.iterdir())
+    monkeypatch.setattr(subscription_cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(subscription_cli.getpass, "getpass", lambda prompt: "test-secret")
+    token = isolated / "data" / "taskspindle" / "subscriptions" / "extension-token"
+    token.parent.mkdir(parents=True)
+    unrelated = isolated / "unrelated"
+    unrelated.write_text("preserve")
+    token.symlink_to(unrelated)
+    assert cli.main(["subscriptions", "setup-extension"]) == 1
+    assert unrelated.read_text() == "preserve"
+    output = capsys.readouterr()
+    assert "test-secret" not in output.out + output.err
+
+
+@pytest.mark.parametrize("token", ["", "secret\nnext", "secret value", "s" * 513, "secret\x00"])
+def test_extension_setup_rejects_invalid_tokens_without_persisting(
+    token: str, isolated: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from taskspindle.subscriptions import cli as subscription_cli
+
+    monkeypatch.setattr(subscription_cli.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(subscription_cli.getpass, "getpass", lambda prompt: token)
+    assert cli.main(["subscriptions", "setup-extension"]) == 1
+    assert not list(isolated.iterdir())

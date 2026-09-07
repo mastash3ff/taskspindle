@@ -5,10 +5,10 @@ live-verified merely because a parser or browser helper exists.
 
 | Provider | Acquisition design | Live verification |
 | --- | --- | --- |
-| ChatGPT | Authenticated billing response: `active_until` and `will_renew`; CodexBar reference | Dedicated Windows Connect attempted; no account/billing observation confirmed. Sign-in and reopen/refresh proof remain pending. |
-| Claude | Authenticated billing page, verified account and explicit renewal/access-end wording | Pending dedicated-profile sign-in and observed page contract |
-| Google AI | Google One billing page; one record for shared Gemini/AGY benefits | Pending dedicated-profile sign-in and observed page contract |
-| Grok | Direct SuperGrok billing page; X/app-store billing excluded | Pending dedicated-profile sign-in and observed page contract |
+| ChatGPT | Authenticated billing response: `active_until` and `will_renew`; CodexBar reference | Earlier dedicated Connect did not confirm billing. Normal-profile extension connection, billing extraction, and reconnect/refresh remain pending. |
+| Claude | Authenticated billing page, verified account and explicit renewal/access-end wording | Pending normal-profile extension connection and observed page contract |
+| Google AI | Google One billing page; one record for shared Gemini/AGY benefits | Pending normal-profile extension connection and observed page contract |
+| Grok | Direct SuperGrok billing page; X/app-store billing excluded | Pending normal-profile extension connection and observed page contract |
 
 ChatGPT source reference:
 [CodexBar subscription capture](https://github.com/steipete/CodexBar/blob/main/Sources/CodexBarCore/OpenAIWeb/OpenAISubscriptionMetadata.swift).
@@ -19,7 +19,10 @@ provider schemas must yield a visible verification error rather than invented da
 Live cancellation behavior must remain explicitly unverified unless observed on an existing
 cancelled subscription. Never cancel a subscription for validation.
 
-## Observed integration evidence (2026-09-07)
+## Previous dedicated-mode integration evidence (2026-09-07)
+
+The following checks describe the earlier dedicated-profile build (`0e1849a`). They do not
+establish successful normal-profile collection through the newly selected extension bridge.
 
 - Windows Node `v24.14.0`, installed Windows Chrome, and pinned `playwright-core 1.63.0`
   successfully provisioned and launched the dedicated collector runtime.
@@ -50,11 +53,31 @@ added stricter settings-container isolation and explicit logged-out navigation d
 credentials, raw billing responses, payment details, or screenshots of authenticated billing
 pages were saved as fixtures. Existing-cancelled-subscription live proof remains outstanding.
 
+## Normal Chrome change
+
+The user requested Connect use normal Chrome with its Google profile and saved passwords.
+The default browser mode now uses the official Playwright Chrome extension; the previous
+dedicated helper remains opt-in. A read-only check found one signed-in Windows Chrome
+profile, `Default`, and no installed Playwright extension. No Chrome password or cookie
+database was read. Extension installation and the private connection token are prerequisites
+for live automatic collection. Opening a normal billing tab without them is not a successful
+subscription connection.
+
+Normal-mode source checks passed: **99 Python tests** across subscriptions and the existing
+web API, and **35 Node tests** on both Linux Node and actual Windows Node. These cover the
+private token handoff, regular Chrome launch arguments, preserved task read-only behavior,
+account mismatch/authentication failure, only-owned-tab cleanup, late tab creation during
+cancellation, and the pinned Playwright extension factory. They do not replace an authenticated
+live extension connection. Ruff, JavaScript syntax, and diff checks also passed.
+
+The supported existing-profile mechanism and per-profile connection token are documented in
+the [official extension guide](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md).
+Chrome restricts debugging switches against its ordinary profile; changing the persistent
+context's profile path alone cannot supply this behavior.
+
 ## Candidate boundary
 
-The tested wheel is `taskspindle-0.2.0-py3-none-any.whl`, SHA-256
-`5aaee471de8a3c83d6e4c1f5230e4443b9b6da946a18849527af9d7aff0a0a27`.
-All 53 packaged source/asset files match the feature checkout; the dedicated Windows helper
-matches those wheel assets. The isolated preview uses the wheel and its own state/configuration.
+Exact build checksums and current verification results are recorded outside the wheel in the
+local candidate build ledger. The preview uses the candidate wheel and its own state/configuration.
 The installed MCP runtime and the existing dashboard on port 8765 have not been activated from
 this candidate. Activation/publication approval follows successful live provider verification.

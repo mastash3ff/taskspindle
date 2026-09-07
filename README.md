@@ -40,7 +40,7 @@ produced.
   the dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
 - **Subscription dates.** An independent browser collector records verified renewal and
   cancellation access-end dates for the [Subscriptions page](docs/subscriptions.md).
-  Collection uses dedicated browser sign-ins and reports unknown or stale results explicitly;
+  Collection uses your normal Chrome profile through the Playwright extension and reports unknown or stale results explicitly;
   it never changes subscriptions or worker routing.
 
 ## Quick start

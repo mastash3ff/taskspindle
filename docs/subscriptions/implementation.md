@@ -1,8 +1,10 @@
 # Automatic subscription tracking implementation
 
 Approved scope: automatically track direct-web ChatGPT, Claude, Google AI (one shared
-Gemini/AGY subscription), and Grok subscriptions. Dedicated browser sign-in/re-sign-in
-is allowed. No billing mutations, app-store/X Premium collection, inference requests,
+Gemini/AGY subscription), and Grok subscriptions. The user's subsequent instruction replaces
+dedicated sign-in with normal Chrome and its saved passwords, using the official Playwright
+extension bridge. Dedicated mode remains an explicit compatibility option.
+No billing mutations, app-store/X Premium collection, inference requests,
 worker routing changes, installed-runtime activation, or publication.
 
 Base: `be70171a42d20bbd6526f55268ac0b2d4a44947a`; branch
@@ -14,11 +16,14 @@ New Python package: `taskspindle.subscriptions`. Provider IDs are `chatgpt`, `cl
 `google_ai`, `grok`. One connected personal account per provider initially.
 
 Browser request JSON (stdin, one request per process): `provider`, `action`
-(`connect` or `refresh`), `profile_dir`, `chrome_path`, `expected_account_id`
+(`connect` or `refresh`), `chrome_path`, `expected_account_id`
 (nullable), `timeout_s`, `timezone`, and internal `operation_nonce` (random per invocation,
 used with OS process identity to authorize cleanup). Stdout contains exactly one result object:
 `{ok: true, observation: ...}` or `{ok: false, error: {code, message}}`.
 Messages must come from a safe allowlist, never raw browser/network errors.
+Normal mode also selects `chrome_profile` and uses an operation-specific ownership directory;
+the private extension token is passed only in the helper environment. Dedicated mode retains
+`profile_dir` for its separate profile. Neither mode exports browser credentials.
 
 An observation contains `provider`, `account_id` (opaque stable hash),
 `account_label` (masked), `billing_channel` (`provider_web`, `apple`, `google_play`,
@@ -59,10 +64,13 @@ its normalized result, or null when idle;
 
 `subscriptions/runtime.py`: `run_browser(paths, provider, action,
 expected_account_id=None) -> result`; `setup_browser(paths) -> dict` provisions only
-the separate subscription browser runtime. Use Windows Node/Chrome from WSL, a
-packaged Node/Playwright helper, and account-specific Windows-local profiles.
-Never read normal browser/CLI credential stores. Support native Linux Node/Chrome
-through the same helper. Serialize profile access and clean up only owned processes.
+the separate subscription browser runtime. Use Windows Node/Chrome from WSL and a
+packaged, pinned Node/Playwright helper attached through the official Chrome extension.
+Normal mode opens regular Chrome for Connect; missing extension setup yields an explicit
+failure and does not save a successful account observation. Never read browser/CLI
+credential stores. Keep the extension token in a private file outside the subscription DB.
+Native Linux retains the explicit dedicated-profile mode. Serialize operations and close only
+collector-owned billing tabs. Normal Chrome must never be terminated by helper cleanup.
 
 Web `build_app` accepts optional `subscription_service` for tests. GET
 `/api/subscriptions` returns service status and an ephemeral `csrf_token` on trusted
@@ -72,7 +80,7 @@ loopback peer, localhost/loopback Host, exact same Origin, JSON, and
 the subscription database. Existing task database remains read-only. Health reports
 `read_only: false`, `task_database_read_only: true` and subscription actions enabled.
 
-CLI: `subscriptions setup-browser`, `connect PROVIDER`, `refresh [PROVIDER]`,
+CLI: `subscriptions setup-browser`, `setup-extension`, `connect PROVIDER`, `refresh [PROVIDER]`,
 `status [--json]`, `watch [--once]`, `service-unit`. Connect/refresh enqueue jobs;
 `watch` owns scheduled and manual collection. `service-unit` prints the reviewed
 unit, never installs/enables it implicitly.
@@ -84,7 +92,7 @@ unit, never installs/enables it implicitly.
 3. Runtime/service: process bridge + queue worker + focused Python tests.
 4. Web: API security + subscription view + focused API/UI tests.
 5. Controller: CLI, dependency/build packaging, documentation, integration, live
-   dedicated-profile evidence, isolated preview, and independent final review.
+   authenticated browser evidence, isolated preview, and independent final review.
 
 Use provider-page evidence before claiming a provider works. Unknown schemas fail
 closed with `PARSE_CHANGED`; auth prompts yield `AUTH_REQUIRED`; wrong account yields

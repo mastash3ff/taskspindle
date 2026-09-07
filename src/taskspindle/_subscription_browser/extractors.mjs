@@ -12,6 +12,7 @@ export const URLS = Object.freeze({
   grok: 'https://grok.com/?_s=billing',
 });
 export const MESSAGES = Object.freeze({
+  SETUP_REQUIRED: 'Install and pair the Playwright extension in the selected Chrome profile.',
   AUTH_REQUIRED: 'Sign in using the dedicated subscription browser.',
   ACCOUNT_MISMATCH: 'The signed-in account differs from the connected account.',
   PARSE_CHANGED: 'The provider did not expose recognized subscription details.',

@@ -1,9 +1,9 @@
-"""Isolated process bridge for the subscription browser collector.
+"""Process bridge for regular-Chrome and dedicated-profile subscription collectors.
 
-The collector never uses a normal Chrome profile or inherits the calling shell's
-credentials.  On WSL it runs the installed Windows Node and Chrome against a
-dedicated directory below ``%LOCALAPPDATA%``; native Linux uses the same packaged
-helper with system Node and Chrome.
+Regular mode opens the user's chosen Chrome profile without remote-debugging or
+user-data-dir flags and talks through the reviewed Playwright MCP extension.
+Dedicated mode remains available for an isolated provider-specific browser profile.
+Neither mode inherits unrelated credentials from the calling shell.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import os
 import platform
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -30,7 +31,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from taskspindle.config import Paths
 
-from .models import ACTIONS, ERROR_MESSAGES, PROVIDER_IDS, validate_result
+from .models import ACTIONS, ERROR_MESSAGES, PROVIDER_IDS, PROVIDERS, validate_result
 
 __all__ = ["run_browser", "setup_browser"]
 
@@ -44,6 +45,7 @@ _MAX_OUTPUT = 1024 * 1024
 _CANCEL_REQUESTED = threading.Event()
 _ASSET_NAMES = (
     "helper.mjs",
+    "normal-helper.mjs",
     "extractors.mjs",
     "page.mjs",
     "ownership.mjs",
@@ -64,6 +66,8 @@ class _Settings:
     local_app_data: str | None
     connect_timeout_s: int
     refresh_timeout_s: int
+    browser_mode: str = "normal"
+    chrome_profile: str = "Default"
 
 
 @dataclass(frozen=True)
@@ -123,8 +127,15 @@ def _load_settings(paths: Paths) -> _Settings:
     if not isinstance(values, dict):
         raise _RuntimeError("CONFIG_INVALID")
     mode = values.get("platform", "auto")
+    browser_mode = values.get("browser_mode", "normal")
+    chrome_profile = values.get("chrome_profile", "Default")
     timezone = values.get("timezone") or _local_timezone()
-    if mode not in {"auto", "windows", "native"} or not isinstance(timezone, str):
+    if (
+        mode not in {"auto", "windows", "native"}
+        or browser_mode not in {"normal", "dedicated"}
+        or not isinstance(timezone, str)
+        or not _valid_chrome_profile(chrome_profile)
+    ):
         raise _RuntimeError("CONFIG_INVALID")
     try:
         ZoneInfo(timezone)
@@ -151,7 +162,49 @@ def _load_settings(paths: Paths) -> _Settings:
         local_app_data=optional_path("local_app_data"),
         connect_timeout_s=timeout("connect_timeout_s", 600),
         refresh_timeout_s=timeout("refresh_timeout_s", 180),
+        browser_mode=browser_mode,
+        chrome_profile=chrome_profile,
     )
+
+
+def _valid_chrome_profile(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    if value == "Default":
+        return True
+    if not value.startswith("Profile "):
+        return False
+    suffix = value.removeprefix("Profile ")
+    return suffix.isascii() and suffix.isdigit() and not suffix.startswith("0")
+
+
+def _extension_token_path(paths: Paths) -> Path:
+    return paths.data_dir / "subscriptions" / "extension-token"
+
+
+def _extension_token(paths: Paths) -> str:
+    token_path = _extension_token_path(paths)
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(token_path, flags)
+    except FileNotFoundError as exc:
+        raise _RuntimeError("SETUP_REQUIRED") from exc
+    except OSError as exc:
+        raise _RuntimeError("CONFIG_INVALID") from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise _RuntimeError("CONFIG_INVALID")
+        raw = os.read(fd, 513)
+    finally:
+        os.close(fd)
+    if not 1 <= len(raw) <= 512 or any(byte < 0x21 or byte > 0x7E for byte in raw):
+        raise _RuntimeError("CONFIG_INVALID")
+    return raw.decode("ascii")
 
 
 def _local_timezone() -> str:
@@ -371,6 +424,53 @@ def _node_env(settings: _Settings) -> dict[str, str]:
     return env
 
 
+def _normal_helper_env(settings: _Settings, token: str) -> dict[str, str]:
+    env = _node_env(settings)
+    env["PLAYWRIGHT_MCP_EXTENSION_TOKEN"] = token
+    return env
+
+
+def _launch_normal_chrome(
+    layout: _Layout,
+    settings: _Settings,
+    provider: str,
+    *,
+    billing_url: bool,
+) -> None:
+    """Open one provider URL in regular Chrome without creating an automation profile."""
+    if layout.mode != "windows":
+        raise _RuntimeError("RUNTIME_UNAVAILABLE")
+
+    def literal(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    chrome = layout.request_chrome
+    arguments = [f"--profile-directory={settings.chrome_profile}"]
+    if billing_url:
+        arguments.append(PROVIDERS[provider]["billing_url"])
+    argument_line = subprocess.list2cmdline(arguments)
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"Start-Process -FilePath {literal(chrome)} "
+        f"-ArgumentList {literal(argument_line)} | Out-Null"
+    )
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    powershell = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    try:
+        proc = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            env=_discovery_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _RuntimeError("BROWSER_UNAVAILABLE") from exc
+    if proc.returncode != 0:
+        raise _RuntimeError("BROWSER_UNAVAILABLE")
+
+
 def _verify_tools(layout: _Layout, settings: _Settings) -> str:
     if not layout.node.is_file() or not layout.chrome.is_file():
         raise _RuntimeError("RUNTIME_UNAVAILABLE")
@@ -400,6 +500,8 @@ def setup_browser(paths: Paths) -> dict[str, Any]:
     try:
         settings = _load_settings(paths)
         layout = _layout(paths, settings)
+        if settings.browser_mode == "normal" and layout.mode != "windows":
+            raise _RuntimeError("RUNTIME_UNAVAILABLE")
         node_version = _verify_tools(layout, settings)
         _private_directory(layout.root)
         _private_directory(layout.profiles)
@@ -438,13 +540,19 @@ def setup_browser(paths: Paths) -> dict[str, Any]:
                     shutil.rmtree(staging)
         return {
             "ok": True,
+            "browser_mode": settings.browser_mode,
             "platform": layout.mode,
             "runtime_dir": str(layout.runtime),
-            "profiles_dir": str(layout.profiles),
+            "profiles_dir": (
+                str(layout.profiles) if settings.browser_mode == "dedicated" else None
+            ),
             "node": str(layout.node),
             "node_version": node_version,
             "chrome": str(layout.chrome),
             "playwright_core": PLAYWRIGHT_VERSION,
+            "extension_required": settings.browser_mode == "normal",
+            "extension_token_path": str(_extension_token_path(paths)),
+            "extension_setup_command": "taskspindle subscriptions setup-extension",
         }
     except _RuntimeError as exc:
         return _failure(exc.code)
@@ -511,6 +619,89 @@ def _terminate_windows_tree(owner: _Owner) -> bool:
     return result.returncode == 0
 
 
+def _terminate_windows_helper(owner: _Owner) -> bool:
+    """Stop one exact helper PID without traversing into regular Chrome."""
+    if not owner.start.startswith("windows:") or not owner.start[8:].isdigit():
+        return False
+    ticks = owner.start[8:]
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$p=Get-Process -Id {owner.pid} -ErrorAction SilentlyContinue;"
+        "if ($null -eq $p) { exit 4 };"
+        f"if ($p.StartTime.ToUniversalTime().Ticks.ToString() -ne '{ticks}') {{ exit 3 }};"
+        "Stop-Process -InputObject $p -Force;"
+        "exit 0"
+    )
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    powershell = Path("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+    try:
+        result = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            env=_discovery_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _cancel_file(profile: Path, operation_nonce: str) -> Path:
+    return profile / f".taskspindle-cancel-{operation_nonce}"
+
+
+def _terminate_normal_helper(
+    proc: subprocess.Popen[str],
+    *,
+    layout: _Layout,
+    profile: Path,
+    operation_nonce: str,
+) -> None:
+    """Cooperatively stop the helper, then target only its exact PID as fallback."""
+    if proc.poll() is not None:
+        return
+    sentinel = _cancel_file(profile, operation_nonce)
+    created = False
+    try:
+        _private_directory(profile)
+        fd = os.open(sentinel, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        os.close(fd)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError:
+        pass
+    # The helper may need two seconds to receive a late page and another two
+    # seconds to close it; allow that bounded cleanup before exact-PID fallback.
+    deadline = _monotonic() + 5.0
+    while proc.poll() is None and _monotonic() < deadline:
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+    owner = _profile_owner(profile, operation_nonce)
+    helper_stopped = False
+    if proc.poll() is None and layout.mode == "windows" and owner is not None:
+        helper_stopped = _terminate_windows_helper(owner)
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=1)
+    if helper_stopped and owner is not None:
+        _remove_owned_profile_lock(profile, owner)
+    if created:
+        with contextlib.suppress(OSError):
+            sentinel.unlink()
+
+
 def _terminate_owned(
     proc: subprocess.Popen[str],
     *,
@@ -572,10 +763,24 @@ def run_browser(
     try:
         settings = _load_settings(paths)
         layout = _layout(paths, settings)
-        helper = layout.runtime / "helper.mjs"
+        _verify_tools(layout, settings)
+        token: str | None = None
+        if settings.browser_mode == "normal":
+            try:
+                token = _extension_token(paths)
+            except _RuntimeError as exc:
+                if action == "connect" and exc.code == "SETUP_REQUIRED":
+                    _launch_normal_chrome(
+                        layout, settings, provider, billing_url=True
+                    )
+                raise
+            if action == "connect":
+                _launch_normal_chrome(layout, settings, provider, billing_url=False)
+            helper = layout.runtime / "normal-helper.mjs"
+        else:
+            helper = layout.runtime / "helper.mjs"
         if not helper.is_file() or not (layout.runtime / "node_modules" / "playwright-core").is_dir():
             raise _RuntimeError("SETUP_REQUIRED")
-        _verify_tools(layout, settings)
         _private_directory(layout.profiles)
         timeout_s = settings.connect_timeout_s if action == "connect" else settings.refresh_timeout_s
         request_profile = (
@@ -592,17 +797,34 @@ def run_browser(
             "timeout_s": timeout_s,
             "timezone": settings.timezone,
         }
+        if settings.browser_mode == "normal":
+            request["chrome_profile"] = settings.chrome_profile
         operation_nonce = str(uuid.uuid4())
         request["operation_nonce"] = operation_nonce
-        lock_path = layout.profiles / f".{provider}.runtime.lock"
+        lock_name = (
+            ".normal.runtime.lock"
+            if settings.browser_mode == "normal"
+            else f".{provider}.runtime.lock"
+        )
+        lock_path = layout.profiles / lock_name
         with _lock(lock_path, wait=_PROFILE_LOCK_WAIT):
             profile_path = layout.profiles / provider
-            script = f"{layout.request_runtime}\\helper.mjs" if layout.mode == "windows" else str(helper)
+            helper_name = helper.name
+            script = (
+                f"{layout.request_runtime}\\{helper_name}"
+                if layout.mode == "windows"
+                else str(helper)
+            )
+            child_env = (
+                _normal_helper_env(settings, token)
+                if token is not None
+                else _node_env(settings)
+            )
             try:
                 proc = subprocess.Popen(
                     [str(layout.node), script],
                     cwd=layout.runtime,
-                    env=_node_env(settings),
+                    env=child_env,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
@@ -616,21 +838,37 @@ def run_browser(
                 input_data: str | None = json.dumps(request, separators=(",", ":")) + "\n"
                 while True:
                     if _CANCEL_REQUESTED.is_set():
-                        _terminate_owned(
-                            proc,
-                            layout=layout,
-                            profile=profile_path,
-                            operation_nonce=operation_nonce,
-                        )
+                        if settings.browser_mode == "normal":
+                            _terminate_normal_helper(
+                                proc,
+                                layout=layout,
+                                profile=profile_path,
+                                operation_nonce=operation_nonce,
+                            )
+                        else:
+                            _terminate_owned(
+                                proc,
+                                layout=layout,
+                                profile=profile_path,
+                                operation_nonce=operation_nonce,
+                            )
                         return _failure("COLLECTOR_FAILED")
                     remaining = deadline - _monotonic()
                     if remaining <= 0:
-                        _terminate_owned(
-                            proc,
-                            layout=layout,
-                            profile=profile_path,
-                            operation_nonce=operation_nonce,
-                        )
+                        if settings.browser_mode == "normal":
+                            _terminate_normal_helper(
+                                proc,
+                                layout=layout,
+                                profile=profile_path,
+                                operation_nonce=operation_nonce,
+                            )
+                        else:
+                            _terminate_owned(
+                                proc,
+                                layout=layout,
+                                profile=profile_path,
+                                operation_nonce=operation_nonce,
+                            )
                         return _failure("TIMEOUT")
                     try:
                         stdout, _ = proc.communicate(input_data, timeout=min(0.25, remaining))
@@ -638,12 +876,20 @@ def run_browser(
                     except subprocess.TimeoutExpired:
                         input_data = None
             finally:
-                _terminate_owned(
-                    proc,
-                    layout=layout,
-                    profile=profile_path,
-                    operation_nonce=operation_nonce,
-                )
+                if settings.browser_mode == "normal":
+                    _terminate_normal_helper(
+                        proc,
+                        layout=layout,
+                        profile=profile_path,
+                        operation_nonce=operation_nonce,
+                    )
+                else:
+                    _terminate_owned(
+                        proc,
+                        layout=layout,
+                        profile=profile_path,
+                        operation_nonce=operation_nonce,
+                    )
                 _CANCEL_REQUESTED.clear()
         if proc.returncode != 0:
             return _failure("COLLECTOR_FAILED")

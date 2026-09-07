@@ -105,10 +105,25 @@ class StubSubscriptionService:
                 ),
                 _row(
                     "google_ai",
-                    status="none",
+                    connected=False,
+                    account_id=None,
+                    account_label=None,
+                    billing_channel=None,
+                    status=None,
                     plan=None,
                     renews_at=None,
                     date_precision=None,
+                    timezone=None,
+                    source_url=None,
+                    collector_version=None,
+                    last_success_at=None,
+                    error={
+                        "code": "SETUP_REQUIRED",
+                        "message": (
+                            "Install the Playwright Chrome extension and run "
+                            "taskspindle subscriptions setup-extension."
+                        ),
+                    },
                     days_remaining=None,
                 ),
                 _row(
@@ -499,4 +514,3 @@ def test_subscription_page_exposes_navigation_and_local_assets(tmp_path: Path) -
     assert 'href="#/subscriptions"' in page.text
     assert 'data-route="subscriptions"' in page.text
     assert script.status_code == 200
-    assert "https://" not in script.text

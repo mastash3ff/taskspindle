@@ -15,8 +15,15 @@ See [collector evidence](subscriptions/evidence.md) for observed validation and 
 
 ```sh
 taskspindle subscriptions setup-browser
+taskspindle subscriptions setup-extension
 taskspindle subscriptions watch
 ```
+
+Install the [official Playwright Chrome extension](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)
+in your usual signed-in Chrome profile before running `setup-extension`. Open the extension's
+status page and copy its `PLAYWRIGHT_MCP_EXTENSION_TOKEN` into the command's hidden terminal
+prompt. This permits automatic connections to that profile. Do not paste the token into
+the dashboard, chat, a command argument, or the TaskSpindle config file.
 
 Keep the collector running in its own terminal initially. In another terminal, or using
 the dashboard's Connect buttons:
@@ -28,14 +35,15 @@ taskspindle subscriptions refresh chatgpt
 taskspindle subscriptions refresh
 ```
 
-Connect queues a visible dedicated Chrome window where you complete the normal sign-in.
+Connect opens the provider's billing page in your normal Chrome profile, with its existing
+sign-ins and Chrome password manager available. It does not create an isolated profile.
 The browser must read billing data and verify the account before the connection succeeds.
-Closing the sign-in window early does not count as successful connection. Reconnect uses
-the same dedicated profile and verifies the same account.
+Without extension setup, Connect still opens the billing page and reports **Setup required**;
+opening a page alone never marks the account connected. Reconnect verifies the same account.
 
 Refresh never opens an interactive login prompt. The collector refreshes connected accounts
 after six hours and handles explicitly requested refreshes immediately when it is available.
-Duplicate requests coalesce; a provider profile cannot be driven concurrently. Authentication
+Duplicate requests coalesce; collection operations cannot drive the same account concurrently. Authentication
 and account-mismatch failures wait for explicit action. `watch --once` processes at most one
 queued or due job, prints its normalized result, and returns a nonzero exit status when
 collection fails. With no work queued or due, it exits successfully without starting a browser.
@@ -45,22 +53,34 @@ change billing details, purchase credits, or alter TaskSpindle provider availabi
 
 ## Browser runtime and configuration
 
-Setup provisions only the packaged, lockfile-pinned Node/Playwright helper. It uses an
+Setup provisions the packaged, lockfile-pinned Node/Playwright helper. It uses an
 installed Chrome executable rather than downloading a browser. On WSL, the helper runs
 through Windows Node and Chrome. Its runtime lives under
-`%LOCALAPPDATA%\TaskSpindle\subscriptions\runtime`; provider profiles live under
-`%LOCALAPPDATA%\TaskSpindle\subscriptions\profiles\<provider>`.
-Native Linux uses local Node/Chrome and TaskSpindle-owned directories.
+`%LOCALAPPDATA%\TaskSpindle\subscriptions\runtime`.
+Normal-profile collection in this version supports Windows Chrome through WSL. Native Linux
+retains the explicit `browser_mode = "dedicated"` collector; it does not launch a regular
+desktop Chrome process under the collector's systemd service.
 
-Browser cookies and credentials remain in these private profiles. Existing normal browser
-profiles and CLI authentication files are never imported. The helper returns only normalized
+Browser cookies and passwords stay in Chrome. TaskSpindle does not import credential files
+or read Chrome password/cookie databases. The helper returns only normalized
 billing metadata and safe errors, not raw provider responses, payment details, or credentials.
+The extension connection token is stored separately in a private `0600` file at
+`<TaskSpindle data directory>/subscriptions/extension-token`; it never enters the subscription
+database or dashboard responses. The official extension requests browser debugging access;
+TaskSpindle's fixed collector code uses its own billing tabs and does not close your other tabs.
+Unattended refresh requires the extension connection to be available. Browser or connection
+failures retain the last verified observation and eventually show it as stale.
+The current extension may focus Chrome or briefly show a billing tab during a scheduled
+refresh. Refresh does not wait for sign-in or a connection-approval prompt; unavailable
+authentication is reported for reconnection.
 
 Optional settings in the normal TaskSpindle config:
 
 ```toml
 [subscriptions]
 platform = "auto" # auto, windows, or native
+browser_mode = "normal" # default; "dedicated" retains the previous separate-profile collector
+chrome_profile = "Default" # Chrome profile directory, e.g. "Default" or "Profile 1"
 timezone = "America/Chicago"
 connect_timeout_s = 600
 refresh_timeout_s = 180
@@ -72,6 +92,12 @@ refresh_timeout_s = 180
 The timezone is used for date-only billing information. Without an override, local timezone
 discovery falls back to UTC. Executable overrides must be absolute. Browser runtime setup
 and persistent collector service activation are separate operations.
+Use the profile directory shown at `chrome://version`, not your Google account name.
+Modern Chrome does not support launching its ordinary profile with Playwright's persistent
+context debugging flags; the extension provides the supported connection to that profile.
+The optional `dedicated` mode keeps profiles under
+`%LOCALAPPDATA%\TaskSpindle\subscriptions\profiles\<provider>` on Windows, and does not use
+your normal Chrome passwords or require an extension token.
 
 ## Date and freshness rules
 
@@ -107,6 +133,7 @@ whenever the host and its user services are running. No external notifications a
 ## Verification
 
 Run the Python subscription tests and the packaged helper's `npm test`. Live verification
-must read each connected provider, close its dedicated browser, and refresh after reopening.
+must read each connected provider and refresh after reconnecting to its normal Chrome profile.
+Do not close unrelated Chrome windows or tabs to run a test.
 Use an already-cancelled subscription when available; fixture tests cover cancellation
 without cancelling a subscription for testing. Report fixture and live evidence separately.

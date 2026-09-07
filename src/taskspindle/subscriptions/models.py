@@ -64,10 +64,12 @@ ERROR_MESSAGES: dict[str, str] = {
     "UNSUPPORTED_BILLING_CHANNEL": "This billing channel must be managed separately.",
     "PARSE_CHANGED": "The provider subscription details could not be read.",
     "INVALID_REQUEST": "The subscription collector request was invalid.",
-    "BROWSER_UNAVAILABLE": "The dedicated subscription browser is unavailable.",
-    "PROFILE_BUSY": "The dedicated subscription browser profile is busy.",
+    "BROWSER_UNAVAILABLE": "Chrome is unavailable for this subscription check.",
+    "PROFILE_BUSY": "A subscription browser operation is already running.",
     "TIMEOUT": "The subscription check timed out.",
-    "SETUP_REQUIRED": "The dedicated subscription browser requires setup.",
+    "SETUP_REQUIRED": (
+        "Install the Playwright Chrome extension and run taskspindle subscriptions setup-extension."
+    ),
     "CONFIG_INVALID": "The subscription browser configuration is invalid.",
     "RUNTIME_UNAVAILABLE": "The subscription collector runtime is unavailable.",
     "COLLECTOR_PROTOCOL_ERROR": "The subscription collector returned an invalid response.",

@@ -1,5 +1,8 @@
 # Dedicated subscription browser
 
+For the normal Chrome profile extension route, see [NORMAL-BROWSER.md](NORMAL-BROWSER.md).
+The dedicated helper below remains available as an explicit legacy mode.
+
 Run `npm ci --ignore-scripts`, then `node helper.mjs`. No browser download is
 needed: `chrome_path` points to an already installed Chrome executable. Supports
 Windows Node/Chrome and native Linux Node/Chrome. `npm test` runs sanitized tests.

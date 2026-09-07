@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sqlite3
 import sys
+import tempfile
+import warnings
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,6 +17,7 @@ from typing import Any
 from ..config import Paths
 
 _PROVIDERS = ("chatgpt", "claude", "google_ai", "grok")
+_EXTENSION_GUIDE = "https://github.com/microsoft/playwright/blob/main/packages/extension/README.md"
 
 
 def add_parser(subparsers: Any) -> None:
@@ -21,7 +25,10 @@ def add_parser(subparsers: Any) -> None:
         "subscriptions", help="connect accounts and collect subscription billing dates"
     )
     commands = parser.add_subparsers(dest="subscription_command", required=True)
-    commands.add_parser("setup-browser", help="provision the separate pinned browser helper")
+    commands.add_parser("setup-browser", help="provision the pinned browser helper")
+    commands.add_parser(
+        "setup-extension", help="save the normal Chrome extension connection token using hidden input"
+    )
     connect = commands.add_parser("connect", help="queue a visible account sign-in")
     connect.add_argument("provider", choices=_PROVIDERS)
     refresh = commands.add_parser("refresh", help="queue a refresh of connected accounts")
@@ -31,6 +38,39 @@ def add_parser(subparsers: Any) -> None:
     watch = commands.add_parser("watch", help="run the independent subscription collector")
     watch.add_argument("--once", action="store_true", help="process at most one due or queued job")
     commands.add_parser("service-unit", help="print a service definition without installing it")
+
+
+def _setup_extension(paths: Paths) -> None:
+    """Keep the browser bridge token out of argv, shell history, JSON and logs."""
+    print(f"Install Playwright in your normal Chrome profile: {_EXTENSION_GUIDE}")
+    print("Open its status page and copy PLAYWRIGHT_MCP_EXTENSION_TOKEN.")
+    if not sys.stdin.isatty():
+        raise ValueError("an interactive terminal is required for hidden token input")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        token = getpass.getpass("Extension token (hidden): ")
+    if not 1 <= len(token) <= 512 or not token.isascii() or any(
+        not 33 <= ord(char) <= 126 for char in token
+    ):
+        raise ValueError("invalid extension token")
+    directory = paths.data_dir / "subscriptions"
+    if directory.is_symlink():
+        raise ValueError("invalid token directory")
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    target = directory / "extension-token"
+    if target.is_symlink():
+        raise ValueError("invalid token file")
+    fd, temporary = tempfile.mkstemp(prefix=".extension-token-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as stream:
+            stream.write(token)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    print("Extension connection configured. Use Connect to verify your account and billing.")
 
 
 def _unit_quote(value: str) -> str:
@@ -93,6 +133,9 @@ def _print_status(payload: dict[str, Any]) -> None:
 def run(args: argparse.Namespace, paths: Paths) -> int:
     command = args.subscription_command
     try:
+        if command == "setup-extension":
+            _setup_extension(paths)
+            return 0
         if command == "service-unit":
             print(service_unit(paths), end="")
             return 0
@@ -130,7 +173,7 @@ def run(args: argparse.Namespace, paths: Paths) -> int:
         return 0
     except KeyboardInterrupt:
         return 130
-    except (OSError, ValueError, sqlite3.Error):
+    except (OSError, ValueError, sqlite3.Error, EOFError, getpass.GetPassWarning):
         # Browser sessions and network exceptions can contain tokens or payment details.
         print("taskspindle subscriptions: operation failed; inspect subscription status", file=sys.stderr)
         return 1

@@ -38,8 +38,10 @@ may not exist yet — `/api/health` says so, and every list renders empty instea
 Subscription actions additionally require a loopback peer and Host, a matching Origin,
 JSON content, and the per-process CSRF token returned to the local dashboard. They are
 not available through a remote reverse proxy. Subscription GETs are cached database reads,
-do not launch a browser, and do not create an absent database. Browser credentials stay in
-dedicated local profiles and never reach the dashboard or task records.
+do not launch a browser, and do not create an absent database. Connect opens your normal
+Chrome profile; its Playwright extension enables billing verification. Browser credentials
+stay in Chrome and never reach the dashboard or task records. The private extension token
+is entered through `subscriptions setup-extension`, never through a dashboard API.
 
 ## What it shows
 

@@ -655,6 +655,9 @@
 
   function subscriptionState(row) {
     var errorCode = row.error && row.error.code;
+    if (errorCode === "SETUP_REQUIRED") {
+      return { text: "Chrome setup required", className: "warn" };
+    }
     if (errorCode === "AUTH_REQUIRED" || errorCode === "ACCOUNT_MISMATCH") {
       return { text: "Reconnect required", className: "warn" };
     }
@@ -692,11 +695,24 @@
     };
   }
 
+  function operationMessage(operation) {
+    if (operation.status === "requesting") return "Submitting the request…";
+    if (operation.action === "connect") {
+      if (operation.status === "running") {
+        return "Chrome verification is running. Connection state updates only after verification succeeds.";
+      }
+      return "Connect queued — your normal Chrome profile will open for verification.";
+    }
+    return operation.status === "running" ? "Subscription refresh is running." : "Refresh queued.";
+  }
+
   function subscriptionActionButton(row, action, operation) {
     var reconnect = action === "connect" && row.connected;
     var label = action === "connect" ? (reconnect ? "Reconnect" : "Connect") : "Refresh now";
     var running = operation && operation.action === action;
-    if (running && operation.status === "running") {
+    if (running && operation.status === "requesting") {
+      label = "Requesting…";
+    } else if (running && operation.status === "running") {
       label = action === "connect" ? (reconnect ? "Reconnecting…" : "Connecting…") : "Refreshing…";
     } else if (running) {
       label += " queued";
@@ -743,9 +759,20 @@
       row.last_success_at ? friendlyBillingDate(row.last_success_at, "datetime") : "-"
     ));
     if (row.error) {
-      activity.appendChild(h("p", { class: "error" },
-        "Verification failed: " + textOrDash(row.error.message)
-      ));
+      if (row.error.code === "SETUP_REQUIRED") {
+        activity.appendChild(h("p", { class: "warning" },
+          "Automatic verification needs the Playwright Chrome extension connection. " +
+          "Existing verified details are retained."
+        ));
+        activity.appendChild(h("p", null,
+          "Run ", h("code", null, "taskspindle subscriptions setup-extension"),
+          " once, enter the private connection token only in its hidden prompt, then choose Connect again."
+        ));
+      } else {
+        activity.appendChild(h("p", { class: "error" },
+          "Verification failed: " + textOrDash(row.error.message)
+        ));
+      }
     } else {
       activity.appendChild(h("p", { class: "muted" }, "Error: none"));
     }
@@ -761,7 +788,7 @@
     }
     if (operation) {
       activity.appendChild(h("p", { class: "operation", "aria-live": "polite" },
-        operation.action + " " + operation.status
+        operationMessage(operation)
       ));
     }
     card.appendChild(activity);
@@ -803,6 +830,21 @@
       clearNode(APP);
       var heading = h("div", { class: "panel" });
       heading.appendChild(h("h1", null, "Subscriptions"));
+      heading.appendChild(h("p", null,
+        "Connect opens the provider billing page in your normal Chrome profile, where your saved passwords are available. ",
+        "TaskSpindle marks the account connected only after it verifies the account and billing details."
+      ));
+      heading.appendChild(h("p", { class: "muted" },
+        "One-time browser setup: ",
+        h("a", {
+          href: "https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm",
+          target: "_blank",
+          rel: "noopener noreferrer",
+        }, "install the Playwright Chrome extension"),
+        ", then run ",
+        h("code", null, "taskspindle subscriptions setup-extension"),
+        ". Enter the private connection token only in that command's hidden prompt."
+      ));
       var collector = data.collector_running ? "Collector running" : "Collector unavailable";
       if (data.collector_last_seen_at) {
         collector += " · last seen " + friendlyBillingDate(data.collector_last_seen_at, "datetime");
@@ -818,11 +860,11 @@
   }
 
   function markSubscriptionPending(provider, action, button) {
-    pendingSubscriptionActions[provider] = { provider: provider, action: action, status: "running" };
+    pendingSubscriptionActions[provider] = { provider: provider, action: action, status: "requesting" };
     Array.prototype.forEach.call(document.querySelectorAll("[data-subscription-provider]"), function (control) {
       if (control.dataset.subscriptionProvider === provider) control.disabled = true;
     });
-    button.textContent = action === "connect" ? "Connecting…" : "Refreshing…";
+    button.textContent = "Requesting…";
   }
 
   function requestSubscriptionAction(provider, action, button) {
