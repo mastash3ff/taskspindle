@@ -1,5 +1,9 @@
 # Configuration
 
+Subscription browser collection uses a separate optional `[subscriptions]` section;
+see [subscription configuration](subscriptions.md#browser-runtime-and-configuration).
+It has no effect on worker profiles, credentials, provider limits, or dispatch decisions.
+
 TaskSpindle reads one file: `$XDG_CONFIG_HOME/taskspindle/config.toml`, or whatever
 `TASKSPINDLE_CONFIG` points at. Built-in provider ids are reserved. `taskspindle setup` writes
 [`examples/config.toml`](../examples/config.toml) there if the file does not already exist, and

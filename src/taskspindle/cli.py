@@ -3,7 +3,7 @@
 The MCP server is what a Codex
 session talks to, and ``worker`` and ``accept`` exist so that the two detached entry points the
 systemd units run can also be run by hand when something has gone wrong. ``setup``, ``doctor``,
-``auth``, ``discover``, ``usage`` and ``web`` are the ones a person actually types.
+``auth``, ``discover``, ``usage``, ``subscriptions`` and ``web`` are the ones a person types.
 
 Nothing here decides anything. Each subcommand resolves the paths, hands off to the module that
 owns the work, and turns whatever comes back into an exit code and a line of output. Failures are
@@ -59,6 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
+    from .subscriptions.cli import add_parser as add_subscriptions_parser
+
+    add_subscriptions_parser(sub)
+
     setup = sub.add_parser("setup", help="install the pinned adapter runtime and lay out the dirs")
     setup.add_argument("--runtime-dir", help="install into this directory instead of the default")
     setup.add_argument("--npm", default="npm", help="the npm executable to use (default: npm)")
@@ -109,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover.add_argument("--json", action="store_true", help="print the findings as JSON")
 
-    web = sub.add_parser("web", help="serve the read-only dashboard on localhost")
+    web = sub.add_parser("web", help="serve the local task and subscription dashboard")
     web.add_argument("--host", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
     web.add_argument("--port", type=int, default=8765, help="port to bind (default: 8765)")
     web.add_argument("--open", action="store_true", help="open the page in a browser")
@@ -132,6 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
+    if args.command == "subscriptions":
+        from .subscriptions.cli import run as run_subscriptions
+
+        return run_subscriptions(args, resolve_paths())
     if args.command == "rollback-concurrency":
         return _rollback_concurrency(args.database)
     if args.command == "setup":

@@ -1,8 +1,7 @@
-"""A read-only web dashboard over the TaskSpindle database.
+"""A local dashboard over TaskSpindle task and subscription state.
 
-Everything here only reads: the database is opened ``mode=ro`` (see :mod:`.db`), and every route
-in :mod:`.app` is GET-only. There is no authentication -- binding anywhere but localhost is the
-caller's decision, made in :mod:`taskspindle.cli`, not here.
+Task data is always opened ``mode=ro`` (see :mod:`.db`). Subscription connect and refresh actions
+are separately protected by loopback peer, Host, same-origin and CSRF checks in :mod:`.app`.
 """
 
 from __future__ import annotations

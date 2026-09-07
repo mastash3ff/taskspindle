@@ -4,8 +4,8 @@
 
 ```
   Codex session                                  browser (localhost)
-        │  MCP over stdio (17 tools, one envelope)        │  taskspindle web: GET only,
-        ▼                                                 ▼  database opened read-only
+        │  MCP over stdio (17 tools, one envelope)        │  taskspindle web:
+        ▼                                                 ▼  task database opened read-only
   taskspindle mcp ──────────────────────────────────────────────┐
   server.py: envelope, annotations, traceback → server.log      │
   service.py: Orchestrator — every rule lives here              │
@@ -35,8 +35,14 @@
   review.py      the reviewer's JSON, and what blocks an acceptance
   limits.py      what a refused turn means for its provider; never what to do about it
   usage.py       token counts per turn, the price table, the rolled-up report
-  web/           the read-only dashboard: Starlette app, one HTML page, its own read-only store
+  web/           dashboard: read-only task store, protected subscription actions
+  subscriptions/ separate SQLite observations/queue, background browser collector, CLI
 ```
+
+Subscription actions use a separate `subscriptions.sqlite3` database and dedicated browser
+profiles. The dashboard queues loopback-only, same-origin, CSRF-protected connection/refresh
+requests; an independent collector processes them and observes billing information. It does
+not change task state or worker eligibility. See [subscription tracking](subscriptions.md).
 
 The MCP server never owns an ACP connection. It writes rows and starts units; the units talk to
 agents. That is what lets the server exit, crash or be restarted without taking the work with it.

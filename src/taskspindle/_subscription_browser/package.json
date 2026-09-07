@@ -1,0 +1,9 @@
+{
+  "name": "taskspindle-subscription-browser",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "playwright-core": "1.63.0" }
+}

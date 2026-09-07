@@ -1,8 +1,8 @@
 """The Starlette application behind ``taskspindle web``.
 
-Every route is read-only: the database is opened ``mode=ro`` (see :mod:`.db`), the diff and log
-files are read but never written, and every route is GET-only. There is no session, no cookie and
-no form -- the dashboard is a static page plus a handful of JSON endpoints it polls.
+Task, provider and usage data stays read-only: the task database is opened ``mode=ro`` (see
+:mod:`.db`) and task artifacts are only read. Separate loopback-only subscription endpoints may
+enqueue connect and refresh work in the subscription service; they cannot mutate task state.
 """
 
 from __future__ import annotations
@@ -10,9 +10,12 @@ from __future__ import annotations
 import functools
 import importlib.resources
 import inspect
+import ipaddress
 import json
 import os
+import secrets
 import sqlite3
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -37,7 +40,10 @@ from .db import ReadOnlyStore
 __all__ = ["build_app"]
 
 _DOCTOR_CACHE_SECONDS = 60
+_MAX_SUBSCRIPTION_BODY_BYTES = 1024
 _WORKER_LOG_TAIL_LINES = 200
+_SUBSCRIPTION_ACTIONS = frozenset({"connect", "refresh"})
+_SUBSCRIPTION_PROVIDERS = frozenset({"chatgpt", "claude", "google_ai", "grok"})
 
 Handler = Callable[[Request], Response | Awaitable[Response]]
 
@@ -79,20 +85,94 @@ def _resolve_within(base: Path, candidate: str | Path | None) -> Path | None:
     return resolved
 
 
+def _loopback_address(value: str) -> bool:
+    """Return whether ``value`` is a numeric loopback address."""
+    try:
+        return ipaddress.ip_address(value.split("%", 1)[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_host(value: str | None) -> bool:
+    """Accept an exact localhost name or numeric loopback Host, with an optional port."""
+    if not value or any(character in value for character in "/?#@"):
+        return False
+    try:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(f"//{value}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    if port == 0:
+        return False
+    return hostname == "localhost" or (hostname is not None and _loopback_address(hostname))
+
+
+def _trusted_loopback(request: Request) -> bool:
+    """Require both the TCP peer and HTTP Host to resolve to the local machine."""
+    peer = request.client.host if request.client is not None else ""
+    return _loopback_address(peer) and _loopback_host(request.headers.get("host"))
+
+
+def _subscription_response(payload: Any, *, status_code: int = 200) -> JSONResponse:
+    """Subscription API response that browsers and intermediaries must never cache."""
+    return JSONResponse(payload, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+def _subscription_guard(handler: Handler) -> Handler:
+    """Return a safe canonical response for subscription storage failures."""
+    if inspect.iscoroutinefunction(handler):
+
+        @functools.wraps(handler)
+        async def wrapped_async(request: Request) -> Response:
+            try:
+                return await handler(request)
+            except (sqlite3.Error, OSError, ValueError):
+                return _subscription_response(
+                    {"error": "SUBSCRIPTION_UNAVAILABLE"}, status_code=503
+                )
+
+        return wrapped_async
+
+    @functools.wraps(handler)
+    def wrapped(request: Request) -> Response:
+        try:
+            return handler(request)  # type: ignore[return-value]
+        except (sqlite3.Error, OSError, ValueError):
+            return _subscription_response({"error": "SUBSCRIPTION_UNAVAILABLE"}, status_code=503)
+
+    return wrapped
+
+
 def build_app(
     paths: Paths,
     profiles: dict[str, Profile],
     *,
     clock: Callable[[], datetime] | None = None,
+    subscription_service: Any | None = None,
 ) -> Starlette:
-    """Build the dashboard app. ``clock`` lets tests fix "now" for provider/usage windows."""
+    """Build the dashboard app with an optionally injected subscription service for tests."""
     clock = clock or (lambda: datetime.now(UTC))
     db_path = paths.state_dir / "taskspindle.sqlite3"
     # The dashboard serves assets from an unpacked filesystem installation (including wheels).
     static_dir = importlib.resources.files("taskspindle.web") / "static"
+    csrf_token = secrets.token_urlsafe(32)
+    subscription_lock = threading.Lock()
 
     def _store() -> ReadOnlyStore:
         return ReadOnlyStore(db_path)
+
+    def _subscriptions() -> Any:
+        nonlocal subscription_service
+        if subscription_service is None:
+            with subscription_lock:
+                if subscription_service is None:
+                    from ..subscriptions.service import SubscriptionService
+
+                    subscription_service = SubscriptionService(paths)
+        return subscription_service
 
     async def _doctor(app_state: Any, *, live: bool) -> dict[str, Any]:
         cache = app_state.doctor_cache
@@ -132,7 +212,9 @@ def build_app(
                     "schema_version": store.schema_version(),
                     "db_path": str(db_path),
                     "db_exists": store.exists,
-                    "read_only": True,
+                    "read_only": False,
+                    "task_database_read_only": True,
+                    "subscription_actions_enabled": True,
                     "version": taskspindle.__version__,
                 }
             )
@@ -308,6 +390,52 @@ def build_app(
                 return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(report)
 
+    # -- subscriptions ---------------------------------------------------------------
+
+    @_subscription_guard
+    def subscriptions_endpoint(request: Request) -> Response:
+        if not _trusted_loopback(request):
+            return _subscription_response({"error": "LOOPBACK_REQUIRED"}, status_code=403)
+        payload = dict(_subscriptions().status())
+        payload["csrf_token"] = csrf_token
+        return _subscription_response(payload)
+
+    @_subscription_guard
+    async def subscription_action_endpoint(request: Request) -> Response:
+        if not _trusted_loopback(request):
+            return _subscription_response({"error": "LOOPBACK_REQUIRED"}, status_code=403)
+        provider = request.path_params["provider"]
+        action = request.path_params["action"]
+        if provider not in _SUBSCRIPTION_PROVIDERS:
+            return _subscription_response({"error": "INVALID_PROVIDER"}, status_code=404)
+        if action not in _SUBSCRIPTION_ACTIONS:
+            return _subscription_response({"error": "INVALID_ACTION"}, status_code=404)
+        expected_origin = f"{request.url.scheme}://{request.headers['host']}"
+        if request.headers.get("origin") != expected_origin:
+            return _subscription_response({"error": "ORIGIN_REQUIRED"}, status_code=403)
+        supplied_token = request.headers.get("x-taskspindle-csrf", "")
+        if not secrets.compare_digest(supplied_token, csrf_token):
+            return _subscription_response({"error": "CSRF_INVALID"}, status_code=403)
+        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            return _subscription_response({"error": "JSON_REQUIRED"}, status_code=415)
+        body_bytes = bytearray()
+        async for chunk in request.stream():
+            if len(body_bytes) + len(chunk) > _MAX_SUBSCRIPTION_BODY_BYTES:
+                return _subscription_response({"error": "REQUEST_TOO_LARGE"}, status_code=413)
+            body_bytes.extend(chunk)
+        try:
+            body = json.loads(body_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return _subscription_response({"error": "INVALID_JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return _subscription_response({"error": "INVALID_JSON"}, status_code=400)
+        try:
+            job = _subscriptions().request(provider, action)
+        except ValueError:
+            return _subscription_response({"error": "ACTION_NOT_AVAILABLE"}, status_code=409)
+        return _subscription_response({"job": job}, status_code=202)
+
     routes = [
         Route("/", index, methods=["GET"]),
         Mount("/static", app=StaticFiles(directory=Path(str(static_dir))), name="static"),
@@ -318,6 +446,12 @@ def build_app(
         Route("/api/providers", providers_endpoint, methods=["GET"]),
         Route("/api/doctor", doctor_endpoint, methods=["GET"]),
         Route("/api/usage", usage_endpoint, methods=["GET"]),
+        Route("/api/subscriptions", subscriptions_endpoint, methods=["GET"]),
+        Route(
+            "/api/subscriptions/{provider}/{action}",
+            subscription_action_endpoint,
+            methods=["POST"],
+        ),
     ]
     app = Starlette(routes=routes)
     app.state.doctor_cache = {"result": None, "at": 0.0}

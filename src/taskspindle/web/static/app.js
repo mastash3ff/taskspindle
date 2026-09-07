@@ -16,6 +16,9 @@
   var taskFilters = { state: "", provider: "", mode: "", q: "" };
   var searchTimer = null;
   var taskRequest = 0;
+  var subscriptionRequest = 0;
+  var subscriptionCsrf = null;
+  var pendingSubscriptionActions = {};
   var usageFilters = { since: "7d", group_by: "provider", provider: "" };
 
   // -- small DOM helpers ------------------------------------------------------------
@@ -132,7 +135,7 @@
   }
 
   function getJSON(url) {
-    return fetch(url, { headers: { Accept: "application/json" } }).then(function (resp) {
+    return fetch(url, { cache: "no-store", credentials: "same-origin", headers: { Accept: "application/json" } }).then(function (resp) {
       return resp.json().catch(function () { return null; }).then(function (body) {
         if (!resp.ok) {
           var message = (body && body.error) || (resp.status + " " + resp.statusText);
@@ -150,6 +153,7 @@
     var parts = hash.split("/").filter(Boolean);
     if (parts[0] === "tasks" && parts[1]) return { name: "task", id: decodeURIComponent(parts[1]) };
     if (parts[0] === "providers") return { name: "providers" };
+    if (parts[0] === "subscriptions") return { name: "subscriptions" };
     if (parts[0] === "usage") return { name: "usage" };
     return { name: "tasks" };
   }
@@ -189,6 +193,8 @@
       });
     } else if (route.name === "providers") {
       run = renderProviders().then(function () { startPolling(30000, renderProviders); });
+    } else if (route.name === "subscriptions") {
+      run = renderSubscriptions().then(function () { startPolling(15000, renderSubscriptions); });
     } else if (route.name === "usage") {
       run = renderUsage().then(function () { startPolling(30000, renderUsage); });
     } else {
@@ -624,6 +630,235 @@
     wrap.appendChild(btn);
     wrap.appendChild(renderDoctorChecks(doctor));
     return wrap;
+  }
+
+  // -- subscriptions ------------------------------------------------------------------
+
+  function friendlyBillingDate(value, precision) {
+    if (!value) return "-";
+    if (precision === "date" && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      var parts = value.split("-").map(Number);
+      return new Intl.DateTimeFormat(undefined, {
+        year: "numeric", month: "short", day: "numeric", timeZone: "UTC",
+      }).format(new Date(Date.UTC(parts[0], parts[1] - 1, parts[2])));
+    }
+    var parsed = new Date(value);
+    return isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+  }
+
+  function remainingText(days) {
+    if (days == null) return "";
+    if (days < 0) return "";
+    if (days === 0) return " — today";
+    return " — " + days + (Math.abs(days) === 1 ? " day remaining" : " days remaining");
+  }
+
+  function subscriptionState(row) {
+    var errorCode = row.error && row.error.code;
+    if (errorCode === "AUTH_REQUIRED" || errorCode === "ACCOUNT_MISMATCH") {
+      return { text: "Reconnect required", className: "warn" };
+    }
+    if (errorCode === "UNSUPPORTED_BILLING_CHANNEL") {
+      return { text: "Unsupported billing channel", className: "warn" };
+    }
+    if (row.error && !row.last_success_at) return { text: "Verification failed", className: "fail" };
+    if (row.status === "renewing") {
+      return {
+        text: row.renews_at ?
+          "Renews on " + friendlyBillingDate(row.renews_at, row.date_precision) : "Renewing",
+        className: "ok",
+      };
+    }
+    if (row.status === "cancelled") {
+      return {
+        text: row.access_ends_at ?
+          "Cancelled — access ends " + friendlyBillingDate(row.access_ends_at, row.date_precision) +
+            remainingText(row.days_remaining) : "Cancelled",
+        className: "warn",
+      };
+    }
+    if (row.status === "expired") return { text: "Expired", className: "fail" };
+    if (row.status === "free") return { text: "Free", className: "unknown" };
+    if (row.status === "none") return { text: "No subscription", className: "unknown" };
+    return { text: "Unavailable", className: "unknown" };
+  }
+
+  function operationState(row) {
+    var operation = pendingSubscriptionActions[row.provider] || row.operation;
+    if (!operation) return null;
+    return {
+      action: operation.action,
+      status: String(operation.status || "queued").toLowerCase(),
+    };
+  }
+
+  function subscriptionActionButton(row, action, operation) {
+    var reconnect = action === "connect" && row.connected;
+    var label = action === "connect" ? (reconnect ? "Reconnect" : "Connect") : "Refresh now";
+    var running = operation && operation.action === action;
+    if (running && operation.status === "running") {
+      label = action === "connect" ? (reconnect ? "Reconnecting…" : "Connecting…") : "Refreshing…";
+    } else if (running) {
+      label += " queued";
+    }
+    var button = h("button", {
+      type: "button",
+      "aria-label": label + " " + (row.label || row.provider),
+      "data-subscription-provider": row.provider,
+      "data-subscription-action": action,
+    }, label);
+    button.disabled = Boolean(operation) || (action === "refresh" && !row.connected);
+    button.addEventListener("click", function () {
+      requestSubscriptionAction(row.provider, action, button).catch(showError);
+    });
+    return button;
+  }
+
+  function renderSubscriptionCard(row) {
+    var state = subscriptionState(row);
+    var operation = operationState(row);
+    var card = h("section", { class: "panel subscription-card" });
+    card.appendChild(h("div", { class: "subscription-heading" },
+      h("h2", null, row.label || row.provider),
+      badge(state.text, state.className)
+    ));
+    var billingLabels = {
+      provider_web: "Provider website",
+      apple: "Apple App Store",
+      google_play: "Google Play",
+      x_premium: "X Premium",
+      unknown: "Unknown",
+    };
+    card.appendChild(kv([
+      ["Account", row.account_label],
+      ["Plan", row.plan],
+      ["Billing", billingLabels[row.billing_channel]],
+      ["Renews", friendlyBillingDate(row.renews_at, row.date_precision)],
+      ["Access ends", friendlyBillingDate(row.access_ends_at, row.date_precision)],
+    ]));
+
+    var activity = h("div", { class: "subscription-activity" });
+    activity.appendChild(h("p", null,
+      h("span", { class: "muted" }, "Last verified: "),
+      row.last_success_at ? friendlyBillingDate(row.last_success_at, "datetime") : "-"
+    ));
+    if (row.error) {
+      activity.appendChild(h("p", { class: "error" },
+        "Verification failed: " + textOrDash(row.error.message)
+      ));
+    } else {
+      activity.appendChild(h("p", { class: "muted" }, "Error: none"));
+    }
+    if (row.freshness === "stale") {
+      activity.appendChild(h("p", { class: "warning" },
+        "Verification is stale. Refresh to confirm the current subscription."
+      ));
+    }
+    if (row.end_passed_unverified) {
+      activity.appendChild(h("p", { class: "warning" },
+        "The recorded access end has passed. Refresh before treating this subscription as expired."
+      ));
+    }
+    if (operation) {
+      activity.appendChild(h("p", { class: "operation", "aria-live": "polite" },
+        operation.action + " " + operation.status
+      ));
+    }
+    card.appendChild(activity);
+
+    var actions = h("div", { class: "subscription-actions" });
+    actions.appendChild(subscriptionActionButton(row, "connect", operation));
+    actions.appendChild(subscriptionActionButton(row, "refresh", operation));
+    card.appendChild(actions);
+    return card;
+  }
+
+  function focusedSubscriptionControl() {
+    var active = document.activeElement;
+    if (!active || !active.dataset || !active.dataset.subscriptionProvider) return null;
+    return {
+      provider: active.dataset.subscriptionProvider,
+      action: active.dataset.subscriptionAction,
+    };
+  }
+
+  function restoreSubscriptionFocus(focused) {
+    if (!focused) return;
+    Array.prototype.some.call(document.querySelectorAll("[data-subscription-provider]"), function (control) {
+      if (control.dataset.subscriptionProvider === focused.provider &&
+          control.dataset.subscriptionAction === focused.action && !control.disabled) {
+        control.focus({ preventScroll: true });
+        return true;
+      }
+      return false;
+    });
+  }
+
+  function renderSubscriptions() {
+    var request = ++subscriptionRequest;
+    var focused = focusedSubscriptionControl();
+    return getJSON("/api/subscriptions").then(function (data) {
+      if (request !== subscriptionRequest || parseRoute().name !== "subscriptions") return;
+      subscriptionCsrf = data.csrf_token;
+      clearNode(APP);
+      var heading = h("div", { class: "panel" });
+      heading.appendChild(h("h1", null, "Subscriptions"));
+      var collector = data.collector_running ? "Collector running" : "Collector unavailable";
+      if (data.collector_last_seen_at) {
+        collector += " · last seen " + friendlyBillingDate(data.collector_last_seen_at, "datetime");
+      }
+      heading.appendChild(h("p", { class: data.collector_running ? "muted" : "error" }, collector));
+      APP.appendChild(heading);
+      var grid = h("div", { class: "subscription-grid" });
+      data.subscriptions.forEach(function (row) { grid.appendChild(renderSubscriptionCard(row)); });
+      APP.appendChild(grid);
+      restoreSubscriptionFocus(focused);
+      setRefreshed();
+    });
+  }
+
+  function markSubscriptionPending(provider, action, button) {
+    pendingSubscriptionActions[provider] = { provider: provider, action: action, status: "running" };
+    Array.prototype.forEach.call(document.querySelectorAll("[data-subscription-provider]"), function (control) {
+      if (control.dataset.subscriptionProvider === provider) control.disabled = true;
+    });
+    button.textContent = action === "connect" ? "Connecting…" : "Refreshing…";
+  }
+
+  function requestSubscriptionAction(provider, action, button) {
+    if (!subscriptionCsrf || pendingSubscriptionActions[provider]) return Promise.resolve();
+    markSubscriptionPending(provider, action, button);
+    return fetch("/api/subscriptions/" + encodeURIComponent(provider) + "/" + action, {
+      method: "POST",
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-TaskSpindle-CSRF": subscriptionCsrf,
+      },
+      body: "{}",
+    }).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (body) {
+        if (!response.ok) {
+          var messages = {
+            LOOPBACK_REQUIRED: "Open the dashboard on this computer to connect an account.",
+            ORIGIN_REQUIRED: "Reload this page from the local dashboard and try again.",
+            CSRF_INVALID: "Reload this page and try again.",
+            ACTION_NOT_AVAILABLE: "Connect this account before refreshing it.",
+            SUBSCRIPTION_UNAVAILABLE: "Subscription tracking is temporarily unavailable.",
+          };
+          throw new Error(messages[body && body.error] || "Unable to request a subscription check. Try again.");
+        }
+        pendingSubscriptionActions[provider] = body.job;
+        return renderSubscriptions();
+      });
+    }).catch(function (error) {
+      delete pendingSubscriptionActions[provider];
+      return renderSubscriptions().then(function () { throw error; });
+    }).then(function () {
+      delete pendingSubscriptionActions[provider];
+    });
   }
 
   // -- usage --------------------------------------------------------------------------

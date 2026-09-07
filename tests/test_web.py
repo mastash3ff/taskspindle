@@ -198,7 +198,9 @@ def test_health_reports_schema_and_db_state(tmp_path: Path) -> None:
     missing = client.get("/api/health").json()
     assert missing["db_exists"] is False
     assert missing["schema_version"] is None
-    assert missing["read_only"] is True
+    assert missing["read_only"] is False
+    assert missing["task_database_read_only"] is True
+    assert missing["subscription_actions_enabled"] is True
 
     _seed(paths)
     present = client.get("/api/health").json()

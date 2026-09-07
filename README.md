@@ -37,7 +37,11 @@ produced.
   provider named. Choosing is yours.
 - **Usage you can see.** Every turn's token counts are recorded from the wire, with an estimated
   cost at published rates that is labelled as an estimate. `usage_report`, `taskspindle usage` and
-  the read-only dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
+  the dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
+- **Subscription dates.** An independent browser collector records verified renewal and
+  cancellation access-end dates for the [Subscriptions page](docs/subscriptions.md).
+  Collection uses dedicated browser sign-ins and reports unknown or stale results explicitly;
+  it never changes subscriptions or worker routing.
 
 ## Quick start
 
@@ -88,7 +92,8 @@ moved underneath you is refused rather than clobbered.
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
-| [dashboard.md](docs/dashboard.md) | `taskspindle web`: the read-only dashboard and its JSON API |
+| [dashboard.md](docs/dashboard.md) | `taskspindle web`: task inspection, subscriptions, and its JSON API |
+| [subscriptions.md](docs/subscriptions.md) | Dedicated browser setup, collection, status, and deployment |
 | [rollback.md](docs/rollback.md) | backing it out without losing anything |
 
 ## Supported platforms
