@@ -8,6 +8,7 @@ those rules into tool behaviour -- git, systemd, the filesystem -- lives in
 from __future__ import annotations
 
 import secrets
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -308,6 +309,7 @@ def _last_success_at(row: dict[str, Any] | None) -> str | None:
 
 def provider_availability(
     store: ProviderStatusReader, profile: Profile, *, now: datetime, model: str | None = None,
+    parent_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """What TaskSpindle currently believes about a provider's willingness to take a turn."""
     key = limits.status_key(profile)
@@ -330,6 +332,21 @@ def provider_availability(
         and selected.get("state") == "throttled"
         and state == "unknown"
     )
+    # Native quota may add a temporary throttle, never remove task/model refusal evidence.
+    from .access_checks import cached_native_check
+
+    native = cached_native_check(store, profile, parent_env, now=now)
+    if state in ("ok", "unknown") and native["eligible_hint"] is False:
+        return {
+            "state": "throttled", "status_key": key, "code": "NATIVE_QUOTA_EXHAUSTED",
+            "window": native["window"], "reset_at": native["reset_at"],
+            "reason": "Grok reported its current quota fully used.",
+            "observed_at": native["checked_at"],
+            "suggested_alternative": limits.suggested_alternative(profile.id),
+            "last_success_at": _last_success_at(account_row), "source": "native_check",
+            "scope": "account", "affected_model": None, "stale": False,
+            "next_action": "wait", "retry_eligible": False,
+        }
     next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
     stored_state = selected.get("state") if selected else None
     return {
@@ -386,14 +403,14 @@ def model_availability(
 
 def require_provider_available(
     store: Store, profile: Profile, *, now: datetime, ignore: bool = False,
-    model: str | None = None,
+    model: str | None = None, parent_env: Mapping[str, str] | None = None,
 ) -> None:
     """Refuse to start on a provider the last turn found throttled or logged out.
 
     This is the whole of the fallback policy: the refusal names the reset time and the other
     first-class provider, and the caller decides. ``ignore`` starts the task anyway.
     """
-    availability = provider_availability(store, profile, now=now, model=model)
+    availability = provider_availability(store, profile, now=now, model=model, parent_env=parent_env)
     if ignore or availability["state"] in ("ok", "unknown"):
         return
     raise TaskSpindleError(

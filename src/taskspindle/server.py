@@ -46,7 +46,6 @@ INTERNAL = "INTERNAL"
 #: The tools that only read. ``task_diff`` is deliberately absent.
 READ_ONLY_TOOLS: frozenset[str] = frozenset(
     {
-        "capabilities",
         "doctor",
         "list_repository_policies",
         "list_tasks",
@@ -199,9 +198,13 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         return _guard(name, log_path, body)
 
     @tool("capabilities")
-    def capabilities() -> dict[str, Any]:
-        """Providers, modes, versions, limits, states and what isolation does and does not mean."""
-        return call("capabilities", orchestrator.capabilities)
+    async def capabilities(check_providers: list[str] | None = None) -> dict[str, Any]:
+        """Cached provider availability. Optional check_providers runs bounded native checks and
+        writes diagnostic cache only; never starts login, a task, or inference."""
+        if not check_providers:
+            return call("capabilities", orchestrator.capabilities)
+        return await _guard_async("capabilities", log_path,
+                                  lambda: orchestrator.capabilities_checked(check_providers))
 
     @tool("doctor")
     async def doctor(live_probes: bool = True) -> dict[str, Any]:

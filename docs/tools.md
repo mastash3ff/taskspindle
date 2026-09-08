@@ -20,30 +20,44 @@ did not anticipate comes back as `INTERNAL` with nothing but the exception's cla
 `details`; its traceback goes to `state_dir/server.log`, not into the conversation, where it would
 leak paths and arguments.
 
-Read-only tools are annotated `readOnlyHint: true`. Seven are: `capabilities`, `doctor`,
-`list_repository_policies`, `list_tasks`, `task_status`, `task_result`, `usage_report`.
+Read-only tools are annotated `readOnlyHint: true`. Six are: `doctor`,
+`list_repository_policies`, `list_tasks`, `task_status`, `task_result`, and `usage_report`.
 **`task_diff` is not one of them**, and that is deliberate: handing a page of a diff over appends a
-receipt that later proves the whole candidate was inspected. Reading changes the record.
+receipt that later proves the whole candidate was inspected. `capabilities` also lacks the hint
+because its optional `check_providers` parameter writes a bounded native diagnostic cache. Calling
+`capabilities` without that parameter remains cached-only and writes nothing.
 
 ## Discovery
 
-### `capabilities` — read-only
+### `capabilities`
 
-No parameters. What you need to compose a valid request, and nothing about any task.
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `check_providers` | string[]\|null | `null` | refresh bounded native diagnostics for these configured profile IDs |
+
+What you need to compose a valid request, and nothing about any task. The default call reads only
+stored task outcomes, capacity, usage windows, and native diagnostic cache entries. With
+`check_providers=["grok"]`, it may run and cache a session-free native Grok quota check before
+returning.
 
 ```json
-{"providers": [{"id": "claude", "first_class": true, "second_class": false, "auth": "oauth",
+{"providers": [{"id": "grok", "first_class": true, "second_class": false, "auth": "oauth",
                 "modes": ["consult", "implement", "review"], "model": null, "gateway_host": null,
-                "availability": {"state": "throttled", "status_key": "claude",
+                "availability": {"state": "throttled", "status_key": "grok",
                                  "code": "PROVIDER_THROTTLED", "window": "five_hour",
                                  "reset_at": "2026-09-04T21:00:00Z",
-                                 "reason": "You've hit your limit · resets 4pm",
+                                 "reason": "The provider reported a usage limit.",
                                  "observed_at": "2026-09-04T18:41:07Z",
-                                 "suggested_alternative": "grok"},
+                                 "suggested_alternative": "claude"},
                 "windows": [{"window": "five_hour", "status": "rejected", "used_percent": 100.0,
-                             "resets_at": "2026-09-04T21:00:00Z", "source": "throttle_error"}]}],
+                             "resets_at": "2026-09-04T21:00:00Z", "source": "throttle_error"}],
+                "native_check": {"state": "quota", "source": "grok_billing",
+                                 "version": "1.0.13", "used_percent": 25.0,
+                                 "window": "weekly", "period_start": "…", "reset_at": "…",
+                                 "freshness": "fresh", "eligible_hint": true,
+                                 "account_binding": "unverified"}}],
  "modes": ["consult", "review", "implement"],
- "versions": {"taskspindle": "0.2.0", "api": 1, "schema": 2,
+ "versions": {"taskspindle": "0.2.0", "api": 1, "schema": 6,
               "adapter_package": "@agentclientprotocol/claude-agent-acp",
               "adapter_version": "0.70.0", "acp": "0.12.0"},
  "limits": {"timeout_s": [60, 14400], "diff_page_bytes": 16384, "diff_page_max_bytes": 262144,
@@ -62,6 +76,22 @@ reads as `ok` again. `suggested_alternative` names the other first-class provide
 one. Nothing is chosen for you: see [`start_task`](#start_task) for what a throttled provider does
 to a request, and [architecture.md](architecture.md#provider-availability) for why that is all it
 does. `windows` is the newest observation of each usage window, as far as the agent reports them.
+
+Every provider includes a normalized `native_check`. Stable fields include `state`, `source`,
+`version`, `checked_at`, `last_attempt_at`, `last_success_at`, `used_percent`, `window`,
+`period_start`, `reset_at`, `freshness`, `eligible_hint`, `checking`, `error_code`, `detail`, and a
+bounded `last_success`. Null fields remain explicit. The native result is account-unbound and
+separate from browser billing and task refusal evidence. Only a fresh, current Grok quota result
+can set `eligible_hint`; explicit exhaustion adds a temporary new-task gate, while a passed reset,
+stale result, unsupported method, or failed check leaves quota unknown. It never clears an
+existing account/model refusal.
+
+The Grok check uses only the installed OAuth CLI's ACP billing extension. It starts no model turn,
+login, browser, or direct HTTP request; reads no token contents; and does not upgrade the CLI. A
+persistent cache shared by OAuth aliases of the same provider account coalesces calls for five
+minutes. Executable, authentication-mode, and relevant configuration/auth-file metadata changes
+invalidate it; model and effort selection do not split the account quota. Unsupported native
+methods are reported as `unsupported` without another transport.
 
 ### `doctor` — read-only
 

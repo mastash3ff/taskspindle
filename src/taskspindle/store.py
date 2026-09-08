@@ -32,6 +32,8 @@ from .models import (
 class ProviderStatusReader(Protocol):
     """The read interface needed to describe provider availability."""
 
+    def get_native_check(self, provider: str) -> dict[str, Any] | None: ...
+
     def get_provider_status(self, provider: str) -> dict[str, Any] | None: ...
 
     def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None: ...
@@ -374,9 +376,22 @@ CREATE TABLE provider_model_status (
 );
 """
 
+_MIGRATION_6 = """
+CREATE TABLE native_checks (
+    provider TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL,
+    attempt_at TEXT,
+    result_json TEXT,
+    success_at TEXT,
+    success_json TEXT,
+    lease_owner TEXT,
+    lease_until TEXT
+);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3), (4, _MIGRATION_4),
-    (5, _MIGRATION_5),
+    (5, _MIGRATION_5), (6, _MIGRATION_6),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1312,6 +1327,55 @@ class Store:
             f"{where} ORDER BY u.id", params
         ).fetchall()
         return [self._usage_row(row) for row in rows]
+
+    # -- native diagnostics: independent from task refusal evidence -------------------
+
+    def get_native_check(self, provider: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM native_checks WHERE provider = ?", (provider,)).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        for key in ("result_json", "success_json"):
+            try:
+                result[key] = _loads(result[key])
+            except (ValueError, TypeError):
+                return None
+            if result[key] is not None and not isinstance(result[key], dict):
+                return None
+        return result
+
+    def claim_native_check(self, provider: str, fingerprint: str, owner: str,
+                           at: str, expires: str, fresh_after: str) -> bool:
+        """Atomically coalesce across processes; never hold SQLite while checking a CLI."""
+        with self._guard(), self.transaction() as conn:
+            row = conn.execute("SELECT * FROM native_checks WHERE provider = ?", (provider,)).fetchone()
+            if row and row["lease_owner"] and row["lease_until"] > at:
+                return False
+            if (row and row["fingerprint"] == fingerprint and row["attempt_at"]
+                    and fresh_after < row["attempt_at"] <= at and row["result_json"]):
+                return False
+            if row is None or row["fingerprint"] != fingerprint:
+                conn.execute("INSERT OR REPLACE INTO native_checks(provider, fingerprint) VALUES (?, ?)",
+                             (provider, fingerprint))
+            conn.execute("UPDATE native_checks SET lease_owner=?, lease_until=? WHERE provider=?",
+                         (owner, expires, provider))
+            return True
+
+    def finish_native_check(self, provider: str, fingerprint: str, owner: str,
+                            at: str, result: dict[str, Any]) -> bool:
+        with self._guard(), self.transaction() as conn:
+            row = conn.execute("SELECT * FROM native_checks WHERE provider=? AND fingerprint=? "
+                               "AND lease_owner=?", (provider, fingerprint, owner)).fetchone()
+            if row is None:
+                return False
+            success = result.get("state") == "quota"
+            conn.execute("UPDATE native_checks SET attempt_at=?, result_json=?, success_at=?, "
+                         "success_json=?, lease_owner=NULL, lease_until=NULL WHERE provider=? "
+                         "AND fingerprint=? AND lease_owner=?",
+                         (at, json.dumps(result), at if success else row["success_at"],
+                          json.dumps(result) if success else row["success_json"],
+                          provider, fingerprint, owner))
+            return True
 
     # -- provider windows -------------------------------------------------------------
 

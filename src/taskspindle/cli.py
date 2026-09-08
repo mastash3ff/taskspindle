@@ -82,6 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_status = sub.add_parser(
         "providers", help="show cached worker availability without starting work",
     )
+    provider_status.add_argument("--provider", help="only this configured provider ID")
     provider_status.add_argument("--json", action="store_true", help="print the report as JSON")
     provider_status.add_argument(
         "--check", action="store_true",
@@ -158,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return _doctor(live_probes=not args.no_live, as_json=args.json)
     if args.command == "providers":
-        return _providers_status(check=args.check, as_json=args.json)
+        return _providers_status(check=args.check, as_json=args.json, provider=args.provider)
     if args.command == "mcp":
         return _mcp()
     if args.command == "worker":
@@ -286,7 +287,7 @@ def _provider_status(paths: Paths) -> list[dict[str, Any]]:
         return []
 
 
-def _providers_status(*, check: bool, as_json: bool) -> int:
+def _providers_status(*, check: bool, as_json: bool, provider: str | None = None) -> int:
     """Project the same availability as MCP/web; native checks never clear task evidence."""
     import sqlite3
     from datetime import UTC, datetime
@@ -298,11 +299,21 @@ def _providers_status(*, check: bool, as_json: bool) -> int:
     paths = resolve_paths()
     try:
         profiles = _profiles(paths)
+        if provider is not None:
+            if provider not in profiles:
+                raise ProfileError("PROFILE_UNKNOWN", "Unknown provider")
+            profiles = {provider: profiles[provider]}
         rows = []
-        with ReadOnlyStore(paths.state_dir / "taskspindle.sqlite3") as store:
+        from .access_checks import cached_native_check, refresh_native_check
+        from .store import Store
+        factory = Store.open if check else ReadOnlyStore
+        with factory(paths.state_dir / "taskspindle.sqlite3") as store:
             for profile in sorted(profiles.values(), key=lambda item: item.id):
+                native = (refresh_native_check(store, profile, os.environ) if check
+                          else cached_native_check(store, profile))
                 checked_at = datetime.now(UTC)
                 row = {
+                    "native_check": native,
                     "id": profile.id, "family": profile.family,
                     "auth": profile.auth, "model": profile.model,
                     "availability": provider_availability(
@@ -310,10 +321,6 @@ def _providers_status(*, check: bool, as_json: bool) -> int:
                     ),
                     "model_availability": model_availability(store, profile, now=checked_at),
                 }
-                if check:
-                    from .access_checks import check_native_access
-
-                    row["native_check"] = check_native_access(profile, os.environ)
                 rows.append(row)
     except (ConfigError, ProfileError, OSError, sqlite3.Error):
         if as_json:

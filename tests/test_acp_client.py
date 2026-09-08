@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from acp import RequestError
+from acp.connection import StreamDirection, StreamEvent
 from acp.schema import PermissionOption, ToolCallUpdate
 
-from taskspindle.acp_client import AcpError, AcpWorker, PermissionPolicy, sealed_env
+from taskspindle import limits
+from taskspindle.acp_client import AcpError, AcpWorker, PermissionPolicy, TurnCapture, sealed_env
 from taskspindle.providers import Profile, build_child_env, env_violations, session_options
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -246,12 +249,129 @@ async def test_a_timed_out_turn_reports_the_transport_retries_it_saw(tmp_path: P
         "retries": 2,
         "last_retry": {
             "attempt": 2, "max_retries": 15, "kind": "http", "type": "retrying",
-            "reason": "request error: error sending request for url (https://example)",
         },
     }
     assert worker.last_result is not None
     assert worker.last_result.stop_reason == "timeout"
     assert [entry["attempt"] for entry in worker.last_result.capture.retries] == [1, 2]
+
+
+def test_retry_diagnostic_never_retains_provider_free_text_or_urls() -> None:
+    from taskspindle.acp_client import safe_retry_summary
+
+    assert safe_retry_summary({
+        "attempt": 3, "max_retries": 15, "kind": "http", "type": "retrying",
+        "httpStatus": 429, "reason": "Bearer secret-value https://provider.example/path",
+    }) == {
+        "attempt": 3, "max_retries": 15, "kind": "http", "type": "retrying",
+        "http_status": 429,
+    }
+    assert safe_retry_summary({"kind": "tool", "reason": "HTTP 401 secret-value"}) == {}
+    assert safe_retry_summary({"kind": ["http"], "type": {"retrying": True}}) == {}
+    # An untrusted ordinary session update cannot manufacture the xAI namespace.
+    assert safe_retry_summary({
+        "origin": "xai_responses", "type": "failed", "error_type": "api",
+        "message": "API error (status 403): Your team has run out of credits",
+    }) == {"type": "failed", "error_type": "api"}
+
+
+def test_xai_terminal_retry_wire_event_extracts_only_the_provider_status() -> None:
+    """Grok 1.0.13 sends this as `_x.ai/session_notification`, not a tool result."""
+    worker = object.__new__(AcpWorker)
+    worker._capture = TurnCapture()
+    worker._expected_config = {}
+    worker._observe(StreamEvent(
+        StreamDirection.INCOMING,
+        {
+            "method": "_x.ai/session_notification",
+            "params": {"update": {
+                "sessionUpdate": "retry_state", "type": "exhausted", "attempts": 3,
+                "is_rate_limited": True, "reason": "private-provider-detail secret-value",
+            }},
+        },
+    ))
+
+    assert worker._capture.retries == [{
+        "type": "exhausted", "origin": "xai_responses", "provider_state": "throttled",
+    }]
+    from taskspindle.acp_client import safe_retry_summary
+    assert (
+        safe_retry_summary(worker._capture.retries[-1], trusted_summary=True)
+        == worker._capture.retries[-1]
+    )
+    terminal = AcpError("ACP_TURN_ERROR", "provider turn failed", cause={
+        "last_retry": worker._capture.retries[-1],
+    })
+    verdict = limits.classify_acp_error(terminal, family="grok")
+    assert (verdict.provider_state, verdict.reason) == (
+        "throttled", "The provider reported a usage limit.",
+    )
+
+
+def test_xai_terminal_failed_wire_event_reduces_credit_403_without_retaining_message() -> None:
+    """The official terminal Failed envelope carries its API status inside the message."""
+    worker = object.__new__(AcpWorker)
+    worker._capture = TurnCapture()
+    worker._expected_config = {}
+    private_message = "API error (status 403): Your team has run out of credits; request=secret"
+    worker._observe(StreamEvent(
+        StreamDirection.INCOMING,
+        {
+            "method": "_x.ai/session_notification",
+            "params": {"update": {
+                "sessionUpdate": "retry_state", "type": "failed", "error_type": "api",
+                "message": private_message,
+            }},
+        },
+    ))
+
+    assert worker._capture.retries == [{
+        "type": "failed", "error_type": "api", "origin": "xai_responses",
+        "credit_evidence": True, "http_status": 403, "provider_state": "access_denied",
+    }]
+    assert private_message not in json.dumps(worker._capture.retries)
+    terminal = AcpError("ACP_TURN_ERROR", "provider turn failed", cause={
+        "last_retry": worker._capture.retries[-1],
+    })
+    verdict = limits.classify_acp_error(terminal, family="grok")
+    assert (verdict.code, verdict.provider_state, verdict.reason) == (
+        limits.PROVIDER_ACCESS_DENIED, "access_denied", "The provider denied account access.",
+    )
+
+
+async def test_terminal_grok_retry_is_merged_into_the_actual_prompt_failure_cause() -> None:
+    """A notification delivered before the terminal RPC error remains source-shaped evidence."""
+    worker = object.__new__(AcpWorker)
+    worker._capture = None
+    worker._expected_config = {}
+    worker._config_violation = False
+    private_message = "API error (status 403): Your team has run out of credits; request=secret"
+
+    class TerminalConnection:
+        async def prompt(self, **_: object) -> object:
+            worker._observe(StreamEvent(
+                StreamDirection.INCOMING,
+                {
+                    "method": "_x.ai/session_notification",
+                    "params": {"update": {
+                        "sessionUpdate": "retry_state", "type": "failed", "error_type": "api",
+                        "message": private_message,
+                    }},
+                },
+            ))
+            raise RequestError.internal_error({"http_status": 403, "message": private_message})
+
+    worker._conn = TerminalConnection()
+    with pytest.raises(AcpError) as raised:
+        await worker.prompt("grok-session", "no external request", timeout=1)
+
+    assert raised.value.cause["last_retry"] == {
+        "type": "failed", "error_type": "api", "origin": "xai_responses",
+        "credit_evidence": True, "http_status": 403, "provider_state": "access_denied",
+    }
+    assert private_message not in json.dumps(raised.value.cause["last_retry"])
+    verdict = limits.classify_acp_error(raised.value, family="grok")
+    assert verdict.provider_state == "access_denied"
 
 
 async def test_a_failing_turn_is_an_acp_turn_error(tmp_path: Path) -> None:

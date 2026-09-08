@@ -306,13 +306,21 @@ class Orchestrator:
 
     # -- capabilities ---------------------------------------------------------------
 
-    def capabilities(self) -> dict[str, Any]:
+    def capabilities(self, check_providers: list[str] | None = None) -> dict[str, Any]:
         """Everything a caller needs to compose a valid request, and nothing about a task.
 
         ``availability`` is the one thing here that changes: what the last turn on each provider
         learned about its seat. A throttled provider is reported, with its reset time and the
         other first-class provider named, so the caller can choose; nothing is chosen for it.
         """
+        from .access_checks import cached_native_check, refresh_native_check
+
+        checks = {}
+        if check_providers:
+            selected = self._known_providers(check_providers)
+            for provider_id in selected:
+                checks[provider_id] = refresh_native_check(
+                    self.store, self.profiles[provider_id], self.parent_env)
         now = self.clock()
         active: dict[str, int] = {}
         for lease in self.store.list_leases():
@@ -334,9 +342,11 @@ class Orchestrator:
                     "modes": sorted(profile.modes),
                     "model": profile.model,
                     "adapter": providers.adapter_metadata(profile),
+                    "native_check": checks.get(profile.id) or cached_native_check(
+                        self.store, profile, self.parent_env, now=now),
                     "gateway_host": profile.gateway_host,
                     "availability": provider_availability(
-                        self.store, profile, now=now, model=profile.model,
+                        self.store, profile, now=now, model=profile.model, parent_env=self.parent_env,
                     ),
                     "model_availability": model_availability(self.store, profile, now=now),
                     "capacity": {
@@ -367,6 +377,23 @@ class Orchestrator:
             "cleanup_states": [state.value for state in CleanupState],
             "isolation": ISOLATION,
         }
+
+    async def capabilities_checked(self, check_providers: list[str] | None = None) -> dict[str, Any]:
+        import asyncio
+
+        from .access_checks import refresh_native_check
+
+        selected = self._known_providers(check_providers or [])
+        def check_one(provider_id: str) -> dict[str, Any]:
+            with Store.open(self.store.path) as store:
+                return refresh_native_check(store, self.profiles[provider_id], self.parent_env)
+        checks = await asyncio.gather(*(asyncio.to_thread(check_one, name) for name in selected))
+        result = self.capabilities()
+        by_id = dict(zip(selected, checks, strict=True))
+        for profile in result["providers"]:
+            if profile["id"] in by_id:
+                profile["native_check"] = by_id[profile["id"]]
+        return result
 
     # -- repository policy ----------------------------------------------------------
 
@@ -537,7 +564,7 @@ class Orchestrator:
             profile = self._profile_for(request)
             require_provider_available(
                 self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
-                model=request.model or profile.model,
+                model=request.model or profile.model, parent_env=self.parent_env,
             )
             placement = self._placement(request)
             record = create_task(
@@ -867,6 +894,7 @@ class Orchestrator:
                     profile,
                     now=self.clock(),
                     model=task.resolved_model or task.requested_model or profile.model,
+                    parent_env=self.parent_env,
                 )
                 if (availability["state"] not in ("ok", "unknown")
                         and not self._initial_status_override(task, profile)):

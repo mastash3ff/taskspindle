@@ -332,3 +332,30 @@ def test_build_orchestrator_loads_configured_capacity(paths, monkeypatch):
         assert orchestrator.capabilities()["limits"]["concurrent_turns_per_provider"] == 4
     finally:
         store.close()
+
+
+async def test_capabilities_checks_only_selected_provider_and_persists_cache(store, paths, monkeypatch):
+    from taskspindle import grok_checks, providers
+    from tests.test_grok_checks import observation
+    profiles = providers.builtin_profiles(paths.runtime_dir, home=paths.state_dir, state_dir=paths.state_dir)
+    orchestrator = Orchestrator(store=store, paths=paths, profiles=profiles,
+        units=FakeUnitBackend(), boot="test", parent_env={"HOME": str(paths.state_dir), "PATH": "/usr/bin"})
+    calls = []
+    def check(profile, env):
+        calls.append(profile.id)
+        return observation()
+    monkeypatch.setattr(grok_checks, "check_grok", check)
+    async with Client(build_server(orchestrator)) as client:
+        default = await client.call_tool("capabilities", {})
+        assert default.data["ok"] and calls == []
+        checked = await client.call_tool("capabilities", {"check_providers": ["grok"]})
+        assert checked.data["ok"]
+        native = next(row["native_check"] for row in checked.data["result"]["providers"]
+                      if row["id"] == "grok")
+        assert native["state"] == "quota" and calls == ["grok"]
+        await client.call_tool("capabilities", {"check_providers": ["grok"]})
+        assert calls == ["grok"]
+        tools = await client.list_tools()
+        assert next(tool for tool in tools if tool.name == "capabilities").annotations.readOnlyHint is False
+    assert store.list_provider_status() == []
+    assert store.list_tasks() == []

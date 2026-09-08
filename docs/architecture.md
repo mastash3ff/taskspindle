@@ -35,14 +35,16 @@
   review.py      the reviewer's JSON, and what blocks an acceptance
   limits.py      what a refused turn means for its provider; never what to do about it
   usage.py       token counts per turn, the price table, the rolled-up report
-  web/           dashboard: read-only task store, protected subscription actions
+  web/           operator console: read-only task/overview store, protected subscription actions
   subscriptions/ separate SQLite observations/queue, background browser collector, CLI
 ```
 
-Subscription actions use a separate `subscriptions.sqlite3` database and dedicated browser
-profiles. The dashboard queues loopback-only, same-origin, CSRF-protected connection/refresh
-requests; an independent collector processes them and observes billing information. It does
-not change task state or worker eligibility. See [subscription tracking](subscriptions.md).
+Subscription actions use a separate `subscriptions.sqlite3` database. Normal mode connects to a
+selected regular Windows Chrome profile through the paired Playwright extension; dedicated mode
+uses separate TaskSpindle browser profiles. The dashboard queues loopback-only, same-origin,
+CSRF-protected connection/refresh requests; an independent collector processes them and observes
+billing information. It does not change task state or worker eligibility. See
+[subscription tracking](subscriptions.md).
 
 The MCP server never owns an ACP connection. It writes rows and starts units; the units talk to
 agents. That is what lets the server exit, crash or be restarted without taking the work with it.
@@ -186,12 +188,14 @@ not gate workers: a browser account is not assumed to be the CLI account.
 message and data of the agent's error — on the `AcpError` it raises, and interprets none of it.
 `limits.py` does the interpreting, in a fixed order of evidence: the ACP "authentication required"
 code; the Claude adapter's `errorKind` (`authentication_failed`, `oauth_org_not_allowed`,
-`rate_limit`, `billing_error`, `model_unavailable`); the Claude Agent SDK's own usage-limit message prefixes, and the
-older `usage limit reached|<epoch>` sentinel, which also gives the reset time; and, for any other
-agent, a few conservative substrings, because Grok documents no limit telemetry. Anything else is
-the failure it always was. A billing refusal is an access denial, not proof of subscription
-expiry. Model refusals bind to the task's selected model, not an unrelated ID in provider output.
-Persisted access reasons and diagnostic fields are sanitized.
+`rate_limit`, `billing_error`, `model_unavailable`); the Claude Agent SDK's own usage-limit message
+prefixes and older `usage limit reached|<epoch>` sentinel; and Grok's terminal structured provider
+HTTP status and source-proven terminal xAI retry notifications. Incidental status numbers and
+tool output do not change account state. A credit-specific 403 needs terminal provider evidence;
+an unrelated 403 stays ambiguous. Retry prose is reduced to fixed diagnostic fields.
+Anything else is the failure it always was. A billing refusal is an access denial, not proof of
+subscription expiry. Model refusals bind to the task's selected model, not an unrelated ID in
+provider output. Persisted access reasons and diagnostic fields are sanitized.
 
 **Recording.** The runner writes a classified refusal in three places: the task's `error` (code
 `PROVIDER_THROTTLED`, `PROVIDER_AUTH_EXPIRED`, `PROVIDER_ACCESS_DENIED`, or
@@ -221,11 +225,24 @@ An explicit `ignore_provider_status` retry remains bounded to the observation it
 native cached-login checks alone do not clear a refusal. Metered workers still require separate
 explicit opt-in and are never selected automatically by the work pool.
 
-`taskspindle providers --check --json` optionally reads supported native cached-login/catalog
-evidence without browser login or inference. These checks are separate from task outcomes and
-never establish billing dates, active entitlement, or browser-account identity. Claude personal
-Pro and Max claims are accepted. Other unsupported checks are labeled rather than guessed.
-The dashboard reads old and new task schemas without running migrations.
+`capabilities(check_providers=["grok"])` and `taskspindle providers --check --provider grok`
+optionally refresh Grok's native quota observation. The checker starts a session-free native ACP
+process, calls the vendor billing extension, and retains only normalized percentage, weekly/monthly
+window, reset, timestamps, version, freshness, and safe status fields. The persistent cache is
+shared by OAuth model aliases of the same provider account. It coalesces concurrent checks for
+five minutes and invalidates on executable, auth mode, or relevant config/auth-file metadata
+changes; model and effort selection do not create separate account quota caches. It never starts inference, login, a browser, or direct HTTP;
+it reads no credential contents and never upgrades the CLI. Unsupported versions keep quota
+unknown rather than trying another transport.
+
+A fresh explicit 100-percent native observation can add a temporary new-task gate. A passed reset,
+stale observation, or unknown quota permits an ordinary attempt unless task evidence still refuses
+it. Native evidence never clears account/model refusals or establishes browser identity, CLI
+account binding, billing dates, or future model-turn success. Because the optional MCP parameter
+writes this diagnostic cache, `capabilities` is not advertised with a read-only annotation; its
+default call is cached-only. Dashboard Overview and Workers GETs read cached task/native/doctor
+data, start no diagnostics, and tolerate older task schemas without migrating them. Schema 6 adds
+the native diagnostic cache without changing task records or provider bindings.
 
 ## What isolation is, and is not
 

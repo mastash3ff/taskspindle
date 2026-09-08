@@ -56,6 +56,7 @@ __all__ = [
     "TurnCapture",
     "TurnResult",
     "error_cause",
+    "safe_retry_summary",
     "sealed_env",
 ]
 
@@ -430,7 +431,10 @@ class AcpWorker:
         elif kind == "turn_completed":
             capture.turn_completed = dict(update)
         elif kind == "retry_state":
-            capture.retries.append(_retry_summary(update))
+            capture.retries.append(safe_retry_summary(
+                update,
+                xai_responses=event.message.get("method") == "_x.ai/session_notification",
+            ))
 
     def _observe_configuration(self, update: dict[str, Any]) -> None:
         """Protect selected values even between configuration requests and turns."""
@@ -627,8 +631,13 @@ class AcpWorker:
             ) from exc
         except Exception as exc:
             self._require_configuration_intact()
+            cause = error_cause(exc)
+            # A terminal Grok request can send its source-proven retry notification before the
+            # prompt RPC error. Keep that already-sanitized transport fact next to the RPC fields;
+            # its provider-controlled message was discarded by the observer.
+            cause.update(_retry_cause(capture))
             raise AcpError(
-                "ACP_TURN_ERROR", f"session/prompt failed: {exc}", cause=error_cause(exc)
+                "ACP_TURN_ERROR", f"session/prompt failed: {exc}", cause=cause
             ) from exc
         except BaseException:
             stop_reason = "cancelled"
@@ -673,20 +682,110 @@ class AcpWorker:
         return self._conn
 
 
-_RETRY_REASON_LIMIT = 200
+_RETRY_KINDS = frozenset({"http"})
+_RETRY_TYPES = frozenset({"retrying", "failed", "exhausted"})
+_RETRY_ERROR_TYPES = frozenset({"api"})
+_RETRY_HTTP_STATUSES = frozenset({401, 402, 403, 429})
+_XAI_API_STATUS = re.compile(r"\bAPI error \(status (401|402|403|429)\b", re.IGNORECASE)
+# This is evaluated only while reducing a verified xAI notification to a fixed enum.  It is
+# deliberately never returned, logged, or stored: terminal API error messages may contain
+# request-specific detail.
+_XAI_CREDIT_MESSAGE = re.compile(
+    r"\b(?:insufficient|out of|no)\s+(?:usage\s+)?credits?\b"
+    r"|\bcredits?\s+(?:are\s+)?(?:exhausted|depleted)\b"
+    r"|\b(?:team|organization|org|account)\s+(?:has\s+)?run\s+out\s+of\s+(?:usage\s+)?credits?\b"
+    r"|\b(?:team|organization|org|account)\b.{0,80}\bspending\s+limit\b",
+    re.IGNORECASE,
+)
 
 
-def _retry_summary(update: Mapping[str, Any]) -> dict[str, Any]:
-    """The diagnostic fields of one ``retry_state`` update, bounded and without free text."""
-    reason = update.get("reason")
-    summary: dict[str, Any] = {
-        "attempt": update.get("attempt"),
-        "max_retries": update.get("max_retries"),
-        "kind": update.get("kind"),
-        "type": update.get("type"),
-    }
-    if isinstance(reason, str):
-        summary["reason"] = reason[:_RETRY_REASON_LIMIT]
+def _bounded_retry_int(value: Any) -> int | None:
+    """A retry counter or HTTP status that cannot carry provider prose."""
+    # ``bool`` is an ``int`` subclass but is not a meaningful retry counter or status.
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100_000 else None
+
+
+def safe_retry_summary(
+    update: Mapping[str, Any] | None, *, xai_responses: bool = False, trusted_summary: bool = False,
+) -> dict[str, Any]:
+    """Keep fixed retry metadata only; never retain provider error text or URLs.
+
+    The Grok adapter's retry notifications are diagnostic transport evidence.  Their ``reason``
+    field is provider-controlled free text and has historically contained request URLs, so it is
+    deliberately not persisted.  A future adapter may supply an explicit numeric HTTP status;
+    retain only the few statuses the availability classifier understands.
+    """
+    if not isinstance(update, Mapping):
+        return {}
+    # Only the observer derives this marker from the JSON-RPC method name. A second reduction
+    # may receive that already-sanitized internal summary across the worker error boundary; do
+    # not let an ordinary session update forge the marker in its own payload.
+    xai_responses = xai_responses or (
+        trusted_summary and update.get("origin") == "xai_responses"
+    )
+    summary: dict[str, Any] = {}
+    for name in ("attempt", "max_retries"):
+        if (value := _bounded_retry_int(update.get(name))) is not None:
+            summary[name] = value
+    kind = update.get("kind")
+    if isinstance(kind, str) and kind in _RETRY_KINDS:
+        summary["kind"] = kind
+    update_type = update.get("type")
+    if isinstance(update_type, str) and update_type in _RETRY_TYPES:
+        summary["type"] = update_type
+    error_type = update.get("error_type")
+    if isinstance(error_type, str) and error_type in _RETRY_ERROR_TYPES:
+        summary["error_type"] = error_type
+    if xai_responses:
+        summary["origin"] = "xai_responses"
+    if xai_responses and update_type == "exhausted" and (
+        update.get("is_rate_limited") is True or update.get("provider_state") == "throttled"
+    ):
+        summary["provider_state"] = "throttled"
+    if (
+        xai_responses and trusted_summary
+        and update.get("provider_state") in {"throttled", "access_denied"}
+    ):
+        summary["provider_state"] = update["provider_state"]
+    # Do not scrape a status out of a text reason: it could describe an agent tool call rather
+    # than Grok's own Responses request.  Only an explicit structured field is evidence.
+    if kind == "http":
+        for field in ("http_status", "httpStatus", "status_code", "statusCode"):
+            status = _bounded_retry_int(update.get(field))
+            if status in _RETRY_HTTP_STATUSES:
+                summary["http_status"] = status
+                break
+    # Preserve the status from a previously sanitized xAI terminal event.  It is deliberately
+    # not accepted from an arbitrary retry envelope without the fixed provenance marker above.
+    if xai_responses and "http_status" not in summary:
+        status = _bounded_retry_int(update.get("http_status"))
+        if status in _RETRY_HTTP_STATUSES:
+            summary["http_status"] = status
+    # Grok 1.0.13's terminal `_x.ai/session_notification` retry event has the form
+    # `{type: "failed", error_type: "api", message: "API error (status 403 ...)"}`.
+    # The namespace and fixed envelope distinguish its own Responses transport from a tool's
+    # arbitrary HTTP output.  Extract its status but never retain the message.
+    message = update.get("message")
+    if (
+        xai_responses and update_type == "failed" and error_type == "api"
+        and isinstance(message, str) and _XAI_CREDIT_MESSAGE.search(message[:512])
+    ):
+        # This boolean is safe only beside the observer-derived namespace.  It lets a matching
+        # structured terminal 403 establish access denial even when the notification itself does
+        # not repeat its HTTP status.
+        summary["credit_evidence"] = True
+    if xai_responses and trusted_summary and update.get("credit_evidence") is True:
+        summary["credit_evidence"] = True
+    if (
+        xai_responses and update_type == "failed" and error_type == "api"
+        and isinstance(message, str) and (match := _XAI_API_STATUS.search(message))
+    ):
+        status = int(match.group(1))
+        summary["http_status"] = status
+        # A 403 has several policy meanings.  Promote it only when the source-proven terminal
+        # Responses message expressly says the account/team has no credits or hit its spend cap.
+        if status == 403 and summary.get("credit_evidence") is True:
+            summary["provider_state"] = "access_denied"
     return summary
 
 

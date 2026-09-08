@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from .acp_client import AcpError
+from .acp_client import AcpError, safe_retry_summary
 from .providers import Profile, opposite_provider
 
 __all__ = [
@@ -100,8 +100,14 @@ _WINDOW_WORDS: tuple[tuple[str, str], ...] = (
     ("7-day", "seven_day"),
     ("weekly", "seven_day"),
 )
-_GROK_THROTTLE_MARKS = ("429", "rate limit", "too many requests", "quota exceeded")
-_GROK_AUTH_MARKS = ("401", "unauthorized", "token expired", "not logged in", "not authenticated")
+_GROK_HTTP_STATUSES = frozenset({401, 402, 403, 429})
+_GROK_CREDIT_MARK = re.compile(
+    r"\b(?:insufficient|out of|no)\s+(?:usage\s+)?credits?\b"
+    r"|\bcredits?\s+(?:are\s+)?(?:exhausted|depleted)\b"
+    r"|\b(?:team|organization|org|account)\s+(?:has\s+)?run\s+out\s+of\s+(?:usage\s+)?credits?\b"
+    r"|\b(?:team|organization|org|account)\b.{0,80}\bspending\s+limit\b",
+    re.IGNORECASE,
+)
 
 #: ``rateLimitType`` values the SDK's ``SDKRateLimitInfo`` may carry.
 _KNOWN_WINDOWS = frozenset(
@@ -169,6 +175,103 @@ def parse_claude_limit_text(text: str) -> tuple[str | None, str | None]:
 def _is_usage_limit_text(text: str) -> bool:
     # The adapter wraps the SDK's message: "session/prompt failed: You've hit your limit".
     return any(prefix in text for prefix in USAGE_LIMIT_PREFIXES)
+
+
+def _explicit_reset_at(data: Any) -> str | None:
+    """Accept only a provider-supplied absolute reset time; never estimate one."""
+    if not isinstance(data, Mapping):
+        return None
+    for field in ("reset_at", "resetAt"):
+        value = data.get(field)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        else:
+            if (converted := epoch_to_iso(value)) is not None:
+                return converted
+    return None
+
+
+def _grok_http_status(cause: Mapping[str, Any], *, acp_code: str) -> int | None:
+    """A structured final provider transport status, never a number scraped from prose."""
+    if acp_code in {"TURN_TIMEOUT", "ACP_TURN_ERROR"}:
+        retry = safe_retry_summary(cause.get("last_retry"), trusted_summary=True)
+        status = retry.get("http_status")
+        if retry.get("origin") == "xai_responses" and status in _GROK_HTTP_STATUSES:
+            return status
+    data = cause.get("rpc_data")
+    if isinstance(data, Mapping):
+        for field in ("http_status", "httpStatus", "status_code", "statusCode"):
+            value = data.get(field)
+            if isinstance(value, int) and not isinstance(value, bool) and value in _GROK_HTTP_STATUSES:
+                return value
+    return None
+
+
+def _grok_retry_classification(cause: Mapping[str, Any], *, acp_code: str) -> Classification | None:
+    """The xAI terminal `RetryState::Exhausted` is explicit quota evidence, without prose."""
+    if acp_code not in {"TURN_TIMEOUT", "ACP_TURN_ERROR"}:
+        return None
+    retry = safe_retry_summary(cause.get("last_retry"), trusted_summary=True)
+    if retry.get("origin") == "xai_responses" and retry.get("provider_state") == "throttled":
+        return Classification(
+            PROVIDER_THROTTLED, "throttled", "unknown", None, True,
+            _SAFE_REASONS["throttled"],
+        )
+    if retry.get("origin") == "xai_responses" and retry.get("provider_state") == "access_denied":
+        return Classification(
+            PROVIDER_ACCESS_DENIED, "access_denied", None, None, False,
+            _SAFE_REASONS["access_denied"],
+        )
+    return None
+
+
+def _grok_credit_evidence(data: Any, rpc_message: Any, retry: Mapping[str, Any]) -> bool:
+    """Whether a source-proven terminal 403's bounded detail says credits were exhausted."""
+    if retry.get("origin") != "xai_responses" or retry.get("type") != "failed":
+        return False
+    # Grok's terminal ``error_data_with_status`` envelope puts the provider message in ``message``.
+    # ``rpc_message`` is considered only after the structured status above has established this as
+    # an ACP provider transport error, never as freestanding text from a tool call.
+    if retry.get("credit_evidence") is True:
+        return True
+    if not isinstance(data, Mapping):
+        return False
+    values = (data.get("message"), data.get("error"), data.get("code"), data.get("error_code"), rpc_message)
+    return any(isinstance(value, str) and _GROK_CREDIT_MARK.search(value[:512]) for value in values)
+
+
+def _grok_status_classification(
+    status: int, data: Any, rpc_message: Any, retry: Mapping[str, Any],
+) -> Classification | None:
+    """Map only documented provider-level status facts; ambiguous 403 stays generic."""
+    if status == 401:
+        return Classification(
+            PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False,
+            _SAFE_REASONS["auth_expired"],
+        )
+    if status == 429:
+        return Classification(
+            PROVIDER_THROTTLED, "throttled", "unknown", _explicit_reset_at(data), True,
+            _SAFE_REASONS["throttled"],
+        )
+    if status == 402:
+        return Classification(
+            PROVIDER_ACCESS_DENIED, "access_denied", None, None, False,
+            _SAFE_REASONS["access_denied"],
+        )
+    # xAI uses 403 for several unrelated authorization policies.  It proves account access only
+    # when a structured provider error explicitly identifies credits; a bare 403 is no evidence.
+    if status == 403 and _grok_credit_evidence(data, rpc_message, retry):
+        return Classification(
+            PROVIDER_ACCESS_DENIED, "access_denied", None, None, False,
+            _SAFE_REASONS["access_denied"],
+        )
+    return None
 
 
 _SAFE_REASONS = {
@@ -275,14 +378,16 @@ def classify_acp_error(exc: AcpError, *, family: str, model: str | None = None) 
     1. JSON-RPC ``-32000`` is the ACP "authentication required" code.
     2. The Claude adapter's ``data.errorKind`` names the SDK's own failure kind.
     3. The message text names a usage limit (the SDK's prefixes, or the classic sentinel).
-    4. For any other family, a few conservative substrings; Grok documents no limit telemetry.
+    4. Grok accepts only terminal source-proven retry state or structured provider transport
+       statuses; generic error text may be a tool result and is never seat evidence.
     5. Otherwise the original code, retryable unless it was a timeout.
     """
     cause = exc.cause
     text = str(cause.get("rpc_message") or exc)
     rpc_code = cause.get("rpc_code")
     data = cause.get("rpc_data")
-    error_kind = data.get("errorKind") if isinstance(data, dict) else None
+    raw_error_kind = data.get("errorKind") if isinstance(data, Mapping) else None
+    error_kind = raw_error_kind if isinstance(raw_error_kind, str) else None
 
     if rpc_code == -32000 or error_kind in AUTH_ERROR_KINDS:
         return Classification(
@@ -314,18 +419,19 @@ def classify_acp_error(exc: AcpError, *, family: str, model: str | None = None) 
             PROVIDER_THROTTLED, "throttled", window or "unknown", reset_at, True,
             _SAFE_REASONS["throttled"],
         )
-    if family != "claude":
-        lowered = text.lower()
-        if any(mark in lowered for mark in _GROK_THROTTLE_MARKS):
-            return Classification(
-                PROVIDER_THROTTLED, "throttled", "unknown", None, True,
-                _SAFE_REASONS["throttled"],
-            )
-        if any(mark in lowered for mark in _GROK_AUTH_MARKS):
-            return Classification(
-                PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False,
-                _SAFE_REASONS["auth_expired"],
-            )
+    # Text can be a tool's HTTP error or contain incidental numbers.  The Grok adapter's
+    # terminal structured transport status is the only accepted provider-level evidence.
+    if family == "grok":
+        if (classification := _grok_retry_classification(cause, acp_code=exc.code)) is not None:
+            return classification
+        retry = safe_retry_summary(cause.get("last_retry"), trusted_summary=True)
+        if (
+            (status := _grok_http_status(cause, acp_code=exc.code)) is not None
+            and (classification := _grok_status_classification(
+                status, data, cause.get("rpc_message"), retry,
+            )) is not None
+        ):
+            return classification
     return Classification(
         exc.code, None, None, None, exc.code != "TURN_TIMEOUT", "The provider turn failed."
     )

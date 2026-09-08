@@ -108,14 +108,15 @@ def test_providers_reads_cached_status_without_creating_task_database(
     report = json.loads(capsys.readouterr().out)
     assert {row["id"] for row in report["providers"]} == {"claude", "grok", "agy"}
     assert all(row["availability"]["state"] == "unknown" for row in report["providers"])
-    assert all("native_check" not in row for row in report["providers"])
+    assert all("native_check" in row for row in report["providers"])
+    assert all(row["native_check"]["eligible_hint"] is None for row in report["providers"])
     assert not (home / "state/taskspindle/taskspindle.sqlite3").exists()
 
 
 def test_provider_check_does_not_clear_recorded_refusal(
     home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from taskspindle import access_checks
+    from taskspindle import access_checks, grok_checks
     from taskspindle.store import Store
 
     database = home / "state/taskspindle/taskspindle.sqlite3"
@@ -123,6 +124,9 @@ def test_provider_check_does_not_clear_recorded_refusal(
     with Store.open(database) as store:
         store.set_provider_status("claude", "auth_expired", source="acp_error", reason="private-value")
         before = store.get_provider_status("claude")
+    monkeypatch.setattr(grok_checks, "check_grok", lambda *_: {
+        "state": "unsupported", "error_code": "METHOD_UNAVAILABLE", "source": "grok_billing",
+    })
     monkeypatch.setattr(access_checks, "check_native_access", lambda *_: {
         "state": "cached_auth", "detail": "cached claim only", "account_binding": "unverified",
     })
@@ -299,3 +303,21 @@ def test_concurrency_rollback_does_not_create_missing_database(home):
     path = home / "absent.sqlite3"
     assert cli.main(["rollback-concurrency", "--database", str(path)]) == 1
     assert not path.exists()
+
+
+def test_provider_filter_check_and_unknown_filter(home, monkeypatch, capsys):
+    from taskspindle import grok_checks
+    calls = []
+    def fake(profile, env):
+        calls.append(profile.id)
+        return {"state": "unsupported", "source": "grok_billing", "error_code": "METHOD_UNAVAILABLE"}
+    monkeypatch.setattr(grok_checks, "check_grok", fake)
+    assert cli.main(["providers", "--check", "--provider", "grok", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert [row["id"] for row in report["providers"]] == ["grok"]
+    assert calls == ["grok"]
+    assert cli.main(["providers", "--check", "--provider", "grok", "--json"]) == 0
+    capsys.readouterr()
+    assert calls == ["grok"]
+    assert cli.main(["providers", "--check", "--provider", "does-not-exist", "--json"]) == 1
+    assert calls == ["grok"]

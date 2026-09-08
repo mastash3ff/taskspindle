@@ -56,7 +56,7 @@ def test_open_creates_a_private_file_and_applies_every_migration(tmp_path: Path)
     mode = stat.S_IMODE(store.path.stat().st_mode)
     assert mode == 0o600
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
-    assert store.schema_version() == 5
+    assert store.schema_version() == 6
     store.close()
 
 
@@ -66,7 +66,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store.close()
     reopened = Store.open(tmp_path / "state" / "taskspindle.sqlite3")
     assert reopened.migrate() == []
-    assert reopened.schema_version() == 5
+    assert reopened.schema_version() == 6
     reopened.close()
 
 

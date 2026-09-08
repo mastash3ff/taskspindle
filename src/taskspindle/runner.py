@@ -562,6 +562,11 @@ async def _run_turn(
         )
         if verdict.provider_state is not None:
             _record_provider_limit(run, profile, verdict)
+        retries = exc.cause.get("retries")
+        safe_retries = (
+            retries if isinstance(retries, int) and not isinstance(retries, bool)
+            and 0 <= retries <= 100_000 else None
+        )
         raise _Failure(
             verdict.code,
             verdict.reason,
@@ -573,8 +578,8 @@ async def _run_turn(
                 "reset_at": verdict.reset_at,
                 "acp_code": exc.code,
                 "rpc_data": limits.safe_rpc_data(exc.cause.get("rpc_data")),
-                "transport_retries": exc.cause.get("retries"),
-                "last_retry": exc.cause.get("last_retry"),
+                "transport_retries": safe_retries,
+                "last_retry": limits.safe_retry_summary(exc.cause.get("last_retry"), trusted_summary=True),
             },
         ) from exc
 

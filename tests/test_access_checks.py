@@ -123,7 +123,7 @@ def test_unsupported_profiles_never_probe(profiles, parent, monkeypatch):
 
     monkeypatch.setattr(access_checks.subprocess, "run", forbidden)
     monkeypatch.setattr(providers, "build_child_env", forbidden)
-    for profile in [profiles["grok"], replace(profiles["claude"], auth="api_key"),
+    for profile in [replace(profiles["claude"], auth="api_key"),
                     replace(profiles["claude"], secret_env=("PRIVATE_TOKEN",)),
                     providers.Profile(id="custom", auth="oauth", command=("PRIVATE_COMMAND",))]:
         result = access_checks.check_native_access(profile, parent)
@@ -220,3 +220,10 @@ def test_forbidden_profile_environment_fails_before_probe(profiles, parent, monk
     result = access_checks.check_native_access(profile, parent)
     assert result["state"] == "check_failed"
     assert_safe(result)
+
+
+def test_grok_dispatches_only_to_bounded_native_checker(profiles, parent, monkeypatch):
+    from taskspindle import grok_checks
+    expected = {"state": "unsupported", "error_code": "METHOD_UNAVAILABLE"}
+    monkeypatch.setattr(grok_checks, "check_grok", lambda profile, env: expected)
+    assert access_checks.check_native_access(profiles["grok"], parent) is expected
