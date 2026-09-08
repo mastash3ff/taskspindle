@@ -1,24 +1,75 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TaskSpindle</title>
-<link rel="icon" href="data:,">
-<link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-<header class="topbar">
-  <span class="brand">TaskSpindle</span>
-  <nav class="tabs">
-    <a href="#/tasks" data-route="tasks">Tasks</a>
-    <a href="#/providers" data-route="providers">Providers</a>
-    <a href="#/subscriptions" data-route="subscriptions">Subscriptions</a>
-    <a href="#/usage" data-route="usage">Usage</a>
-  </nav>
-  <span class="refreshed" id="refreshed"></span>
-</header>
-<main id="app"></main>
-<script src="/static/app.js"></script>
-</body>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>TaskSpindle Operator Console</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/style.css">
+    <script>
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem("taskspindle-theme") || "dark";
+      } catch (_) {}
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#app">Skip to content</a>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="Primary navigation">
+        <a class="brand" href="#/overview" aria-label="TaskSpindle overview">
+          <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
+            <path d="M24 3 42 13v22L24 45 6 35V13Z" />
+            <path d="M15 17h18M15 31h18M18 17l12 14M30 17 18 31" />
+          </svg>
+          <span><strong>TaskSpindle</strong><small>Operator console</small></span>
+        </a>
+        <nav class="primary-nav">
+          <a href="#/overview" data-route="overview"><span aria-hidden="true">◫</span>Overview</a>
+          <a href="#/tasks" data-route="tasks"><span aria-hidden="true">≡</span>Tasks</a>
+          <a href="#/workers" data-route="workers"><span aria-hidden="true">◇</span>Workers</a>
+          <a href="#/subscriptions" data-route="subscriptions"><span aria-hidden="true">◎</span>Subscriptions</a>
+          <a href="#/usage" data-route="usage"><span aria-hidden="true">⌁</span>Usage</a>
+        </nav>
+        <div class="sidebar-foot">
+          <button class="command-hint" id="open-command" type="button">
+            <span>Find a task</span><kbd>Ctrl K</kbd>
+          </button>
+          <small>Local operator surface</small>
+        </div>
+      </aside>
+      <button class="drawer-backdrop" id="drawer-backdrop" aria-label="Close navigation" tabindex="-1"></button>
+      <div class="workspace">
+        <header class="topbar">
+          <button class="icon-button menu-button" id="menu-button" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">☰</button>
+          <div class="breadcrumbs" id="breadcrumbs" aria-live="polite"></div>
+          <div class="topbar-actions">
+            <span class="refreshed" id="refreshed"></span>
+            <label class="theme-control"><span class="sr-only">Color theme</span>
+              <select id="theme-select" aria-label="Color theme">
+                <option value="dark">Dark</option>
+                <option value="light">Light</option>
+                <option value="system">System</option>
+              </select>
+            </label>
+          </div>
+        </header>
+        <main id="app" tabindex="-1"><div class="loading-state">Loading operator console…</div></main>
+      </div>
+    </div>
+
+    <dialog class="command-dialog" id="command-dialog" aria-labelledby="command-title">
+      <form method="dialog" class="command-frame">
+        <div class="command-input-row">
+          <span aria-hidden="true">⌕</span>
+          <input id="command-input" type="search" autocomplete="off" placeholder="Search task ID, repository, state…" aria-labelledby="command-title">
+          <button class="key-button" value="cancel" aria-label="Close task search">Esc</button>
+        </div>
+        <h2 class="sr-only" id="command-title">Find a task</h2>
+        <div class="command-results" id="command-results" role="listbox"></div>
+      </form>
+    </dialog>
+    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <script src="/static/app.js"></script>
+  </body>
 </html>

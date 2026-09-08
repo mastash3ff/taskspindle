@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import warnings
 from datetime import UTC, datetime
@@ -18,7 +19,7 @@ with warnings.catch_warnings():
     from starlette.testclient import TestClient
 
 import taskspindle
-from taskspindle import service, usage
+from taskspindle import access_checks, service, usage
 from taskspindle.config import Paths
 from taskspindle.models import (
     AuthMode,
@@ -33,6 +34,7 @@ from taskspindle.models import (
 )
 from taskspindle.providers import Profile
 from taskspindle.store import Store
+from taskspindle.web import app as web_app
 from taskspindle.web.app import build_app
 from taskspindle.web.db import ReadOnlyStore
 
@@ -301,8 +303,153 @@ def test_providers_shape_and_throttled_availability(tmp_path: Path) -> None:
     assert by_id["grok"]["availability"]["state"] == "throttled"
     assert by_id["grok"]["availability"]["reset_at"] == "2030-01-03T00:00:00Z"
     assert any(w["window"] == "5h" for w in by_id["claude"]["windows"])
-    assert isinstance(body["doctor"], dict)
-    assert "checks" in body["doctor"]
+    assert body["doctor"] == {
+        "ok": None, "checks": [], "status": "not_run", "cached": False,
+        "fresh": False, "checked_at": None,
+    }
+
+
+def test_providers_get_runs_no_doctor_or_native_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    _seed(paths)
+
+    async def forbidden_doctor(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        pytest.fail("provider dashboard load must not run diagnostics")
+
+    monkeypatch.setattr(web_app, "run_doctor_async", forbidden_doctor)
+    monkeypatch.setattr(
+        access_checks, "refresh_native_check",
+        lambda *args, **kwargs: pytest.fail("provider dashboard load must not refresh native data"),
+    )
+    response = _client(paths).get("/api/providers")
+    assert response.status_code == 200
+    assert response.json()["doctor"]["status"] == "not_run"
+
+
+def test_explicit_doctor_populates_provider_cache_without_rerunning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    calls = []
+
+    async def fake_doctor(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["live_probes"])
+        return {"ok": True, "checks": [{"name": "fake", "ok": True, "detail": "safe"}]}
+
+    monkeypatch.setattr(web_app, "run_doctor_async", fake_doctor)
+    client = _client(paths)
+    assert client.get("/api/doctor").json()["ok"] is True
+    cached = client.get("/api/providers").json()["doctor"]
+    assert calls == [False]
+    assert cached["status"] == "cached"
+    assert cached["cached"] is True
+    assert cached["fresh"] is True
+    assert cached["checked_at"] == "2030-01-02T12:00:00Z"
+
+    assert client.get("/api/doctor", params={"live": "1"}).json()["ok"] is True
+    assert calls == [False, True]
+
+
+def test_providers_projects_only_cached_native_check_without_running_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    _seed(paths)
+    fingerprint = access_checks.native_fingerprint(PROFILES["grok"], os.environ)
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        assert store.claim_native_check(
+            "grok", fingerprint, "owner", "2030-01-02T11:59:00Z",
+            "2030-01-02T11:59:40Z", "2030-01-02T11:54:00Z",
+        )
+        assert store.finish_native_check(
+            "grok", fingerprint, "owner", "2030-01-02T11:59:01Z",
+            {
+                "state": "quota", "source": "grok_billing", "version": "1.2.3",
+                "checked_at": "2030-01-02T11:59:01Z", "used_percent": 25.0,
+                "window": "weekly", "period_start": "2030-01-01T00:00:00Z",
+                "reset_at": "2030-02-01T00:00:00Z", "error_code": None,
+                "detail": "Cached quota observation.",
+            },
+        )
+
+    monkeypatch.setattr(
+        access_checks, "refresh_native_check",
+        lambda *args, **kwargs: pytest.fail("GET must not refresh the native cache"),
+    )
+    native = next(
+        row for row in _client(paths).get("/api/providers").json()["providers"]
+        if row["id"] == "grok"
+    )["native_check"]
+    assert native["state"] == "quota"
+    assert native["used_percent"] == 25.0
+    assert native["freshness"] == "fresh"
+    assert native["eligible_hint"] is True
+
+
+def test_providers_native_projection_supports_schema_5_and_does_not_create_a_database(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    db_path = paths.state_dir / "taskspindle.sqlite3"
+    missing = _client(paths).get("/api/providers")
+    assert missing.status_code == 200
+    assert not db_path.exists()
+    assert all(row["native_check"]["freshness"] == "unknown" for row in missing.json()["providers"])
+
+    _seed(paths)
+    connection = sqlite3.connect(db_path)
+    connection.execute("DROP TABLE native_checks")
+    connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+    connection.commit()
+    connection.close()
+    old = _client(paths).get("/api/providers")
+    assert old.status_code == 200
+    assert all(row["native_check"]["freshness"] == "unknown" for row in old.json()["providers"])
+
+
+def test_providers_native_projection_never_exposes_corrupt_cached_strings(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _seed(paths)
+    secret = "DO-NOT-EXPOSE-CACHED-SECRET"
+    fingerprint = access_checks.native_fingerprint(PROFILES["grok"], os.environ)
+    connection = sqlite3.connect(paths.state_dir / "taskspindle.sqlite3")
+    connection.execute(
+        "INSERT OR REPLACE INTO native_checks(provider, fingerprint, attempt_at, result_json, "
+        "success_at, success_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "grok", fingerprint, "2030-01-02T11:59:00Z",
+            json.dumps({"state": secret, "detail": secret, "unexpected": secret}),
+            "2030-01-02T11:00:00Z", json.dumps({"state": "quota", "detail": secret}),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    response = _client(paths).get("/api/providers")
+    assert response.status_code == 200
+    assert secret not in response.text
+
+
+def test_providers_treats_invalid_cached_native_json_as_unverified(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _seed(paths)
+    fingerprint = access_checks.native_fingerprint(PROFILES["grok"], os.environ)
+    connection = sqlite3.connect(paths.state_dir / "taskspindle.sqlite3")
+    connection.execute(
+        "INSERT OR REPLACE INTO native_checks(provider, fingerprint, attempt_at, result_json, "
+        "success_json) VALUES (?, ?, ?, ?, ?)",
+        ("grok", fingerprint, "2030-01-02T11:59:00Z", "{invalid", "{invalid"),
+    )
+    connection.commit()
+    connection.close()
+
+    response = _client(paths).get("/api/providers")
+    assert response.status_code == 200
+    native = next(row for row in response.json()["providers"] if row["id"] == "grok")["native_check"]
+    assert native["state"] == "not_checked"
+    assert native["last_success"] is None
 
 
 # -- usage ----------------------------------------------------------------------------

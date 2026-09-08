@@ -89,15 +89,23 @@ browser and CLI accounts are not assumed to match. ChatGPT is the coordinator, n
 Google AI is associated with the `agy` product without claiming an account binding.
 
 ```sh
-taskspindle providers --json         # cached worker observations; no provider processes
-taskspindle providers --check --json # optional cached login/catalog checks; no inference or browser login
+taskspindle providers --json                         # cached observations; no processes
+taskspindle providers --check --provider grok --json # bounded native quota check
 ```
 
-The optional checks support Claude's personal Pro/Max OAuth claim and the pinned Antigravity
-model catalog. Grok is explicitly unsupported for this separate diagnostic; its real task
-outcomes still supply access evidence. A native check cannot verify a billing deadline or clear
-an unresolved task refusal. After restoring access, an explicitly authorized ordinary-task
-retry can use the existing `ignore_provider_status` mechanism; no synthetic prompt is needed.
+The Grok check uses the installed OAuth CLI's session-free ACP billing extension, caches the
+normalized quota window for five minutes, and can also be requested through MCP as
+`capabilities(check_providers=["grok"])`. It performs no model turn, login, browser collection,
+direct HTTP request, token read, or CLI upgrade. Unsupported versions leave quota unknown. The
+installed Grok 1.0.13 path has returned a valid normalized weekly quota/reset observation in a
+live native check; its private percentage and timestamps are not published here. The result does
+not establish browser/CLI account identity or a future model turn.
+
+A native check cannot verify a billing deadline or clear an unresolved task/model refusal. Only a
+fresh explicit exhausted quota adds a temporary gate; a passed reset, stale result, unsupported
+method, or unknown quota permits an ordinary needed attempt under the existing rules. After
+restoring access, an explicitly authorized ordinary-task retry can use the existing
+`ignore_provider_status` mechanism; no synthetic prompt is needed.
 
 Before creating new work, the Codex coordinator reads `capabilities` and selects a compatible
 subscription worker using its availability and `model_availability`. Explicit provider/model

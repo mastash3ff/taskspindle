@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+- **Operator console.** The local dashboard now opens on a bounded Overview and navigates through
+  Overview, Tasks, Workers, Subscriptions, and Usage. It adds responsive keyboard-accessible
+  navigation, a `Ctrl+K`/`Cmd+K` task finder, dark/light/system themes, and packaged local modules
+  without a CDN. The old `#/providers` location resolves to Workers.
+- **Cached-only dashboard diagnostics.** `GET /api/overview` reports global counts plus bounded
+  active and attention lists. Overview and Workers start no provider processes: Workers projects
+  cached `native_check` and doctor data, and an absent doctor cache is shown as not run. Explicit
+  `/api/doctor` and `/api/doctor?live=1` requests retain their existing diagnostic behavior.
+- **Native Grok quota check.** `capabilities(check_providers=["grok"])` and
+  `taskspindle providers --check --provider grok` run a session-free native ACP billing check and
+  cache its normalized result for five minutes. The installed Grok 1.0.13 path returned a valid
+  weekly quota/reset observation in live validation; private values stay in the local evidence
+  ledger. No inference, login, browser, direct HTTP, token read, or CLI upgrade is used.
+- **Conservative quota gating.** Only a fresh explicit exhausted native quota adds a temporary
+  new-task gate. Passed resets, stale observations, unsupported methods, and unknown quota permit
+  an ordinary attempt unless task-derived account/model evidence still refuses it. The check never
+  selects a provider, moves a task, clears a refusal, or enables a metered fallback.
+- **Scoped Grok refusals.** Grok account state now uses terminal structured provider HTTP status,
+  plus source-proven terminal xAI retry evidence. Incidental tool errors and unrelated 403 responses
+  stay unclassified; stored retry diagnostics exclude provider prose and URLs.
+- **Honest MCP annotations.** Default `capabilities()` remains cached-only. The tool is no longer
+  marked read-only because its optional provider check writes only the bounded native diagnostic
+  cache; task records and provider refusal evidence are unchanged.
+
 ## v0.2.0
 
 Adds subscription visibility, subscription-aware worker eligibility, native Antigravity support,
@@ -25,8 +51,10 @@ and broader task inspection while keeping provider choice and task ownership exp
 - **Discovery probes.** `discover --probe` optionally initializes installed ACP agents without
   authenticating or generating a turn. Per-agent results include useful timeout errors; a failed
   probe does not prevent the remaining probes from running.
-- **Known limitation.** Grok continuation succeeded with per-turn usage in the recorded
-  three-turn verification, but an intermittent direct ACP reload timeout remains unexplained.
+- **Continuation verification.** Grok continuation succeeded with per-turn usage in the recorded
+  three-turn verification. The earlier intermittent direct ACP reload timeout is historical
+  evidence rather than an active release blocker; continuation still uses a fresh unit and the
+  stored session, with no automatic replacement conversation.
 
 - **Grok read-only turns use the `read-only` sandbox.** `strict` allowed writes inside the
   worktree and, on WSL, denied the `/etc/resolv.conf` symlink target so the sandboxed agent's
@@ -82,9 +110,10 @@ and broader task inspection while keeping provider choice and task ownership exp
   adapter reports into `provider_windows`. New read-only tool `usage_report`, new command
   `taskspindle usage`, and `task_result` now carries `usage`, `warnings` and structured
   `quota_warnings`.
-- **Dashboard.** `taskspindle web` serves a read-only page on localhost: tasks, timelines,
-  transcripts, diffs, reviews, provider availability and the usage report. The database is opened
-  read-only and there are no mutation endpoints.
+- **Dashboard.** `taskspindle web` serves a local page for tasks, timelines, transcripts, diffs,
+  reviews, provider availability, usage, and subscriptions. The task database is opened read-only;
+  the only mutation endpoints are loopback/same-origin/CSRF-protected requests that queue Connect
+  or Refresh work in the separate subscription database.
 - **Attribution fixed.** `reported_model`, `gateway_host` and the adapter's `agent` name and
   version are now filled in; they were always null before.
 - **`task_diff` defaults to 16384 bytes** (the maximum stays 262144), because an MCP client
@@ -95,7 +124,8 @@ and broader task inspection while keeping provider choice and task ownership exp
 - **Read-only turns are enforced by the agents themselves.** A Claude worker is put in the
   adapter's `plan` session mode for a consult or a review and in `default` mode for an implement,
   so the permission gate is consulted instead of the operator's own `bypassPermissions` setting; a
-  Grok consult or review runs inside `--sandbox strict`, the one flag that makes its writes ask.
+  Grok consult or review runs inside the CLI's `--sandbox read-only` mode, which reads the workspace
+  and kernel-denies writes.
   A request to switch mode is refused and recorded as `MODE_SWITCH_ATTEMPT`; an agent that refuses
   the mode fails the turn with `MODE_UNAVAILABLE`.
 - **Reviewers are shown the diff.** A review prompt carries the candidate's recorded diff (or the

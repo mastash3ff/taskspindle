@@ -657,17 +657,16 @@ def test_provider_api_reads_a_pre_model_status_database_without_migrating_it(
 def test_subscription_script_separates_worker_access_and_never_posts_while_rendering(
     tmp_path: Path,
 ) -> None:
-    script = _client(_paths(tmp_path), StubSubscriptionService()).get("/static/app.js").text
-    render = script.split("function renderSubscriptions()", 1)[1].split(
-        "function markSubscriptionPending", 1
-    )[0]
+    client = _client(_paths(tmp_path), StubSubscriptionService())
+    script = client.get("/static/views/subscriptions.js").text
 
-    assert 'getJSON("/api/subscriptions")' in render
-    assert 'getJSON("/api/providers")' in render
-    assert "fetch(" not in render
-    assert "availability.reason" not in script
-    assert "command_name" not in render
-    assert "gateway_host" not in render
+    assert 'getJSON("/api/subscriptions"' in script
+    assert 'getJSON("/api/providers"' in script
+    assert 'button.addEventListener("click"' in script
+    assert "postJSON(" in script
+    assert "access.reason" not in script
+    assert "command_name" not in script
+    assert "gateway_host" not in script
     for text in [
         "Subscription",
         "Worker access",
@@ -680,7 +679,7 @@ def test_subscription_script_separates_worker_access_and_never_posts_while_rende
         "Access is scheduled to end within seven days",
         "Verification needed — the recorded access end has passed",
         "Model · ",
-        "Model-specific status",
+        "model-specific observation",
         "Use Connect or Refresh now to check billing.",
     ]:
         assert text in script

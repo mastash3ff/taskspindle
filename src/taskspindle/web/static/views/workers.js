@@ -1,0 +1,117 @@
+import { getJSON } from "../api.js";
+import { badge, emptyState, formatDate, h, labeledValue, sectionHeading, table } from "../dom.js";
+
+const NEXT_ACTION = {
+  start: "Ready for a new task.", retry: "Retry a task to verify access.", wait: "Wait for the limit to reset, then retry.",
+  sign_in: "Sign in to this worker CLI, then retry.", review_access: "Review profile access, then retry.", choose_model: "Choose another model, then retry.",
+};
+const SOURCE = {
+  task_success: "Successful task", turn_ok: "Successful task", native_auth_check: "Native CLI check", rate_limit_event: "Quota report",
+  acp_prompt_response: "Worker response", acp_error: "Worker refusal", worker_error: "Worker refusal",
+};
+
+function availabilityCard(worker, item, model = null) {
+  const state = item || {};
+  return h("article", { class: `availability-card ${model ? "availability-model" : ""}` },
+    h("div", { class: "card-title-row" }, h("div", {}, h("span", { class: "eyebrow", text: model ? "Model status" : "Worker access" }), h("h3", { text: model || worker.id })), badge(state.state || "unknown", (state.state || "unknown").replaceAll("_", " "))),
+    h("p", { class: "status-reason", text: state.reason || (state.state === "unknown" ? "No current access evidence." : "No status detail.") }),
+    h("dl", { class: "mini-details" },
+      labeledValue("Scope", state.scope || "—"),
+      labeledValue("Source", SOURCE[state.source] || (state.source ? "Worker status record" : "No evidence")),
+      labeledValue("Observed", formatDate(state.observed_at)),
+      labeledValue("Last success", formatDate(state.last_success_at)),
+      state.reset_at ? labeledValue("Reset", formatDate(state.reset_at)) : null,
+    ),
+    state.stale ? h("div", { class: "callout callout-warning", text: "This observation is stale." }) : null,
+    h("p", { class: "next-action", text: state.next_action === "wait" && state.reset_at ? `Wait until ${formatDate(state.reset_at)}, then retry.` : NEXT_ACTION[state.next_action] || "Run a worker task to establish current access." }),
+  );
+}
+
+function nativeCheck(check) {
+  if (!check) return null;
+  const retained = check.last_success && check.state !== "quota";
+  const snapshot = retained ? check.last_success : check;
+  const details = [
+    labeledValue("Freshness", check.freshness || "unknown"),
+    labeledValue("Last attempt", formatDate(check.last_attempt_at)),
+    labeledValue("Last success", formatDate(check.last_success_at || check.last_success?.checked_at)),
+    snapshot?.plan ? labeledValue("Plan", snapshot.plan) : null,
+    snapshot?.model_count != null ? labeledValue("Models", snapshot.model_count) : null,
+    snapshot?.used_percent != null ? labeledValue("Used", `${snapshot.used_percent}%`) : null,
+    snapshot?.window ? labeledValue("Window", snapshot.window) : null,
+    snapshot?.reset_at ? labeledValue("Reset", formatDate(snapshot.reset_at)) : null,
+  ];
+  return h("section", { class: "native-check" },
+    h("div", { class: "card-title-row" }, h("h3", { text: "Native check" }), badge(check.state || "not_checked", String(check.state || "not checked").replaceAll("_", " "))),
+    h("p", { class: "panel-note", text: "Cached CLI evidence only. Account binding is unverified." }),
+    retained ? h("p", { class: "panel-note", text: "Showing quota details from the last successful same-account check." }) : null,
+    h("dl", { class: "mini-details" }, details),
+    check.detail ? h("p", { class: "status-reason", text: check.detail }) : null,
+  );
+}
+
+function workerCard(worker) {
+  const selected = worker.availability?.scope === "model" ? worker.availability.affected_model : null;
+  const models = (worker.model_availability || []).filter((item) => item?.affected_model && item.affected_model !== selected);
+  return h("section", { class: "panel worker-card", dataset: { provider: worker.id } },
+    h("header", { class: "worker-card-header" }, h("div", {}, h("span", { class: "eyebrow", text: worker.family || "Worker" }), h("h2", { text: worker.id })), badge(worker.availability?.state || "unknown")),
+    h("dl", { class: "detail-grid compact" }, labeledValue("Profile", worker.id), labeledValue("Model", worker.model || "Provider default"), labeledValue("Auth", worker.auth), labeledValue("Modes", (worker.modes || []).join(", ")), labeledValue("Command", worker.command_name, { mono: true }), labeledValue("Gateway", worker.gateway_host, { mono: true })),
+    availabilityCard(worker, worker.availability, selected),
+    models.length ? h("details", { class: "model-details", dataset: { persistKey: `models-${worker.id}` } }, h("summary", { text: `${models.length} model observation${models.length === 1 ? "" : "s"}` }), h("div", { class: "model-grid" }, models.map((item) => availabilityCard(worker, item, item.affected_model)))) : null,
+    nativeCheck(worker.native_check),
+  );
+}
+
+function windowTable(providers) {
+  const rows = providers.flatMap((worker) => (worker.windows || []).map((item) => ({ worker: worker.id, ...item })));
+  return h("section", { class: "panel" }, sectionHeading("Usage windows", "Cached telemetry"), rows.length ? table(
+    ["Worker", "Window", "Status", "Used", "Resets", "Observed"],
+    rows.map((row) => h("tr", {},
+      h("td", { "data-label": "Worker", text: row.worker }),
+      h("td", { "data-label": "Window", text: row.window }),
+      h("td", { "data-label": "Status" }, badge(row.status || "unknown")),
+      h("td", { "data-label": "Used", text: row.used_percent == null ? "—" : `${row.used_percent}%` }),
+      h("td", { "data-label": "Resets", text: formatDate(row.resets_at) }),
+      h("td", { "data-label": "Observed", text: formatDate(row.observed_at) }),
+    )),
+    "responsive-table",
+  ) : emptyState("No window telemetry", "A worker has not reported a usage window yet."));
+}
+
+function doctorPanel(doctor, context) {
+  const body = h("div", { class: "doctor-results" });
+  const fill = (result) => {
+    const content = result?.checks?.length ? h("ul", { class: "check-list" }, result.checks.map((check) => h("li", {},
+      badge(check.ok ? "ok" : check.advisory ? "warning" : "failed", check.ok ? "Pass" : check.advisory ? "Advisory" : "Fail"),
+      h("span", {}, h("strong", { text: check.name }), h("small", { text: check.detail })),
+    ))) : emptyState(result?.status === "not_run" ? "Run diagnostics" : "No doctor checks", result?.status === "not_run" ? "Live diagnostics have not been run." : "No cached diagnostics are available.");
+    body.replaceChildren(content);
+  };
+  fill(doctor);
+  const button = h("button", { class: "button button-secondary", type: "button", text: "Run live probes" });
+  button.addEventListener("click", async () => {
+    button.disabled = true; button.textContent = "Running probes…";
+    try { const { data } = await getJSON("/api/doctor?live=1", { fresh: true, fallback: false }); fill(data); context.toast("Live probes finished."); }
+    catch (error) { context.toast(error.message, "danger"); }
+    finally { button.disabled = false; button.textContent = "Run live probes"; }
+  });
+  const status = doctor?.status === "not_run" ? "Not run" : doctor?.cached ? (doctor.fresh ? "Cached · current" : "Cached · stale") : "Cached status unavailable";
+  return h("details", { class: "panel disclosure doctor-disclosure", dataset: { persistKey: "system-doctor" } },
+    h("summary", {}, h("span", { text: "System diagnostics" }), h("span", { text: status })),
+    h("div", { class: "disclosure-body" },
+      h("div", { class: "doctor-actions" }, h("p", { class: "panel-note", text: `Live probes run only when you choose this action.${doctor?.checked_at ? ` Last checked ${formatDate(doctor.checked_at)}.` : ""}` }), button),
+      doctor?.cached && !doctor.fresh ? h("div", { class: "callout callout-warning", text: "Cached doctor results are stale. Run live probes for current diagnostics." }) : null,
+      body,
+    ),
+  );
+}
+
+export async function renderWorkers(_route, { signal, toast } = {}) {
+  const { data, stale } = await getJSON("/api/providers", { signal, fresh: true });
+  const providers = data.providers || [];
+  return h("div", { class: "view workers-view", dataset: { stale: String(stale) } },
+    h("div", { class: "page-heading" }, h("div", {}, h("span", { class: "eyebrow", text: "Execution access" }), h("h1", { text: "Workers" }), h("p", { text: "See task evidence, model-specific refusals, and cached native checks for each configured worker." })), stale ? badge("stale", "Cached data") : null),
+    h("div", { class: "worker-grid" }, providers.map(workerCard)),
+    windowTable(providers), doctorPanel(data.doctor, { toast }),
+  );
+}

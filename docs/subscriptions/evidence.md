@@ -1,8 +1,9 @@
 # Collector verification evidence
 
-Current candidate evidence was collected on 2026-09-07 using the installed Windows Node,
-a selected normal Chrome profile, and a privately paired Playwright extension 0.4.0.
-The installed MCP runtime and dashboard on port 8765 remain unchanged.
+The original subscription candidate evidence below was collected on 2026-09-07 using Windows
+Node, a selected normal Chrome profile, and a privately paired Playwright extension 0.4.0.
+That subscription build was subsequently released as v0.2.0. The separate operator-console/Grok
+candidate is described in the final section; its validation does not replace the installed runtime.
 
 | Provider | Acquisition | Verified result |
 | --- | --- | --- |
@@ -71,7 +72,8 @@ Live cancellation and expired/free/no-subscription transitions for supported dir
 remain unverified. Their regression fixtures use synthetic identities and shifted dates.
 No subscription was cancelled or modified for testing. No credentials, raw provider payloads,
 payment details, real account identifiers, or real billing dates are included in these docs or
-regression fixtures. At the time of this evidence capture, activation and publication had not occurred.
+regression fixtures. Activation and publication had not occurred at the time of this original
+capture; the later delivery state is recorded below.
 
 ## Opt-in scheduling and warning follow-up
 
@@ -96,8 +98,10 @@ updates, startup refusal checks, and read-only access to the existing task datab
 
 Noninteractive native checks on the validation host reported cached eligible Claude personal-plan
 authentication and a nonempty AGY Gemini catalog. These checks establish neither current entitlement
-nor browser/CLI account identity. Grok has no supported noninteractive native status check;
-its availability still uses observed task outcomes. No synthetic inference requests were sent.
+nor browser/CLI account identity. A later session-free native check against the installed Grok
+1.0.13 ACP path successfully returned a normalized weekly quota window and reset. The private
+percentage and timestamps are retained only in the local evidence ledger. No synthetic inference
+request, login, browser request, direct provider HTTP call, token read, or CLI upgrade was used.
 
 The rebuilt isolated dashboard passed desktop and mobile rendering checks in headless Windows
 Chrome with no page errors, horizontal overflow, or mutation requests. Clearly labeled browser
@@ -108,11 +112,39 @@ Cancellation and other subscription transitions retain fixture coverage rather t
 The packaged preview has scheduled collection disabled, no active collection jobs, and preserves
 the earlier confirmed subscription snapshots and observation history. Its isolated task database
 is absent, so worker availability correctly displays unknown. Source, wheel, and installed preview
-files were compared byte-for-byte across 65 packaged files. The production dashboard remains
-read-only against schema 4, and the installed MCP runtime and installed work-pool skill are unchanged.
+files were compared byte-for-byte across 65 packaged files. That v0.2.0 runtime and the revised
+work-pool guidance were subsequently activated and published. The newer operator-console and Grok
+native-cache work remains a source candidate; its schema-6 migration has not been activated.
 
 The exact build ledger, full test output, normalized native-check results, Windows screenshots,
 and browser verification script are retained in the local delivery directory
 `~/.local/state/taskspindle-subscription-implementation/20260907/worker-selection/`.
-At the time of this evidence capture, candidate task-database schema 5 had been tested but had not
-been activated in the installed runtime, and the revised work-pool guidance was not installed.
+The original worker-selection ledger predates that activation. Current UI/Grok candidate evidence
+is retained separately under `~/.local/state/taskspindle-ui-grok/20260907/`; documentation does not
+claim Windows visual verification until the isolated candidate preview has completed it.
+
+## Operator-console and Grok hardening candidate
+
+The isolated candidate uses a copy of task/subscription state and a separate Windows helper
+directory. Grok Connect, Refresh, and Refresh after collector restart succeeded using the normal
+Chrome profile. Identity, direct SuperGrok plan, and a date-only renewal boundary were verified.
+No subscription was cancelled or modified. A whole Chrome restart must be performed by the user;
+that checkpoint is still unverified. Cancellation, expiry, renewal reversal, account mismatch,
+and changed-page handling use sanitized fixtures, including a Grok DOM renewal/cancellation/
+renewal transition. X-derived and app-store billing remain unsupported.
+
+The installed Grok 1.0.13 returned normalized weekly quota through `initialize` followed by the
+`_x.ai/billing` extension method. No authentication request, session creation, inference prompt,
+browser, direct HTTP request, credential copying, or upgrade was used. CLI Claude status reported
+cached personal OAuth, and Antigravity reported its model catalog; neither proves current model
+entitlement. Quota and billing observations retain separate sources and timestamps.
+
+The final backend suite passed 1,019 tests, including the real transient systemd test. The local
+frontend module suite passed seven tests and the subscription helper suite passed 87 tests. Grok
+cache/refusal integration received independent review; fixes cover shared OAuth aliases, exact
+process environment, malformed cache data, process cleanup, terminal retry propagation, and
+provider-error provenance. Native subprocess tests verify that successful and timed-out owned
+processes have exited. Windows screenshots, interactive checks, package hashes, and task-history
+preservation evidence are recorded in the private candidate delivery report under
+`~/.local/state/taskspindle-ui-grok/20260907/`. Activation and publication require approval of that
+exact tested build.

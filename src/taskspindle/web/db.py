@@ -17,7 +17,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..models import CheckRecord, TaskRecord
+from ..models import ACTIVE_STATES, CheckRecord, CleanupState, TaskRecord, TaskState
 
 __all__ = ["ReadOnlyStore"]
 
@@ -129,6 +129,83 @@ class ReadOnlyStore:
             f"SELECT * FROM tasks{where} ORDER BY created_at DESC, id DESC LIMIT ?", params
         ).fetchall()
         return [TaskRecord.from_row(row) for row in rows]
+
+    def task_overview(self, *, limit: int) -> dict[str, Any]:
+        """Return global lifecycle counts and bounded dashboard task lists.
+
+        The aggregate queries deliberately do not share the list limit.  Repository data is
+        limited to the public display identity the overview needs; git directories and root
+        commits never enter the projection.
+        """
+        empty = {
+            "counts": {"total": 0, "active": 0, "attention": 0, "awaiting_review": 0},
+            "active_tasks": [],
+            "attention_tasks": [],
+        }
+        if self._conn is None:
+            return empty
+
+        active_states = tuple(state.value for state in ACTIVE_STATES)
+        attention_states = (
+            TaskState.RESULT_READY.value,
+            TaskState.INTERRUPTED.value,
+            TaskState.RECOVERY_AMBIGUOUS.value,
+        )
+        active_marks = ", ".join("?" for _ in active_states)
+        attention_marks = ", ".join("?" for _ in attention_states)
+        attention_where = (
+            f"(t.state IN ({attention_marks}) OR "
+            "(t.state = ? AND t.cleanup_state IS NOT ?))"
+        )
+
+        total = int(self._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        active = int(
+            self._conn.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE state IN ({active_marks})", active_states
+            ).fetchone()[0]
+        )
+        attention_params = (*attention_states, TaskState.FAILED.value, CleanupState.COMPLETE.value)
+        attention = int(
+            self._conn.execute(
+                f"SELECT COUNT(*) FROM tasks t WHERE {attention_where}", attention_params
+            ).fetchone()[0]
+        )
+        awaiting_review = int(
+            self._conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE state = ?", (TaskState.RESULT_READY.value,)
+            ).fetchone()[0]
+        )
+
+        def task_rows(where: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            rows = self._conn.execute(
+                "SELECT t.*, r.display_path AS repository_display_path "
+                "FROM tasks t LEFT JOIN repositories r ON r.id = t.repository_id "
+                f"WHERE {where} ORDER BY t.updated_at DESC, t.id DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+            result = []
+            for row in rows:
+                task_data = dict(row)
+                repository_display_path = task_data.pop("repository_display_path")
+                repository = None
+                if task_data.get("repository_id") is not None:
+                    repository = {
+                        "id": task_data["repository_id"],
+                        "path": repository_display_path,
+                    }
+                result.append({"task": TaskRecord.from_row(task_data), "repository": repository})
+            return result
+
+        return {
+            "counts": {
+                "total": total,
+                "active": active,
+                "attention": attention,
+                "awaiting_review": awaiting_review,
+            },
+            "active_tasks": task_rows(f"t.state IN ({active_marks})", active_states),
+            "attention_tasks": task_rows(attention_where, attention_params),
+        }
 
     # -- events ---------------------------------------------------------------------
 
@@ -272,6 +349,28 @@ class ReadOnlyStore:
             return []
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
         return [dict(row) for row in rows]
+
+    def get_native_check(self, provider: str) -> dict[str, Any] | None:
+        """Read a schema-6 native-check cache row; older databases have no cache."""
+        if self._conn is None:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM native_checks WHERE provider = ?", (provider,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return None
+            raise
+        if row is None:
+            return None
+        result = dict(row)
+        for column in ("result_json", "success_json"):
+            try:
+                result[column] = _loads(result.get(column))
+            except (TypeError, ValueError):
+                result[column] = None
+        return result
 
     # -- turn usage -------------------------------------------------------------------
 

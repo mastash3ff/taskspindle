@@ -541,7 +541,9 @@ _WINDOW_NOTES = {
         "refreshed only while a Claude turn runs: the adapter forwards the SDK's rate_limit_event, "
         "and a usage-limit refusal records the window as rejected"
     ),
-    "grok": "Grok 1.0.13 emits no window telemetry; only a refusal is observed",
+    "grok": (
+        "Task refusals supply window evidence; optional native Grok billing checks are shown under Workers"
+    ),
 }
 
 

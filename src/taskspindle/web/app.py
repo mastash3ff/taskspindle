@@ -13,6 +13,7 @@ import inspect
 import ipaddress
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -30,7 +31,7 @@ from starlette.staticfiles import StaticFiles
 
 import taskspindle
 
-from .. import limits, usage
+from .. import access_checks, limits, usage
 from ..config import Paths
 from ..doctor import run_doctor_async
 from ..providers import Profile
@@ -69,6 +70,48 @@ def _guard(handler: Handler) -> Handler:
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     return wrapped
+
+
+_TASK_SUMMARY_CHARS = 160
+_TASK_SUMMARY_SCAN_CHARS = 8192
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?<![\w-])([\"']?(?:[\w-]+[_-])?"
+    r"(?:api[_ -]?key|access[_ -]?key(?:[_ -]?id)?|access[_ -]?token|refresh[_ -]?token|"
+    r"client[_ -]?secret|token|secret|password|passwd|pwd)[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"\n]*(?:\"|$)|'[^'\n]*(?:'|$)|[^\s,;]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_AUTHORIZATION_VALUE = re.compile(r"\b(Bearer|Basic)[ \t]+[^\s,;\"'<>]+", re.IGNORECASE)
+
+
+def _task_summary(prompt: str) -> str:
+    """A bounded first meaningful line; redact common credential syntax before truncation."""
+    text = _PRIVATE_KEY_BLOCK.sub("[private key redacted]", prompt[:_TASK_SUMMARY_SCAN_CHARS])
+    text = _AUTHORIZATION_VALUE.sub(r"\1 [redacted]", text)
+    text = _CREDENTIAL_ASSIGNMENT.sub(r"\1[redacted]", text)
+    for line in text.splitlines():
+        line = re.sub(r"^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-*+][ \t]+|\d+[.)][ \t]+)", "", line)
+        line = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", line).split()).strip()
+        if not line or line == "[private key redacted]" or re.fullmatch(r"[`~#*_=-]+", line):
+            continue
+        if line.startswith(("```", "~~~")):
+            continue
+        return line if len(line) <= _TASK_SUMMARY_CHARS else line[:_TASK_SUMMARY_CHARS - 1].rstrip() + "…"
+    return "Untitled task"
+
+
+def _task_display(record: Any, repository: dict[str, Any] | None) -> dict[str, Any]:
+    result = task_view(record).model_dump(mode="json")
+    result["summary"] = _task_summary(record.prompt)
+    result["repository"] = {
+        "id": record.repository_id,
+        "path": repository.get("display_path", repository.get("path")) if repository else None,
+    }
+    return result
 
 
 def _resolve_within(base: Path, candidate: str | Path | None) -> Path | None:
@@ -193,6 +236,7 @@ def build_app(
         if not live:
             cache["result"] = result
             cache["at"] = time.monotonic()
+            cache["checked_at"] = clock().astimezone(UTC).isoformat().replace("+00:00", "Z")
         return result
 
     # -- static page --------------------------------------------------------------
@@ -237,8 +281,42 @@ def build_app(
                 limit=limit,
                 q=params.get("q"),
             )
-        tasks = [task_view(record).model_dump(mode="json") for record in records]
+            repositories = {row["id"]: row for row in store.list_repositories()}
+        tasks = [_task_display(record, repositories.get(record.repository_id)) for record in records]
         return JSONResponse({"tasks": tasks})
+
+    @_guard
+    def overview_endpoint(request: Request) -> Response:
+        raw_limit = request.query_params.get("limit", "20")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            return JSONResponse({"error": "INVALID_LIMIT"}, status_code=400)
+        if not 1 <= limit <= 100:
+            return JSONResponse({"error": "INVALID_LIMIT"}, status_code=400)
+        with _store() as store:
+            overview = store.task_overview(limit=limit)
+
+        def project(entry: dict[str, Any]) -> dict[str, Any]:
+            return _task_display(entry["task"], entry["repository"])
+
+        active_tasks = [project(entry) for entry in overview["active_tasks"]]
+        attention_tasks = [project(entry) for entry in overview["attention_tasks"]]
+        counts = overview["counts"]
+        generated_at = clock().astimezone(UTC).isoformat().replace("+00:00", "Z")
+        return JSONResponse(
+            {
+                "generated_at": generated_at,
+                "counts": counts,
+                "active_tasks": active_tasks,
+                "attention_tasks": attention_tasks,
+                "limit": limit,
+                "truncated": {
+                    "active": counts["active"] > len(active_tasks),
+                    "attention": counts["attention"] > len(attention_tasks),
+                },
+            }
+        )
 
     def _build_turn(
         record: Any,
@@ -298,7 +376,7 @@ def build_app(
 
         return JSONResponse(
             {
-                "task": task_view(record).model_dump(mode="json"),
+                "task": _task_display(record, repository),
                 "events": events,
                 "turns": turns,
                 "checks": checks,
@@ -359,6 +437,9 @@ def build_app(
                         "model_availability": model_availability(
                             store, profile, now=observed_now
                         ),
+                        "native_check": access_checks.cached_native_check(
+                            store, profile, now=observed_now
+                        ),
                         "windows": store.latest_provider_windows(limits.status_key(profile)),
                     }
                 )
@@ -367,7 +448,24 @@ def build_app(
                 for row in store.list_provider_status()
                 if (safe := limits.safe_status_row(row)) is not None
             ]
-        doctor_result = await _doctor(request.app.state, live=False)
+        cache = request.app.state.doctor_cache
+        if cache["result"] is None:
+            doctor_result = {
+                "ok": None,
+                "checks": [],
+                "status": "not_run",
+                "cached": False,
+                "fresh": False,
+                "checked_at": None,
+            }
+        else:
+            doctor_result = dict(cache["result"])
+            doctor_result.update(
+                status="cached",
+                cached=True,
+                fresh=(time.monotonic() - cache["at"] < _DOCTOR_CACHE_SECONDS),
+                checked_at=cache["checked_at"],
+            )
         return JSONResponse({"providers": providers_out, "status": status, "doctor": doctor_result})
 
     @_guard
@@ -450,6 +548,7 @@ def build_app(
         Route("/", index, methods=["GET"]),
         Mount("/static", app=StaticFiles(directory=Path(str(static_dir))), name="static"),
         Route("/api/health", health, methods=["GET"]),
+        Route("/api/overview", overview_endpoint, methods=["GET"]),
         Route("/api/tasks", list_tasks_endpoint, methods=["GET"]),
         Route("/api/tasks/{task_id}", task_detail_endpoint, methods=["GET"]),
         Route("/api/tasks/{task_id}/diff", task_diff_endpoint, methods=["GET"]),
@@ -464,5 +563,5 @@ def build_app(
         ),
     ]
     app = Starlette(routes=routes)
-    app.state.doctor_cache = {"result": None, "at": 0.0}
+    app.state.doctor_cache = {"result": None, "at": 0.0, "checked_at": None}
     return app

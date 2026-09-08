@@ -42,6 +42,42 @@ test('Grok exact session identity plus observed billing labels produces a safe r
     assert.equal(normalize('grok',evidence,hash('bob@example.com'),'UTC').error.code,'ACCOUNT_MISMATCH');
   } finally {cleanup();}
 });
+test('Grok billing DOM transitions from renewal to cancellation and back',async()=>{
+  const cleanup=setup({text:'SuperGrok\nInvoices\nRenews September 25, 2026'});
+  try {
+    await window.fetch('/api/auth/session');await waitIdentity();
+    const root=document.querySelectorAll('[role="dialog"]')[0];
+    const renewing=normalize('grok',await readEvidence('grok'),null,'America/Chicago');
+    assert.equal(renewing.ok,true);
+    assert.deepEqual({
+      status:renewing.observation.status,
+      renews_at:renewing.observation.renews_at,
+      access_ends_at:renewing.observation.access_ends_at,
+      date_precision:renewing.observation.date_precision,
+    },{status:'renewing',renews_at:'2026-09-25',access_ends_at:null,date_precision:'date'});
+
+    root.innerText='SuperGrok\nInvoices\nCancelled\nAccess ends October 3, 2026';
+    const cancelled=normalize('grok',await readEvidence('grok'),renewing.observation.account_id,'America/Chicago');
+    assert.equal(cancelled.ok,true);
+    assert.equal(cancelled.observation.account_id,renewing.observation.account_id);
+    assert.deepEqual({
+      status:cancelled.observation.status,
+      renews_at:cancelled.observation.renews_at,
+      access_ends_at:cancelled.observation.access_ends_at,
+      date_precision:cancelled.observation.date_precision,
+    },{status:'cancelled',renews_at:null,access_ends_at:'2026-10-03',date_precision:'date'});
+
+    root.innerText='SuperGrok\nInvoices\nRenews November 3, 2026';
+    const restored=normalize('grok',await readEvidence('grok'),cancelled.observation.account_id,'America/Chicago');
+    assert.equal(restored.ok,true);
+    assert.deepEqual({
+      status:restored.observation.status,
+      renews_at:restored.observation.renews_at,
+      access_ends_at:restored.observation.access_ends_at,
+      date_precision:restored.observation.date_precision,
+    },{status:'renewing',renews_at:'2026-11-03',access_ends_at:null,date_precision:'date'});
+  } finally {cleanup();}
+});
 test('Grok ignores wrong origin, nonexact paths, and unknown session schema',async()=>{
   for(const route of ['https://other.example/api/auth/session','/api/auth/session/other']) {
     const cleanup=setup();
