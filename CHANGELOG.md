@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 (unreleased)
 
 - **Operator console.** The local dashboard now opens on a bounded Overview and navigates through
   Overview, Tasks, Workers, Subscriptions, and Usage. It adds responsive keyboard-accessible

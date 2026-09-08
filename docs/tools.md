@@ -57,7 +57,7 @@ returning.
                                  "freshness": "fresh", "eligible_hint": true,
                                  "account_binding": "unverified"}}],
  "modes": ["consult", "review", "implement"],
- "versions": {"taskspindle": "0.2.0", "api": 1, "schema": 6,
+ "versions": {"taskspindle": "0.3.0", "api": 1, "schema": 6,
               "adapter_package": "@agentclientprotocol/claude-agent-acp",
               "adapter_version": "0.70.0", "acp": "0.12.0"},
  "limits": {"timeout_s": [60, 14400], "diff_page_bytes": 16384, "diff_page_max_bytes": 262144,

@@ -1,6 +1,6 @@
 """TaskSpindle: a local MCP worker orchestrator for OAuth-backed coding agents."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 API_VERSION = 1
 SCHEMA_VERSION = 6
 ADAPTER_PACKAGE = "@agentclientprotocol/claude-agent-acp"
