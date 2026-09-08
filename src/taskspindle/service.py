@@ -251,6 +251,14 @@ def transition(
             EventKind.STATE_CHANGED,
             {"from": record.state.value, "to": to_state.value, "reason": reason},
         )
+        if to_state in {TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
+            from .provider_recovery import finish
+
+            error = fields.get("error") or {}
+            finish(
+                store, task_id, "failed", now=datetime.now(UTC),
+                code=error.get("code") or to_state.value,
+            )
     return updated
 
 
@@ -312,6 +320,10 @@ def provider_availability(
     parent_env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """What TaskSpindle currently believes about a provider's willingness to take a turn."""
+    from .provider_recovery import status as recovery_status
+
+    model = model if model is not None else profile.model
+    recovery = recovery_status(store, profile, now=now, model=model, parent_env=parent_env)
     key = limits.status_key(profile)
     account_row = store.get_provider_status(key)
     account_state = limits.effective_state(account_row, now)
@@ -338,6 +350,7 @@ def provider_availability(
     native = cached_native_check(store, profile, parent_env, now=now)
     if state in ("ok", "unknown") and native["eligible_hint"] is False:
         return {
+            "evidence_revision": recovery["evidence_revision"], "recovery": recovery,
             "state": "throttled", "status_key": key, "code": "NATIVE_QUOTA_EXHAUSTED",
             "window": native["window"], "reset_at": native["reset_at"],
             "reason": "Grok reported its current quota fully used.",
@@ -350,6 +363,7 @@ def provider_availability(
     next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
     stored_state = selected.get("state") if selected else None
     return {
+        "evidence_revision": recovery["evidence_revision"], "recovery": recovery,
         "state": state,
         "status_key": key,
         "code": selected.get("code") if selected and state != "ok" else None,
@@ -373,15 +387,28 @@ def provider_availability(
 
 def model_availability(
     store: ProviderStatusReader, profile: Profile, *, now: datetime,
+    parent_env: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Safe model-scoped observations a caller can use before choosing an override."""
     key = limits.status_key(profile)
+    from .provider_recovery import status as recovery_status
+
     result: list[dict[str, Any]] = []
-    for row in store.list_provider_model_status(key):
+    rows = list(store.list_provider_model_status(key))
+    permit_reader = getattr(store, "latest_recovery_permit", None)
+    permit = permit_reader(key) if permit_reader else None
+    if (permit and permit["provider"] == profile.id and permit["model"]
+            and not any(row["model"] == permit["model"] for row in rows)):
+        # Keep explicitly named retries discoverable before that model has reported any
+        # evidence. This remains an unknown observation, never entitlement proof.
+        rows.append({"model": permit["model"], "state": "unknown"})
+    for row in sorted(rows, key=lambda row: row["model"]):
         state = limits.effective_state(row, now)
         next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
         model = str(row["model"])
+        recovery = recovery_status(store, profile, now=now, model=model, parent_env=parent_env)
         result.append({
+            "evidence_revision": recovery["evidence_revision"], "recovery": recovery,
             "state": state,
             "status_key": key,
             "code": row.get("code") if state != "ok" else None,
@@ -394,7 +421,7 @@ def model_availability(
             "source": limits.safe_provider_source(row.get("source")),
             "scope": "model",
             "affected_model": model,
-            "stale": _observation_stale(row, now),
+            "stale": _observation_stale(row, now) if "observed_at" in row else False,
             "next_action": next_action,
             "retry_eligible": retry_eligible,
         })

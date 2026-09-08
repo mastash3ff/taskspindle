@@ -32,6 +32,8 @@ from .models import (
 class ProviderStatusReader(Protocol):
     """The read interface needed to describe provider availability."""
 
+    def latest_recovery_permit(self, status_key: str) -> dict[str, Any] | None: ...
+
     def get_native_check(self, provider: str) -> dict[str, Any] | None: ...
 
     def get_provider_status(self, provider: str) -> dict[str, Any] | None: ...
@@ -389,9 +391,32 @@ CREATE TABLE native_checks (
 );
 """
 
+_MIGRATION_7 = """
+CREATE TABLE provider_recovery_permits (
+    permit_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    status_key TEXT NOT NULL,
+    model TEXT,
+    state TEXT NOT NULL CHECK(state IN
+        ('armed', 'claimed', 'succeeded', 'failed', 'revoked', 'expired')),
+    evidence_revision TEXT NOT NULL,
+    account_fingerprint TEXT,
+    model_fingerprint TEXT,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    task_id TEXT UNIQUE REFERENCES tasks(id),
+    outcome TEXT,
+    outcome_code TEXT
+);
+CREATE UNIQUE INDEX provider_recovery_active_key
+    ON provider_recovery_permits(status_key) WHERE state IN ('armed', 'claimed');
+CREATE INDEX provider_recovery_history
+    ON provider_recovery_permits(status_key, created_at);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3), (4, _MIGRATION_4),
-    (5, _MIGRATION_5), (6, _MIGRATION_6),
+    (5, _MIGRATION_5), (6, _MIGRATION_6), (7, _MIGRATION_7),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1101,6 +1126,26 @@ class Store:
             conn.execute("DELETE FROM integration_journal WHERE task_id = ?", (task_id,))
 
     # -- provider status --------------------------------------------------------------
+
+    def get_recovery_permit(self, permit_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_recovery_permits WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_task_recovery_permit(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_recovery_permits WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def latest_recovery_permit(self, status_key: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_recovery_permits WHERE status_key = ? "
+            "ORDER BY (state IN ('armed', 'claimed')) DESC, created_at DESC, rowid DESC LIMIT 1",
+            (status_key,),
+        ).fetchone()
+        return dict(row) if row else None
 
     def set_provider_status(
         self,

@@ -1,6 +1,6 @@
 # Tool reference
 
-Seventeen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
+Eighteen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
 nothing else is: there is no side channel, no implicit action and no tool that decides on a
 candidate's behalf.
 
@@ -72,7 +72,7 @@ allowlisted environments are containment by construction and not an OS sandbox.
 `availability` is the one part of this answer that changes. `state` is `unknown` until a turn has
 run on the provider, `ok` after one that did, and `throttled` or `auth_expired` after one the
 provider refused for a usage, rate, credit or login reason; a throttle whose `reset_at` has passed
-reads as `ok` again. `suggested_alternative` names the other first-class provider when there is
+reads as `unknown` again. `suggested_alternative` names the other first-class provider when there is
 one. Nothing is chosen for you: see [`start_task`](#start_task) for what a throttled provider does
 to a request, and [architecture.md](architecture.md#provider-availability) for why that is all it
 does. `windows` is the newest observation of each usage window, as far as the agent reports them.
@@ -86,12 +86,48 @@ can set `eligible_hint`; explicit exhaustion adds a temporary new-task gate, whi
 stale result, unsupported method, or failed check leaves quota unknown. It never clears an
 existing account/model refusal.
 
+Availability also carries `evidence_revision` and `recovery`. The revision identifies the exact
+cached account and selected-model evidence plus effective quota restrictions. `recovery` reports
+the latest controlled attempt for that provider account: `state`, `permit_id`, provider and model
+scope, creation and expiry, bound task and outcome, whether a new attempt can be armed, the next
+action, and a shell-quoted `cli_command` when arming is allowed. For an explicitly requested model
+with no model observation, use `recovery.account_evidence_revision`; new model evidence makes that
+revision invalid for arming. A named permit also appears in `model_availability` with unknown model
+status until the model supplies evidence. Reading these fields never runs a
+check or starts inference.
+
 The Grok check uses only the installed OAuth CLI's ACP billing extension. It starts no model turn,
 login, browser, or direct HTTP request; reads no token contents; and does not upgrade the CLI. A
 persistent cache shared by OAuth aliases of the same provider account coalesces calls for five
 minutes. Executable, authentication-mode, and relevant configuration/auth-file metadata changes
 invalidate it; model and effort selection do not split the account quota. Unsupported native
 methods are reported as `unsupported` without another transport.
+
+### `provider_recovery`
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `action` | `arm`\|`revoke` | — | create one permit or revoke an unused permit |
+| `provider` | string\|null | `null` | configured profile ID; required for `arm` |
+| `model` | string\|null | `null` | exact model scope for `arm` |
+| `evidence_revision` | string\|null | `null` | revision read from current availability; required for `arm` |
+| `permit_id` | string\|null | `null` | permit to revoke; required for `revoke` |
+
+`arm` creates one single-use permit bound to the named provider, model scope, and exact cached
+refusal evidence. It rejects changed evidence, a future reset, fresh native quota exhaustion,
+malformed evidence, and another active attempt for the same provider account. It does not check a
+provider, open a browser, log in, dispatch work, or run inference. Pass the returned `permit_id` as
+`recovery_permit_id` on exactly one `start_task` request. Arm only after the user explicitly
+authorizes that retry; cached evidence and an available permit never authorize autonomous retry.
+
+`revoke` accepts only `action` and `permit_id`. It can revoke an armed permit; a permit already
+claimed by a task cannot become reusable. Both actions return the safe recovery projection inside
+the standard envelope. This tool changes authorization state and is not annotated read-only.
+
+For the equivalent operator flow, `taskspindle providers --retry-next --provider ID [--model
+MODEL]` reads the current cached revision and arms it atomically. `taskspindle providers
+--revoke-retry PERMIT_ID` revokes an unused permit. These flags cannot be combined with `--check`;
+neither command performs provider checks, browser work, login, or inference.
 
 ### `doctor` — read-only
 
@@ -156,6 +192,7 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `timeout_s` | int | `1800` | 60–14400 |
 | `allow_metered` | bool | `false` | required for an `api_key` profile |
 | `ignore_provider_status` | bool | `false` | start even on a provider currently believed throttled or logged out |
+| `recovery_permit_id` | string\|null | `null` | consume one controlled-retry permit bound to this provider/model and current evidence |
 | `acceptance_criteria` | string\|null | `null` | **implement only, required** |
 | `path_prefixes` | string[]\|null | `null` | **implement only, required**; repository-relative, no `..`, no leading `/` |
 | `verification_commands` | string[]\|null | `null` | **implement only, required**; may be `[]` |
@@ -202,6 +239,13 @@ re-queued on another provider and nothing waits for the reset: you either start 
 provider you now choose, wait, or pass `ignore_provider_status: true` and start it anyway — the
 turn will most likely be refused again, and that refusal refreshes the record. A turn that runs
 clears the state.
+
+`recovery_permit_id` is the controlled replacement for an unrestricted retry. It is mutually
+exclusive with the legacy `ignore_provider_status` flag. Task creation validates the permit and
+permanently claims it in the same transaction as the task and its `PROVIDER_RECOVERY_ATTEMPT`
+warning. Expiry applies until the initial prompt is admitted; it never interrupts a running turn.
+The permit settles permanently as succeeded when provider access was established, or failed when
+no turn was accepted or an unrelated failure occurred.
 
 ### `list_tasks` — read-only
 
@@ -527,4 +571,13 @@ invalidates the review: get a new one.
 | `PROVIDER_THROTTLED` | on a FAILED task: the provider refused the turn for a usage, rate or credit limit |
 | `PROVIDER_AUTH_EXPIRED` | on a FAILED task: the provider refused the turn because the seat is logged out or not allowed |
 | `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and the reset has not passed |
+| `RECOVERY_EVIDENCE_CHANGED` | cached provider evidence changed after the permit was proposed or armed |
+| `RECOVERY_NOT_ELIGIBLE` | current refusal/reset/native evidence does not allow a controlled attempt |
+| `RECOVERY_ACTIVE_ATTEMPT` | the provider account already has an armed or claimed attempt |
+| `RECOVERY_NOT_FOUND` | no such recovery permit |
+| `RECOVERY_ALREADY_CLAIMED` | a task claimed the permit, so it cannot be revoked |
+| `RECOVERY_SCOPE_MISMATCH` | the named provider or model does not match the permit |
+| `RECOVERY_NOT_AVAILABLE` | the permit has already been used or settled |
+| `RECOVERY_EXPIRED` | the permit expired before initial prompt admission |
+| `RECOVERY_INVALID_SCOPE` | the provider or model identifier is not safe and valid |
 | `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |

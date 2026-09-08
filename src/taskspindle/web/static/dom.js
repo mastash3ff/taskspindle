@@ -163,7 +163,21 @@ export function restoreViewState(root, state) {
       } catch (_) { selection.removeAllRanges(); }
     }
   }
-  window.scrollTo({ left: state.scrollX, top: state.scrollY, behavior: "instant" });
+  const renderedView = root.firstChild;
+  const routeHash = typeof location === "undefined" ? null : location.hash;
+  const stillCurrent = () => root.isConnected !== false && root.firstChild === renderedView
+    && (routeHash == null || location.hash === routeHash);
+  const restoreWindowScroll = () => {
+    if (stillCurrent()) window.scrollTo({ left: state.scrollX, top: state.scrollY, behavior: "instant" });
+  };
+  restoreWindowScroll();
+  // Chrome can apply focus or scroll anchoring after the replacement DOM lays out, even
+  // when focus used preventScroll. Pin the captured position through the next two paints.
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => {
+    if (!stillCurrent()) return;
+    restoreWindowScroll();
+    requestAnimationFrame(restoreWindowScroll);
+  });
 }
 
 export function safeJSON(value) {

@@ -23,7 +23,7 @@ from typing import Any
 
 import taskspindle
 
-from . import integration, providers, recovery, repos, units, usage, worktrees
+from . import integration, provider_recovery, providers, recovery, repos, units, usage, worktrees
 from .config import Paths, concurrency_limits
 from .integration import Journal
 from .limits import status_fingerprint, status_override_matches
@@ -348,7 +348,9 @@ class Orchestrator:
                     "availability": provider_availability(
                         self.store, profile, now=now, model=profile.model, parent_env=self.parent_env,
                     ),
-                    "model_availability": model_availability(self.store, profile, now=now),
+                    "model_availability": model_availability(
+                        self.store, profile, now=now, parent_env=self.parent_env,
+                    ),
                     "capacity": {
                         "limit": self.concurrency.get(profile.id, 1),
                         "active": active.get(profile.id, 0),
@@ -562,18 +564,46 @@ class Orchestrator:
         """Create, prepare and queue one task."""
         with self._cycle():
             profile = self._profile_for(request)
-            require_provider_available(
-                self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
-                model=request.model or profile.model, parent_env=self.parent_env,
-            )
+            model = request.model or profile.model
+            if request.recovery_permit_id is None:
+                require_provider_available(
+                    self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
+                    model=model, parent_env=self.parent_env,
+                )
             placement = self._placement(request)
-            record = create_task(
-                self.store,
-                request,
-                repository_id=placement.repository_id,
-                auth_mode=AuthMode(profile.auth),
-                provider_family=profile.family,
-            )
+            with self.store.transaction():
+                if request.recovery_permit_id is not None:
+                    if placement.repository_id:
+                        require_grant(
+                            self.store, placement.repository_id, request.provider, request.mode,
+                        )
+                    if request.review_target and request.review_target.kind == "candidate":
+                        subject = require_task(self.store, request.review_target.task_id or "")
+                        if (subject.state is not TaskState.RESULT_READY
+                                or subject.candidate_sha != request.review_target.candidate_sha):
+                            raise TaskSpindleError(CANDIDATE_MISMATCH, "The review candidate changed.")
+                        self._require_independent(subject, request.provider)
+                    provider_recovery.validate(
+                        self.store, profile, request.recovery_permit_id, now=self.clock(),
+                        model=model, parent_env=self.parent_env,
+                    )
+                record = create_task(
+                    self.store,
+                    request,
+                    repository_id=placement.repository_id,
+                    auth_mode=AuthMode(profile.auth),
+                    provider_family=profile.family,
+                )
+                if request.recovery_permit_id is not None:
+                    provider_recovery.claim(
+                        self.store, profile, request.recovery_permit_id, record.id,
+                        now=self.clock(), model=model, parent_env=self.parent_env,
+                    )
+                    self.store.append_event(record.id, EventKind.WARNING, {
+                        "code": "PROVIDER_RECOVERY_ATTEMPT",
+                        "permit_id": request.recovery_permit_id,
+                        "provider": profile.id, "model": model,
+                    })
             if request.ignore_provider_status:
                 key = limits_key(profile)
                 model = request.model or profile.model
@@ -588,10 +618,38 @@ class Orchestrator:
                         self.store.get_provider_model_status(key, model) if model else None
                     ),
                 })
-            self._prepare(record, request, placement)
+            try:
+                self._prepare(record, request, placement)
+            except Exception:
+                # Filesystem/setup errors outside _prepare's classified exceptions still burn
+                # an already claimed permit. Never quietly leave a second attempt authorized.
+                if request.recovery_permit_id is not None:
+                    self._fail(record.id, "PREPARATION_FAILED", "Task preparation failed.")
+                raise
             self.dispatch_queued()
             final = require_task(self.store, record.id)
         return _acknowledge(final)
+
+    def provider_recovery(
+        self, action: str, *, provider: str | None = None, model: str | None = None,
+        evidence_revision: str | None = None, permit_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Authorize or revoke a retry without reconciliation, dispatch, or live checks."""
+        if action == "revoke":
+            if not permit_id or provider is not None or model is not None or evidence_revision is not None:
+                raise TaskSpindleError(INVALID_REQUEST, "revoke requires only permit_id")
+            return provider_recovery.revoke(self.store, permit_id, now=self.clock())
+        if action != "arm" or not provider or not evidence_revision or permit_id is not None:
+            raise TaskSpindleError(INVALID_REQUEST, "arm requires provider and evidence_revision")
+        profile = self.profiles.get(provider)
+        if profile is None:
+            raise TaskSpindleError(INVALID_REQUEST, "provider is not configured")
+        if model is not None and not model.strip():
+            raise TaskSpindleError(INVALID_REQUEST, "model must not be empty")
+        return provider_recovery.arm(
+            self.store, profile, evidence_revision=evidence_revision, now=self.clock(),
+            model=model or profile.model, parent_env=self.parent_env,
+        )
 
     def _profile_for(self, request: StartTaskRequest) -> Profile:
         try:
@@ -889,6 +947,15 @@ class Orchestrator:
                 profile = self.profiles.get(task.provider)
                 require_task_profile(task, profile)
                 assert profile is not None
+                permit = self.store.get_task_recovery_permit(task.id)
+                recovery_override = False
+                if permit is not None and len(self.store.list_turns(task.id)) == 1:
+                    provider_recovery.validate(
+                        self.store, profile, permit["permit_id"], task_id=task.id, now=self.clock(),
+                        model=task.resolved_model or task.requested_model or profile.model,
+                        parent_env=self.parent_env,
+                    )
+                    recovery_override = True
                 availability = provider_availability(
                     self.store,
                     profile,
@@ -897,6 +964,7 @@ class Orchestrator:
                     parent_env=self.parent_env,
                 )
                 if (availability["state"] not in ("ok", "unknown")
+                        and not recovery_override
                         and not self._initial_status_override(task, profile)):
                     return False
                 if not self.store.acquire_lease(

@@ -334,8 +334,20 @@ function turnsPanel(turns) {
 }
 
 function eventsPanel(events) {
+  const payloadText = (event) => {
+    const payload = event.payload || {};
+    if (event.kind === "WARNING" && (payload.code || payload.warning) === "PROVIDER_RECOVERY_ATTEMPT") {
+      const detail = [payload.permit_id ? `permit ${payload.permit_id}` : null, payload.model ? `model ${payload.model}` : null].filter(Boolean).join(" · ");
+      return `Controlled worker recovery attempt${detail ? ` · ${detail}` : ""}`;
+    }
+    if (event.kind === "WARNING" && (payload.code || payload.warning) === "PROVIDER_RECOVERY_OUTCOME") {
+      const detail = [payload.permit_id ? `permit ${payload.permit_id}` : null, payload.outcome || null, payload.outcome_code ? `code ${payload.outcome_code}` : null].filter(Boolean).join(" · ");
+      return `Controlled worker recovery outcome${detail ? ` · ${detail}` : ""}`;
+    }
+    return event.payload ? safeJSON(event.payload) : "—";
+  };
   return h("section", { id: "task-panel-events", class: "panel task-tab-panel", role: "tabpanel", "aria-labelledby": "task-tab-events", dataset: { taskSection: "events" } }, sectionHeading(`Events (${events?.length || 0})`, "State transition history"),
-    events?.length ? table(["At", "Kind", "Payload"], events.map((event) => h("tr", {}, h("td", { "data-label": "At", text: formatDate(event.at) }), h("td", { "data-label": "Kind", text: event.kind }), h("td", { "data-label": "Payload", class: "mono", text: event.payload ? safeJSON(event.payload) : "—" }))), "responsive-table") : emptyState("No events", "No events were recorded."),
+    events?.length ? table(["At", "Kind", "Payload"], events.map((event) => h("tr", {}, h("td", { "data-label": "At", text: formatDate(event.at) }), h("td", { "data-label": "Kind", text: event.kind }), h("td", { "data-label": "Payload", class: "mono", text: payloadText(event) }))), "responsive-table") : emptyState("No events", "No events were recorded."),
   );
 }
 

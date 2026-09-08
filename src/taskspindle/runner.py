@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import limits, providers, repos, units, usage, worktrees
+from . import limits, provider_recovery, providers, repos, units, usage, worktrees
 from .acp_client import AcpError, AcpWorker, PermissionPolicy, TurnResult
 from .agy_cli import AgyCliWorker
 from .agy_cli import model_catalog as cli_model_catalog
@@ -431,6 +431,11 @@ async def run_worker(
                 await heartbeat
         if running and run is not None:
             _complete_turn(run)
+            if run.revision == 1:
+                provider_recovery.finish(
+                    store, task_id, "failed", now=datetime.now(UTC),
+                    code=(run.task.error or {}).get("code") or run.task.state.value,
+                )
             store.release_lease(run.task.provider, task_id)
         if log is not None:
             log.write("done")
@@ -527,7 +532,6 @@ async def _run_turn(
                 evidence = {"auth": "oauth", "auth_method_id": "cached_native_cli",
                             "source": "authenticated_model_catalog"}
                 run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
-                _capture_model_status_at_start(run, profile)
                 result = await _prompt(run, agent, cancel_event, native=True)
             else:
                 run.agent_info = dict(agent.init.agent_info) if agent.init else {}
@@ -535,7 +539,6 @@ async def _run_turn(
                     evidence = _post_init_evidence(profile, agent)
                 run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
                 await _open_session(run, agent)
-                _capture_model_status_at_start(run, profile)
                 result = await _prompt(run, agent, cancel_event)
     except AcpError as exc:
         # The client retains updates even when prompt/cancel/timeout raises. Capture
@@ -712,6 +715,12 @@ def _effective_model(run: _Run, profile: Profile) -> str | None:
 
 def _capture_model_status_at_start(run: _Run, profile: Profile) -> None:
     """Snapshot and gate the exact resolved model immediately before its prompt starts."""
+    with run.store.transaction():
+        _capture_and_validate_provider_status(run, profile)
+
+
+def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
+    """Keep the permit check and success comparison snapshot on one database revision."""
     key = limits.status_key(profile)
     model = _effective_model(run, profile)
     run.provider_status_at_start = run.store.get_provider_status(key)
@@ -722,6 +731,16 @@ def _capture_model_status_at_start(run: _Run, profile: Profile) -> None:
     # Availability selection applies to a newly launched managed task. Existing tasks keep their
     # established continuation/recovery behavior while still recording real provider outcomes.
     if run.revision != 1:
+        return
+    permit = run.store.get_task_recovery_permit(run.task_id)
+    if permit is not None:
+        try:
+            provider_recovery.validate(
+                run.store, profile, permit["permit_id"], task_id=run.task_id,
+                now=datetime.now(UTC), model=model, parent_env=os.environ,
+            )
+        except TaskSpindleError as exc:
+            raise _Failure(exc.code, exc.message, retryable=False, details=exc.details) from exc
         return
     availability = provider_availability(run.store, profile, now=datetime.now(UTC), model=model)
     overridden = any(
@@ -864,6 +883,8 @@ async def _prompt(
     run: _Run, agent: AcpWorker | AgyCliWorker, cancel_event: asyncio.Event, *, native: bool = False,
 ) -> TurnResult:
     """Send the turn, racing it against a cancel request."""
+    if run.profile is not None:
+        _capture_model_status_at_start(run, run.profile)
     session_id = run.session_id or ""
     _CANCEL_HOOKS[run.task_id] = cancel_event.set
     run.prompt_started_at = now()
@@ -977,6 +998,11 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
             task_id=run.task_id,
             source="rate_limit_event",
         )
+        if run.revision == 1:
+            provider_recovery.finish(
+                run.store, run.task_id, "failed", now=datetime.now(UTC),
+                code=limits.PROVIDER_THROTTLED,
+            )
     elif not run.cancelled and result.stop_reason != "cancelled":
         model = _effective_model(run, profile)
         expected_model = (
@@ -990,6 +1016,10 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
             model=model,
             expected_model=expected_model,
         )
+        if run.revision == 1:
+            provider_recovery.finish(
+                run.store, run.task_id, "succeeded", now=datetime.now(UTC),
+            )
 
 
 #: How long, and how often, to wait for Claude Code to write the session record that names the

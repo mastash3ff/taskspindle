@@ -4,7 +4,7 @@
 
 ```
   Codex session                                  browser (localhost)
-        │  MCP over stdio (17 tools, one envelope)        │  taskspindle web:
+        │  MCP over stdio (18 tools, one envelope)        │  taskspindle web:
         ▼                                                 ▼  task database opened read-only
   taskspindle mcp ──────────────────────────────────────────────┐
   server.py: envelope, annotations, traceback → server.log      │
@@ -17,6 +17,7 @@
   reviews · grants · leases            │                                    │
   artifacts · journals                 │                                    │
   provider_status · provider_windows   │                                    │
+  provider_recovery_permits            │                                    │
   turn_usage                           │                                    │
         ▲                              ▼                                    ▼
         │            taskspindle-worker-<task>.service     taskspindle-accept-<task>.service
@@ -34,6 +35,7 @@
   recovery.py    what to believe when a worker vanished
   review.py      the reviewer's JSON, and what blocks an acceptance
   limits.py      what a refused turn means for its provider; never what to do about it
+  provider_recovery.py  single-use authorization bound to cached refusal evidence
   usage.py       token counts per turn, the price table, the rolled-up report
   web/           operator console: read-only task/overview store, protected subscription actions
   subscriptions/ separate SQLite observations/queue, background browser collector, CLI
@@ -214,16 +216,24 @@ failure survives. Schema 5 adds this evidence without changing task ownership or
 last successful use, staleness, reset time, retry eligibility, and a suggested next action.
 `model_availability` lists known model observations even when a profile has no fixed default.
 A passed reset means `unknown` and eligible for an ordinary attempt, not proven healthy.
-Unresolved refusals remain blocking even when their observations become stale.
+Unresolved refusals remain blocking even when their observations become stale. Each availability
+projection includes an `evidence_revision` and a recovery projection derived entirely from cached
+state.
 
 The Codex coordinator selects a compatible subscription worker before calling `start_task`,
 preserving explicit provider/model requirements, repository grants, capacity, and review
 independence. Unknown access permits ordinary needed work; it never justifies synthetic probes.
 TaskSpindle receives an explicit provider and does not migrate, retry, or change that task's
 provider. When none is eligible the coordinator reports the constraint and next action.
-An explicit `ignore_provider_status` retry remains bounded to the observation it overrides;
-native cached-login checks alone do not clear a refusal. Metered workers still require separate
-explicit opt-in and are never selected automatically by the work pool.
+A controlled retry first arms one permit against that exact evidence revision, then names the
+permit on one `start_task`. Arming and task creation both reject changed evidence, future resets,
+fresh native quota exhaustion, scope changes, and another active attempt for the shared provider
+account. Task creation claims the permit transactionally, so it cannot authorize two tasks. The
+permit is settled permanently from the accepted provider turn; expiry only governs admission and
+never interrupts running work. The legacy `ignore_provider_status` field remains compatible but
+is mutually exclusive with a permit. Native cached-login checks alone do not clear a refusal.
+Metered workers still require separate explicit opt-in and are never selected automatically by
+the work pool.
 
 `capabilities(check_providers=["grok"])` and `taskspindle providers --check --provider grok`
 optionally refresh Grok's native quota observation. The checker starts a session-free native ACP
@@ -241,8 +251,9 @@ it. Native evidence never clears account/model refusals or establishes browser i
 account binding, billing dates, or future model-turn success. Because the optional MCP parameter
 writes this diagnostic cache, `capabilities` is not advertised with a read-only annotation; its
 default call is cached-only. Dashboard Overview and Workers GETs read cached task/native/doctor
-data, start no diagnostics, and tolerate older task schemas without migrating them. Schema 6 adds
-the native diagnostic cache without changing task records or provider bindings.
+data, start no diagnostics, and tolerate older task schemas without migrating them. The CLI's
+default `providers` status path also uses the read-only store. Schema 6 adds the native diagnostic
+cache; schema 7 adds recovery permits without changing task ownership or provider binding.
 
 ## What isolation is, and is not
 

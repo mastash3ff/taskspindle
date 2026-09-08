@@ -86,7 +86,7 @@ moved underneath you is refused rather than clobbered.
 | --- | --- |
 | [install.md](docs/install.md) | requirements, installing, XDG locations, uninstalling |
 | [codex-registration.md](docs/codex-registration.md) | registering the server, the timeouts, granting a repository |
-| [tools.md](docs/tools.md) | all seventeen tools, the envelope, the acceptance and review rules |
+| [tools.md](docs/tools.md) | all eighteen tools, the envelope, controlled recovery, and acceptance rules |
 | [configuration.md](docs/configuration.md) | `config.toml`, `taskspindle discover`, and what second-class providers may not do |
 | [antigravity.md](docs/antigravity.md) | native AGY login reuse, model selection, containment and release gates |
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |

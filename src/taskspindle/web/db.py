@@ -307,6 +307,31 @@ class ReadOnlyStore:
 
     # -- provider status --------------------------------------------------------------
 
+    def _recovery_lookup(self, clause: str, value: str) -> dict[str, Any] | None:
+        if self._conn is None:
+            return None
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM provider_recovery_permits WHERE " + clause, (value,)
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return None
+            raise
+        return dict(row) if row else None
+
+    def get_recovery_permit(self, permit_id: str) -> dict[str, Any] | None:
+        return self._recovery_lookup("permit_id = ?", permit_id)
+
+    def get_task_recovery_permit(self, task_id: str) -> dict[str, Any] | None:
+        return self._recovery_lookup("task_id = ?", task_id)
+
+    def latest_recovery_permit(self, status_key: str) -> dict[str, Any] | None:
+        return self._recovery_lookup(
+            "status_key = ? ORDER BY (state IN ('armed', 'claimed')) DESC, "
+            "created_at DESC, rowid DESC LIMIT 1", status_key,
+        )
+
     def get_provider_status(self, provider: str) -> dict[str, Any] | None:
         if self._conn is None:
             return None

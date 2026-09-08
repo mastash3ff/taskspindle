@@ -1,4 +1,4 @@
-"""The MCP surface: the seventeen tools, their annotations, and the envelope they all return."""
+"""The MCP surface: the eighteen tools, their annotations, and the envelope they all return."""
 
 from __future__ import annotations
 
@@ -52,15 +52,80 @@ def server(store: Store, paths: Paths):
     return build_server(orchestrator)
 
 
-async def test_the_seventeen_tools_are_exposed_with_honest_annotations(server) -> None:
+async def test_the_eighteen_tools_are_exposed_with_honest_annotations(server) -> None:
     async with Client(server) as client:
         tools = await client.list_tools()
 
     assert [tool.name for tool in tools] == list(TOOL_NAMES)
-    assert len(tools) == 17
+    assert len(tools) == 18
     read_only = {tool.name for tool in tools if tool.annotations.readOnlyHint}
     assert read_only == set(READ_ONLY_TOOLS)
     assert "task_diff" not in read_only
+    assert "provider_recovery" not in read_only
+
+
+async def test_provider_recovery_validates_and_delegates_inside_the_envelope(
+    server, monkeypatch,
+) -> None:
+    """Dropping argument validation would expose ambiguous state-changing recovery calls."""
+    calls: list[tuple[Any, ...]] = []
+
+    def recover(self, action, **kwargs):
+        calls.append((action, kwargs))
+        return {"state": "armed" if action == "arm" else "revoked", **kwargs}
+
+    monkeypatch.setattr(Orchestrator, "provider_recovery", recover, raising=False)
+    async with Client(server) as client:
+        armed = await client.call_tool("provider_recovery", {
+            "action": "arm", "provider": "grok", "model": "grok-4",
+            "evidence_revision": "ev_example",
+        })
+        revoked = await client.call_tool("provider_recovery", {
+            "action": "revoke", "permit_id": "rp_example",
+        })
+        invalid = [
+            await client.call_tool("provider_recovery", {"action": "arm", "provider": "grok"}),
+            await client.call_tool("provider_recovery", {
+                "action": "arm", "provider": "grok", "model": " ",
+                "evidence_revision": "ev_example",
+            }),
+            await client.call_tool("provider_recovery", {
+                "action": "arm", "provider": "grok", "evidence_revision": "ev_example",
+                "permit_id": "rp_unrelated",
+            }),
+            await client.call_tool("provider_recovery", {"action": "revoke"}),
+            await client.call_tool("provider_recovery", {"action": "retry", "provider": "grok"}),
+            await client.call_tool("provider_recovery", {
+                "action": "revoke", "permit_id": "rp_example", "provider": "grok",
+            }),
+        ]
+
+    assert armed.data["ok"] is True
+    assert revoked.data["ok"] is True
+    assert calls == [
+        ("arm", {
+            "provider": "grok", "model": "grok-4", "evidence_revision": "ev_example",
+            "permit_id": None,
+        }),
+        ("revoke", {
+            "provider": None, "model": None, "evidence_revision": None,
+            "permit_id": "rp_example",
+        }),
+    ]
+    assert all(result.data["ok"] is False for result in invalid)
+    assert all(result.data["error"]["code"] == "INVALID_REQUEST" for result in invalid)
+
+
+async def test_provider_recovery_policy_errors_stay_inside_the_envelope(server) -> None:
+    """A valid wire shape with an unknown provider must remain a safe TaskSpindle error."""
+    async with Client(server) as client:
+        result = await client.call_tool("provider_recovery", {
+            "action": "arm", "provider": "unknown", "evidence_revision": "ev_example",
+        })
+
+    assert result.data["ok"] is False
+    assert result.data["error"]["code"] == "INVALID_REQUEST"
+    assert "traceback" not in json.dumps(result.data).lower()
 
 
 async def test_capabilities_returns_an_envelope(server) -> None:
@@ -105,6 +170,7 @@ async def test_the_request_object_tools_describe_their_fields(server) -> None:
         assert tools[name].inputSchema["properties"]["request"]["type"] == "object"
     assert "- acceptance_criteria: string | null (optional)" in tools["start_task"].description
     assert "- provider: string (required)" in tools["start_task"].description
+    assert "- recovery_permit_id: string | null (optional)" in tools["start_task"].description
     assert "- modes: array of" in tools["authorize_repository"].description
 
 

@@ -141,3 +141,20 @@ test("task detail tabs use roving focus and URL-backed activation", async () => 
   assert.equal(next.focused, true);
   assert.equal(next.clicked, 1);
 });
+
+test("task events explain controlled provider recovery attempts and outcomes", async () => {
+  const recoveryDetail = { ...detail, events: [
+    { at: "2026-09-07T11:01:00Z", kind: "WARNING",
+      payload: { code: "PROVIDER_RECOVERY_ATTEMPT", permit_id: "recovery-1", model: "grok-4.6" } },
+    { at: "2026-09-07T11:02:00Z", kind: "WARNING",
+      payload: { code: "PROVIDER_RECOVERY_OUTCOME", permit_id: "recovery-1", outcome: "failed", outcome_code: "PROVIDER_AUTH_EXPIRED" } },
+  ] };
+  globalThis.fetch = async () => response(JSON.stringify(recoveryDetail));
+  const view = await renderTaskDetail("ts_fixture", { route: route("tab=events") });
+  assert.match(textOf(view), /Controlled worker recovery attempt/);
+  assert.match(textOf(view), /permit recovery-1/);
+  assert.match(textOf(view), /model grok-4\.6/);
+  assert.match(textOf(view), /Controlled worker recovery outcome/);
+  assert.match(textOf(view), /failed/);
+  assert.match(textOf(view), /code PROVIDER_AUTH_EXPIRED/);
+});

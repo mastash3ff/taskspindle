@@ -1,6 +1,6 @@
 [project]
 name = "taskspindle"
-version = "0.3.0"
+version = "0.4.0"
 description = "A local MCP worker orchestrator for OAuth-backed coding agents, isolated worktrees, review, recovery, and Codex-owned integration."
 readme = "README.md"
 license = "Apache-2.0"

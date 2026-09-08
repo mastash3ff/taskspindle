@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.4.0 (unreleased)
+
+- **Controlled worker recovery.** Codex and the CLI can arm one explicit "Retry next task"
+  permit against the current account/model refusal evidence. Schema 7 records a single active
+  permit per shared provider availability key, with a 24-hour deadline, revocation, permanent
+  task association, and outcome history. Arming and revoking run no provider checks or prompts.
+- **Bounded initial attempts.** Task creation validates grants, provider/model scope and review
+  independence before atomically consuming the permit. Preparation or startup failure consumes
+  it. Dispatch and initial prompt admission reject changed refusals and expired permits; future
+  quota resets and fresh native exhaustion cannot be bypassed. A successful turn clears only
+  the evidence it tested. Existing continuations and legacy overrides remain compatible.
+- **Read-only recovery visibility.** Cached capabilities, provider status and the Workers screen
+  expose evidence revisions, armed/pending recovery, deadlines, associated tasks and outcomes.
+  The dashboard supplies copyable CLI instructions and adds no recovery mutation endpoint.
+  Billing remains advisory and separate; scheduled collection stays opt-in and disabled.
+- **Isolated packaging smoke.** MCP smoke tests now pass temporary XDG paths directly to the
+  child process, preventing a packaging check from opening the installed runtime's database.
+
 ## v0.3.0
 
 - **Operator console.** The local dashboard now opens on a bounded Overview and navigates through

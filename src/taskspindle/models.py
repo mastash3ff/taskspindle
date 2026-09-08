@@ -258,6 +258,8 @@ class StartTaskRequest(BaseModel):
     #: Start on a provider TaskSpindle currently believes is throttled or logged out. The turn
     #: will most likely fail again, but the choice is the caller's, never TaskSpindle's.
     ignore_provider_status: bool = False
+    #: A single-use authorization bound to current refusal evidence and this new task.
+    recovery_permit_id: str | None = Field(default=None, min_length=1, max_length=128)
     # implement only
     acceptance_criteria: str | None = None
     path_prefixes: list[str] | None = None
@@ -289,6 +291,13 @@ class StartTaskRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_mode(self) -> StartTaskRequest:
+        if self.recovery_permit_id is not None:
+            if self.ignore_provider_status:
+                raise ValueError("recovery_permit_id and ignore_provider_status are mutually exclusive")
+            if not self.recovery_permit_id.strip():
+                raise ValueError("recovery_permit_id must not be empty")
+            if self.model is not None and not self.model.strip():
+                raise ValueError("recovery model must not be empty")
         if self.mode is Mode.IMPLEMENT:
             missing = []
             if not self.repository:
