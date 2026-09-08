@@ -255,8 +255,8 @@ class StartTaskRequest(BaseModel):
     effort: str | None = None
     timeout_s: int = Field(default=1800, ge=60, le=14400)
     allow_metered: bool = False
-    #: Start on a provider TaskSpindle currently believes is throttled or logged out. The turn
-    #: will most likely fail again, but the choice is the caller's, never TaskSpindle's.
+    #: Recognized legacy input. Admission rejects true with LEGACY_OVERRIDE_RETIRED;
+    #: recovery uses an explicitly authorized permit or the ordinary quota-retry claim.
     ignore_provider_status: bool = False
     #: A single-use authorization bound to current refusal evidence and this new task.
     recovery_permit_id: str | None = Field(default=None, min_length=1, max_length=128)

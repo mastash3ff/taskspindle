@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from taskspindle import repos, runner, service
+from taskspindle import provider_recovery, repos, runner, service
 from taskspindle.config import Paths
 from taskspindle.models import (
     AcceptTaskRequest,
@@ -658,7 +658,7 @@ def test_capabilities_describes_the_providers_and_the_limits(harness: Harness) -
     assert capabilities["providers"][0]["windows"] == []
 
 
-def test_a_throttled_provider_is_refused_until_its_reset_unless_overridden(
+def test_a_throttled_provider_is_refused_and_legacy_override_cannot_create_a_task(
     harness: Harness, make_repo
 ) -> None:
     repo = make_repo()
@@ -681,18 +681,25 @@ def test_a_throttled_provider_is_refused_until_its_reset_unless_overridden(
     assert excinfo.value.retryable is True
     assert excinfo.value.details["reset_at"] == "2999-01-01T00:00:00Z"
     assert excinfo.value.details["window"] == "five_hour"
-    assert "ignore_provider_status" in excinfo.value.details["override"]
+    assert "captured current evidence" in excinfo.value.details["override"]
     shown = harness.orchestrator.capabilities()["providers"][0]["availability"]
     assert shown["state"] == "throttled"
     assert store.list_tasks() == []
 
-    # The caller may insist, and the task then runs like any other.
-    started = harness.orchestrator.start_task(
-        implement_request(repo, ignore_provider_status=True)
+    with pytest.raises(TaskSpindleError) as retired:
+        harness.orchestrator.start_task(implement_request(repo, ignore_provider_status=True))
+    assert retired.value.code == "LEGACY_OVERRIDE_RETIRED"
+    assert store.list_tasks() == []
+
+    profile = harness.orchestrator.profiles[AUTHOR]
+    evidence = provider_recovery.status(
+        store, profile, now=harness.orchestrator.clock(), parent_env=harness.orchestrator.parent_env,
     )
-    assert started["state"] == TaskState.RESULT_READY.value
-    # ... and a turn that ran is what clears the throttle.
-    assert harness.orchestrator.capabilities()["providers"][0]["availability"]["state"] == "ok"
+    with pytest.raises(TaskSpindleError) as no_quota_bypass:
+        harness.orchestrator.provider_recovery(
+            "arm", provider=AUTHOR, evidence_revision=evidence["evidence_revision"],
+        )
+    assert no_quota_bypass.value.code == "RECOVERY_NOT_ELIGIBLE"
 
     # A throttle whose reset has passed is not a refusal at all.
     store.set_provider_status(
@@ -705,7 +712,7 @@ def test_a_throttled_provider_is_refused_until_its_reset_unless_overridden(
     assert elapsed["retry_eligible"] is True
 
 
-def test_initial_override_is_bound_to_exact_account_and_model_observations(
+def test_retired_override_cannot_authorize_prompt_and_permit_stays_bound_to_model_evidence(
     harness: Harness, make_repo,
 ) -> None:
     harness.defer()
@@ -715,35 +722,32 @@ def test_initial_override_is_bound_to_exact_account_and_model_observations(
     store.set_provider_status(
         AUTHOR, "auth_expired", source="acp_error", reason="legacy-secret-account-value",
     )
-    task_id = harness.orchestrator.start_task(implement_request(
-        repo, model="model-a", ignore_provider_status=True,
-    ))["task_id"]
-    task = store.get_task(task_id)
     profile = harness.orchestrator.profiles[AUTHOR]
-    assert task is not None
-    assert harness.orchestrator._initial_status_override(task, profile)
-    event_text = json.dumps(store.list_events(task_id))
-    assert "legacy-secret" not in event_text
+    with pytest.raises(TaskSpindleError) as retired:
+        harness.orchestrator.start_task(implement_request(repo, model="model-a", ignore_provider_status=True))
+    assert retired.value.code == "LEGACY_OVERRIDE_RETIRED"
+    assert store.list_tasks() == []
 
-    store.set_provider_status(AUTHOR, "access_denied", source="acp_error")
-    assert not harness.orchestrator._initial_status_override(task, profile)
-
-    store.set_provider_model_status(
-        REVIEWER, "model-a", "model_unavailable", source="acp_error",
-        reason="legacy-secret-model-value",
+    evidence = provider_recovery.status(
+        store, profile, now=harness.orchestrator.clock(), model="model-a",
+        parent_env=harness.orchestrator.parent_env,
     )
-    model_task_id = harness.orchestrator.start_task(implement_request(
-        repo, provider=REVIEWER, model="model-a", ignore_provider_status=True,
+    permit = harness.orchestrator.provider_recovery(
+        "arm", provider=AUTHOR, model="model-a", evidence_revision=evidence["evidence_revision"],
+    )
+    task_id = harness.orchestrator.start_task(implement_request(
+        repo, model="model-a", recovery_permit_id=permit["permit_id"],
     ))["task_id"]
-    model_task = store.get_task(model_task_id)
-    model_profile = harness.orchestrator.profiles[REVIEWER]
-    assert model_task is not None
-    assert harness.orchestrator._initial_status_override(model_task, model_profile)
+    assert store.get_recovery_permit(permit["permit_id"])["state"] == "claimed"
     store.set_provider_model_status(
-        REVIEWER, "model-a", "model_unavailable", source="rate_limit_event",
+        AUTHOR, "model-a", "model_unavailable", source="rate_limit_event",
     )
-    assert not harness.orchestrator._initial_status_override(model_task, model_profile)
-    assert "legacy-secret" not in json.dumps(store.list_events(model_task_id))
+    harness.run_pending()
+    task = store.get_task(task_id)
+    assert task.state is TaskState.FAILED
+    assert task.error["code"] == "RECOVERY_EVIDENCE_CHANGED"
+    assert store.get_recovery_permit(permit["permit_id"])["state"] == "failed"
+    assert "legacy-secret" not in json.dumps(store.list_events(task_id))
 
 
 def test_usage_report_rolls_the_finished_tasks_up(harness: Harness, make_repo) -> None:

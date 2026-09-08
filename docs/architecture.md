@@ -220,6 +220,14 @@ Unresolved refusals remain blocking even when their observations become stale. E
 projection includes an `evidence_revision` and a recovery projection derived entirely from cached
 state.
 
+Quota is a separate durable projection. `quota_restrictions` retains every applicable account or
+model-family window with its scope, normalized model family, reset, source, observation, and
+opaque fingerprint. A changed `auth_context` invalidates authorization tied to the earlier context;
+it never clears quota restrictions or identifies an account. After all applicable restrictions have
+passed their reset, aliases of the same OAuth seat share one ordinary, acceptance-bearing retry
+claim. A pending claim is attached to its task and prevents duplicate replacement tasks. An
+unaffected model remains eligible under the normal capacity and grant rules.
+
 The Codex coordinator selects a compatible subscription worker before calling `start_task`,
 preserving explicit provider/model requirements, repository grants, capacity, and review
 independence. Unknown access permits ordinary needed work; it never justifies synthetic probes.
@@ -230,8 +238,11 @@ permit on one `start_task`. Arming and task creation both reject changed evidenc
 fresh native quota exhaustion, scope changes, and another active attempt for the shared provider
 account. Task creation claims the permit transactionally, so it cannot authorize two tasks. The
 permit is settled permanently from the accepted provider turn; expiry only governs admission and
-never interrupts running work. The legacy `ignore_provider_status` field remains compatible but
-is mutually exclusive with a permit. Native cached-login checks alone do not clear a refusal.
+never interrupts running work. A non-quota refusal or an explicitly authorized throttle with no
+reported reset may use this one exact permit. A quota restriction with a reported future reset and
+fresh native exhaustion never bypass it. The legacy `ignore_provider_status` field remains
+recognizable for compatibility but is rejected as `LEGACY_OVERRIDE_RETIRED`. Native cached-login
+checks alone do not clear a refusal.
 Metered workers still require separate explicit opt-in and are never selected automatically by
 the work pool.
 
@@ -253,7 +264,8 @@ writes this diagnostic cache, `capabilities` is not advertised with a read-only 
 default call is cached-only. Dashboard Overview and Workers GETs read cached task/native/doctor
 data, start no diagnostics, and tolerate older task schemas without migrating them. The CLI's
 default `providers` status path also uses the read-only store. Schema 6 adds the native diagnostic
-cache; schema 7 adds recovery permits without changing task ownership or provider binding.
+cache; schema 7 adds recovery permits; schema 8 adds durable quota windows, authentication-context
+binding, and shared post-reset retry claims without changing task ownership or provider binding.
 
 ## What isolation is, and is not
 

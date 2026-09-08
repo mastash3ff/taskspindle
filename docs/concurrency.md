@@ -32,6 +32,14 @@ lease. The task ID is unique, so competing MCP processes cannot start duplicate 
 the configured provider limit. Queue dispatch rechecks provider availability and takes capacity
 before starting the unit. Lower limits prevent new acquisitions without canceling running work.
 
+Quota eligibility is checked in the same selection path. Every currently applicable quota window
+blocks its scope until its reset; overlapping windows do not collapse into a single provider flag.
+Once the applicable resets pass, OAuth aliases sharing a seat may claim exactly one ordinary
+post-reset task. The claim is transactional and bound to that task, so another client receives
+`QUOTA_RETRY_PENDING` rather than creating a duplicate. A restricted model family does not consume
+capacity reserved for unaffected models, which continue through the normal grant, compatibility,
+and capacity checks.
+
 Each worker has its own worktree or scratch repository, systemd unit, process, session, temporary
 directory, stderr, transcript, and turn usage record. Continuation uses that task's session and
 worktree and claims its next turn separately. Completion, cancellation, and recovery release the

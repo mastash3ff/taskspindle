@@ -129,7 +129,7 @@ class ProfileError(Exception):
     """A profile could not be resolved, or refused a task.
 
     ``code`` is one of ``PROFILE_UNKNOWN``, ``PROFILE_INVALID``, ``OAUTH_REJECTED``,
-    ``MODE_NOT_ALLOWED``, ``METERED_NOT_ALLOWED``.
+    ``MODE_NOT_ALLOWED``, ``METERED_NOT_ALLOWED``, ``AUTH_CONTEXT_CONFLICT``.
     """
 
     def __init__(self, code: str, message: str) -> None:
@@ -417,6 +417,7 @@ def load_profiles(
     home: Path,
     state_dir: Path,
     data_dir: Path | None = None,
+    parent_env: Mapping[str, str] | None = None,
 ) -> dict[str, Profile]:
     """Built-in profiles plus every ``[providers.<id>]`` table in ``config``."""
     write_grok_overlay(state_dir)
@@ -426,6 +427,11 @@ def load_profiles(
         raise ProfileError("PROFILE_INVALID", "providers must be a table")
     for profile_id, table in providers.items():
         profiles[profile_id] = _configured_profile(profile_id, table, profiles)
+    # Reject aliases that would select another OAuth login before any caller can launch them.
+    # The local import avoids a module cycle: auth_context uses Profile and ProfileError above.
+    from .auth_context import validate_contexts
+
+    validate_contexts(profiles, parent_env if parent_env is not None else os.environ)
     return profiles
 
 
@@ -602,9 +608,14 @@ def build_child_env(
 # OAuth evidence
 
 
-def default_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
-    """Run a short local command and capture its output as text."""
-    return subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+def default_runner(
+    command: list[str], *, env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a short local command in the supplied already-sanitized environment."""
+    return subprocess.run(
+        command, capture_output=True, text=True, timeout=30, check=False,
+        env=dict(env) if env is not None else None,
+    )
 
 
 def _rejected(field_name: str, detail: str) -> ProfileError:
@@ -654,7 +665,9 @@ def claude_oauth_evidence(
     }
 
 
-def grok_oauth_evidence(auth_methods: Sequence[Mapping[str, Any] | object], *, home: Path) -> dict[str, Any]:
+def grok_oauth_evidence(
+    auth_methods: Sequence[Mapping[str, Any] | object], *, home: Path, grok_home: Path | None = None,
+) -> dict[str, Any]:
     """Prove the Grok endpoint is on a cached OAuth token rather than an API key."""
     ids: list[str] = []
     for method in auth_methods:
@@ -666,7 +679,8 @@ def grok_oauth_evidence(auth_methods: Sequence[Mapping[str, Any] | object], *, h
             "OAUTH_REJECTED",
             f"grok advertised no OAuth auth method (got: {', '.join(ids) or 'none'})",
         )
-    if not (home / ".grok" / "auth.json").is_file():
+    auth_home = grok_home if grok_home is not None else home / ".grok"
+    if not (auth_home / "auth.json").is_file():
         raise ProfileError("OAUTH_REJECTED", "grok auth file is missing")
     return {"auth_method_ids": ids, "auth_file_present": True}
 

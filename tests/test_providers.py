@@ -22,6 +22,7 @@ from taskspindle.providers import (
     build_child_env,
     builtin_profiles,
     claude_oauth_evidence,
+    default_runner,
     env_violations,
     grok_oauth_evidence,
     load_profiles,
@@ -576,6 +577,23 @@ def test_claude_oauth_evidence_does_not_expose_process_errors(error: Exception) 
     assert "secret-token" not in str(excinfo.value)
 
 
+def test_default_runner_passes_only_the_explicit_preflight_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def run(command, **kwargs):
+        seen.update(command=command, env=kwargs["env"])
+        return _completed(GOOD_STATUS)
+
+    monkeypatch.setattr(providers.subprocess, "run", run)
+    env = {"HOME": "/isolated/home", "CLAUDE_CONFIG_DIR": "/isolated/claude"}
+
+    default_runner(["claude", "auth", "status"], env=env)
+
+    assert seen == {"command": ["claude", "auth", "status"], "env": env}
+
+
 def test_grok_oauth_evidence_requires_a_cached_token_and_auth_file(tmp_path: Path) -> None:
     home = tmp_path / "home"
     (home / ".grok").mkdir(parents=True)
@@ -593,3 +611,21 @@ def test_grok_oauth_evidence_requires_a_cached_token_and_auth_file(tmp_path: Pat
     with pytest.raises(ProfileError) as wrong_method:
         grok_oauth_evidence([{"id": "api_key"}], home=home)
     assert wrong_method.value.code == "OAUTH_REJECTED"
+
+
+def test_grok_oauth_evidence_uses_explicit_grok_home_without_ambient_fallback(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    ambient = home / ".grok"
+    selected = tmp_path / "selected-grok"
+    ambient.mkdir(parents=True)
+    (ambient / "auth.json").write_text("ambient", encoding="utf-8")
+
+    with pytest.raises(ProfileError) as missing_selected:
+        grok_oauth_evidence([{"id": "cached_token"}], home=home, grok_home=selected)
+    assert missing_selected.value.code == "OAUTH_REJECTED"
+
+    selected.mkdir()
+    (selected / "auth.json").write_text("selected", encoding="utf-8")
+    assert grok_oauth_evidence(
+        [{"id": "cached_token"}], home=home, grok_home=selected,
+    )["auth_file_present"] is True

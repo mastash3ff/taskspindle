@@ -500,6 +500,7 @@ def build_orchestrator(
         home=Path(env.get("HOME", "")),
         state_dir=resolved.state_dir,
         data_dir=resolved.data_dir,
+        parent_env=env,
     )
     orchestrator = Orchestrator(
         store=store,

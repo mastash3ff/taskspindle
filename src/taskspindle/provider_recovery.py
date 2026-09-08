@@ -50,10 +50,24 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
     account = store.get_provider_status(key)
     selected = store.get_provider_model_status(key, model) if model else None
     native = cached_native_check(store, profile, parent_env, now=now)
+    from .quota import evaluate as evaluate_quota
+
+    quota = evaluate_quota(store, profile, now, model=model, parent_env=parent_env)
     rows = [row for row in (account, selected) if row is not None]
     future_reset = any((_time(row.get("reset_at")) or now) > now for row in rows)
     exhausted = native.get("eligible_hint") is False
-    restrictions = {"future_reset": future_reset, "native_exhausted": exhausted}
+    # A bare throttle is deliberately recoverable only through this one-shot permit.
+    # A supplied future reset, or current fresh native exhaustion, is never bypassable.
+    quota_future = [
+        row
+        for row in quota["quota_restrictions"]
+        if _time(row.get("reset_at") or row.get("resets_at")) is not None
+    ]
+    restrictions = {
+        "future_reset": future_reset or bool(quota_future),
+        "native_exhausted": exhausted,
+        "quota_fingerprints": quota["evidence_fingerprints"],
+    }
     if exhausted:
         restrictions.update(
             {name: native.get(name) for name in ("checked_at", "reset_at", "window", "used_percent")}
@@ -65,6 +79,7 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
         "account_fingerprint": limits.status_fingerprint(account),
         "model_fingerprint": limits.status_fingerprint(selected),
         "restrictions": restrictions,
+        "auth_context": quota["auth_context"]["fingerprint"],
     }
     # The model name binds the permit scope separately. With no model observation, the
     # account evidence revision must also be usable for an explicitly named unseen model.
@@ -72,7 +87,8 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
     observed = {key: value for key, value in identity.items() if key != "model"}
     revision = hashlib.sha256(json.dumps(observed, sort_keys=True).encode()).hexdigest()
     account_observed = {
-        **observed, "model_fingerprint": limits.status_fingerprint(None),
+        **observed,
+        "model_fingerprint": limits.status_fingerprint(None),
         "restrictions": {
             **restrictions,
             "future_reset": bool(account and (_time(account.get("reset_at")) or now) > now),
@@ -80,6 +96,9 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
     }
     account_revision = hashlib.sha256(json.dumps(account_observed, sort_keys=True).encode()).hexdigest()
     refusals = [row for row in rows if limits.effective_state(row, now) in _REFUSALS]
+    recoverable_quota = any(
+        (row.get("reset_at") or row.get("resets_at")) is None for row in quota["quota_restrictions"]
+    )
     malformed = (
         any(row.get("state") not in _REFUSALS | {"ok", "unknown"} for row in rows)
         or any(row.get("reset_at") is not None and _time(row["reset_at"]) is None for row in rows)
@@ -87,7 +106,9 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
             _time(row.get("observed_at")) is None or _time(row.get("observed_at")) > now for row in refusals
         )
     )
-    eligible = bool(refusals) and not (future_reset or exhausted or malformed)
+    eligible = (bool(refusals) or recoverable_quota) and not (
+        restrictions["future_reset"] or exhausted or malformed
+    )
     return {
         **identity,
         "evidence_revision": revision,
@@ -142,6 +163,7 @@ def _project(
         or row["evidence_revision"] != evidence["evidence_revision"]
     ):
         action = "inspect_permit"
+    context_changed = bool(row and row.get("auth_context") != evidence["auth_context"])
     command = None
     if can_arm:
         args = ["taskspindle", "providers", "--retry-next", "--provider", evidence["provider"]]
@@ -156,6 +178,7 @@ def _project(
         "cli_command": command,
         "evidence_revision": evidence["evidence_revision"],
         "account_evidence_revision": evidence["account_evidence_revision"],
+        "warning": "AUTH_CONTEXT_CHANGED" if context_changed else None,
     }
 
 
@@ -229,8 +252,8 @@ def arm(
         conn.execute(
             "INSERT INTO provider_recovery_permits "
             "(permit_id, provider, status_key, model, state, evidence_revision, "
-            "account_fingerprint, model_fingerprint, created_at, expires_at) "
-            "VALUES (?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?)",
+            "account_fingerprint, model_fingerprint, auth_context, created_at, expires_at) "
+            "VALUES (?, ?, ?, ?, 'armed', ?, ?, ?, ?, ?, ?)",
             (
                 permit_id,
                 profile.id,
@@ -239,6 +262,7 @@ def arm(
                 evidence_revision,
                 evidence["account_fingerprint"],
                 evidence["model_fingerprint"],
+                evidence["auth_context"],
                 _stamp(now),
                 _stamp(now + timedelta(hours=24)),
             ),
@@ -308,6 +332,10 @@ def validate(
     if (_time(row["expires_at"]) or now) <= now:
         _error("EXPIRED", "Recovery permit expired before prompt admission.")
     evidence = _evidence(store, profile, now, row["model"], parent_env)
+    if not row.get("auth_context"):
+        _error("AUTH_CONTEXT_UNBOUND", "Recovery permit predates auth-context binding; revoke and re-arm.")
+    if row["auth_context"] != evidence["auth_context"]:
+        _error("AUTH_CONTEXT_CHANGED", "Authentication metadata changed; revoke and re-arm recovery.")
     if evidence["evidence_revision"] != row["evidence_revision"]:
         _error("EVIDENCE_CHANGED", "Availability evidence changed after recovery was armed.")
     if not evidence["eligible"]:

@@ -9,8 +9,15 @@
 - **Bounded initial attempts.** Task creation validates grants, provider/model scope and review
   independence before atomically consuming the permit. Preparation or startup failure consumes
   it. Dispatch and initial prompt admission reject changed refusals and expired permits; future
-  quota resets and fresh native exhaustion cannot be bypassed. A successful turn clears only
-  the evidence it tested. Existing continuations and legacy overrides remain compatible.
+  quota restrictions with a reported future reset and fresh native exhaustion cannot be bypassed.
+  An explicitly authorized missing-reset throttle remains eligible for its one exact permit. A
+  successful turn clears only the evidence it tested. Existing continuations remain compatible; `ignore_provider_status` is
+  recognized only to return `LEGACY_OVERRIDE_RETIRED`.
+- **Durable quota windows and post-reset retries.** Schema 8 retains every applicable quota window
+  with scope, model family, reset, source, observation and opaque fingerprint. Changed authentication
+  context invalidates recovery authorization without clearing restrictions. After reset, aliases of
+  a shared OAuth seat atomically claim one ordinary retry; `QUOTA_RETRY_PENDING` prevents duplicates.
+  Unaffected model families retain their ordinary capacity and grant eligibility.
 - **Read-only recovery visibility.** Cached capabilities, provider status and the Workers screen
   expose evidence revisions, armed/pending recovery, deadlines, associated tasks and outcomes.
   The dashboard supplies copyable CLI instructions and adds no recovery mutation endpoint.
@@ -120,8 +127,8 @@ and broader task inspection while keeping provider choice and task ownership exp
   with the window and reset time the provider gave, recorded on the task, as a `PROVIDER_LIMIT`
   event and in a new `provider_status` table, and surfaced in `capabilities`, in an advisory
   `doctor` check, and as a `PROVIDER_UNAVAILABLE` refusal of the next `start_task` on that
-  provider (`ignore_provider_status` overrides it). Nothing is retried elsewhere: the rule that a
-  provider is never substituted is unchanged.
+  provider (`ignore_provider_status` overrode it in that release; v0.4 retires the override).
+  Nothing is retried elsewhere: the rule that a provider is never substituted is unchanged.
 - **Usage.** Token counts are captured per turn from the agents themselves — the Claude adapter's
   prompt response and Grok's `turn_completed` update — into a new `turn_usage` table, with an
   estimated cost at published rates that is labelled an estimate, and the usage windows the Claude

@@ -23,10 +23,20 @@ from typing import Any
 
 import taskspindle
 
-from . import integration, provider_recovery, providers, recovery, repos, units, usage, worktrees
+from . import (
+    auth_context,
+    integration,
+    provider_recovery,
+    providers,
+    quota,
+    recovery,
+    repos,
+    units,
+    usage,
+    worktrees,
+)
 from .config import Paths, concurrency_limits
 from .integration import Journal
-from .limits import status_fingerprint, status_override_matches
 from .models import (
     ACTIVE_STATES,
     TERMINAL_STATES,
@@ -206,6 +216,7 @@ class Orchestrator:
         self.units = units
         self.boot = boot
         self.parent_env = dict(parent_env)
+        auth_context.validate_contexts(self.profiles, self.parent_env)
         self.clock = clock
         _mkdir(paths.state_dir)
 
@@ -562,6 +573,12 @@ class Orchestrator:
 
     def start_task(self, request: StartTaskRequest) -> dict[str, Any]:
         """Create, prepare and queue one task."""
+        if request.ignore_provider_status:
+            raise TaskSpindleError(
+                "LEGACY_OVERRIDE_RETIRED",
+                "Remove ignore_provider_status. Use a recovery permit for a recoverable refusal; "
+                "wait for active quota restrictions to lift.",
+            )
         with self._cycle():
             profile = self._profile_for(request)
             model = request.model or profile.model
@@ -569,24 +586,42 @@ class Orchestrator:
                 require_provider_available(
                     self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
                     model=model, parent_env=self.parent_env,
+                    defer_model=model is None,
                 )
             placement = self._placement(request)
             with self.store.transaction():
+                if placement.repository_id:
+                    require_grant(
+                        self.store, placement.repository_id, request.provider, request.mode,
+                    )
+                if request.review_target and request.review_target.kind == "candidate":
+                    subject = require_task(self.store, request.review_target.task_id or "")
+                    if (subject.state is not TaskState.RESULT_READY
+                            or subject.candidate_sha != request.review_target.candidate_sha):
+                        raise TaskSpindleError(CANDIDATE_MISMATCH, "The review candidate changed.")
+                    self._require_independent(subject, request.provider)
                 if request.recovery_permit_id is not None:
-                    if placement.repository_id:
-                        require_grant(
-                            self.store, placement.repository_id, request.provider, request.mode,
-                        )
-                    if request.review_target and request.review_target.kind == "candidate":
-                        subject = require_task(self.store, request.review_target.task_id or "")
-                        if (subject.state is not TaskState.RESULT_READY
-                                or subject.candidate_sha != request.review_target.candidate_sha):
-                            raise TaskSpindleError(CANDIDATE_MISMATCH, "The review candidate changed.")
-                        self._require_independent(subject, request.provider)
                     provider_recovery.validate(
                         self.store, profile, request.recovery_permit_id, now=self.clock(),
                         model=model, parent_env=self.parent_env,
                     )
+                else:
+                    require_provider_available(
+                        self.store, profile, now=self.clock(), model=model,
+                        parent_env=self.parent_env, defer_model=model is None,
+                    )
+                quota_evidence = quota.evaluate(
+                    self.store, profile, now=self.clock(), model=model,
+                    parent_env=self.parent_env, defer_model=model is None,
+                )
+                trial_fingerprints = quota_evidence["retry_fingerprints"]
+                if trial_fingerprints:
+                    holder = self.store.get_active_quota_retry_claim(limits_key(profile))
+                    if holder is not None:
+                        raise TaskSpindleError(
+                            "QUOTA_RETRY_PENDING", "Another task is testing this account's quota recovery.",
+                            retryable=True, details={"task_id": holder["task_id"]},
+                        )
                 record = create_task(
                     self.store,
                     request,
@@ -594,6 +629,23 @@ class Orchestrator:
                     auth_mode=AuthMode(profile.auth),
                     provider_family=profile.family,
                 )
+                self.store.set_task_auth_context(
+                    record.id, auth_context.fingerprint(profile, self.parent_env),
+                )
+                if trial_fingerprints:
+                    claimed = self.store.claim_quota_retry(
+                        status_key=limits_key(profile), task_id=record.id,
+                        restriction_fingerprints=trial_fingerprints,
+                    )
+                    if claimed is None:  # guarded by the same immediate transaction
+                        raise TaskSpindleError(
+                            "QUOTA_RETRY_PENDING", "Another task is testing this account's quota recovery.",
+                            retryable=True,
+                        )
+                    self.store.append_event(record.id, EventKind.WARNING, {
+                        "code": "QUOTA_RETRY_ATTEMPT", "provider": profile.id,
+                        "status_key": limits_key(profile), "model": model,
+                    })
                 if request.recovery_permit_id is not None:
                     provider_recovery.claim(
                         self.store, profile, request.recovery_permit_id, record.id,
@@ -604,26 +656,12 @@ class Orchestrator:
                         "permit_id": request.recovery_permit_id,
                         "provider": profile.id, "model": model,
                     })
-            if request.ignore_provider_status:
-                key = limits_key(profile)
-                model = request.model or profile.model
-                self.store.append_event(record.id, EventKind.WARNING, {
-                    "code": "PROVIDER_STATUS_OVERRIDE",
-                    "status_key": key,
-                    "model": model,
-                    "account_status_fingerprint": status_fingerprint(
-                        self.store.get_provider_status(key)
-                    ),
-                    "model_status_fingerprint": status_fingerprint(
-                        self.store.get_provider_model_status(key, model) if model else None
-                    ),
-                })
             try:
                 self._prepare(record, request, placement)
             except Exception:
                 # Filesystem/setup errors outside _prepare's classified exceptions still burn
                 # an already claimed permit. Never quietly leave a second attempt authorized.
-                if request.recovery_permit_id is not None:
+                if request.recovery_permit_id is not None or trial_fingerprints:
                     self._fail(record.id, "PREPARATION_FAILED", "Task preparation failed.")
                 raise
             self.dispatch_queued()
@@ -918,23 +956,6 @@ class Orchestrator:
                 started.append(task.id)
         return started
 
-    def _initial_status_override(self, task: TaskRecord, profile: Profile) -> bool:
-        """An explicit override covers only the initial turn and the status it observed."""
-        if len(self.store.list_turns(task.id)) != 1:
-            return False
-        key = limits_key(profile)
-        model = task.resolved_model or task.requested_model or profile.model
-        account_status = self.store.get_provider_status(key)
-        model_status = self.store.get_provider_model_status(key, model) if model else None
-        return any(
-            event["kind"] == EventKind.WARNING.value
-            and status_override_matches(
-                event["payload"], status_key_value=key, model=model,
-                account_status=account_status, model_status=model_status,
-            )
-            for event in self.store.list_events(task.id)
-        )
-
     def _start_worker(self, task: TaskRecord) -> bool:
         """Claim capacity and publish task identity before starting its unit outside the lock."""
         unit = units.worker_unit_name(task.id)
@@ -947,9 +968,17 @@ class Orchestrator:
                 profile = self.profiles.get(task.provider)
                 require_task_profile(task, profile)
                 assert profile is not None
+                initial = len(self.store.list_turns(task.id)) == 1
+                if initial:
+                    bound_context = self.store.get_task_auth_context(task.id)
+                    if (bound_context is not None
+                            and bound_context != auth_context.fingerprint(profile, self.parent_env)):
+                        raise TaskSpindleError(
+                            "AUTH_CONTEXT_CHANGED", "Authentication context changed before task admission.",
+                        )
                 permit = self.store.get_task_recovery_permit(task.id)
                 recovery_override = False
-                if permit is not None and len(self.store.list_turns(task.id)) == 1:
+                if permit is not None and initial:
                     provider_recovery.validate(
                         self.store, profile, permit["permit_id"], task_id=task.id, now=self.clock(),
                         model=task.resolved_model or task.requested_model or profile.model,
@@ -962,10 +991,14 @@ class Orchestrator:
                     now=self.clock(),
                     model=task.resolved_model or task.requested_model or profile.model,
                     parent_env=self.parent_env,
+                    defer_model=(task.resolved_model or task.requested_model or profile.model) is None,
                 )
                 if (availability["state"] not in ("ok", "unknown")
-                        and not recovery_override
-                        and not self._initial_status_override(task, profile)):
+                        and not recovery_override):
+                    if initial and self.store.get_task_quota_retry_claim(task.id) is not None:
+                        raise TaskSpindleError(
+                            "PROVIDER_UNAVAILABLE", "Quota restrictions changed before the retry started.",
+                        )
                     return False
                 if not self.store.acquire_lease(
                     task.provider, task.id, unit, None, self.boot,

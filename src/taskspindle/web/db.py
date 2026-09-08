@@ -375,6 +375,83 @@ class ReadOnlyStore:
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
         return [dict(row) for row in rows]
 
+    # -- quota evidence / retry history ----------------------------------------------
+
+    def _table_exists(self, name: str) -> bool:
+        if self._conn is None:
+            return False
+        return self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone() is not None
+
+    def get_task_auth_context(self, task_id: str) -> str | None:
+        if not self._table_exists("task_provider_context"):
+            return None
+        row = self._conn.execute(
+            "SELECT auth_context FROM task_provider_context WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def get_provider_auth_context(self, status_key: str) -> str | None:
+        if not self._table_exists("provider_auth_context"):
+            return None
+        row = self._conn.execute(
+            "SELECT auth_context FROM provider_auth_context WHERE status_key = ?", (status_key,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def list_quota_restrictions(
+        self, status_key: str | None = None, *, unresolved_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        if not self._table_exists("provider_quota_restrictions"):
+            return []
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status_key is not None:
+            clauses.append("status_key = ?")
+            params.append(status_key)
+        if unresolved_only:
+            clauses.append("resolved_at IS NULL")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            "SELECT * FROM provider_quota_restrictions" + where + " ORDER BY observed_at, id", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_active_quota_retry_claim(self, status_key: str) -> dict[str, Any] | None:
+        if not self._table_exists("provider_quota_retry_attempts"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM provider_quota_retry_attempts WHERE status_key = ? "
+            "AND state IN ('claimed', 'prompting') ORDER BY id DESC LIMIT 1", (status_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_task_quota_retry_claim(self, task_id: str) -> dict[str, Any] | None:
+        if not self._table_exists("provider_quota_retry_attempts"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def successful_quota_retry_fingerprints(self, status_key: str) -> set[str]:
+        if not self._table_exists("provider_quota_retry_attempts"):
+            return set()
+        rows = self._conn.execute(
+            "SELECT restriction_fingerprints FROM provider_quota_retry_attempts "
+            "WHERE status_key = ? AND state = 'succeeded' ORDER BY id", (status_key,)
+        ).fetchall()
+        result: set[str] = set()
+        for row in rows:
+            try:
+                values = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(values, list):
+                result.update(value for value in values if isinstance(value, str))
+        return result
+
     def get_native_check(self, provider: str) -> dict[str, Any] | None:
         """Read a schema-6 native-check cache row; older databases have no cache."""
         if self._conn is None:

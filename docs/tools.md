@@ -191,7 +191,7 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `effort` | string\|null | `null` | as above |
 | `timeout_s` | int | `1800` | 60–14400 |
 | `allow_metered` | bool | `false` | required for an `api_key` profile |
-| `ignore_provider_status` | bool | `false` | start even on a provider currently believed throttled or logged out |
+| `ignore_provider_status` | bool | `false` | recognized legacy input; `true` is rejected with `LEGACY_OVERRIDE_RETIRED` before task creation |
 | `recovery_permit_id` | string\|null | `null` | consume one controlled-retry permit bound to this provider/model and current evidence |
 | `acceptance_criteria` | string\|null | `null` | **implement only, required** |
 | `path_prefixes` | string[]\|null | `null` | **implement only, required**; repository-relative, no `..`, no leading `/` |
@@ -233,12 +233,12 @@ uncommitted changes inside the task's own path prefixes — `details.code = DIRT
 **`PROVIDER_UNAVAILABLE`** is the whole of TaskSpindle's answer to a subscription limit. When the
 last turn on a provider was refused for a usage, rate, credit or login reason, the next
 `start_task` on that provider is refused too, with `details` carrying the `state`, the `window`,
-the `reset_at` the provider gave (when it gave one), the `reason` in the provider's own words, and
+the `reset_at` the provider gave (when it gave one), a sanitized `reason`, and
 `suggested_alternative`, the other first-class provider. The error is `retryable`. Nothing is
-re-queued on another provider and nothing waits for the reset: you either start the task on the
-provider you now choose, wait, or pass `ignore_provider_status: true` and start it anyway — the
-turn will most likely be refused again, and that refusal refreshes the record. A turn that runs
-clears the state.
+re-queued on another provider. A reported future reset means wait; a missing reset may receive one
+explicitly authorized `recovery_permit_id` attempt. `ignore_provider_status` is retired and returns
+`LEGACY_OVERRIDE_RETIRED`; it cannot start a task. A turn that runs clears only the evidence it
+actually established.
 
 `recovery_permit_id` is the controlled replacement for an unrestricted retry. It is mutually
 exclusive with the legacy `ignore_provider_status` flag. Task creation validates the permit and
@@ -571,6 +571,8 @@ invalidates the review: get a new one.
 | `PROVIDER_THROTTLED` | on a FAILED task: the provider refused the turn for a usage, rate or credit limit |
 | `PROVIDER_AUTH_EXPIRED` | on a FAILED task: the provider refused the turn because the seat is logged out or not allowed |
 | `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and the reset has not passed |
+| `QUOTA_RETRY_PENDING` | the shared provider seat already has its single ordinary post-reset attempt bound to another task |
+| `LEGACY_OVERRIDE_RETIRED` | `ignore_provider_status` was supplied; cached provider status cannot be bypassed |
 | `RECOVERY_EVIDENCE_CHANGED` | cached provider evidence changed after the permit was proposed or armed |
 | `RECOVERY_NOT_ELIGIBLE` | current refusal/reset/native evidence does not allow a controlled attempt |
 | `RECOVERY_ACTIVE_ATTEMPT` | the provider account already has an armed or claimed attempt |

@@ -22,7 +22,7 @@ globalThis.document = {
   createTextNode: (text) => new FakeNode("#text", text),
 };
 
-const { recoveryFeedback } = await import("../../src/taskspindle/web/static/views/workers.js");
+const { recoveryFeedback, __test__ } = await import("../../src/taskspindle/web/static/views/workers.js");
 const textOf = (node) => node.textContent + node.children.map(textOf).join("");
 const nodes = (node, predicate) => {
   const result = predicate(node) ? [node] : [];
@@ -95,4 +95,23 @@ test("shared-scope permits and newer refusals retain explicit warnings", () => {
   assert.match(textOf(succeeded), /Recovery succeeded/);
   assert.match(textOf(succeeded), /Current access is separate/);
   assert.match(textOf(succeeded), /newer availability evidence/);
+});
+
+test("quota restrictions show each scope and reset while auth metadata remains non-identifying", () => {
+  const details = __test__.quotaDetails({
+    quota_restrictions: [
+      { scope: "account", model_family: "all", window: "five_hour", reset: "2030-01-03T00:00:00Z", source: "rate_limit_event", observed: "2030-01-02T23:00:00Z", fingerprint: "quota-a" },
+      { scope: "model_family", model_family: "grok-5", window: "weekly", reset: "2030-01-09T00:00:00Z", source: "native_auth_check", observed: "2030-01-02T23:01:00Z", fingerprint: "quota-b" },
+    ],
+    auth_context: { changed: true, fingerprint: "context-new" },
+    quota_retry: { state: "pending", task_id: "ts_post_reset" },
+  });
+  assert.match(textOf(details), /Active quota restrictions/);
+  assert.match(textOf(details), /five_hour/);
+  assert.match(textOf(details), /weekly/);
+  assert.match(textOf(details), /Authentication context changed/);
+  assert.match(textOf(details), /does not identify an account/);
+  assert.match(textOf(details), /Quota retry pending/);
+  const task = nodes(details, (node) => node.tag === "a")[0];
+  assert.equal(task.attributes.href, "#/tasks/ts_post_reset");
 });

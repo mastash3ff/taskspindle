@@ -22,6 +22,46 @@ const RECOVERY_COPY = {
 };
 const RECOVERY_TONE = { none: "warning", armed: "warning", claimed: "warning", succeeded: "positive", failed: "danger", expired: "danger", revoked: "neutral" };
 
+function quotaRestrictions(restrictions = []) {
+  if (!Array.isArray(restrictions) || !restrictions.length) return null;
+  return h("section", { class: "quota-restrictions", "aria-label": "Active quota restrictions" },
+    h("h4", { text: restrictions.length === 1 ? "Active quota restriction" : "Active quota restrictions" }),
+    h("div", { class: "quota-restriction-list" }, restrictions.map((restriction) => h("article", { class: "quota-restriction" },
+      h("dl", { class: "mini-details" },
+        labeledValue("Scope", restriction.scope || "—"),
+        labeledValue("Model family", restriction.model_family || restriction.model || "All models"),
+        labeledValue("Window", restriction.window || "—"),
+        labeledValue("Reset", formatDate(restriction.reset || restriction.reset_at)),
+        labeledValue("Source", SOURCE[restriction.source] || restriction.source || "—"),
+        labeledValue("Observed", formatDate(restriction.observed || restriction.observed_at)),
+        restriction.fingerprint ? labeledValue("Evidence fingerprint", restriction.fingerprint, { mono: true }) : null,
+      ),
+    ))),
+  );
+}
+
+function authContext(context) {
+  if (!context?.changed) return null;
+  return h("div", { class: "callout callout-warning auth-context" },
+    h("strong", { text: "Authentication context changed." }),
+    h("span", { text: " This metadata signals that availability evidence came from a changed authentication context; it does not identify an account." }),
+    context.fingerprint ? h("code", { text: context.fingerprint }) : null,
+  );
+}
+
+function quotaRetry(retry) {
+  if (!retry || !["pending", "claimed", "prompting"].includes(retry.state)) return null;
+  const task = retry.task_id ? h("a", { href: routeHref("tasks", retry.task_id), class: "text-link mono", text: retry.task_id }) : null;
+  return h("div", { class: "callout callout-warning quota-retry" },
+    h("strong", { text: "Quota retry pending." }),
+    task ? h("span", {}, " Task: ", task, ".") : h("span", { text: " A post-reset attempt is already pending." }),
+  );
+}
+
+export const __test__ = {
+  quotaDetails: (availability) => h("div", {}, quotaRestrictions(availability.quota_restrictions), authContext(availability.auth_context), quotaRetry(availability.quota_retry)),
+};
+
 export function recoveryFeedback(recovery, context = {}) {
   if (!recovery || (recovery.state === "none" && !recovery.can_arm && !recovery.cli_command)) return null;
   const state = recovery.state || "none";
@@ -77,6 +117,9 @@ function availabilityCard(worker, item, model = null, context = {}) {
       state.reset_at ? labeledValue("Reset", formatDate(state.reset_at)) : null,
     ),
     state.stale ? h("div", { class: "callout callout-warning", text: "This observation is stale." }) : null,
+    quotaRestrictions(state.quota_restrictions),
+    authContext(state.auth_context),
+    quotaRetry(state.quota_retry),
     h("p", { class: "next-action", text: state.next_action === "wait" && state.reset_at ? `Wait until ${formatDate(state.reset_at)}, then retry.` : NEXT_ACTION[state.next_action] || "Run a worker task to establish current access." }),
     recoveryFeedback(state.recovery, context),
   );

@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import limits, provider_recovery, providers, repos, units, usage, worktrees
+from . import auth_context, limits, provider_recovery, providers, quota, repos, units, usage, worktrees
 from .acp_client import AcpError, AcpWorker, PermissionPolicy, TurnResult
 from .agy_cli import AgyCliWorker
 from .agy_cli import model_catalog as cli_model_catalog
@@ -273,6 +273,8 @@ class _Run:
     provider_status_at_start: dict[str, Any] | None = None
     provider_model_at_start: str | None = None
     provider_model_status_at_start: dict[str, Any] | None = None
+    provider_auth_context_at_start: str | None = None
+    quota_fingerprints_at_start: list[str] = field(default_factory=list)
 
     @property
     def task_id(self) -> str:
@@ -436,6 +438,9 @@ async def run_worker(
                     store, task_id, "failed", now=datetime.now(UTC),
                     code=(run.task.error or {}).get("code") or run.task.state.value,
                 )
+                store.finish_quota_retry(
+                    task_id, "failed", code=(run.task.error or {}).get("code") or run.task.state.value,
+                )
             store.release_lease(run.task.provider, task_id)
         if log is not None:
             log.write("done")
@@ -480,7 +485,12 @@ async def _run_turn(
     task = run.task
     _check_lease(run, boot=boot)
     profile = _resolve_profile(run, profiles)
+    try:
+        auth_context.validate_contexts(profiles, os.environ)
+    except ProfileError as exc:
+        raise _Failure(exc.code, str(exc)) from exc
     run.profile = profile
+    run.provider_auth_context_at_start = _check_initial_auth_context(run, profile)
     run.provider_status_at_start = run.store.get_provider_status(limits.status_key(profile))
     run.provider_model_at_start = _effective_model(run, profile)
     if run.provider_model_at_start:
@@ -496,8 +506,13 @@ async def _run_turn(
         raise _Failure(exc.code, str(exc)) from exc
 
     try:
-        evidence = _pre_spawn_evidence(profile, oauth_runner)
+        selected_oauth_runner = oauth_runner
+        if selected_oauth_runner is None and profile.family == "claude":
+            def selected_oauth_runner(command: list[str]) -> Any:
+                return providers.default_runner(command, env=run.child_env)
+        evidence = _pre_spawn_evidence(profile, selected_oauth_runner)
     except _Failure as failure:
+        _check_initial_auth_context(run, profile)
         state = "access_denied" if failure.code == limits.PROVIDER_ACCESS_DENIED else "auth_expired"
         safe = {
             "access_denied": "The provider denied account access.",
@@ -509,6 +524,7 @@ async def _run_turn(
             limits.Classification(failure.code, state, None, None, False, safe, source="native_auth_check"),
         )
         raise _Failure(failure.code, safe, retryable=False, details=failure.details) from failure
+    _check_initial_auth_context(run, profile)
     workspace = _workspace(run)
 
     stderr_path = run.dir / f"agent-{run.revision}.stderr"
@@ -536,7 +552,8 @@ async def _run_turn(
             else:
                 run.agent_info = dict(agent.init.agent_info) if agent.init else {}
                 if evidence is None:
-                    evidence = _post_init_evidence(profile, agent)
+                    _check_initial_auth_context(run, profile)
+                    evidence = _post_init_evidence(profile, agent, env=run.child_env)
                 run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
                 await _open_session(run, agent)
                 result = await _prompt(run, agent, cancel_event)
@@ -560,6 +577,8 @@ async def _run_turn(
             return _settle_cancelled(run)
         if exc.code == "RESUME_UNAVAILABLE":
             raise _Interrupted("RESUME_UNAVAILABLE", str(exc)) from exc
+        if run.prompt_started_at is None:
+            _check_initial_auth_context(run, profile)
         verdict = limits.classify_acp_error(
             exc, family=profile.family, model=_effective_model(run, profile),
         )
@@ -719,6 +738,18 @@ def _capture_model_status_at_start(run: _Run, profile: Profile) -> None:
         _capture_and_validate_provider_status(run, profile)
 
 
+def _check_initial_auth_context(run: _Run, profile: Profile) -> str:
+    """Guard preflight as well as prompting against a changed login location or metadata."""
+    current = auth_context.fingerprint(profile, os.environ)
+    if run.revision == 1:
+        expected = run.store.get_task_auth_context(run.task_id) or run.provider_auth_context_at_start
+        if expected is not None and expected != current:
+            raise _Failure(
+                "AUTH_CONTEXT_CHANGED", "Authentication context changed before the initial prompt.",
+            )
+    return current
+
+
 def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
     """Keep the permit check and success comparison snapshot on one database revision."""
     key = limits.status_key(profile)
@@ -728,10 +759,22 @@ def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
     run.provider_model_status_at_start = (
         run.store.get_provider_model_status(key, model) if model else None
     )
+    current_context = _check_initial_auth_context(run, profile)
+    run.provider_auth_context_at_start = current_context
+    quota_evidence = quota.evaluate(
+        run.store, profile, now=datetime.now(UTC), model=model, parent_env=os.environ,
+    )
+    run.quota_fingerprints_at_start = quota_evidence["evidence_fingerprints"]
     # Availability selection applies to a newly launched managed task. Existing tasks keep their
     # established continuation/recovery behavior while still recording real provider outcomes.
     if run.revision != 1:
         return
+    bound_context = run.store.get_task_auth_context(run.task_id)
+    if bound_context is not None and bound_context != current_context:
+        raise _Failure("AUTH_CONTEXT_CHANGED", "Authentication context changed before the initial prompt.")
+    if bound_context is None:
+        # Pre-v8 queued tasks acquire a binding at their first guarded admission.
+        run.store.set_task_auth_context(run.task_id, current_context)
     permit = run.store.get_task_recovery_permit(run.task_id)
     if permit is not None:
         try:
@@ -741,24 +784,39 @@ def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
             )
         except TaskSpindleError as exc:
             raise _Failure(exc.code, exc.message, retryable=False, details=exc.details) from exc
-        return
-    availability = provider_availability(run.store, profile, now=datetime.now(UTC), model=model)
-    overridden = any(
-        event["kind"] == EventKind.WARNING.value
-        and limits.status_override_matches(
-            event["payload"], status_key_value=key, model=model,
-            account_status=run.provider_status_at_start,
-            model_status=run.provider_model_status_at_start,
+    else:
+        availability = provider_availability(
+            run.store, profile, now=datetime.now(UTC), model=model, parent_env=os.environ,
         )
-        for event in run.store.list_events(run.task_id)
-    )
-    if availability["state"] not in ("ok", "unknown") and not overridden:
-        raise _Failure(
-            PROVIDER_UNAVAILABLE,
-            f"Provider is {availability['state']}: {availability['reason']}",
-            retryable=True,
-            details={"provider": profile.id, **availability},
-        )
+        if availability["state"] not in ("ok", "unknown"):
+            raise _Failure(
+                PROVIDER_UNAVAILABLE,
+                f"Provider is {availability['state']}: {availability['reason']}",
+                retryable=True, details={"provider": profile.id, **availability},
+            )
+    trial = run.store.get_task_quota_retry_claim(run.task_id)
+    fingerprints = quota_evidence["retry_fingerprints"]
+    if fingerprints and trial is None:
+        if bound_context is not None:
+            raise _Failure(
+                "QUOTA_EVIDENCE_CHANGED", "A quota retry became necessary after task creation.",
+                retryable=True,
+            )
+        trial = run.store.claim_quota_retry(key, run.task_id, fingerprints)
+        if trial is None:
+            holder = run.store.get_active_quota_retry_claim(key)
+            raise _Failure(
+                "QUOTA_RETRY_PENDING", "Another task is testing this account's quota recovery.",
+                retryable=True, details={"task_id": holder["task_id"] if holder else None},
+            )
+    if trial is not None:
+        if trial["state"] != "claimed":
+            raise _Failure("QUOTA_RETRY_SPENT", "This quota retry has already been admitted or settled.")
+        run.store.refine_quota_retry(run.task_id, fingerprints)
+        if fingerprints:
+            run.store.mark_quota_retry_prompting(run.task_id)
+        else:
+            run.store.finish_quota_retry(run.task_id, "failed", code="QUOTA_RETRY_NOT_NEEDED")
 
 
 def _pre_spawn_evidence(
@@ -788,13 +846,16 @@ def _pre_spawn_evidence(
     return {"auth": profile.auth}
 
 
-def _post_init_evidence(profile: Profile, agent: AcpWorker) -> dict[str, Any]:
+def _post_init_evidence(
+    profile: Profile, agent: AcpWorker, *, env: Mapping[str, str],
+) -> dict[str, Any]:
     """Grok's evidence comes from what it advertised at ``initialize``."""
     method_ids = agent.init.auth_method_ids if agent.init else ()
     try:
         return providers.grok_oauth_evidence(
             [{"id": method_id} for method_id in method_ids],
-            home=Path(os.environ.get("HOME", "")),
+            home=Path(env.get("HOME", "/nonexistent")),
+            grok_home=Path(env["GROK_HOME"]) if "GROK_HOME" in env else None,
         )
     except ProfileError as exc:
         raise _Failure(exc.code, str(exc)) from exc
@@ -942,7 +1003,7 @@ def _record_provider_limit(run: _Run, profile: Profile, verdict: limits.Classifi
             source=verdict.source,
             observed_at=observed,
         )
-    elif verdict.scope != "model":
+    elif verdict.scope != "model" and verdict.provider_state != "throttled":
         run.store.set_provider_status(
             key,
             verdict.provider_state or "ok",
@@ -966,14 +1027,20 @@ def _record_provider_limit(run: _Run, profile: Profile, verdict: limits.Classifi
             task_id=run.task_id,
             source="throttle_error",
             observed_at=observed,
+            period_key=f"{verdict.window or 'unknown'}|{verdict.reset_at or 'unknown'}",
         )
+    captured_context = run.provider_auth_context_at_start
+    current_context = auth_context.fingerprint(profile, os.environ)
+    if captured_context is None or captured_context == current_context:
+        run.store.set_provider_auth_context(key, current_context)
     run.log.write(f"provider {key} {verdict.provider_state} ({verdict.code})")
 
 
 def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> None:
     """Record observed windows without clearing a sibling's newer quota or auth failure."""
     key = limits.status_key(profile)
-    rejected = None
+    rejected = False
+    model = _effective_model(run, profile)
     for info in result.capture.rate_limits:
         window = limits.rate_limit_window(info)
         run.store.insert_provider_window(
@@ -984,42 +1051,54 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
             resets_at=window["resets_at"],
             task_id=run.task_id,
             source="rate_limit_event",
+            period_key=f"{window['window']}|{window['resets_at'] or 'unknown'}",
         )
-        if window["status"] == "rejected":
-            rejected = window
-    if rejected is not None:
-        run.store.set_provider_status(
-            key,
-            "throttled",
-            code=limits.PROVIDER_THROTTLED,
-            window=rejected["window"],
-            reason="the agent reported its usage window as rejected",
-            reset_at=rejected["resets_at"],
-            task_id=run.task_id,
-            source="rate_limit_event",
-        )
+        if window["status"] == "rejected" and quota.window_applies(window["window"], model):
+            rejected = True
+    if rejected:
         if run.revision == 1:
             provider_recovery.finish(
                 run.store, run.task_id, "failed", now=datetime.now(UTC),
                 code=limits.PROVIDER_THROTTLED,
             )
+            run.store.finish_quota_retry(run.task_id, "failed", code=limits.PROVIDER_THROTTLED)
     elif not run.cancelled and result.stop_reason != "cancelled":
-        model = _effective_model(run, profile)
+        current_context = auth_context.fingerprint(profile, os.environ)
+        if (run.provider_auth_context_at_start is not None
+                and run.provider_auth_context_at_start != current_context):
+            # A metadata change is not proof of an account switch. It is enough to make this
+            # turn unsuitable for clearing evidence under the current authentication context.
+            if run.revision == 1:
+                provider_recovery.finish(
+                    run.store, run.task_id, "failed", now=datetime.now(UTC), code="AUTH_CONTEXT_CHANGED",
+                )
+                run.store.finish_quota_retry(run.task_id, "failed", code="AUTH_CONTEXT_CHANGED")
+            return
         expected_model = (
             run.provider_model_status_at_start
             if model == run.provider_model_at_start else None
         )
-        run.store.mark_provider_healthy(
-            key,
-            expected=run.provider_status_at_start,
-            task_id=run.task_id,
-            model=model,
-            expected_model=expected_model,
-        )
-        if run.revision == 1:
-            provider_recovery.finish(
-                run.store, run.task_id, "succeeded", now=datetime.now(UTC),
+        with run.store.transaction():
+            run.store.mark_provider_healthy(
+                key, expected=run.provider_status_at_start, task_id=run.task_id,
+                model=model, expected_model=expected_model,
             )
+            quota.resolve(
+                run.store, profile, run.quota_fingerprints_at_start,
+                now=datetime.now(UTC), task_id=run.task_id, parent_env=os.environ,
+                captured_auth_context=run.provider_auth_context_at_start,
+            )
+            run.store.set_provider_auth_context(key, current_context)
+            if run.revision == 1:
+                provider_recovery.finish(
+                    run.store, run.task_id, "succeeded", now=datetime.now(UTC),
+                )
+                trial = run.store.get_task_quota_retry_claim(run.task_id)
+                if trial and trial["state"] in ("claimed", "prompting"):
+                    run.store.finish_quota_retry(run.task_id, "succeeded")
+                    run.store.append_event(run.task_id, EventKind.WARNING, {
+                        "code": "QUOTA_RETRY_OUTCOME", "outcome": "succeeded",
+                    })
 
 
 #: How long, and how often, to wait for Claude Code to write the session record that names the

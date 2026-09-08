@@ -411,6 +411,29 @@ def test_provider_text_status_shows_controlled_recovery_fields(
     assert "Recovery next action: arm" in output
 
 
+def test_provider_text_status_shows_all_quota_windows_and_safe_auth_context(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli._print_quota_context({
+        "quota_restrictions": [
+            {"scope": "account", "model_family": "all", "window": "five_hour",
+             "reset": "2030-01-03T00:00:00Z", "source": "rate_limit_event",
+             "observed": "2030-01-02T23:00:00Z"},
+            {"scope": "model_family", "model_family": "grok-5", "window": "weekly",
+             "reset": "2030-01-09T00:00:00Z", "source": "native_auth_check",
+             "observed": "2030-01-02T23:01:00Z"},
+        ],
+        "auth_context": {"changed": True, "fingerprint": "context-new"},
+        "quota_retry": {"state": "pending", "task_id": "ts_post_reset"},
+    }, indent="  ")
+    output = capsys.readouterr().out
+    assert "window=five_hour" in output
+    assert "window=weekly" in output
+    assert "Authentication context changed (metadata only; not an account identity)." in output
+    assert "Authentication context fingerprint: context-new" in output
+    assert "Quota retry pending: ts_post_reset" in output
+
+
 def test_revoke_retry_revokes_by_permit_id_without_loading_profiles(
     home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

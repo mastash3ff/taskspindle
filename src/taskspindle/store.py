@@ -414,9 +414,149 @@ CREATE INDEX provider_recovery_history
     ON provider_recovery_permits(status_key, created_at);
 """
 
+# Quota evidence deliberately has its own append-only-ish history.  ``provider_status``
+# remains the compatibility projection for auth/access refusals; a new quota observation must
+# never erase one of those rows.
+_MIGRATION_8 = """
+ALTER TABLE provider_windows ADD COLUMN status_key TEXT;
+ALTER TABLE provider_windows ADD COLUMN scope TEXT NOT NULL DEFAULT 'account';
+ALTER TABLE provider_windows ADD COLUMN model TEXT;
+ALTER TABLE provider_windows ADD COLUMN period_key TEXT;
+ALTER TABLE provider_windows ADD COLUMN period_start TEXT;
+ALTER TABLE provider_windows ADD COLUMN evidence_fingerprint TEXT;
+ALTER TABLE provider_windows ADD COLUMN resolved_at TEXT;
+UPDATE provider_windows
+   SET status_key = provider,
+       scope = CASE window WHEN 'seven_day_opus' THEN 'model_family'
+                           WHEN 'seven_day_sonnet' THEN 'model_family'
+                           ELSE 'account' END,
+       model = CASE window WHEN 'seven_day_opus' THEN 'opus'
+                           WHEN 'seven_day_sonnet' THEN 'sonnet'
+                           ELSE NULL END,
+       period_key = window || '|' || COALESCE(resets_at, 'unknown'),
+       evidence_fingerprint = 'legacy-window:' || id
+ WHERE status_key IS NULL;
+CREATE INDEX provider_windows_scoped_idx
+    ON provider_windows(status_key, scope, model, period_key, observed_at);
+
+CREATE TABLE task_provider_context (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    auth_context TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+CREATE TABLE provider_auth_context (
+    status_key TEXT PRIMARY KEY,
+    auth_context TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+
+ALTER TABLE provider_recovery_permits ADD COLUMN auth_context TEXT;
+UPDATE provider_recovery_permits
+   SET state = 'revoked', outcome = COALESCE(outcome, 'revoked'),
+       outcome_code = COALESCE(outcome_code, 'AUTH_CONTEXT_UNBOUND')
+ WHERE state = 'armed' AND auth_context IS NULL;
+
+CREATE TABLE provider_quota_restrictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status_key TEXT NOT NULL,
+    scope TEXT NOT NULL CHECK(scope IN ('account', 'model_family', 'model')),
+    model TEXT,
+    window TEXT NOT NULL,
+    period_key TEXT NOT NULL,
+    period_start TEXT,
+    reset_at TEXT,
+    observed_at TEXT NOT NULL,
+    task_id TEXT REFERENCES tasks(id),
+    source TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'rejected' CHECK(status = 'rejected'),
+    evidence_fingerprint TEXT NOT NULL,
+    resolved_at TEXT,
+    resolved_task_id TEXT REFERENCES tasks(id),
+    resolved_context TEXT,
+    UNIQUE(status_key, evidence_fingerprint)
+);
+CREATE INDEX provider_quota_restrictions_active_idx
+    ON provider_quota_restrictions(status_key, scope, model, period_key, period_start, observed_at)
+    WHERE resolved_at IS NULL;
+
+CREATE TABLE provider_quota_retry_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status_key TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+    restriction_fingerprints TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('claimed', 'prompting', 'succeeded', 'failed')),
+    claimed_at TEXT NOT NULL,
+    prompt_started_at TEXT,
+    finished_at TEXT,
+    outcome_code TEXT
+);
+CREATE UNIQUE INDEX provider_quota_retry_active_key
+    ON provider_quota_retry_attempts(status_key) WHERE state IN ('claimed', 'prompting');
+CREATE INDEX provider_quota_retry_success_idx
+    ON provider_quota_retry_attempts(status_key, finished_at) WHERE state = 'succeeded';
+
+-- Preserve explicit historical rejected windows unless durable provider/task success proves that
+-- the same account and scope subsequently accepted work.  Rate-limit telemetry is optional.
+INSERT INTO provider_quota_restrictions
+    (status_key, scope, model, window, period_key, reset_at, observed_at, task_id, source,
+     evidence_fingerprint)
+SELECT w.status_key, w.scope, w.model, w.window, w.period_key, w.resets_at, w.observed_at,
+       w.task_id,
+       'migration_provider_window', w.evidence_fingerprint
+ FROM provider_windows AS w
+ WHERE w.status = 'rejected'
+   AND NOT EXISTS (
+       SELECT 1 FROM provider_status AS success
+       JOIN tasks AS successful_task ON successful_task.id = success.task_id
+        WHERE success.provider = w.status_key
+          AND success.state = 'ok'
+          AND success.last_success_at > w.observed_at
+          AND COALESCE(successful_task.provider_family, successful_task.provider) = w.status_key
+          AND (
+              w.scope = 'account'
+              OR (w.scope = 'model_family' AND (
+                  (w.model = 'opus' AND instr(lower(COALESCE(successful_task.resolved_model, '')),
+                                                  'opus') > 0)
+                  OR (w.model = 'sonnet' AND instr(lower(COALESCE(successful_task.resolved_model, '')),
+                                                     'sonnet') > 0)
+              ))
+              OR (w.scope = 'model' AND successful_task.resolved_model = w.model)
+          )
+   );
+INSERT INTO provider_quota_restrictions
+    (status_key, scope, model, window, period_key, reset_at, observed_at, task_id, source,
+     evidence_fingerprint)
+SELECT p.provider, CASE p.window WHEN 'seven_day_opus' THEN 'model_family'
+                                 WHEN 'seven_day_sonnet' THEN 'model_family'
+                                 ELSE 'account' END,
+       CASE p.window WHEN 'seven_day_opus' THEN 'opus'
+                     WHEN 'seven_day_sonnet' THEN 'sonnet'
+                     ELSE NULL END,
+       COALESCE(p.window, 'legacy_throttled'),
+       COALESCE(p.window, 'legacy_throttled') || '|' || COALESCE(p.reset_at, 'unknown'),
+       p.reset_at, p.observed_at, p.task_id,
+       'migration_provider_status', 'legacy-status:' || p.provider || ':' || p.observed_at
+ FROM provider_status AS p
+ WHERE p.state = 'throttled'
+   AND (p.last_success_at IS NULL OR p.last_success_at <= p.observed_at)
+   AND NOT EXISTS (
+       SELECT 1 FROM provider_quota_restrictions AS q
+        WHERE q.status_key = p.provider
+          AND q.scope = CASE p.window WHEN 'seven_day_opus' THEN 'model_family'
+                                      WHEN 'seven_day_sonnet' THEN 'model_family'
+                                      ELSE 'account' END
+          AND q.model IS CASE p.window WHEN 'seven_day_opus' THEN 'opus'
+                                       WHEN 'seven_day_sonnet' THEN 'sonnet'
+                                       ELSE NULL END
+          AND q.window = COALESCE(p.window, 'legacy_throttled')
+          AND q.period_key = COALESCE(p.window, 'legacy_throttled') || '|'
+                             || COALESCE(p.reset_at, 'unknown')
+   );
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3), (4, _MIGRATION_4),
-    (5, _MIGRATION_5), (6, _MIGRATION_6), (7, _MIGRATION_7),
+    (5, _MIGRATION_5), (6, _MIGRATION_6), (7, _MIGRATION_7), (8, _MIGRATION_8),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1305,6 +1445,241 @@ class Store:
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
         return [dict(row) for row in rows]
 
+    # -- auth context and durable quota evidence -------------------------------------
+
+    def get_task_auth_context(self, task_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT auth_context FROM task_provider_context WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def set_task_auth_context(self, task_id: str, auth_context: str) -> None:
+        """Bind a task to an opaque credential-context fingerprint."""
+        if not auth_context:
+            raise StoreError("auth_context must not be empty")
+        with self._guard(), self.transaction() as conn:
+            current = conn.execute(
+                "SELECT auth_context FROM task_provider_context WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if current and current[0] != auth_context:
+                raise ConstraintError("task auth_context is immutable")
+            conn.execute(
+                "INSERT INTO task_provider_context(task_id, auth_context, observed_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET observed_at = excluded.observed_at",
+                (task_id, auth_context, now()),
+            )
+
+    def get_provider_auth_context(self, status_key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT auth_context FROM provider_auth_context WHERE status_key = ?", (status_key,)
+        ).fetchone()
+        return str(row[0]) if row else None
+
+    def set_provider_auth_context(self, status_key: str, auth_context: str) -> None:
+        """Store the latest opaque context without changing auth/access availability."""
+        if not auth_context:
+            raise StoreError("auth_context must not be empty")
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO provider_auth_context(status_key, auth_context, observed_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(status_key) DO UPDATE SET auth_context = excluded.auth_context, "
+                "observed_at = excluded.observed_at",
+                (status_key, auth_context, now()),
+            )
+
+    def record_quota_restriction(
+        self,
+        status_key: str,
+        *,
+        scope: str,
+        period_key: str,
+        evidence_fingerprint: str,
+        source: str,
+        window: str | None = None,
+        model: str | None = None,
+        period_start: str | None = None,
+        reset_at: str | None = None,
+        observed_at: str | None = None,
+        task_id: str | None = None,
+        resolved_context: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one exact quota refusal and supersede only its prior period generation."""
+        if scope not in {"account", "model_family", "model"}:
+            raise StoreError("invalid quota restriction scope")
+        if not status_key or not period_key or not evidence_fingerprint or not source:
+            raise StoreError("quota restriction identity must not be empty")
+        stamp = observed_at or now()
+        with self._guard(), self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM provider_quota_restrictions WHERE status_key = ? "
+                "AND evidence_fingerprint = ?", (status_key, evidence_fingerprint)
+            ).fetchone()
+            if existing:
+                return dict(existing)
+            # A later rejection for the same observed period is authoritative.  Different periods
+            # remain independently enforceable, so an old weekly refusal cannot erase a daily one.
+            conn.execute(
+                "UPDATE provider_quota_restrictions SET resolved_at = ?, resolved_context = ? "
+                "WHERE status_key = ? AND scope = ? AND model IS ? AND window = ? AND period_key = ? "
+                "AND period_start IS ? AND resolved_at IS NULL",
+                (
+                    stamp, resolved_context, status_key, scope, model, window or period_key,
+                    period_key, period_start,
+                ),
+            )
+            cur = conn.execute(
+                "INSERT INTO provider_quota_restrictions(status_key, scope, model, window, period_key, "
+                "period_start, reset_at, observed_at, task_id, source, evidence_fingerprint, "
+                "resolved_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (status_key, scope, model, window or period_key, period_key, period_start, reset_at,
+                 stamp, task_id, source, evidence_fingerprint, resolved_context),
+            )
+            row = conn.execute(
+                "SELECT * FROM provider_quota_restrictions WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            return dict(row)
+
+    def list_quota_restrictions(
+        self, status_key: str | None = None, *, unresolved_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status_key is not None:
+            clauses.append("status_key = ?")
+            params.append(status_key)
+        if unresolved_only:
+            clauses.append("resolved_at IS NULL")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            "SELECT * FROM provider_quota_restrictions" + where + " ORDER BY observed_at, id", params
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_quota_restrictions(
+        self,
+        status_key: str,
+        fingerprints: Sequence[str],
+        *,
+        task_id: str | None = None,
+        resolved_at: str | None = None,
+        resolved_context: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve only the exact evidence a successful ordinary attempt consumed."""
+        unique = tuple(dict.fromkeys(value for value in fingerprints if value))
+        if not unique:
+            return []
+        marks = ", ".join("?" for _ in unique)
+        stamp = resolved_at or now()
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "UPDATE provider_quota_restrictions SET resolved_at = ?, resolved_task_id = ?, "
+                "resolved_context = ? WHERE status_key = ? AND resolved_at IS NULL "
+                f"AND evidence_fingerprint IN ({marks})",
+                (stamp, task_id, resolved_context, status_key, *unique),
+            )
+            rows = conn.execute(
+                "SELECT * FROM provider_quota_restrictions WHERE status_key = ? "
+                f"AND evidence_fingerprint IN ({marks}) ORDER BY id", (status_key, *unique),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_active_quota_retry_claim(self, status_key: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_quota_retry_attempts WHERE status_key = ? "
+            "AND state IN ('claimed', 'prompting') ORDER BY id DESC LIMIT 1", (status_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_task_quota_retry_claim(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def claim_quota_retry(
+        self, status_key: str, task_id: str, restriction_fingerprints: Sequence[str],
+    ) -> dict[str, Any] | None:
+        """Claim the one ordinary post-reset retry; terminal rows are immutable history."""
+        fingerprints = tuple(dict.fromkeys(value for value in restriction_fingerprints if value))
+        if not status_key or not task_id or not fingerprints:
+            raise StoreError("quota retry claim requires status key, task and evidence")
+        with self._guard(), self.transaction() as conn:
+            own = conn.execute(
+                "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if own:
+                return dict(own)
+            active = conn.execute(
+                "SELECT 1 FROM provider_quota_retry_attempts WHERE status_key = ? "
+                "AND state IN ('claimed', 'prompting')", (status_key,)
+            ).fetchone()
+            if active:
+                return None
+            cur = conn.execute(
+                "INSERT INTO provider_quota_retry_attempts(status_key, task_id, restriction_fingerprints, "
+                "state, claimed_at) VALUES (?, ?, ?, 'claimed', ?)",
+                (status_key, task_id, json.dumps(fingerprints), now()),
+            )
+            row = conn.execute(
+                "SELECT * FROM provider_quota_retry_attempts WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            return dict(row)
+
+    def mark_quota_retry_prompting(self, task_id: str) -> dict[str, Any] | None:
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "UPDATE provider_quota_retry_attempts SET state = 'prompting', prompt_started_at = ? "
+                "WHERE task_id = ? AND state = 'claimed'", (now(), task_id),
+            )
+            return self.get_task_quota_retry_claim(task_id)
+
+    def refine_quota_retry(
+        self, task_id: str, restriction_fingerprints: Sequence[str],
+    ) -> dict[str, Any] | None:
+        """Narrow a conservative pre-prompt claim after exact model resolution.
+
+        This never touches a prompt that has begun and accepts an empty set when resolution
+        establishes that no ordinary retry is needed.  The original restriction rows remain
+        untouched for other model families.
+        """
+        fingerprints = tuple(dict.fromkeys(value for value in restriction_fingerprints if value))
+        with self._guard(), self.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE provider_quota_retry_attempts SET restriction_fingerprints = ? "
+                "WHERE task_id = ? AND state = 'claimed'", (json.dumps(fingerprints), task_id),
+            )
+            if cur.rowcount != 1:
+                return None
+            return self.get_task_quota_retry_claim(task_id)
+
+    def finish_quota_retry(
+        self, task_id: str, outcome: str, *, code: str | None = None,
+    ) -> dict[str, Any] | None:
+        if outcome not in {"succeeded", "failed"}:
+            raise StoreError("invalid quota retry outcome")
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "UPDATE provider_quota_retry_attempts SET state = ?, finished_at = ?, outcome_code = ? "
+                "WHERE task_id = ? AND state IN ('claimed', 'prompting')",
+                (outcome, now(), code, task_id),
+            )
+            return self.get_task_quota_retry_claim(task_id)
+
+    def successful_quota_retry_fingerprints(self, status_key: str) -> set[str]:
+        rows = self._conn.execute(
+            "SELECT restriction_fingerprints FROM provider_quota_retry_attempts "
+            "WHERE status_key = ? AND state = 'succeeded' ORDER BY id", (status_key,)
+        ).fetchall()
+        result: set[str] = set()
+        for row in rows:
+            try:
+                values = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(values, list):
+                result.update(value for value in values if isinstance(value, str))
+        return result
+
     # -- turn usage -------------------------------------------------------------------
 
     def insert_turn_usage(self, turn_id: int, task_id: str, provider: str, **fields: Any) -> int:
@@ -1435,27 +1810,70 @@ class Store:
         resets_at: str | None = None,
         task_id: str | None = None,
         observed_at: str | None = None,
+        status_key: str | None = None,
+        scope: str = "account",
+        model: str | None = None,
+        period_key: str | None = None,
+        period_start: str | None = None,
+        evidence_fingerprint: str | None = None,
     ) -> int:
         """Record one observation of a provider's usage window."""
+        effective_key = status_key or provider
+        effective_scope = scope
+        effective_model = model
+        if scope == "account" and window in {"seven_day_opus", "seven_day_sonnet"}:
+            effective_scope = "model_family"
+            effective_model = "opus" if window.endswith("opus") else "sonnet"
+        stamp = observed_at or now()
+        effective_period = period_key or f"{window}|{resets_at or 'unknown'}"
+        effective_fingerprint = evidence_fingerprint or (
+            f"provider-window:{effective_key}:{effective_scope}:{effective_model or '-'}:"
+            f"{effective_period}:{stamp}"
+        )
         with self._guard(), self.transaction() as conn:
             cur = conn.execute(
                 "INSERT INTO provider_windows(provider, window, status, used_percent, resets_at, "
-                "observed_at, task_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "observed_at, task_id, source, status_key, scope, model, period_key, period_start, "
+                "evidence_fingerprint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     provider,
                     window,
                     status,
                     used_percent,
                     resets_at,
-                    observed_at or now(),
+                    stamp,
                     task_id,
                     source,
+                    effective_key,
+                    effective_scope,
+                    effective_model,
+                    effective_period,
+                    period_start,
+                    effective_fingerprint,
                 ),
             )
-            return int(cur.lastrowid or 0)
+            window_id = int(cur.lastrowid or 0)
+            # The legacy window writer remains a compatible ingestion surface.  Explicit rejected
+            # observations also enter the durable enforcement history; allowed telemetry never
+            # does.  Nested transactions join this one, so evidence is never half-recorded.
+            if status == "rejected":
+                self.record_quota_restriction(
+                    effective_key,
+                    scope=effective_scope,
+                    model=effective_model,
+                    window=window,
+                    period_key=effective_period,
+                    period_start=period_start,
+                    reset_at=resets_at,
+                    observed_at=stamp,
+                    task_id=task_id,
+                    source=source,
+                    evidence_fingerprint=effective_fingerprint,
+                )
+            return window_id
 
     def latest_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]:
-        """The newest observation of every ``(provider, window)`` pair."""
+        """The newest observation of every scoped provider-window period."""
         params: list[Any] = []
         where = ""
         if provider is not None:
@@ -1463,7 +1881,8 @@ class Store:
             params.append(provider)
         rows = self._conn.execute(
             "SELECT * FROM provider_windows WHERE id IN ("
-            f"SELECT MAX(id) FROM provider_windows{where} GROUP BY provider, window"
+            f"SELECT MAX(id) FROM provider_windows{where} "
+            "GROUP BY status_key, scope, model, period_key, period_start"
             ") ORDER BY provider, window",
             params,
         ).fetchall()

@@ -315,9 +315,12 @@ def test_availability_exposes_stale_account_evidence_without_claiming_success(tm
         "scope": "account",
         "affected_model": None,
         "stale": True,
-        "next_action": "retry",
-        "retry_eligible": True,
-    }
+            "next_action": "retry",
+            "retry_eligible": True,
+            "quota_restrictions": [],
+            "auth_context": availability["auth_context"],
+            "quota_retry": {"state": "none", "task_id": None, "fingerprints": []},
+        }
 
 
 def test_model_unavailable_only_blocks_the_matching_model(tmp_path) -> None:

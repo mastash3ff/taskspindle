@@ -130,6 +130,14 @@ uses the local browser clipboard and does not execute it. Recovery tasks also re
 successful attempt remains distinct from current availability, so newer refusal evidence remains
 visible and blocking. The dashboard never sends a recovery mutation request.
 
+Availability also carries `quota_restrictions`, one normalized row for every applicable quota
+window: `scope`, `model_family`, `window`, `reset`, `source`, `observed`, and an opaque
+`fingerprint`. Overlapping account and model-family restrictions remain separately visible.
+`auth_context` supplies an opaque fingerprint, whether it changed, and its observation; a changed
+context is metadata about the evidence, never an account identity. `quota_retry` reports the
+single shared post-reset retry state, its task ID, and restriction fingerprints. When it is
+pending, claimed, or prompting, Workers links to that task without creating, retrying, or mutating anything.
+
 Repository usage groups display the registered repository path when available. The JSON keeps
 `repository_id` as its stable grouping key and adds `repository_path`; missing paths fall back
 to the ID, while repository-free turns display as "No repository".

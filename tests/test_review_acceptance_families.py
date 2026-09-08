@@ -32,6 +32,12 @@ from tests.test_orchestrator import (
 )
 
 
+@pytest.fixture(autouse=True)
+def isolated_worker_home(harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep inline workers on the fixture's isolated auth-context location."""
+    monkeypatch.setenv("HOME", str(harness.orchestrator.paths.state_dir))
+
+
 @pytest.fixture
 def reviewed(harness, make_repo):
     repo = make_repo()

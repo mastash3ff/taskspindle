@@ -104,8 +104,9 @@ not establish browser/CLI account identity or a future model turn.
 A native check cannot verify a billing deadline or clear an unresolved task/model refusal. Only a
 fresh explicit exhausted quota adds a temporary gate; a passed reset, stale result, unsupported
 method, or unknown quota permits an ordinary needed attempt under the existing rules. After
-restoring access, an explicitly authorized ordinary-task retry can use the existing
-`ignore_provider_status` mechanism; no synthetic prompt is needed.
+restoring access, a throttle without a reported reset may receive one explicitly authorized
+`recovery_permit_id` ordinary-task retry; no synthetic prompt is needed. A reported future reset
+and fresh native exhaustion remain waiting conditions, and `ignore_provider_status` is retired.
 
 Before creating new work, the Codex coordinator reads `capabilities` and selects a compatible
 subscription worker using its availability and `model_availability`. Explicit provider/model

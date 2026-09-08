@@ -35,6 +35,12 @@ from tests.test_orchestrator import (
 from tests.test_store import make_task
 
 
+@pytest.fixture(autouse=True)
+def isolated_worker_home(harness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Match the worker's auth-context view to this fixture's isolated orchestrator home."""
+    monkeypatch.setenv("HOME", str(harness.orchestrator.paths.state_dir))
+
+
 def _omit_family(monkeypatch):
     create = orchestrator_module.create_task
 

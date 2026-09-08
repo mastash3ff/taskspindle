@@ -366,15 +366,38 @@ def _providers_status(*, check: bool, as_json: bool, provider: str | None = None
             print(f"  Last successful use: {availability.get('last_success_at') or 'not observed'}")
             if availability.get("reset_at"):
                 print(f"  Reported quota reset: {availability['reset_at']}")
+            _print_quota_context(availability, indent="  ")
             _print_provider_recovery(availability, indent="  ")
             for model in row["model_availability"]:
                 if model["affected_model"] != availability.get("affected_model"):
                     print(f"  Model {model['affected_model']}: {model['state']} — {model['next_action']}")
+                    _print_quota_context(model, indent="    ")
                     _print_provider_recovery(model, indent="    ")
             if check:
                 native = row["native_check"]
                 print(f"  Native check: {native['state']} — {native['detail']}")
     return 0
+
+
+def _print_quota_context(availability: dict[str, Any], *, indent: str) -> None:
+    """Print quota/auth/retry evidence without implying a provider identity."""
+    for restriction in availability.get("quota_restrictions") or []:
+        model_family = restriction.get("model_family") or restriction.get("model") or "-"
+        reset = restriction.get("reset") or restriction.get("reset_at") or "-"
+        observed = restriction.get("observed") or restriction.get("observed_at") or "-"
+        print(
+            f"{indent}Quota restriction: scope={restriction.get('scope') or '-'} "
+            f"model_family={model_family} window={restriction.get('window') or '-'} "
+            f"reset={reset} source={restriction.get('source') or '-'} observed={observed}"
+        )
+    context = availability.get("auth_context") or {}
+    if context.get("changed"):
+        print(f"{indent}Authentication context changed (metadata only; not an account identity).")
+        if context.get("fingerprint"):
+            print(f"{indent}Authentication context fingerprint: {context['fingerprint']}")
+    retry = availability.get("quota_retry") or {}
+    if retry.get("state") == "pending":
+        print(f"{indent}Quota retry pending: {retry.get('task_id') or '-'}")
 
 
 def _print_provider_recovery(availability: dict[str, Any], *, indent: str) -> None:
@@ -467,17 +490,19 @@ def _provider_recovery(
 
 
 def _profiles(paths: Paths) -> dict[str, Any]:
-    from . import providers
+    from . import auth_context, providers
     from .config import load_config
 
     settings = load_config(paths.config_file)
-    return providers.load_profiles(
+    loaded = providers.load_profiles(
         settings,
         runtime_dir=paths.runtime_dir,
         home=Path(os.environ.get("HOME", "")),
         state_dir=paths.state_dir,
         data_dir=paths.data_dir,
     )
+    auth_context.validate_contexts(loaded, os.environ)
+    return loaded
 
 
 def _check(name: str, detail: str) -> dict[str, Any]:
