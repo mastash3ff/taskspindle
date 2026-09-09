@@ -894,6 +894,10 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
         await _configure_agy_session(run, agent)
         return
     await _apply_session_mode(run, agent)
+    if run.profile and run.profile.family == "claude" and run.task.requested_model:
+        # The adapter can restore a settings or transcript model instead of options.model.
+        # Confirm the explicit task choice before effort, which a model switch can reset.
+        await agent.set_config_option(run.session_id, "model", run.task.requested_model)
     if run.profile and run.profile.family == "claude" and run.profile.effort:
         # The adapter can replace options.effort with a persisted setting while opening a
         # session. Apply and confirm the task selection after both new_session and load_session.

@@ -138,8 +138,9 @@ def test_task_selection_does_not_bypass_profile_restrictions(tmp_path, restricti
 
 @pytest.mark.parametrize("kind", [TurnKind.INITIAL, TurnKind.CONTINUE, TurnKind.RESUME])
 @pytest.mark.parametrize("confirmation", ["confirmed", "refused", "unsupported"])
-async def test_claude_effort_is_confirmed_after_new_or_load(tmp_path, kind, confirmation):
-    """An adapter's saved low effort must not override the task's explicit high effort."""
+@pytest.mark.parametrize("selection", ["model", "effort", "both"])
+async def test_claude_selection_is_confirmed_after_new_or_load(tmp_path, kind, confirmation, selection):
+    """Conflicting adapter settings must not replace the task's explicit model or effort."""
     script = tmp_path / "agent.json"
     metadata = tmp_path / "metadata.json"
     script.write_text(
@@ -148,6 +149,7 @@ async def test_claude_effort_is_confirmed_after_new_or_load(tmp_path, kind, conf
                 "load_session": True,
                 "capture_meta_to": str(metadata),
                 "unconfirmed_config": confirmation == "refused",
+                "reset_config_on_set": {"model": {"effort": "low"}},
                 "config_options": []
                 if confirmation == "unsupported"
                 else [
@@ -157,7 +159,17 @@ async def test_claude_effort_is_confirmed_after_new_or_load(tmp_path, kind, conf
                         "type": "select",
                         "currentValue": "low",
                         "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}],
-                    }
+                    },
+                    {
+                        "id": "model",
+                        "name": "Model",
+                        "type": "select",
+                        "currentValue": "claude-saved-model",
+                        "options": [
+                            {"value": "claude-saved-model", "name": "Saved"},
+                            {"value": "claude-selected-model", "name": "Selected"},
+                        ],
+                    },
                 ],
             }
         )
@@ -168,8 +180,8 @@ async def test_claude_effort_is_confirmed_after_new_or_load(tmp_path, kind, conf
         task = store.update_task(
             task.id,
             None,
-            requested_model="selected-model",
-            requested_effort="high",
+            requested_model="claude-selected-model" if selection in {"model", "both"} else None,
+            requested_effort="high" if selection in {"effort", "both"} else None,
             mode=Mode.CONSULT,
             session_id=None if kind is TurnKind.INITIAL else "saved-session",
         )
@@ -191,13 +203,18 @@ async def test_claude_effort_is_confirmed_after_new_or_load(tmp_path, kind, conf
         ) as agent:
             if confirmation == "confirmed":
                 await runner._open_session(run, agent)
-                assert agent.session_config_options[0]["currentValue"] == "high"
+                expected_effort = "low" if selection == "model" else "high"
+                expected_model = "claude-saved-model" if selection == "effort" else "claude-selected-model"
+                assert agent.session_config_options[0]["currentValue"] == expected_effort
+                assert agent.session_config_options[1]["currentValue"] == expected_model
+                assert agent.session_model == expected_model
+                assert run.session_model == expected_model
                 assert agent.mode == "plan"
-                assert store.get_task(task.id).requested_effort == "high"
+                assert store.get_task(task.id).requested_effort == task.requested_effort
                 if kind is TurnKind.INITIAL:
                     options = json.loads(metadata.read_text())["claudeCode"]["options"]
-                    assert options["model"] == "selected-model"
-                    assert options["effort"] == "high"
+                    assert options.get("model") == task.requested_model
+                    assert options.get("effort") == task.requested_effort
                     assert options["disallowedTools"] == ["Agent", "Task", "TeamCreate", "SendMessage"]
                 else:
                     assert run.session_id == "saved-session"

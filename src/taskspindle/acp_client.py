@@ -604,7 +604,7 @@ class AcpWorker:
                 "CONFIG_UNAVAILABLE", f"agent refused {config_id!r} = {value!r}: {exc}",
                 cause=error_cause(exc),
             ) from exc
-        self.session_config_options = options
+        self._remember_session_configuration(response)
 
     async def prompt(self, session_id: str, text: str, *, timeout: float) -> TurnResult:
         """Send one turn and capture everything it produced."""
