@@ -67,6 +67,87 @@ def test_missing_period_and_bad_dates_fail_closed():
         assert grok_checks.parse_billing(value) is None
 
 
+def test_extra_usage_parser_preserves_native_cent_units_and_known_zero():
+    value = billing()
+    value["on_demand_enabled"] = True
+    value["config"].update(
+        prepaidBalance={"val": 1234}, onDemandCap={}, onDemandUsed={"val": 500},
+    )
+    parsed = grok_checks.parse_extra_usage(value)
+    assert parsed == {
+        "on_demand_enabled": True,
+        "prepaid_balance": 1234,
+        "on_demand_cap": 0,
+        "on_demand_used": 500,
+        "unit": "usd_cents",
+        "currency": "USD",
+        "auto_topup": None,
+    }
+    assert "SECRET" not in json.dumps(parsed)
+
+
+@pytest.mark.parametrize("amount", [True, -1, 2**63, "500", float("nan"), 1.5, None])
+def test_extra_usage_rejects_unknown_shapes_and_invalid_money(amount):
+    value = {"config": {"prepaidBalance": {"val": amount}}, "on_demand_enabled": "true"}
+    parsed = grok_checks.parse_extra_usage(value)
+    assert parsed["prepaid_balance"] is None
+    assert parsed["on_demand_cap"] is None
+    assert parsed["on_demand_enabled"] is None
+    assert grok_checks.parse_extra_usage({"config": {"prepaidBalance": 500}})["prepaid_balance"] is None
+    invalid_unit = grok_checks.parse_extra_usage({"config": {"prepaidBalance": {"usd": 5}}})
+    assert invalid_unit["prepaid_balance"] is None
+
+
+def test_auto_topup_is_read_only_observation_with_absent_distinct_from_zero():
+    assert grok_checks.parse_auto_topup({"rule": None}) is None
+    assert grok_checks.parse_auto_topup({"rule": {}}) == {
+        "enabled": False, "topup_amount": None, "max_amount_per_month": None,
+    }
+    assert grok_checks.parse_auto_topup({"rule": {
+        "enabled": True, "topupAmount": {"val": 500}, "maxAmountPerMonth": {},
+        "token": "SECRET",
+    }}) == {"enabled": True, "topup_amount": 500, "max_amount_per_month": 0}
+
+
+def test_native_cache_keeps_safe_billing_and_discards_arbitrary_fields():
+    value = observation()
+    value["billing"] = {
+        "on_demand_enabled": True, "prepaid_balance": 1200, "on_demand_cap": 0,
+        "on_demand_used": 20, "unit": "usd_cents", "currency": "USD",
+        "auto_topup": {"enabled": False, "topup_amount": 500, "max_amount_per_month": None},
+        "token": "SECRET", "source": "SECRET", "observed_at": "SECRET",
+    }
+    result = access_checks._safe_grok_result(value)
+    assert result["billing"]["prepaid_balance"] == 1200
+    assert result["billing"]["auto_topup"]["enabled"] is False
+    assert result["billing"]["source"] == "grok_billing"
+    assert result["billing"]["observed_at"] == value["checked_at"]
+    assert "SECRET" not in json.dumps(result)
+
+
+def test_native_cache_does_not_relabel_unknown_units_as_dollars():
+    value = observation()
+    value["billing"] = {"unit": "ticks", "currency": "USD", "prepaid_balance": 500}
+    assert access_checks._safe_grok_result(value)["billing"] is None
+
+
+def test_optional_topup_extension_failure_preserves_quota(profile, tmp_path):
+    cli = fake_cli(tmp_path)
+    from pathlib import Path
+
+    path = Path(cli)
+    path.write_text(path.read_text().replace(
+        "result={'rule':{'enabled':True,'topupAmount':{'val':500},'maxAmountPerMonth':{'val':2000}}}",
+        "print(json.dumps({'jsonrpc':'2.0','id':req['id'],'error':{'code':-32601}}),flush=True);continue",
+    ))
+    result = grok_checks.check_grok(
+        replace(profile, command=(cli,)), {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+    )
+    assert result["state"] == "quota"
+    assert result["error_code"] is None
+    assert result["billing"]["auto_topup"] is None
+
+
 def fake_cli(tmp_path, mode="quota"):
     path = tmp_path / "grok"
     path.write_text(
@@ -82,9 +163,11 @@ with open(os.path.join(os.environ['HOME'], 'native-process.pid'), 'w') as proof:
  proof.write(str(os.getpid()))
 for line in sys.stdin:
  req=json.loads(line)
- assert req['method'] in ('initialize','_x.ai/billing')
+ assert req['method'] in ('initialize','_x.ai/billing','_x.ai/auto-topup-rule')
  if req['method']=='initialize':
   result={'authMethods':[{'id':'cached_token'}]}
+ elif req['method']=='_x.ai/auto-topup-rule':
+  result={'rule':{'enabled':True,'topupAmount':{'val':500},'maxAmountPerMonth':{'val':2000}}}
  else:
   MODE = """
         + repr(mode)
@@ -111,6 +194,10 @@ def test_exact_protocol_no_session_auth_prompt(profile, tmp_path, mode):
     )
     assert result["state"] == ("quota" if mode == "quota" else "unsupported")
     assert result["version"] == "1.0.13"
+    if mode == "quota":
+        assert result["billing"]["auto_topup"] == {
+            "enabled": True, "topup_amount": 500, "max_amount_per_month": 2000,
+        }
     assert "SECRET" not in json.dumps(result)
     with pytest.raises(ProcessLookupError):
         os.kill(int((tmp_path / "native-process.pid").read_text()), 0)

@@ -1,5 +1,6 @@
 import { getJSON } from "../api.js";
 import { badge, emptyState, formatDate, h, labeledValue, sectionHeading, table } from "../dom.js";
+import { nativeOverageDetails } from "../native-overage.js";
 import { routeHref } from "../router.js";
 
 const NEXT_ACTION = {
@@ -157,6 +158,7 @@ function workerCard(worker, context) {
     availabilityCard(worker, worker.availability, selected, context),
     models.length ? h("details", { class: "model-details", dataset: { persistKey: `models-${worker.id}` } }, h("summary", { text: `${models.length} model observation${models.length === 1 ? "" : "s"}` }), h("div", { class: "model-grid" }, models.map((item) => availabilityCard(worker, item, item.affected_model, context)))) : null,
     nativeCheck(worker.native_check),
+    nativeOverageDetails(worker.native_overage || worker.availability?.native_overage, worker.native_check),
   );
 }
 

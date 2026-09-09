@@ -20,7 +20,7 @@ import stat
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -153,6 +153,8 @@ class Profile:
     base: str | None = None
     #: Host of ``ANTHROPIC_BASE_URL`` / ``OPENAI_BASE_URL`` in :attr:`env`, for attribution only.
     gateway_host: str | None = None
+
+    native_overage: str = "observe_only"
 
     @property
     def family(self) -> str:
@@ -432,7 +434,10 @@ def load_profiles(
     from .auth_context import validate_contexts
 
     validate_contexts(profiles, parent_env if parent_env is not None else os.environ)
-    return profiles
+    from .config import native_overage_policies
+
+    policies = native_overage_policies(config, profiles)
+    return {name: replace(profile, native_overage=policies[name]) for name, profile in profiles.items()}
 
 
 def profile_for_task(

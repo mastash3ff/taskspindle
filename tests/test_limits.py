@@ -299,7 +299,10 @@ def test_availability_exposes_stale_account_evidence_without_claiming_success(tm
         )
         availability = service.provider_availability(store, profile, now=now)
 
+    assert availability["native_overage"]["eligibility"] == "unknown"
+    assert availability["native_overage"]["policy"] == "observe_only"
     assert availability == {
+        "native_overage": availability["native_overage"],
         "evidence_revision": availability["evidence_revision"],
         "recovery": availability["recovery"],
         "state": "unknown",

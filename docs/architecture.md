@@ -72,7 +72,8 @@ you last read and refuses with `STALE_STATE_VERSION` if it has moved.
 | `RESUMING` | `RUNNING`, `FAILED`, `CANCELLING`, `INTERRUPTED`, `RECOVERY_AMBIGUOUS` |
 | `RECOVERY_AMBIGUOUS` | `RESUMING`, `CANCELLING` |
 | `CANCELLING` | `CANCELLED`, `FAILED` |
-| `ACCEPTED`, `REJECTED`, `CANCELLED`, `FAILED` | nothing; these are terminal |
+| `FAILED` | `RESUMING` only for an eligible native extra-usage quota continuation |
+| `ACCEPTED`, `REJECTED`, `CANCELLED` | nothing; these are terminal |
 
 Two mode restrictions sit on top of the table:
 
@@ -266,6 +267,10 @@ data, start no diagnostics, and tolerate older task schemas without migrating th
 default `providers` status path also uses the read-only store. Schema 6 adds the native diagnostic
 cache; schema 7 adds recovery permits; schema 8 adds durable quota windows, authentication-context
 binding, and shared post-reset retry claims without changing task ownership or provider binding.
+Schema 9 adds nullable per-turn native-overage metadata, bounded admission claims, and safe
+native observations. Historical billing remains unknown. [Native extra usage](native-overage.md)
+adds exact-profile standing policy and a same-session quota continuation; account settings
+remain the spending authority. Native-overage service success preserves included-quota evidence.
 
 ## What isolation is, and is not
 

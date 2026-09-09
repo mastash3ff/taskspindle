@@ -223,3 +223,18 @@ def test_native_child_stays_in_transport_process_group(layout) -> None:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
         process.communicate(timeout=3)
+
+
+def test_native_overage_policy_controls_only_credit_setting(layout) -> None:
+    from taskspindle.agy_cli_policy import prepare_launch
+
+    home, workspace, task = layout
+    for policy, credits in (("observe_only", False), ("provider_managed", True)):
+        argv = prepare_launch(Path(sys.executable), workspace, task, home, "consult", (), (),
+                              native_overage=policy)
+        settings = json.loads((task / "agy-cli-policy" / "settings.json").read_text())
+        assert settings["useG1Credits"] is credits
+        assert settings["enableTerminalSandbox"] is True
+        assert settings["allowNonWorkspaceAccess"] is False
+        assert "--unshare-pid" in argv
+        assert "write_file(*)" in settings["permissions"]["deny"]

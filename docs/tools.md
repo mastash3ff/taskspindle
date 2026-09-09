@@ -323,15 +323,22 @@ have not seen. A new candidate revision has a new digest, and its coverage start
 | `expected_state_version` | int | — |
 | `prompt` | string | `""` |
 
-One more turn. What it means depends on where the task is. A continuation is not gated on the
-provider's availability the way `start_task` is: its provider is fixed by the task, and a refused
-turn records the refusal like any other.
+One more turn. What it means depends on where the task is. Ordinary observe-only
+continuations retain their existing refusal handling. Native extra-usage continuations
+recheck current policy and eligibility; the provider and original model remain fixed.
 
 | State | Mode | Turn |
 | --- | --- | --- |
 | `RESULT_READY` | implement | a **repair** on the candidate, producing a new revision |
 | `COMPLETED` | consult | a **follow-up** question in the same session |
 | `INTERRUPTED` | any | a **resume** of the interrupted turn |
+| `FAILED` | any | a narrow **resume** only when `native_overage.continuation.eligible` is true |
+
+The failed-task path requires original included-quota failure evidence, a retained
+usable workspace, original model/authentication/session, and a definitely stopped worker.
+Inspect `task_status.native_overage.continuation` for current eligibility and its reason.
+It preserves partial work and adds a continuation turn; it never replays the original request.
+See [native extra usage](native-overage.md).
 
 Anything else is `ILLEGAL_TRANSITION`. A resume of a task with no stored session is
 `RESUME_UNAVAILABLE`. A task in `RECOVERY_AMBIGUOUS` is reconciled once more first, and if it is
@@ -482,11 +489,16 @@ Where the numbers come from, and what they are not:
   the per-model breakdown kept untouched in the record's `raw`. Only when an agent reported
   nothing does TaskSpindle read the Claude session record the adapter's own Claude Code wrote —
   the one file for that turn's session, nothing else under `~/.claude/projects`.
-- **`cost_estimate_usd` is an estimate**, and always says so. A subscription seat is not billed
-  per token; the figure is what the same tokens would cost at the published API rates, from a
+- **`cost_estimate_usd` is an estimate**, and always says so. OAuth sessions may consume native
+  extra usage; this figure is not a reported charge. It prices tokens at published API rates from a
   static price table whose date is `price_table_version`, so seat usage can be compared and
   budgeted. Grok's own cost figure is not converted, because its unit is not documented; a model
   the table does not know has no estimate.
+- **`native_overage`** counts all turns by recorded policy and observed billing classification,
+  including tokenless and historical unknown turns, with the requested grouping/filter. Account
+  balances and caps are observations shared by the account, not task charges. Task status/result
+  exposes the latest turn snapshot; failed task status separately exposes current continuation
+  eligibility. See [native extra usage](native-overage.md).
 - **Outcomes, timings and violations** are computed from the task, turn, check and event tables
   on every call; nothing is aggregated ahead of time.
 - **Windows** are observed, never polled. For Claude, the adapter forwards the SDK's rate-limit

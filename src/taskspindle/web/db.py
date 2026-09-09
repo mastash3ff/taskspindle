@@ -234,8 +234,55 @@ class ReadOnlyStore:
         for row in rows:
             turn = dict(row)
             turn["attribution"] = _loads(turn["attribution"])
+            turn["native_overage"] = _loads(turn.get("native_overage"))
             turns.append(turn)
         return turns
+
+    def list_native_overage_turns(
+        self, *, since: str | None = None, provider: str | None = None,
+    ) -> list[dict[str, Any]]:
+        from ..native_overage import unknown
+
+        if self._conn is None:
+            return []
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
+        projection = "r.native_overage" if "native_overage" in columns else "NULL AS native_overage"
+        conditions, params = [], []
+        for clause, value in (("r.started_at >= ?", since), ("t.provider = ?", provider)):
+            if value is not None:
+                conditions.append(clause)
+                params.append(value)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        rows = self._conn.execute(
+            "SELECT r.id AS turn_id, r.task_id, r.revision, t.provider, t.mode, "
+            "COALESCE(t.resolved_model, t.requested_model) AS model, t.repository_id, "
+            "r.started_at AS captured_at, " + projection + " FROM turns r "
+            "JOIN tasks t ON t.id = r.task_id" + where + " ORDER BY r.id", params,
+        )
+        return [dict(row) | {"native_overage": unknown() | (_loads(row["native_overage"]) or {})}
+                for row in rows]
+
+    def get_native_overage_attempt(self, key: str) -> dict[str, Any] | None:
+        if not self._table_exists("native_overage_attempts"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM native_overage_attempts WHERE claim_key = ?", (key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_native_overage_attempts(self) -> list[dict[str, Any]]:
+        if not self._table_exists("native_overage_attempts"):
+            return []
+        return [dict(row) for row in self._conn.execute("SELECT * FROM native_overage_attempts")]
+
+    def latest_native_overage_observation(self, status_key: str) -> dict[str, Any] | None:
+        if not self._table_exists("native_overage_observations"):
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM native_overage_observations WHERE status_key = ? "
+            "ORDER BY id DESC LIMIT 1", (status_key,),
+        ).fetchone()
+        return dict(row) | {"observed": _loads(row["observed"])} if row else None
 
     # -- checks ---------------------------------------------------------------------
 

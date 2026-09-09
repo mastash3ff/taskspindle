@@ -30,6 +30,25 @@ Their ids are reserved. You cannot redefine them in `config.toml`.
 personal login. Setup, authentication and the enforced worker policy are described in
 [antigravity.md](antigravity.md). An `agy`-derived profile cannot switch to API-key authentication.
 
+## `[native_overage]`
+
+Every exact profile defaults to `"observe_only"`. Setting an OAuth profile to
+`"provider_managed"` is standing authorization for native extra usage after included
+allowance exhaustion. Provider account settings remain the spending authority.
+Aliases require their own entry; API-key profiles cannot use this policy.
+
+```toml
+[native_overage]
+claude = "observe_only"
+grok = "observe_only"
+agy = "observe_only"
+```
+
+`observe_only` retains ordinary quota gates and disables AGY credits. It cannot
+prevent Claude/Grok from consuming extra usage already enabled on the provider
+account. `allow_metered` remains the separate API-key authorization gate.
+See [native extra usage](native-overage.md) for continuation, telemetry, and rollout.
+
 ## `[providers.<id>]`
 
 Any other ACP-speaking stdio agent is a **configured, second-class profile**.

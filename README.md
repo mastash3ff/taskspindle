@@ -92,6 +92,7 @@ moved underneath you is refused rather than clobbered.
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
+| [native-overage.md](docs/native-overage.md) | Native extra usage policy, billing observations, and rollout |
 | [dashboard.md](docs/dashboard.md) | `taskspindle web`: task inspection, subscriptions, and its JSON API |
 | [subscriptions.md](docs/subscriptions.md) | Dedicated browser setup, collection, status, and deployment |
 | [rollback.md](docs/rollback.md) | backing it out without losing anything |

@@ -145,7 +145,7 @@ def _grok_eligible(profile: Profile) -> bool:
 def _safe_grok_result(value: Any) -> dict[str, Any] | None:
     import re
 
-    from .grok_checks import parse_billing, parse_time
+    from .grok_checks import parse_billing, parse_time, safe_extra_usage
 
     if not isinstance(value, dict):
         return None
@@ -188,6 +188,7 @@ def _safe_grok_result(value: Any) -> dict[str, Any] | None:
         "window": None,
         "period_start": None,
         "reset_at": None,
+        "billing": None,
     }
     if state == "quota":
         raw_window = value.get("window")
@@ -211,6 +212,7 @@ def _safe_grok_result(value: Any) -> dict[str, Any] | None:
         if quota is None:
             return None
         result.update(quota)
+        result["billing"] = safe_extra_usage(value.get("billing"), result["checked_at"])
     return result
 
 
@@ -240,6 +242,7 @@ def cached_native_check(
         "error_code": None,
         "freshness": "unknown",
         "eligible_hint": None,
+        "billing": None,
         "last_success": None,
         "checking": False,
         "detail": "No current native quota observation is available.",

@@ -31,7 +31,7 @@ from starlette.staticfiles import StaticFiles
 
 import taskspindle
 
-from .. import access_checks, limits, usage
+from .. import access_checks, limits, native_overage, usage
 from ..config import Paths
 from ..doctor import run_doctor_async
 from ..providers import Profile
@@ -420,7 +420,8 @@ def build_app(
         with _store() as store:
             providers_out = []
             observed_now = clock()
-            for profile in sorted(profiles.values(), key=lambda item: item.id):
+            for original in sorted(profiles.values(), key=lambda item: item.id):
+                profile = native_overage.current_profile(original, profiles, paths.config_file)
                 providers_out.append(
                     {
                         "id": profile.id,

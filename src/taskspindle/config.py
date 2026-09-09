@@ -89,3 +89,19 @@ def concurrency_limits(settings: Mapping[str, Any], providers: Iterable[str]) ->
         if type(limit) is not int or limit < 1:
             raise ConfigError(f"concurrency.{provider} must be a positive integer")
     return {provider: configured.get(provider, 1) for provider in sorted(names)}
+
+
+def native_overage_policies(settings: Mapping[str, Any], profiles: Mapping[str, Any]) -> dict[str, str]:
+    """Exact-profile standing authorization; account billing remains provider controlled."""
+    configured = settings.get("native_overage", {})
+    if not isinstance(configured, dict):
+        raise ConfigError("native_overage must be a table of exact profile policies")
+    unknown = set(configured) - set(profiles)
+    if unknown:
+        raise ConfigError(f"native_overage contains unknown provider(s): {', '.join(sorted(unknown))}")
+    for name, policy in configured.items():
+        if not isinstance(policy, str) or policy not in {"observe_only", "provider_managed"}:
+            raise ConfigError(f"native_overage.{name} must be observe_only or provider_managed")
+        if profiles[name].auth != "oauth":
+            raise ConfigError(f"native_overage.{name} requires a native OAuth profile")
+    return {name: configured.get(name, "observe_only") for name in sorted(profiles)}

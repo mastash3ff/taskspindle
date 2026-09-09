@@ -74,6 +74,16 @@ EXAMPLE_CONFIG = """\
 #grok = 4
 #agy = 4
 #
+# Native extra usage is separate from API-key authentication. Every exact profile defaults
+# to observe_only. Provider-managed is standing authorization to use native paid allowance
+# after included allowance exhaustion; provider account settings control spending.
+# Observe-only is NOT a strict no-charge gate for Claude/Grok accounts with extra usage enabled.
+# See docs/native-overage.md. These commented examples do not enable spending.
+#[native_overage]
+#claude = "observe_only"
+#grok = "observe_only"
+#agy = "observe_only"
+#
 # A [providers.<id>] table adds a second-class profile. Second-class is a rule, not a label:
 # such a profile is never a default, never a fallback, and never chosen as a reviewer on its
 # own. A task uses it only when start_task names it and the repository grant lists that exact

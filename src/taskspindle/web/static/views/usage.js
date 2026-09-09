@@ -1,5 +1,6 @@
 import { getJSON } from "../api.js";
 import { badge, emptyState, h, metric, s, sectionHeading, table } from "../dom.js";
+import { nativeOverageSummary } from "../native-overage.js";
 import { updateRouteQuery } from "../router.js";
 
 const GROUPS = ["provider", "day", "provider_day", "model", "mode", "repository_id"];
@@ -87,6 +88,7 @@ export async function renderUsage(route, { signal } = {}) {
     h("div", { class: "page-heading" }, h("div", {}, h("span", { class: "eyebrow", text: "Observed consumption" }), h("h1", { text: "Usage" }), h("p", { text: "Explore recorded token volume, outcomes, timing, and provider window telemetry." })), stale ? badge("stale", "Cached data") : null),
     controls(route),
     h("section", { class: "metric-grid" }, metric("Turns", compact(totals.turns), "Recorded"), metric("Input", compact(totals.input), "Recorded aggregate"), metric("Output", compact(totals.output), "Recorded aggregate"), metric("Estimated cost", totals.priced ? `$${totals.cost.toFixed(2)}` : "Unavailable", totals.priced ? `${totals.priced}/${totals.turns} turns priced` : "No priced turns")),
+    nativeOverageSummary(data.native_overage),
     h("div", { class: "usage-grid chart-grid" },
       h("section", { class: "panel" }, sectionHeading("Provider distribution", "Observed tokens"), usageChart(providerUsage, ["provider"], "Token distribution by provider")),
       h("section", { class: "panel" }, sectionHeading("Outcome distribution", "Recorded task states"), outcomeChart(data.outcomes)),
@@ -98,6 +100,6 @@ export async function renderUsage(route, { signal } = {}) {
       h("section", { class: "panel" }, sectionHeading("Violations", "Policy observations"), data.violations?.length ? table(["Worker", "Kind", "Count"], data.violations.map((row) => h("tr", {}, h("td", { text: row.provider }), h("td", { text: row.kind }), h("td", { text: row.count })))) : emptyState("No violations", "No violations were recorded.")),
       h("section", { class: "panel" }, sectionHeading("Window telemetry", "Provider reports"), data.windows?.length ? h("ul", { class: "window-list" }, data.windows.map((item) => h("li", {}, h("div", {}, h("strong", { text: item.provider }), badge(item.state)), h("p", { text: item.note })))) : emptyState("No window telemetry", "No provider window observations were recorded.")),
     ),
-    h("p", { class: "cost-note", text: `Token totals are recorded aggregates; turns without provider token telemetry contribute zero. ${data.cost_note || "Cost figures are estimates based on recorded usage and available pricing."}` }),
+    h("p", { class: "cost-note", text: `Token totals are recorded aggregates; turns without provider token telemetry are omitted from token totals. ${data.cost_note || "Cost figures are estimates based on recorded usage and available pricing."}` }),
   );
 }

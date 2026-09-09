@@ -72,7 +72,7 @@ def test_schema_two_upgrade_preserves_records_and_adds_nullable_selection(tmp_pa
             before = {table: _rows(store, table) for table in tables}
 
     with Store.open(path) as store:
-        assert store.schema_version() == 8
+        assert store.schema_version() == 9
         assert store.migrate() == []
         for table in tables:
             after = _rows(store, table)
@@ -81,6 +81,9 @@ def test_schema_two_upgrade_preserves_records_and_adds_nullable_selection(tmp_pa
                     assert row.pop("resolved_model") is None
                     assert row.pop("resolved_effort") is None
                     assert row.pop("provider_family") is None
+            if table == "turns":
+                for row in after:
+                    assert row.pop("native_overage") is None
             assert after == before[table]
         migrated = store.get_task(task.id)
         assert migrated.session_id == "retained-session"

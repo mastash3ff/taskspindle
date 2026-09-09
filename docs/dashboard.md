@@ -69,10 +69,15 @@ is entered through `subscriptions setup-extension`, never through a dashboard AP
   arms, revokes, or starts a recovery attempt. A "run live probes"
   button explicitly calls `/api/doctor?live=1`; an untouched dashboard reports doctor status as
   not run rather than treating the absence of a diagnostic as success. The old `#/providers`
-  location remains an alias for `#/workers`.
+  location remains an alias for `#/workers`. Native extra usage shows the current exact-profile
+  policy, account/worker control scope, eligibility and safe billing observations, with unknowns
+  preserved. Policy changes are read on refresh. Grok balances/caps and automatic-top-up settings
+  are read-only account diagnostics; they are not task charges or spending controls.
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
   choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
-  counts, window telemetry notes, and the cost-estimate disclaimer.
+  counts, window telemetry notes, and the cost-estimate disclaimer. Billing classifications count
+  all turns separately, including historical/tokenless unknown turns; native-overage observations
+  never turn token estimates or account balances into reported task charges.
 - **Subscriptions** — ChatGPT, Claude, Google AI, and Grok billing observations, including
   renewal/access-end dates, cancellation countdowns, freshness, account connection, and
   collection failures. Google AI is one subscription shared by Gemini/AGY. ChatGPT is

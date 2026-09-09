@@ -26,7 +26,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import auth_context, limits, provider_recovery, providers, quota, repos, units, usage, worktrees
+from . import (
+    auth_context,
+    limits,
+    native_overage,
+    provider_recovery,
+    providers,
+    quota,
+    repos,
+    units,
+    usage,
+    worktrees,
+)
 from .acp_client import AcpError, AcpWorker, PermissionPolicy, TurnResult
 from .agy_cli import AgyCliWorker
 from .agy_cli import model_catalog as cli_model_catalog
@@ -266,6 +277,7 @@ class _Run:
     #: The model that actually answered, when the wire or the session file said.
     reported_model: str | None = None
     session_model: str | None = None
+    continuation_model: str | None = None
     usage: usage.TurnUsage | None = None
     prompt_started_at: str | None = None
     prompt_ended_at: str | None = None
@@ -275,6 +287,8 @@ class _Run:
     provider_model_status_at_start: dict[str, Any] | None = None
     provider_auth_context_at_start: str | None = None
     quota_fingerprints_at_start: list[str] = field(default_factory=list)
+    native_service_succeeded: bool = False
+    policy_config_seen: bool = False
 
     @property
     def task_id(self) -> str:
@@ -380,6 +394,7 @@ async def run_worker(
             revision=int(pending["revision"]),
             kind=kind,
             prompt=pending["prompt"] or compose_prompt(task, kind),
+            continuation_model=(pending.get("native_overage") or {}).get("continuation_model"),
             warnings=_carried_warnings(task.warnings),
         )
         log.write(f"start task={task_id} state={task.state.value} kind={kind.value} boot={boot}")
@@ -489,7 +504,22 @@ async def _run_turn(
         auth_context.validate_contexts(profiles, os.environ)
     except ProfileError as exc:
         raise _Failure(exc.code, str(exc)) from exc
+    config_file = Path(os.environ.get("TASKSPINDLE_CONFIG", str(run.paths.config_file)))
+    run.policy_config_seen = config_file.exists()
+    if run.policy_config_seen:
+        profile = native_overage.current_profile(profile, profiles, config_file)
     run.profile = profile
+    try:
+        native_overage.admit(
+            run.store,
+            profile,
+            run.store.list_turns(run.task_id)[-1],
+            datetime.now(UTC),
+            model=_effective_model(run, profile),
+            parent_env=os.environ,
+        )
+    except TaskSpindleError as exc:
+        raise _Failure(exc.code, exc.message, details=exc.details) from exc
     run.provider_auth_context_at_start = _check_initial_auth_context(run, profile)
     run.provider_status_at_start = run.store.get_provider_status(limits.status_key(profile))
     run.provider_model_at_start = _effective_model(run, profile)
@@ -562,6 +592,7 @@ async def _run_turn(
         # them before settling so failure never discards useful partial work.
         run.result = worker.last_result
         if run.result is not None:
+            _record_native_observations(run, profile, run.result)
             await _record_usage(run, profile, workspace, run.result)
             _record_violations(run, run.result)
         current = run.store.get_task(run.task_id)
@@ -638,10 +669,14 @@ def _native_agy_worker(run: _Run, profile: Profile, workspace: Path, stderr_path
 
     try:
         command = prepare_launch(
-            binary=Path(profile.command[0]), workspace=workspace, task_dir=run.dir,
-            home=Path(run.child_env["HOME"]), mode=run.task.mode.value,
+            binary=Path(profile.command[0]),
+            workspace=workspace,
+            task_dir=run.dir,
+            home=Path(run.child_env["HOME"]),
+            mode=run.task.mode.value,
             allowed_prefixes=run.task.path_prefixes or (),
             verification_commands=run.task.verification_commands or (),
+            native_overage=profile.native_overage,
         )
     except (OSError, ValueError) as exc:
         raise _Failure("AGY_POLICY_UNAVAILABLE", str(exc)) from exc
@@ -725,7 +760,8 @@ def _resolve_profile(run: _Run, profiles: Mapping[str, Profile]) -> Profile:
 def _effective_model(run: _Run, profile: Profile) -> str | None:
     """The most specific model identity known for this turn."""
     return (
-        run.task.resolved_model
+        run.continuation_model
+        or run.task.resolved_model
         or run.session_model
         or run.task.requested_model
         or profile.model
@@ -741,7 +777,7 @@ def _capture_model_status_at_start(run: _Run, profile: Profile) -> None:
 def _check_initial_auth_context(run: _Run, profile: Profile) -> str:
     """Guard preflight as well as prompting against a changed login location or metadata."""
     current = auth_context.fingerprint(profile, os.environ)
-    if run.revision == 1:
+    if run.revision == 1 or profile.native_overage == "provider_managed":
         expected = run.store.get_task_auth_context(run.task_id) or run.provider_auth_context_at_start
         if expected is not None and expected != current:
             raise _Failure(
@@ -752,6 +788,34 @@ def _check_initial_auth_context(run: _Run, profile: Profile) -> str:
 
 def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
     """Keep the permit check and success comparison snapshot on one database revision."""
+    config_file = Path(os.environ.get("TASKSPINDLE_CONFIG", str(run.paths.config_file)))
+    if config_file.exists() or run.policy_config_seen:
+        # Only policies are reloaded here; profile identity remains bound to this worker.
+        settings = load_config(config_file)
+        from dataclasses import replace
+
+        from .config import native_overage_policies
+
+        selected = settings.get("native_overage", {})
+        if isinstance(selected, dict):
+            settings = dict(settings) | {
+                "native_overage": {profile.id: selected[profile.id]} if profile.id in selected else {}
+            }
+        profile = replace(
+            profile, native_overage=native_overage_policies(settings, {profile.id: profile})[profile.id]
+        )
+    try:
+        projection = native_overage.admit(
+            run.store,
+            profile,
+            run.store.list_turns(run.task_id)[-1],
+            datetime.now(UTC),
+            model=_effective_model(run, profile),
+            parent_env=os.environ,
+            prompting=True,
+        )
+    except TaskSpindleError as exc:
+        raise _Failure(exc.code, exc.message, details=exc.details) from exc
     key = limits.status_key(profile)
     model = _effective_model(run, profile)
     run.provider_status_at_start = run.store.get_provider_status(key)
@@ -768,6 +832,13 @@ def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
     # Availability selection applies to a newly launched managed task. Existing tasks keep their
     # established continuation/recovery behavior while still recording real provider outcomes.
     if run.revision != 1:
+        if profile.native_overage != "provider_managed":
+            return
+        availability = provider_availability(
+            run.store, profile, now=datetime.now(UTC), model=model, parent_env=os.environ, task_id=run.task_id
+        )
+        if projection["eligibility"] != "overage" and availability["state"] not in {"ok", "unknown"}:
+            raise _Failure(PROVIDER_UNAVAILABLE, "Provider restrictions block this continuation.")
         return
     bound_context = run.store.get_task_auth_context(run.task_id)
     if bound_context is not None and bound_context != current_context:
@@ -786,9 +857,14 @@ def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
             raise _Failure(exc.code, exc.message, retryable=False, details=exc.details) from exc
     else:
         availability = provider_availability(
-            run.store, profile, now=datetime.now(UTC), model=model, parent_env=os.environ,
+            run.store,
+            profile,
+            now=datetime.now(UTC),
+            model=model,
+            parent_env=os.environ,
+            task_id=run.task_id,
         )
-        if availability["state"] not in ("ok", "unknown"):
+        if projection["eligibility"] != "overage" and availability["state"] not in ("ok", "unknown"):
             raise _Failure(
                 PROVIDER_UNAVAILABLE,
                 f"Provider is {availability['state']}: {availability['reason']}",
@@ -893,6 +969,28 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
         return
     await _apply_session_mode(run, agent)
     run.session_model = agent.session_model
+    if run.profile and run.profile.family == "grok":
+        selections = [
+            option.get("currentValue")
+            for option in agent.session_config_options
+            if option.get("id") == "model"
+        ]
+        if len(selections) == 1 and isinstance(selections[0], str) and selections[0]:
+            run.session_model = selections[0]
+        elif (
+            not selections
+            and run.profile.model
+            and run.profile.effort
+            and run.profile.command == providers._grok_command(run.profile.model, run.profile.effort)
+        ):
+            # Only the exact supported native CLI shape binds --model. Custom
+            # launchers must provide the actual restored selection over ACP.
+            run.session_model = run.profile.model
+    run.store.update_turn_native_overage(run.turn_id, {"session_model": run.session_model})
+    if run.continuation_model and run.session_model != run.continuation_model:
+        raise _Failure(
+            "RESUME_MODEL_CHANGED", "The restored session did not confirm the original model identity."
+        )
     if run.session_model is not None:
         run.log.write(f"session model from ACP: {run.session_model}")
 
@@ -1036,11 +1134,64 @@ def _record_provider_limit(run: _Run, profile: Profile, verdict: limits.Classifi
     run.log.write(f"provider {key} {verdict.provider_state} ({verdict.code})")
 
 
+def _record_native_observations(
+    run: _Run,
+    profile: Profile,
+    result: TurnResult,
+) -> tuple[dict[str, Any], set[bool]]:
+    observed: dict[str, Any] = {}
+    flags: set[bool] = set()
+    ambiguous = False
+    for info in result.capture.rate_limits:
+        safe = native_overage.normalize_observation(info)
+        ambiguous |= "in_use" not in safe
+        if safe:
+            run.store.record_native_overage_observation(
+                limits.status_key(profile),
+                run.task_id,
+                run.turn_id,
+                safe,
+                now(),
+                run.provider_auth_context_at_start,
+            )
+            observed.update(safe)
+            if "in_use" in safe:
+                flags.add(safe["in_use"])
+    if ambiguous:
+        observed["in_use_unknown"] = True
+        observed.pop("in_use", None)
+    if True in flags:
+        observed["in_use"] = True
+    if observed:
+        classification = (
+            "unknown"
+            if ambiguous
+            else "mixed"
+            if flags == {True, False}
+            else "native_overage"
+            if flags == {True}
+            else "included"
+            if flags == {False}
+            else "unknown"
+        )
+        run.store.update_turn_native_overage(
+            run.turn_id,
+            {
+                "observed": observed,
+                "observed_at": now(),
+                "source": "rate_limit_event",
+                "billing_classification": classification,
+            },
+        )
+    return observed, flags
+
+
 def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> None:
     """Record observed windows without clearing a sibling's newer quota or auth failure."""
     key = limits.status_key(profile)
     rejected = False
     model = _effective_model(run, profile)
+    observed, flags = _record_native_observations(run, profile, result)
     for info in result.capture.rate_limits:
         window = limits.rate_limit_window(info)
         run.store.insert_provider_window(
@@ -1055,6 +1206,36 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
         )
         if window["status"] == "rejected" and quota.window_applies(window["window"], model):
             rejected = True
+    turn_policy = run.store.list_turns(run.task_id)[-1].get("native_overage") or {}
+    using_overage = turn_policy.get("eligibility") == "overage" or True in flags
+    if using_overage:
+        success = (
+            not run.cancelled
+            and result.stop_reason != "cancelled"
+            and not rejected
+            and observed.get("status") != "rejected"
+        )
+        # Explicit overage usage can coexist with a rejected included window.
+        if (
+            True in flags
+            and observed.get("status") != "rejected"
+            and not run.cancelled
+            and result.stop_reason != "cancelled"
+        ):
+            success = True
+        current = auth_context.fingerprint(profile, os.environ)
+        success = success and current == run.provider_auth_context_at_start
+        native_overage.finish(
+            run.store,
+            profile,
+            run.turn_id,
+            success,
+            now=datetime.now(UTC),
+            parent_env=os.environ,
+            code=None if success else "NATIVE_REFUSAL",
+        )
+        run.native_service_succeeded = success
+        return
     if rejected:
         if run.revision == 1:
             provider_recovery.finish(
@@ -1450,6 +1631,19 @@ def _complete_turn(run: _Run) -> None:
         return
     run.turn_completed = True
     profile = run.profile
+    if not run.native_service_succeeded:
+        if profile is not None:
+            native_overage.finish(
+                run.store,
+                profile,
+                run.turn_id,
+                False,
+                now=datetime.now(UTC),
+                parent_env=os.environ,
+                code=(run.task.error or {}).get("code") or run.task.state.value,
+            )
+        else:
+            run.store.finish_native_overage(run.turn_id, False, run.task.state.value)
     with contextlib.suppress(StoreError):
         run.store.complete_turn(
             run.turn_id,
@@ -1464,6 +1658,7 @@ def _complete_turn(run: _Run) -> None:
                 "resolved_model": run.task.resolved_model,
                 "resolved_effort": run.task.resolved_effort,
                 "reported_model": run.reported_model,
+                "session_model": run.session_model,
                 "auth": profile.auth if profile else None,
                 "gateway_host": profile.gateway_host if profile else None,
                 "agent": run.agent_info or None,

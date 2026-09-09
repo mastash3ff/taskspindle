@@ -189,6 +189,7 @@ def transition(
     *,
     reason: str,
     expected_state_version: int | None = None,
+    native_quota_continuation: bool = False,
     **fields: Any,
 ) -> TaskRecord:
     """Move a task to ``to_state``, applying ``fields`` and the audit event atomically."""
@@ -205,6 +206,8 @@ def transition(
                 },
             )
         allowed = LEGAL_TRANSITIONS.get(record.state, frozenset())
+        if native_quota_continuation and record.state is TaskState.FAILED and to_state is TaskState.RESUMING:
+            allowed = frozenset({TaskState.RESUMING})
         if to_state not in allowed:
             raise TaskSpindleError(
                 ILLEGAL_TRANSITION,
@@ -311,6 +314,37 @@ def _last_success_at(row: dict[str, Any] | None) -> str | None:
 
 
 def provider_availability(
+    store: ProviderStatusReader,
+    profile: Profile,
+    *,
+    now: datetime,
+    model: str | None = None,
+    parent_env: Mapping[str, str] | None = None,
+    defer_model: bool = False,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    from . import native_overage, quota
+
+    view = _provider_availability(
+        store, profile, now=now, model=model, parent_env=parent_env, defer_model=defer_model
+    )
+    evidence = quota.evaluate(store, profile, now, model, parent_env, defer_model)
+    native = native_overage.project(store, profile, now, model, parent_env, task_id, evidence)
+    view["native_overage"] = native
+    if native["admission_reason"] == "hard_provider_block" and view["state"] in {"ok", "unknown"}:
+        view.update(state="throttled", next_action="wait", retry_eligible=False,
+                    reason="A provider hard limit remains active.")
+    if native["eligibility"] == "overage" and view["state"] in {"throttled", "ok", "unknown"}:
+        view.update(
+            state="unknown",
+            next_action="start",
+            retry_eligible=True,
+            reason="Standing policy permits a provider-enforced native overage attempt.",
+        )
+    return view
+
+
+def _provider_availability(
     store: ProviderStatusReader,
     profile: Profile,
     *,

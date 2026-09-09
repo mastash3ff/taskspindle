@@ -39,7 +39,7 @@ def parse_time(value: Any) -> datetime | None:
 
 
 def parse_billing(value: Any) -> dict[str, Any] | None:
-    """Allowlist the current native schema; money, principal IDs and raw data are discarded."""
+    """Allowlist quota fields; extra usage is parsed separately from account identity."""
     if not isinstance(value, dict) or not isinstance(value.get("config"), dict):
         return None
     config = value["config"]
@@ -63,6 +63,75 @@ def parse_billing(value: Any) -> dict[str, Any] | None:
         "window": window,
         "period_start": start.isoformat().replace("+00:00", "Z") if start else None,
         "reset_at": end.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _amount(value: Any) -> int | None:
+    # Preserve integer USD cents exactly, including in the JavaScript dashboard.
+    return value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+
+
+def _cent(value: Any) -> int | None:
+    # Grok's native BillingConfig Cent is {val: i64}, in USD cents. The
+    # documented proto3 representation of zero is {}, not an absent field.
+    if not isinstance(value, dict):
+        return None
+    return _amount(0 if value == {} else value.get("val"))
+
+
+def parse_auto_topup(value: Any) -> dict[str, Any] | None:
+    """Read the native rule; never create or change a purchase instruction."""
+    rule = value.get("rule") if isinstance(value, dict) else None
+    if not isinstance(rule, dict):
+        return None
+    enabled = rule.get("enabled", False)  # proto3 omits false
+    return {
+        "enabled": enabled if type(enabled) is bool else None,
+        "topup_amount": _cent(rule.get("topupAmount")),
+        "max_amount_per_month": _cent(rule.get("maxAmountPerMonth")),
+    }
+
+
+def parse_extra_usage(value: Any) -> dict[str, Any]:
+    """Allowlist native account billing; these are not per-task charges.
+
+    Units and zero semantics: xai-org/grok-build,
+    crates/codegen/xai-grok-shell/src/extensions/billing.rs (Cent).
+    on_demand_enabled is a remote feature flag, not user spending permission.
+    """
+    value = value if isinstance(value, dict) else {}
+    config = value.get("config")
+    config = config if isinstance(config, dict) else {}
+    enabled = value.get("on_demand_enabled")
+    return {
+        "on_demand_enabled": enabled if type(enabled) is bool else None,
+        "prepaid_balance": _cent(config.get("prepaidBalance")),
+        "on_demand_cap": _cent(config.get("onDemandCap")),
+        "on_demand_used": _cent(config.get("onDemandUsed")),
+        "unit": "usd_cents",
+        "currency": "USD",
+        "auto_topup": None,
+    }
+
+
+def safe_extra_usage(value: Any, observed_at: str | None) -> dict[str, Any] | None:
+    """Revalidate persisted normalized observations at the public boundary."""
+    if not isinstance(value, dict) or value.get("unit") != "usd_cents" or value.get("currency") != "USD":
+        return None
+    enabled = value.get("on_demand_enabled")
+    rule = value.get("auto_topup")
+    topup = None
+    if isinstance(rule, dict):
+        topup = {
+            "enabled": rule.get("enabled") if type(rule.get("enabled")) is bool else None,
+            "topup_amount": _amount(rule.get("topup_amount")),
+            "max_amount_per_month": _amount(rule.get("max_amount_per_month")),
+        }
+    return {
+        "on_demand_enabled": enabled if type(enabled) is bool else None,
+        **{key: _amount(value.get(key)) for key in ("prepaid_balance", "on_demand_cap", "on_demand_used")},
+        "unit": "usd_cents", "currency": "USD", "auto_topup": topup,
+        "source": "grok_billing", "observed_at": observed_at,
     }
 
 
@@ -200,6 +269,7 @@ def check_grok(profile: Profile, parent_env: Mapping[str, str]) -> dict[str, Any
         "period_start": None,
         "reset_at": None,
         "error_code": "CHECK_FAILED",
+        "billing": None,
         "detail": "The native quota check did not establish current quota.",
     }
     deadline = time.monotonic() + TIMEOUT_S - 1  # reserve owned-process cleanup within 30 seconds
@@ -258,6 +328,15 @@ def check_grok(profile: Profile, parent_env: Mapping[str, str]) -> dict[str, Any
                     error_code=None,
                     detail="Grok reported quota usage; model-turn access and account binding are unverified.",
                 )
+                extra = parse_extra_usage(billing)
+                # This extension is optional. Its absence or timeout cannot erase
+                # the quota observation, and shares the existing bounded deadline.
+                try:
+                    topup = _rpc(process, selector, "_x.ai/auto-topup-rule", 3, deadline, buffer, {})
+                    extra["auto_topup"] = parse_auto_topup(topup)
+                except CheckFailure:
+                    pass
+                result["billing"] = safe_extra_usage(extra, result["checked_at"])
     except CheckFailure as exc:
         result["error_code"] = exc.code
     except subprocess.TimeoutExpired:
@@ -274,6 +353,7 @@ def check_grok(profile: Profile, parent_env: Mapping[str, str]) -> dict[str, Any
                 window=None,
                 period_start=None,
                 reset_at=None,
+                billing=None,
                 detail="The native quota check did not establish current quota.",
             )
     if result["error_code"] in {"METHOD_UNAVAILABLE", "SCHEMA_UNAVAILABLE", "UNSUPPORTED_PROFILE"}:

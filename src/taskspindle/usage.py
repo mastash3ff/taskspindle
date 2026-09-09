@@ -5,8 +5,8 @@ turn's own token counts, and Grok sends a ``turn_completed`` update carrying the
 agent reported nothing does TaskSpindle read the Claude session file the adapter's own Claude Code
 wrote -- and only the one file for this turn's session, never the rest of ``~/.claude/projects``.
 
-Costs are estimates. A subscription seat has no per-token bill; the number is what the same tokens
-would have cost at the published API rates, so that seat usage can be compared and budgeted. Grok
+Costs are estimates: the number is what the same tokens would have cost at published API rates.
+OAuth sessions can consume provider-managed extra usage; an estimate is not proof of a charge. Grok
 reports its own ``costUsdTicks`` whose unit is not documented; it is kept raw and never converted.
 """
 
@@ -437,6 +437,40 @@ def _stats(values: list[int]) -> dict[str, Any]:
     }
 
 
+def native_overage_report(
+    rows: list[dict[str, Any]], *, group_by: str,
+    repositories: Mapping[str, str | None] | None = None,
+) -> dict[str, Any]:
+    """Count all turns, including historical/tokenless turns, without pricing account balances."""
+    groups: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
+    unknown = 0
+    modes = {str(row["task_id"]): row.get("mode") for row in rows}
+    for row in rows:
+        native = row.get("native_overage")
+        native = native if isinstance(native, dict) else {}
+        classification = native.get("billing_classification")
+        if classification not in {"included", "native_overage", "mixed"}:
+            classification = "unknown"
+            unknown += 1
+        policy = native.get("policy")
+        if policy not in {"observe_only", "provider_managed"}:
+            policy = "unknown"
+        key = _group_key(row, modes, group_by) | {"policy": policy, "billing_classification": classification}
+        bucket = groups.setdefault(tuple(sorted(key.items())), {**key, "turns": 0})
+        bucket["turns"] += 1
+        if group_by == "repository_id":
+            bucket["repository_path"] = (repositories or {}).get(row.get("repository_id"))
+    return {
+        "total_turns": len(rows), "observed_turns": len(rows) - unknown, "unknown_turns": unknown,
+        "groups": list(groups.values()),
+        "note": (
+            "Billing classification uses provider observations; authorization alone is not a charge. "
+            "Historical or missing telemetry remains unknown. Account balances and spending caps "
+            "are shared observations, not task charges. Token estimates are reported separately."
+        ),
+    }
+
+
 def report(
     store: UsageReader,
     *,
@@ -512,6 +546,10 @@ def report(
         for row in store.violation_counts(since=since)
         if provider is None or row["provider"] == provider
     ]
+    overage_rows = store.list_native_overage_turns(since=since, provider=provider)
+    overage_repositories = {
+        row["id"]: row.get("display_path") for row in store.list_repositories()
+    } if group_by == "repository_id" else {}
     return {
         "since": since,
         "provider": provider,
@@ -519,8 +557,11 @@ def report(
         "generated_at": moment.isoformat(timespec="seconds").replace("+00:00", "Z"),
         "cost_note": (
             "cost_estimate_usd is what the tokens would cost at the published API rates "
-            f"(price table {PRICE_TABLE_VERSION}); subscription seats are not billed per token, "
-            "and Grok's own cost figure is kept raw and not converted."
+            f"(price table {PRICE_TABLE_VERSION}); it is not a reported charge. OAuth sessions can "
+            "consume provider-managed extra usage. Grok's cost ticks remain raw and unconverted."
+        ),
+        "native_overage": native_overage_report(
+            overage_rows, group_by=group_by, repositories=overage_repositories,
         ),
         "usage": list(groups.values()),
         "outcomes": outcomes,

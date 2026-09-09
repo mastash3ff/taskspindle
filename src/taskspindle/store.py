@@ -55,6 +55,13 @@ class UsageReader(ProviderStatusReader, Protocol):
         task_id: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
+    def list_native_overage_turns(
+        self,
+        *,
+        since: str | None = None,
+        provider: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
     def list_provider_status(self) -> list[dict[str, Any]]: ...
 
     def latest_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]: ...
@@ -554,9 +561,44 @@ SELECT p.provider, CASE p.window WHEN 'seven_day_opus' THEN 'model_family'
    );
 """
 
+_MIGRATION_9 = """
+ALTER TABLE turns ADD COLUMN native_overage TEXT;
+CREATE TABLE native_overage_attempts (
+    claim_key TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    turn_id INTEGER NOT NULL REFERENCES turns(id),
+    status_key TEXT NOT NULL,
+    auth_context TEXT NOT NULL,
+    model TEXT,
+    evidence_fingerprints TEXT NOT NULL,
+    policy_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome_code TEXT
+);
+CREATE TABLE native_overage_observations (
+    id INTEGER PRIMARY KEY,
+    status_key TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    turn_id INTEGER NOT NULL REFERENCES turns(id),
+    observed TEXT NOT NULL,
+    auth_context TEXT,
+    source TEXT NOT NULL,
+    observed_at TEXT NOT NULL
+);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
-    (1, _MIGRATION_1), (2, _MIGRATION_2), (3, _MIGRATION_3), (4, _MIGRATION_4),
-    (5, _MIGRATION_5), (6, _MIGRATION_6), (7, _MIGRATION_7), (8, _MIGRATION_8),
+    (1, _MIGRATION_1),
+    (2, _MIGRATION_2),
+    (3, _MIGRATION_3),
+    (4, _MIGRATION_4),
+    (5, _MIGRATION_5),
+    (6, _MIGRATION_6),
+    (7, _MIGRATION_7),
+    (8, _MIGRATION_8),
+    (9, _MIGRATION_9),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -933,24 +975,40 @@ class Store:
         stop_reason: str | None = None,
         response: str | None = None,
         attribution: dict[str, Any] | None = None,
+        native_overage: dict[str, Any] | None = None,
     ) -> int:
         kind_value = kind.value if isinstance(kind, Enum) else kind
+        columns = [
+            "task_id",
+            "revision",
+            "kind",
+            "prompt",
+            "session_id",
+            "started_at",
+            "ended_at",
+            "stop_reason",
+            "response",
+            "attribution",
+        ]
+        values = [
+            task_id,
+            revision,
+            kind_value,
+            prompt,
+            session_id,
+            started_at or now(),
+            ended_at,
+            stop_reason,
+            response,
+            _json_or_none(attribution),
+        ]
+        if self.schema_version() >= 9:
+            columns.append("native_overage")
+            values.append(_json_or_none(native_overage))
         with self._guard(), self.transaction() as conn:
             cur = conn.execute(
-                "INSERT INTO turns(task_id, revision, kind, prompt, session_id, started_at, "
-                "ended_at, stop_reason, response, attribution) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    task_id,
-                    revision,
-                    kind_value,
-                    prompt,
-                    session_id,
-                    started_at or now(),
-                    ended_at,
-                    stop_reason,
-                    response,
-                    _json_or_none(attribution),
-                ),
+                f"INSERT INTO turns({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+                values,
             )
             return int(cur.lastrowid or 0)
 
@@ -988,8 +1046,245 @@ class Store:
         for row in rows:
             turn = dict(row)
             turn["attribution"] = _loads(turn["attribution"])
+            turn["native_overage"] = _loads(turn.get("native_overage"))
             turns.append(turn)
         return turns
+
+    def update_turn_native_overage(self, turn_id: int, fields: Mapping[str, Any]) -> None:
+        with self.transaction():
+            row = self._conn.execute("SELECT native_overage FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"no such turn: {turn_id}")
+            value = (_loads(row[0]) or {}) | dict(fields)
+            self._conn.execute(
+                "UPDATE turns SET native_overage = ? WHERE id = ?", (json.dumps(value), turn_id)
+            )
+
+    def list_native_overage_turns(
+        self, *, since: str | None = None, provider: str | None = None
+    ) -> list[dict[str, Any]]:
+        from .native_overage import unknown
+
+        conditions, params = [], []
+        for clause, value in (("r.started_at >= ?", since), ("t.provider = ?", provider)):
+            if value is not None:
+                conditions.append(clause)
+                params.append(value)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        rows = self._conn.execute(
+            "SELECT r.id AS turn_id, r.task_id, r.revision, t.provider, t.mode, "
+            "COALESCE(t.resolved_model, t.requested_model) AS model, t.repository_id, "
+            "r.started_at AS captured_at, r.native_overage FROM turns r JOIN tasks t ON t.id = r.task_id"
+            + where
+            + " ORDER BY r.id",
+            params,
+        )
+        return [
+            dict(row) | {"native_overage": unknown() | (_loads(row["native_overage"]) or {})} for row in rows
+        ]
+
+    def get_native_overage_attempt(self, key: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM native_overage_attempts WHERE claim_key = ?", (key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_native_overage_attempts(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._conn.execute("SELECT * FROM native_overage_attempts")]
+
+    def claim_native_overage(
+        self, key: str, task_id: str, turn_id: int, evidence: Mapping[str, Any], policy_fingerprint: str
+    ) -> bool:
+        with self.transaction():
+            holder = self._conn.execute(
+                "SELECT 1 FROM native_overage_attempts WHERE status_key = ? AND auth_context = ? "
+                "AND model IS ? AND state IN ('claimed', 'prompting') AND turn_id != ? LIMIT 1",
+                (evidence["status_key"], evidence["auth_context"]["fingerprint"], evidence["model"], turn_id),
+            ).fetchone()
+            if holder:
+                return False
+            # Model selection may refine a pre-prompt claim. The old key records why
+            # it ended, and cannot remain an unexplained account-wide pending attempt.
+            previous = self._conn.execute(
+                "SELECT claim_key, state FROM native_overage_attempts WHERE turn_id = ? AND claim_key != ? "
+                "AND state IN ('claimed', 'prompting')",
+                (turn_id, key),
+            ).fetchall()
+            if any(row["state"] == "prompting" for row in previous):
+                return False
+            existing = self.get_native_overage_attempt(key)
+            if existing and existing["state"] == "superseded":
+                self._conn.execute("DELETE FROM native_overage_attempts WHERE claim_key = ?", (key,))
+                existing = None
+            if existing and not (
+                existing["state"] == "succeeded"
+                or (existing["state"] == "claimed" and existing["turn_id"] == turn_id)
+            ):
+                return False
+            for row in previous:
+                self._conn.execute(
+                    "UPDATE native_overage_attempts SET state = 'superseded', finished_at = ?, "
+                    "outcome_code = 'MODEL_REFINED_BEFORE_PROMPT' WHERE claim_key = ?",
+                    (now(), row["claim_key"]),
+                )
+            if existing:
+                return existing["state"] == "succeeded" or (
+                    existing["state"] == "claimed" and existing["turn_id"] == turn_id
+                )
+            self._conn.execute(
+                "INSERT INTO native_overage_attempts(claim_key, task_id, turn_id, status_key, "
+                "auth_context, model, evidence_fingerprints, policy_fingerprint, state, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)",
+                (
+                    key,
+                    task_id,
+                    turn_id,
+                    evidence["status_key"],
+                    evidence["auth_context"]["fingerprint"],
+                    evidence["model"],
+                    json.dumps(evidence["evidence_fingerprints"]),
+                    policy_fingerprint,
+                    now(),
+                ),
+            )
+            return True
+
+    def mark_native_overage_prompting(self, key: str, turn_id: int) -> bool:
+        with self.transaction():
+            row = self._conn.execute("SELECT native_overage FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            saved = _loads(row[0]) if row else None
+            if not saved or saved.get("prompt_started_at"):
+                return False
+            self.update_turn_native_overage(turn_id, {"prompt_started_at": now()})
+            self._conn.execute(
+                "UPDATE native_overage_attempts SET state = 'prompting' "
+                "WHERE claim_key = ? AND turn_id = ? AND state = 'claimed'",
+                (key, turn_id),
+            )
+            return True
+
+    def finish_native_overage(
+        self, turn_id: int, success: bool, code: str | None = None, *, final_claim_key: str | None = None
+    ) -> None:
+        with self.transaction():
+            row = self._conn.execute("SELECT native_overage FROM turns WHERE id = ?", (turn_id,)).fetchone()
+            saved = _loads(row[0]) if row else None
+            key = saved.get("claim_key") if saved else None
+            if not key:
+                return
+            if final_claim_key and final_claim_key != key:
+                original = self.get_native_overage_attempt(key)
+                if original:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO native_overage_attempts "
+                        "SELECT ?, task_id, turn_id, status_key, auth_context, model, evidence_fingerprints, "
+                        "policy_fingerprint, state, created_at, finished_at, outcome_code "
+                        "FROM native_overage_attempts WHERE claim_key = ?",
+                        (final_claim_key, key),
+                    )
+                    clause = " AND state IN ('claimed', 'prompting')" if success else ""
+                    self._conn.execute(
+                        "UPDATE native_overage_attempts SET state = ?, finished_at = ?, outcome_code = ? "
+                        "WHERE claim_key = ?" + clause,
+                        ("succeeded" if success else "refused", now(), code, final_claim_key),
+                    )
+            # A sibling success cannot erase a refusal, even when it completed later.
+            clause = " AND state IN ('claimed', 'prompting')" if success else ""
+            self._conn.execute(
+                "UPDATE native_overage_attempts SET state = ?, finished_at = ?, outcome_code = ? "
+                "WHERE claim_key = ?" + clause,
+                ("succeeded" if success else "refused", now(), code, key),
+            )
+
+    def record_native_overage_observation(
+        self,
+        status_key: str,
+        task_id: str,
+        turn_id: int,
+        observed: Mapping[str, Any],
+        observed_at: str,
+        auth_context: str | None = None,
+    ) -> None:
+        from .quota import _time
+
+        with self.transaction():
+            prior = self.latest_native_overage_observation(status_key)
+            previous = prior["observed"] if prior and prior.get("auth_context") == auth_context else {}
+            incoming = dict(observed)
+            paid_fields = {"status", "disabled_reason", "resets_at"}
+            prior_blocked = previous.get("status") == "rejected" or previous.get("disabled_reason") not in {
+                None,
+                "fetch_error",
+                "unknown",
+            }
+            if prior_blocked and incoming.get("disabled_reason") in {"fetch_error", "unknown"}:
+                incoming.pop("disabled_reason", None)
+            paid_change = bool(paid_fields & incoming.keys())
+            affirmative = incoming.get("status") in {"allowed", "allowed_warning"} and (
+                incoming.get("disabled_reason") in {None, "fetch_error", "unknown"}
+            )
+            if paid_change and affirmative:
+                row = self._conn.execute(
+                    "SELECT started_at, native_overage FROM turns WHERE id = ?", (turn_id,)
+                ).fetchone()
+                saved = (_loads(row["native_overage"]) or {}) if row else {}
+                started = _time(saved.get("prompt_started_at") or (row["started_at"] if row else None))
+                denied_at = _time(previous.get("paid_observed_at"))
+                if (
+                    prior_blocked
+                    and previous.get("paid_turn_id") != turn_id
+                    and (started is None or denied_at is None or denied_at >= started)
+                ):
+                    # An already running sibling cannot erase a refusal observed after it began.
+                    incoming = {key: value for key, value in incoming.items() if key not in paid_fields}
+                    paid_change = False
+            same_source = previous.get("paid_turn_id") == turn_id
+            same_paid = bool(
+                paid_change
+                and same_source
+                and not (affirmative and prior_blocked)
+                and previous.get("paid_observed_at")
+                and all(previous.get(key) == value for key, value in incoming.items() if key in paid_fields)
+            )
+            if same_paid:
+                paid_change = False
+            if paid_change:
+                concrete_reason = incoming.get("disabled_reason") not in {None, "fetch_error", "unknown"}
+                concrete_denial = incoming.get("status") == "rejected" or concrete_reason
+                if (
+                    concrete_denial
+                    and "resets_at" not in incoming
+                    and (
+                        not same_source
+                        or not prior_blocked
+                        or incoming.get("disabled_reason") != previous.get("disabled_reason")
+                    )
+                ):
+                    previous = {key: value for key, value in previous.items() if key != "resets_at"}
+                generation = previous.get("paid_generation", 0)
+                if affirmative and prior_blocked:
+                    generation += 1
+                if "status" in incoming:
+                    # Explicit available status clears old disabled settings. A rejection
+                    # without a supplied reset never inherits a stale passed reset.
+                    clear = paid_fields if affirmative else {"status", "resets_at"}
+                    previous = {key: value for key, value in previous.items() if key not in clear}
+                incoming.update(
+                    paid_turn_id=turn_id, paid_observed_at=observed_at, paid_generation=generation
+                )
+            merged = previous | incoming
+            self._conn.execute(
+                "INSERT INTO native_overage_observations(status_key, task_id, turn_id, "
+                "observed, auth_context, source, observed_at) VALUES (?, ?, ?, ?, ?, 'rate_limit_event', ?)",
+                (status_key, task_id, turn_id, json.dumps(merged), auth_context, observed_at),
+            )
+
+    def latest_native_overage_observation(self, status_key: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM native_overage_observations WHERE status_key = ? ORDER BY id DESC LIMIT 1",
+            (status_key,),
+        ).fetchone()
+        return dict(row) | {"observed": _loads(row["observed"])} if row else None
 
     # -- checks ---------------------------------------------------------------------
 

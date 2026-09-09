@@ -98,6 +98,7 @@ def prepare_launch(
     mode: str,
     allowed_prefixes: Sequence[str],
     verification_commands: Sequence[str],
+    native_overage: str = "observe_only",
 ) -> tuple[str, ...]:
     """Prepare persistent private state and return argv before model/stream flags.
 
@@ -108,6 +109,8 @@ def prepare_launch(
     from .agy_cli_adapter import require_cached_token
     from .providers import AGY_PIN_ENV, ProfileError
 
+    if native_overage not in {"observe_only", "provider_managed"}:
+        raise ValueError("invalid native overage policy")
     if mode not in {"consult", "review", "implement"}:
         raise ValueError(f"unsupported native AGY mode: {mode}")
     binary, workspace, task_dir, home = (path.resolve() for path in (binary, workspace, task_dir, home))
@@ -165,11 +168,20 @@ def prepare_launch(
         deny.append("write_file(*)")
     allow = [f"read_file({workspace})"]
     allow.extend(f"write_file({path})" for path in scopes)
-    settings = _file(policy / "settings.json", json.dumps({
-        "artifactReviewPolicy": "asks-for-review",
-        "enableTerminalSandbox": True, "allowNonWorkspaceAccess": False,
-        "useG1Credits": False, "permissions": {"deny": deny, "ask": [], "allow": allow},
-    }, indent=2) + "\n")
+    settings = _file(
+        policy / "settings.json",
+        json.dumps(
+            {
+                "artifactReviewPolicy": "asks-for-review",
+                "enableTerminalSandbox": True,
+                "allowNonWorkspaceAccess": False,
+                "useG1Credits": native_overage == "provider_managed",
+                "permissions": {"deny": deny, "ask": [], "allow": allow},
+            },
+            indent=2,
+        )
+        + "\n",
+    )
 
     # The transport creates the process group; a second session here would hide
     # native descendants from its SIGINT/SIGTERM cancellation sequence.
