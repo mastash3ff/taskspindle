@@ -715,7 +715,9 @@ def _resolve_profile(run: _Run, profiles: Mapping[str, Profile]) -> Profile:
             allow_metered=run.task.allow_metered,
         )
         require_task_profile(run.task, profile)
-        return profile
+        return providers.with_task_selection(
+            profile, model=run.task.requested_model, effort=run.task.requested_effort,
+        )
     except ProfileError as exc:
         raise _Failure(exc.code, str(exc)) from exc
     except TaskSpindleError as exc:
@@ -892,6 +894,10 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
         await _configure_agy_session(run, agent)
         return
     await _apply_session_mode(run, agent)
+    if run.profile and run.profile.family == "claude" and run.profile.effort:
+        # The adapter can replace options.effort with a persisted setting while opening a
+        # session. Apply and confirm the task selection after both new_session and load_session.
+        await agent.set_config_option(run.session_id, "effort", run.profile.effort)
     run.session_model = agent.session_model
     if run.session_model is not None:
         run.log.write(f"session model from ACP: {run.session_model}")
