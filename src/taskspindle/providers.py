@@ -48,6 +48,7 @@ __all__ = [
     "reviewer_independent",
     "session_mode",
     "session_options",
+    "with_task_selection",
     "write_grok_overlay",
 ]
 
@@ -461,6 +462,30 @@ def profile_for_task(
     return profile
 
 
+def with_task_selection(profile: Profile, *, model: str | None, effort: str | None) -> Profile:
+    """Apply saved built-in task overrides without rewriting configured provider commands.
+
+    AGY resolves its own selection against its authenticated model catalog.
+    """
+    if profile.family not in {"claude", "grok"} or (model is None and effort is None):
+        return profile
+    if not profile.first_class:
+        raise ProfileError(
+            "PROFILE_INVALID",
+            "Per-task model and effort overrides require the built-in Claude or Grok profile; "
+            "configure the selection on a custom profile instead.",
+        )
+    for value in (model, effort):
+        if value is not None and not value.strip():
+            raise ProfileError("PROFILE_INVALID", "Task model and effort must not be empty.")
+    selected = replace(profile, model=model or profile.model, effort=effort or profile.effort)
+    if profile.family == "grok":
+        selected = replace(selected, command=_grok_command(
+            selected.model or _GROK_DEFAULT_MODEL, selected.effort or _GROK_DEFAULT_EFFORT,
+        ))
+    return selected
+
+
 def launch_command(profile: Profile, mode: str) -> tuple[str, ...]:
     """The argv a worker launches ``profile`` with for a task in ``mode``.
 
@@ -712,4 +737,6 @@ def session_options(profile: Profile) -> dict[str, Any]:
     }
     if profile.model:
         options["model"] = profile.model
+    if profile.effort:
+        options["effort"] = profile.effort
     return {"claudeCode": {"options": options}}

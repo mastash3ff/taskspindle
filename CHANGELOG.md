@@ -1,6 +1,19 @@
 # Changelog
 
-## v0.4.0 (unreleased)
+## v0.4.0
+
+- **Native extra usage.** Exact-profile `provider_managed` opt-in permits bounded native
+  OAuth extra usage under provider account controls; `observe_only` remains the default.
+  API-key authorization stays separate. No provider switching or billing-setting changes.
+- **Quota-failed continuation.** Eligible tasks resume their original session, model and
+  retained work with atomic account-scoped admission, fresh authorization checks and durable
+  refusal evidence. Schema 9 preserves historical billing as unknown.
+- **Usage visibility.** Workers and Usage expose policy, admission, native billing observations
+  and classification separately from estimated token costs. Live extra-usage billing remains
+  unqualified; see `docs/native-overage.md` for activation and qualification guidance.
+- **Explicit model and effort selection.** Built-in Claude and Grok task selections are
+  forwarded and confirmed after opening or restoring sessions, including bounded Grok
+  configuration transitions.
 
 - **Controlled worker recovery.** Codex and the CLI can arm one explicit "Retry next task"
   permit against the current account/model refusal evidence. Schema 7 records a single active
