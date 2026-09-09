@@ -308,6 +308,8 @@ class AcpWorker:
         #: Exact advertised configuration, kept independently of model attribution.
         self.session_config_options: list[dict[str, Any]] = []
         self._expected_config: dict[str, str] = {}
+        self._pending_config: dict[str, str] = {}
+        self._pending_config_request_id: int | str | None = None
         self._config_violation = False
         #: The last prompt's capture, including a prompt that raised or was cancelled.
         self.last_result: TurnResult | None = None
@@ -376,6 +378,29 @@ class AcpWorker:
 
     def _observe(self, event: StreamEvent) -> None:
         """Synchronous, inline in receive order: see the module docstring."""
+        pending = getattr(self, "_pending_config", {})
+        if pending:
+            message = event.message
+            params = message.get("params")
+            if (
+                event.direction is StreamDirection.OUTGOING
+                and message.get("method") == "session/set_config_option"
+                and isinstance(params, dict)
+                and params.get("configId") in pending
+                and params.get("value") == self._expected_config[params["configId"]]
+            ):
+                self._pending_config_request_id = message.get("id")
+            elif (
+                event.direction is StreamDirection.INCOMING
+                and "method" not in message
+                and ("result" in message or "error" in message)
+                and self._pending_config_request_id is not None
+                and message.get("id") == self._pending_config_request_id
+            ):
+                # Close the transition in wire order, before an immediately following
+                # notification can arrive and before the awaiting coroutine resumes.
+                self._pending_config = {}
+                self._pending_config_request_id = None
         if event.direction is not StreamDirection.INCOMING:
             return
         params = event.message.get("params")
@@ -443,7 +468,7 @@ class AcpWorker:
         kind = update.get("sessionUpdate")
         changed = False
         if kind == "current_mode_update" and "mode" in self._expected_config:
-            changed = update.get("currentModeId") != self._expected_config["mode"]
+            changed = not self._matches_expected_config("mode", update.get("currentModeId"))
         elif kind == "config_option_update":
             options = update.get("configOptions")
             if not isinstance(options, list):
@@ -453,7 +478,7 @@ class AcpWorker:
                     if not isinstance(option, dict) or not isinstance(option.get("id"), str):
                         changed = True
                     elif option["id"] in self._expected_config:
-                        changed |= option.get("currentValue") != self._expected_config[option["id"]]
+                        changed |= not self._matches_expected_config(option["id"], option.get("currentValue"))
         if changed and not self._config_violation:
             self._config_violation = True
             if self._capture is not None:
@@ -577,10 +602,22 @@ class AcpWorker:
             ) from exc
         self.mode = mode_id
 
+    def _matches_expected_config(self, key: str, value: Any) -> bool:
+        pending = getattr(self, "_pending_config", {})
+        return value == self._expected_config[key] or (key in pending and value == pending[key])
+
     async def set_config_option(self, session_id: str, config_id: str, value: str) -> None:
         """Confirm the selection and preserve every previously selected protected value."""
         self._require_configuration_intact()
         previous = self._expected_config
+        observed = [option.get("currentValue") for option in self.session_config_options
+                    if option.get("id") == config_id]
+        # Providers can deliver the preceding full snapshot during this RPC. Permit only
+        # this field's observed old value until its correlated response arrives.
+        self._pending_config = (
+            {config_id: observed[0]} if len(observed) == 1 and isinstance(observed[0], str) else {}
+        )
+        self._pending_config_request_id = None
         # A server can publish the approved selection before returning its response.
         self._expected_config = {**previous, config_id: value}
         try:
@@ -588,6 +625,7 @@ class AcpWorker:
                 self._connection().set_config_option(session_id=session_id, config_id=config_id, value=value),
                 timeout=self._handshake_timeout,
             )
+            self._pending_config = {}
             self._require_configuration_intact()
             options = _config_options(response)
             self._observe_configuration({"sessionUpdate": "config_option_update", "configOptions": options})
@@ -604,6 +642,9 @@ class AcpWorker:
                 "CONFIG_UNAVAILABLE", f"agent refused {config_id!r} = {value!r}: {exc}",
                 cause=error_cause(exc),
             ) from exc
+        finally:
+            self._pending_config = {}
+            self._pending_config_request_id = None
         self._remember_session_configuration(response)
 
     async def prompt(self, session_id: str, text: str, *, timeout: float) -> TurnResult:

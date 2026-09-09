@@ -894,14 +894,19 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
         await _configure_agy_session(run, agent)
         return
     await _apply_session_mode(run, agent)
-    if run.profile and run.profile.family == "claude" and run.task.requested_model:
-        # The adapter can restore a settings or transcript model instead of options.model.
+    if run.profile and run.profile.family in {"claude", "grok"} and run.task.requested_model:
         # Confirm the explicit task choice before effort, which a model switch can reset.
         await agent.set_config_option(run.session_id, "model", run.task.requested_model)
+        run.log.write(f"session model option {run.task.requested_model}")
     if run.profile and run.profile.family == "claude" and run.profile.effort:
         # The adapter can replace options.effort with a persisted setting while opening a
         # session. Apply and confirm the task selection after both new_session and load_session.
         await agent.set_config_option(run.session_id, "effort", run.profile.effort)
+        run.log.write(f"session effort {run.profile.effort}")
+    if run.profile and run.profile.family == "grok" and run.task.requested_effort:
+        # Grok can start at its configured default despite --reasoning-effort on the argv.
+        await agent.set_config_option(run.session_id, "reasoning_effort", run.task.requested_effort)
+        run.log.write(f"session reasoning_effort {run.task.requested_effort}")
     run.session_model = agent.session_model
     if run.session_model is not None:
         run.log.write(f"session model from ACP: {run.session_model}")
