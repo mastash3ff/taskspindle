@@ -12,6 +12,7 @@ test("routes preserve task ids, filters, and the providers alias", () => {
   assert.equal(detail.query.get("state"), "RUNNING");
   assert.equal(detail.query.get("q"), "a b");
   assert.equal(parseHash("#/providers").name, "workers");
+  assert.equal(parseHash("#/subscriptions").name, "workers");
 });
 
 test("routeHref encodes task identity and query state", () => {

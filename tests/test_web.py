@@ -201,15 +201,30 @@ def test_health_reports_schema_and_db_state(tmp_path: Path) -> None:
     missing = client.get("/api/health").json()
     assert missing["db_exists"] is False
     assert missing["schema_version"] is None
-    assert missing["read_only"] is False
+    assert missing["read_only"] is True
     assert missing["task_database_read_only"] is True
-    assert missing["subscription_actions_enabled"] is True
+    assert "subscription_actions_enabled" not in missing
 
     _seed(paths)
     present = client.get("/api/health").json()
     assert present["db_exists"] is True
     assert present["schema_version"] == taskspindle.SCHEMA_VERSION
     assert present["db_path"] == str(paths.state_dir / "taskspindle.sqlite3")
+
+
+def test_retired_subscription_api_is_not_routed(tmp_path: Path) -> None:
+    client = _client(_paths(tmp_path))
+
+    assert client.get("/api/subscriptions").status_code == 404
+    assert client.post("/api/subscriptions/claude/refresh", json={}).status_code == 404
+
+
+def test_dashboard_navigation_contains_only_current_views(tmp_path: Path) -> None:
+    page = _client(_paths(tmp_path)).get("/")
+
+    assert page.status_code == 200
+    assert 'href="#/workers"' in page.text
+    assert 'href="#/subscriptions"' not in page.text
 
 
 # -- tasks ----------------------------------------------------------------------------
@@ -288,6 +303,132 @@ def test_diff_endpoint_and_404_for_a_task_without_one(tmp_path: Path) -> None:
 
 
 # -- providers --------------------------------------------------------------------------
+
+
+def test_provider_status_is_read_only_and_uses_shared_projection(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    client = _client(paths)
+
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    response = client.get("/api/providers")
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    assert response.status_code == 200
+    availability = response.json()["providers"][0]["availability"]
+    assert {
+        "state",
+        "last_success_at",
+        "source",
+        "scope",
+        "affected_model",
+        "stale",
+        "next_action",
+        "retry_eligible",
+    } <= availability.keys()
+    assert response.json()["providers"][0]["model_availability"] == []
+    assert before == after == []
+
+
+def test_provider_api_sanitizes_legacy_status_reason_and_source_in_entire_response(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    reason_secret = "PRIVATE legacy CLI refusal with bearer credential"
+    source_secret = "PRIVATE /home/account/oauth.json"
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        store.set_provider_status(
+            "claude",
+            "access_denied",
+            code="PROVIDER_ACCESS_DENIED",
+            reason=reason_secret,
+            source=source_secret,
+            observed_at="2030-01-02T12:00:00Z",
+        )
+    response = _client(paths).get("/api/providers")
+
+    assert response.status_code == 200
+    assert reason_secret not in response.text
+    assert source_secret not in response.text
+    status = response.json()["status"][0]
+    assert status["provider"] == "claude"
+    assert status["state"] == "access_denied"
+    assert status["code"] == "PROVIDER_ACCESS_DENIED"
+    assert status["reason"] == "The provider denied account access."
+    assert status["source"] == "legacy"
+
+
+def test_provider_api_requests_model_scoped_shared_availability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[str, str | None]] = []
+    projection = {
+        "state": "model_unavailable",
+        "status_key": "agy",
+        "code": "MODEL_UNAVAILABLE",
+        "window": None,
+        "reset_at": None,
+        "reason": "The selected model is unavailable.",
+        "observed_at": "2030-01-02T12:00:00Z",
+        "suggested_alternative": None,
+        "last_success_at": "2030-01-02T11:00:00Z",
+        "source": "worker_error",
+        "scope": "model",
+        "affected_model": "gemini-test",
+        "stale": False,
+        "next_action": "choose_model",
+        "retry_eligible": False,
+    }
+
+    def fake_availability(
+        store: Any, profile: Profile, *, now: Any, model: str | None = None
+    ) -> dict[str, Any]:
+        del store, now
+        seen.append((profile.id, model))
+        return projection
+
+    monkeypatch.setattr("taskspindle.web.app.provider_availability", fake_availability)
+    model_projection = [
+        {
+            **projection,
+            "affected_model": "gemini-other",
+            "observed_at": "2030-01-02T10:00:00Z",
+        }
+    ]
+    monkeypatch.setattr(
+        "taskspindle.web.app.model_availability",
+        lambda store, profile, *, now: model_projection,
+    )
+    profile = Profile(
+        id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
+    )
+    response = TestClient(build_app(_paths(tmp_path), {"agy": profile})).get("/api/providers")
+
+    assert response.status_code == 200
+    assert response.json()["providers"][0]["availability"] == projection
+    assert response.json()["providers"][0]["model_availability"] == model_projection
+    assert seen == [("agy", "gemini-test")]
+
+
+def test_provider_api_reads_a_pre_model_status_database_without_migrating_it(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    db_path = paths.state_dir / "taskspindle.sqlite3"
+    with Store.open(db_path):
+        pass
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("DROP TABLE provider_model_status")
+    before = db_path.read_bytes()
+    profile = Profile(
+        id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
+    )
+    client = TestClient(build_app(paths, {"agy": profile}))
+
+    response = client.get("/api/providers")
+
+    assert response.status_code == 200
+    assert response.json()["providers"][0]["availability"]["state"] == "unknown"
+    assert db_path.read_bytes() == before
 
 
 def test_providers_shape_and_throttled_availability(tmp_path: Path) -> None:

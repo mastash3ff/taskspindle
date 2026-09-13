@@ -1,4 +1,4 @@
-const ROUTES = new Set(["overview", "tasks", "workers", "subscriptions", "usage"]);
+const ROUTES = new Set(["overview", "tasks", "workers", "usage"]);
 
 export function parseHash(hash = location.hash) {
   const raw = (hash || "#/overview").replace(/^#\/?/, "");
@@ -6,6 +6,7 @@ export function parseHash(hash = location.hash) {
   const parts = pathPart.split("/").filter(Boolean).map(decodeURIComponent);
   let name = parts[0] || "overview";
   if (name === "providers") name = "workers";
+  if (name === "subscriptions") name = "workers";
   if (!ROUTES.has(name)) name = "overview";
   return { name, id: name === "tasks" ? parts[1] || null : null, query: new URLSearchParams(queryPart) };
 }

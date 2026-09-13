@@ -38,10 +38,6 @@ produced.
 - **Usage you can see.** Every turn's token counts are recorded from the wire, with an estimated
   cost at published rates that is labelled as an estimate. `usage_report`, `taskspindle usage` and
   the dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
-- **Subscription dates.** An independent browser collector records verified renewal and
-  cancellation access-end dates for the [Subscriptions page](docs/subscriptions.md).
-  Collection uses your normal Chrome profile through the Playwright extension and reports unknown or stale results explicitly;
-  it never changes subscriptions or worker routing.
 
 ## Quick start
 
@@ -93,8 +89,7 @@ moved underneath you is refused rather than clobbered.
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
 | [native-overage.md](docs/native-overage.md) | Native extra usage policy, billing observations, and rollout |
-| [dashboard.md](docs/dashboard.md) | `taskspindle web`: task inspection, subscriptions, and its JSON API |
-| [subscriptions.md](docs/subscriptions.md) | Dedicated browser setup, collection, status, and deployment |
+| [dashboard.md](docs/dashboard.md) | `taskspindle web`: task and worker inspection and its JSON API |
 | [rollback.md](docs/rollback.md) | backing it out without losing anything |
 
 ## Supported platforms

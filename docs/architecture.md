@@ -37,16 +37,8 @@
   limits.py      what a refused turn means for its provider; never what to do about it
   provider_recovery.py  single-use authorization bound to cached refusal evidence
   usage.py       token counts per turn, the price table, the rolled-up report
-  web/           operator console: read-only task/overview store, protected subscription actions
-  subscriptions/ separate SQLite observations/queue, background browser collector, CLI
+  web/           operator console: read-only task, worker, overview and usage projections
 ```
-
-Subscription actions use a separate `subscriptions.sqlite3` database. Normal mode connects to a
-selected regular Windows Chrome profile through the paired Playwright extension; dedicated mode
-uses separate TaskSpindle browser profiles. The dashboard queues loopback-only, same-origin,
-CSRF-protected connection/refresh requests; an independent collector processes them and observes
-billing information. It does not change task state or worker eligibility. See
-[subscription tracking](subscriptions.md).
 
 The MCP server never owns an ACP connection. It writes rows and starts units; the units talk to
 agents. That is what lets the server exit, crash or be restarted without taking the work with it.
@@ -229,7 +221,7 @@ passed their reset, aliases of the same OAuth seat share one ordinary, acceptanc
 claim. A pending claim is attached to its task and prevents duplicate replacement tasks. An
 unaffected model remains eligible under the normal capacity and grant rules.
 
-The Codex coordinator selects a compatible subscription worker before calling `start_task`,
+The Codex coordinator selects a compatible OAuth worker before calling `start_task`,
 preserving explicit provider/model requirements, repository grants, capacity, and review
 independence. Unknown access permits ordinary needed work; it never justifies synthetic probes.
 TaskSpindle receives an explicit provider and does not migrate, retry, or change that task's

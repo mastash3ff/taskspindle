@@ -115,3 +115,51 @@ test("quota restrictions show each scope and reset while auth metadata remains n
   const task = nodes(details, (node) => node.tag === "a")[0];
   assert.equal(task.attributes.href, "#/tasks/ts_post_reset");
 });
+
+test("automatic recovery shows policy, state, attempts, timing, hold reason, and active task", () => {
+  const details = __test__.availabilityCard({ id: "claude" }, {
+    state: "throttled", automatic_recovery: {
+      policy: "hybrid", state: "cooldown", attempts_used: 1, attempts_remaining: 2,
+      next_attempt_at: "2030-01-03T00:00:00Z", hold_reason: "Provider access refused.",
+      active_task_id: "ts_recovery", episode_id: "episode-1", evidence_revision: "evidence-2",
+    },
+  });
+
+  assert.match(textOf(details), /Automatic recovery/);
+  assert.match(textOf(details), /hybrid/);
+  assert.match(textOf(details), /cooldown/);
+  assert.match(textOf(details), /Attempts remaining2/);
+  assert.match(textOf(details), /Next attempt/);
+  assert.match(textOf(details), /Provider access refused/);
+  assert.match(textOf(details), /episode-1/);
+  assert.match(textOf(details), /evidence-2/);
+  const task = nodes(details, (node) => node.tag === "a")[0];
+  assert.equal(task.attributes.href, "#/tasks/ts_recovery");
+});
+
+test("automatic recovery is absent for older provider responses", () => {
+  const details = __test__.availabilityCard({ id: "claude" }, { state: "unknown" });
+  assert.doesNotMatch(textOf(details), /Automatic recovery/);
+});
+
+test("hybrid recovery replaces manual retry controls with automatic state guidance", () => {
+  const manual = {
+    state: "none", provider: "claude", can_arm: true,
+    cli_command: "taskspindle providers --retry-next --provider claude",
+  };
+  const held = __test__.availabilityCard({ id: "claude" }, {
+    state: "auth_expired", next_action: "sign_in", recovery: manual,
+    automatic_recovery: { policy: "hybrid", state: "held", attempts_remaining: 0 },
+  });
+  assert.match(textOf(held), /Recovery is held until new relevant positive evidence is recorded/);
+  assert.doesNotMatch(textOf(held), /Controlled retry available|Copy command|Sign in/);
+  assert.equal(nodes(held, (node) => node.tag === "button").length, 0);
+
+  const trialReady = __test__.availabilityCard({ id: "claude" }, {
+    state: "auth_expired", next_action: "retry", recovery: manual,
+    automatic_recovery: { policy: "hybrid", state: "trial_ready", attempts_remaining: 1 },
+  });
+  assert.match(textOf(trialReady), /New positive evidence permits one automatic trial when work is pending/);
+  assert.doesNotMatch(textOf(trialReady), /Controlled retry available|Copy command|Retry a task/);
+  assert.equal(nodes(trialReady, (node) => node.tag === "button").length, 0);
+});

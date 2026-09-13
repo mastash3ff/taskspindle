@@ -25,16 +25,5 @@ export async function getJSON(path, { signal, fresh = false, fallback = true } =
   }
 }
 
-export async function postJSON(path, body, csrfToken, { signal } = {}) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { Accept: "application/json", "Content-Type": "application/json", "X-TaskSpindle-CSRF": csrfToken },
-    body: JSON.stringify(body || {}),
-    cache: "no-store",
-    signal,
-  });
-  return parseResponse(response);
-}
-
 export function peek(path) { return cache.get(path); }
 export function clearCache(path = null) { if (path) cache.delete(path); else cache.clear(); }

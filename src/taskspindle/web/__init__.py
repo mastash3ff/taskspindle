@@ -1,7 +1,6 @@
-"""A local dashboard over TaskSpindle task and subscription state.
+"""A local dashboard over TaskSpindle task and worker state.
 
-Task data is always opened ``mode=ro`` (see :mod:`.db`). Subscription connect and refresh actions
-are separately protected by loopback peer, Host, same-origin and CSRF checks in :mod:`.app`.
+Task data is always opened ``mode=ro`` (see :mod:`.db`), and the dashboard exposes no mutation API.
 """
 
 from __future__ import annotations

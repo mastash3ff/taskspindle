@@ -2,6 +2,10 @@
 
 ## v0.4.0
 
+- **Browser billing retired.** The subscription collector, browser helper, CLI commands,
+  dashboard page, and mutation APIs are removed. Historical browser data and profiles are left
+  inert. Native CLI quota, billing, overage, Workers, tasks, and usage telemetry remain available;
+  the old `#/subscriptions` location now opens Workers.
 - **Native extra usage.** Exact-profile `provider_managed` opt-in permits bounded native
   OAuth extra usage under provider account controls; `observe_only` remains the default.
   API-key authorization stays separate. No provider switching or billing-setting changes.

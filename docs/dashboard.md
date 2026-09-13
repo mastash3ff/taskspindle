@@ -3,9 +3,6 @@
 `taskspindle web` serves a local operator console over HTTP. It presents the same tasks, turns,
 checks, reviews, cached worker status and usage rollups that the MCP tools and CLI read. The task
 database is opened `mode=ro`, so a dashboard bug cannot corrupt what a running worker is writing.
-The separate **Subscriptions** page can enqueue account sign-in and refresh operations in
-`subscriptions.sqlite3`; it cannot change a provider subscription or a TaskSpindle task. See
-[subscription tracking](subscriptions.md).
 
 ## Starting it
 
@@ -35,15 +32,7 @@ Every task read goes through a connection opened `sqlite3.connect(..., mode=ro)`
 `PRAGMA query_only=1`: a write attempt raises rather than mutating the database. The database file
 may not exist yet — `/api/health` says so, and every list renders empty instead of failing.
 Overview and Workers use only that cached state. Loading either page starts no provider process,
-native quota check, doctor probe, browser, or billing collection.
-
-Subscription actions additionally require a loopback peer and Host, a matching Origin,
-JSON content, and the per-process CSRF token returned to the local dashboard. They are
-not available through a remote reverse proxy. Subscription GETs are cached database reads,
-do not launch a browser, and do not create an absent database. Connect opens your normal
-Chrome profile; its Playwright extension enables billing verification. Browser credentials
-stay in Chrome and never reach the dashboard or task records. The private extension token
-is entered through `subscriptions setup-extension`, never through a dashboard API.
+native quota check, doctor probe, browser, or billing collection. All dashboard APIs are read-only.
 
 ## What it shows
 
@@ -73,25 +62,22 @@ is entered through `subscriptions setup-extension`, never through a dashboard AP
   policy, account/worker control scope, eligibility and safe billing observations, with unknowns
   preserved. Policy changes are read on refresh. Grok balances/caps and automatic-top-up settings
   are read-only account diagnostics; they are not task charges or spending controls.
+  Automatic recovery shows the configured policy, current state, remaining attempts, next attempt,
+  hold reason, and any active task. Older runtime responses without that projection remain valid.
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
   choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
   counts, window telemetry notes, and the cost-estimate disclaimer. Billing classifications count
   all turns separately, including historical/tokenless unknown turns; native-overage observations
   never turn token estimates or account balances into reported task charges.
-- **Subscriptions** — ChatGPT, Claude, Google AI, and Grok billing observations, including
-  renewal/access-end dates, cancellation countdowns, freshness, account connection, and
-  collection failures. Google AI is one subscription shared by Gemini/AGY. ChatGPT is
-  listed even though it is not a TaskSpindle worker profile.
-
-The navigation order is **Overview**, **Tasks**, **Workers**, **Subscriptions**, and **Usage**.
+The navigation order is **Overview**, **Tasks**, **Workers**, and **Usage**.
 `Ctrl+K` or `Cmd+K` opens navigation destinations and a GET-only finder over as many as 200
 recent tasks. Typing filters task ID, summary, repository, and state; arrow keys select a result,
-Enter opens it, and Escape closes the palette. Account actions remain explicit buttons. Dark, light, and system themes persist under the browser-local
+Enter opens it, and Escape closes the palette. Dark, light, and system themes persist under the browser-local
 `taskspindle-theme` preference; dark is the default. The responsive sidebar, focus handling, and
 status labels remain keyboard accessible.
 
-Overview polls every 10 seconds, Tasks and task detail every 5, Workers every 15, Subscriptions
-every 5, and Usage every 30. Polling pauses while the tab is hidden. Request generations and
+Overview polls every 10 seconds, Tasks and task detail every 5, Workers every 15, and Usage every
+30. Polling pauses while the tab is hidden. Request generations and
 `AbortController` reject stale responses, while the GET cache retains the last usable data when a
 refresh fails. A "last refreshed" stamp says how current the displayed data is.
 
@@ -105,12 +91,11 @@ and an `initialize` probe — matching `taskspindle doctor` without `--no-live`.
 
 ## JSON API
 
-Task routes below are GET-only; other methods are `405`. Subscription actions are the
-explicit POST exceptions. Errors are JSON, never a traceback.
+Routes below are GET-only; other methods are `405`. Errors are JSON, never a traceback.
 
 | Route | Returns |
 | --- | --- |
-| `/api/health` | task DB health; `read_only: false`, `task_database_read_only: true`, subscription-action capability, version |
+| `/api/health` | task DB health; `read_only: true`, `task_database_read_only: true`, version |
 | `/api/overview?limit` | global task counts plus bounded active/attention rows; default `limit` 20, max 100 |
 | `/api/tasks?q&state&provider&mode&limit` | `{tasks: [...]}`, newest first, `limit` default 100, max 1000 |
 | `/api/tasks/{id}` | task, events, turns (with usage and transcript), checks, review, repository, worker log tail; `404` `TASK_NOT_FOUND` |
@@ -118,9 +103,6 @@ explicit POST exceptions. Errors are JSON, never a traceback.
 | `/api/providers` | per-profile availability, windows, cached `native_check`, sanitized provider status, cached doctor report; no probes |
 | `/api/doctor?live=1` | run the doctor report with explicit live probes |
 | `/api/usage?since&provider&group_by` | the same shape as `taskspindle usage --json`; `400` on a bad `since` or `group_by` |
-| `/api/subscriptions` | cached subscription records, collector health, and local CSRF token |
-| `POST /api/subscriptions/{provider}/connect` | queue visible connection/reconnection; 202 |
-| `POST /api/subscriptions/{provider}/refresh` | queue a noninteractive billing refresh; 202 |
 
 `/` serves the page itself; `/static/*` serves its packaged modules and styles. The console uses
 plain HTML, CSS, and JavaScript — no build step or CDN, and no request leaves the browser's own
@@ -142,6 +124,10 @@ window: `scope`, `model_family`, `window`, `reset`, `source`, `observed`, and an
 context is metadata about the evidence, never an account identity. `quota_retry` reports the
 single shared post-reset retry state, its task ID, and restriction fingerprints. When it is
 pending, claimed, or prompting, Workers links to that task without creating, retrying, or mutating anything.
+
+`automatic_recovery` is an optional availability projection for compatibility with older runtime
+responses. When present, it carries `policy`, `state`, `attempts_used`, `attempts_remaining`,
+`next_attempt_at`, `hold_reason`, `active_task_id`, `episode_id`, and `evidence_revision`.
 
 Repository usage groups display the registered repository path when available. The JSON keeps
 `repository_id` as its stable grouping key and adds `repository_path`; missing paths fall back

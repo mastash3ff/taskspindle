@@ -4,11 +4,10 @@ import { parseHash, routeHref, subscribe } from "./router.js";
 import { renderOverview } from "./views/overview.js";
 import { renderTasks } from "./views/tasks.js";
 import { renderWorkers } from "./views/workers.js";
-import { renderSubscriptions } from "./views/subscriptions.js";
 import { renderUsage } from "./views/usage.js";
 
-const renderers = { overview: renderOverview, tasks: renderTasks, workers: renderWorkers, subscriptions: renderSubscriptions, usage: renderUsage };
-const POLL = { overview: 10_000, tasks: 5_000, workers: 15_000, subscriptions: 5_000, usage: 30_000 };
+const renderers = { overview: renderOverview, tasks: renderTasks, workers: renderWorkers, usage: renderUsage };
+const POLL = { overview: 10_000, tasks: 5_000, workers: 15_000, usage: 30_000 };
 let generation = 0, controller = null, timer = null, currentRoute = null;
 const app = document.getElementById("app");
 const routeKey = (route) => `${route.name}/${route.id || ""}?${route.query.toString()}`;
@@ -86,7 +85,7 @@ function setupCommand() {
   let tasks = [], selected = 0, debounce = null;
   const destinations = [
     ["Overview", "Current activity and attention", routeHref("overview")], ["Tasks", "Execution ledger", routeHref("tasks")],
-    ["Workers", "Access and model status", routeHref("workers")], ["Subscriptions", "Browser billing verification", routeHref("subscriptions")], ["Usage", "Tokens, outcomes, and limits", routeHref("usage")],
+    ["Workers", "Access and model status", routeHref("workers")], ["Usage", "Tokens, outcomes, and limits", routeHref("usage")],
   ];
   const paint = () => {
     const q = input.value.trim().toLowerCase();

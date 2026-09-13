@@ -33,6 +33,17 @@ def test_no_command_prints_the_help_and_exits_two(capsys: pytest.CaptureFixture[
     assert "COMMAND" in capsys.readouterr().out
 
 
+def test_retired_subscriptions_command_is_rejected_without_creating_state(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["subscriptions", "status"])
+
+    assert raised.value.code == 2
+    assert "invalid choice: 'subscriptions'" in capsys.readouterr().err
+    assert not (home / "state").exists()
+
+
 def test_taskspindle_config_overrides_the_xdg_config_file(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

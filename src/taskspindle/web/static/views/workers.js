@@ -61,7 +61,36 @@ function quotaRetry(retry) {
 
 export const __test__ = {
   quotaDetails: (availability) => h("div", {}, quotaRestrictions(availability.quota_restrictions), authContext(availability.auth_context), quotaRetry(availability.quota_retry)),
+  availabilityCard,
 };
+
+function automaticRecovery(recovery) {
+  if (!recovery) return null;
+  const task = recovery.active_task_id ? h("a", { href: routeHref("tasks", recovery.active_task_id), class: "text-link mono", text: recovery.active_task_id }) : null;
+  return h("section", { class: "automatic-recovery", "aria-label": "Automatic recovery" },
+    h("div", { class: "card-title-row" }, h("h4", { text: "Automatic recovery" }), badge(recovery.state || "unknown", String(recovery.state || "unknown").replaceAll("_", " "))),
+    h("dl", { class: "mini-details" },
+      labeledValue("Policy", recovery.policy || "—"),
+      recovery.attempts_used != null ? labeledValue("Attempts used", recovery.attempts_used) : null,
+      recovery.attempts_remaining != null ? labeledValue("Attempts remaining", recovery.attempts_remaining) : null,
+      recovery.next_attempt_at ? labeledValue("Next attempt", formatDate(recovery.next_attempt_at)) : null,
+      recovery.active_task_id ? labeledValue("Active task", null, { node: task }) : null,
+      recovery.episode_id ? labeledValue("Episode", recovery.episode_id, { mono: true }) : null,
+      recovery.evidence_revision ? labeledValue("Evidence revision", recovery.evidence_revision, { mono: true }) : null,
+    ),
+    recovery.hold_reason ? h("p", { class: "status-reason", text: recovery.hold_reason }) : null,
+  );
+}
+
+function automaticRecoveryNextAction(recovery) {
+  if (recovery.state === "held") return "Recovery is held until new relevant positive evidence is recorded.";
+  if (recovery.state === "trial_ready") return "New positive evidence permits one automatic trial when work is pending.";
+  if (recovery.state === "trial_running") return "The automatic recovery trial is running.";
+  if (recovery.state === "cooldown") return recovery.next_attempt_at
+    ? `Automatic recovery is cooling down until ${formatDate(recovery.next_attempt_at)}.`
+    : "Automatic recovery is cooling down.";
+  return "Automatic recovery is eligible when work is pending.";
+}
 
 export function recoveryFeedback(recovery, context = {}) {
   if (!recovery || (recovery.state === "none" && !recovery.can_arm && !recovery.cli_command)) return null;
@@ -107,6 +136,7 @@ export function recoveryFeedback(recovery, context = {}) {
 
 function availabilityCard(worker, item, model = null, context = {}) {
   const state = item || {};
+  const hybridRecovery = state.automatic_recovery?.policy === "hybrid";
   return h("article", { class: `availability-card ${model ? "availability-model" : ""}` },
     h("div", { class: "card-title-row" }, h("div", {}, h("span", { class: "eyebrow", text: model ? "Model status" : "Worker access" }), h("h3", { text: model || worker.id })), badge(state.state || "unknown", (state.state || "unknown").replaceAll("_", " "))),
     h("p", { class: "status-reason", text: state.reason || (state.state === "unknown" ? "No current access evidence." : "No status detail.") }),
@@ -121,8 +151,9 @@ function availabilityCard(worker, item, model = null, context = {}) {
     quotaRestrictions(state.quota_restrictions),
     authContext(state.auth_context),
     quotaRetry(state.quota_retry),
-    h("p", { class: "next-action", text: state.next_action === "wait" && state.reset_at ? `Wait until ${formatDate(state.reset_at)}, then retry.` : NEXT_ACTION[state.next_action] || "Run a worker task to establish current access." }),
-    recoveryFeedback(state.recovery, context),
+    automaticRecovery(state.automatic_recovery),
+    h("p", { class: "next-action", text: hybridRecovery ? automaticRecoveryNextAction(state.automatic_recovery) : state.next_action === "wait" && state.reset_at ? `Wait until ${formatDate(state.reset_at)}, then retry.` : NEXT_ACTION[state.next_action] || "Run a worker task to establish current access." }),
+    hybridRecovery ? null : recoveryFeedback(state.recovery, context),
   );
 }
 
