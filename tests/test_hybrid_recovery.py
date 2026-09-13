@@ -559,3 +559,56 @@ def test_migrated_undated_refusal_stays_held_until_relevant_positive_edge(tmp_pa
         attempt(migrated, "undated-trial", now)
         hybrid.finish(migrated, "undated-trial", "failed", now=now)
         assert status(migrated, now + timedelta(days=365))["state"] == "held"
+
+
+@pytest.mark.parametrize("negative", ["quota", "auth_required"])
+def test_migrated_native_baseline_releases_exhausted_episode_once(tmp_path, monkeypatch, negative):
+    from taskspindle import hybrid_recovery as hybrid
+    from taskspindle import store as store_module
+    from taskspindle.access_checks import native_fingerprint
+
+    grok = replace(providers.Profile(id="grok", auth="oauth", command=("grok",)), provider_recovery="hybrid")
+    env = {"HOME": str(tmp_path)}
+    path = tmp_path / "native-baseline.db"
+    fingerprint = native_fingerprint(grok, env)
+    sample = {
+        "state": negative,
+        "checked_at": NOW.isoformat().replace("+00:00", "Z"),
+        "used_percent": 100,
+        "window": "monthly",
+        "period_start": "2026-09-01T00:00:00Z",
+        "reset_at": "2026-10-01T00:00:00Z",
+    }
+
+    def cache(store, at, payload):
+        stamp = at.isoformat().replace("+00:00", "Z")
+        assert store.claim_native_check("grok", fingerprint, "test", stamp, stamp, stamp)
+        store.finish_native_check("grok", fingerprint, "test", stamp, payload | {"checked_at": stamp})
+
+    with monkeypatch.context() as before:
+        before.setattr(store_module, "MIGRATIONS", store_module.MIGRATIONS[:9])
+        with Store.open(path) as legacy:
+            if negative == "auth_required":
+                legacy.set_provider_status(
+                    "grok", "auth_expired", source="acp_error", observed_at=NOW.isoformat()
+                )
+            cache(legacy, NOW, sample)
+    with Store.open(path) as migrated:
+        assert migrated.list_recovery_evidence("grok") == []
+        assert hybrid.status(migrated, grok, now=NOW, parent_env=env)["attempts_used"] == 0
+        now = NOW
+        for index, delay in enumerate((5, 15, 60)):
+            now += timedelta(minutes=delay)
+            make_task(migrated, f"migrated{index}")
+            assert hybrid.admit(migrated, grok, f"migrated{index}", now=now, parent_env=env, prompting=True)
+            hybrid.finish(migrated, f"migrated{index}", "failed", now=now)
+        assert hybrid.status(migrated, grok, now=now, parent_env=env)["state"] == "held"
+        cache(migrated, now, sample | {"state": "quota", "used_percent": 20})
+        assert hybrid.status(migrated, grok, now=now, parent_env=env)["state"] == "trial_ready"
+        make_task(migrated, "baseline-trial")
+        hybrid.admit(migrated, grok, "baseline-trial", now=now, parent_env=env, prompting=True)
+        hybrid.finish(migrated, "baseline-trial", "failed", now=now)
+        cache(migrated, now + timedelta(minutes=5), sample | {"state": "quota", "used_percent": 20})
+        assert (
+            hybrid.status(migrated, grok, now=now + timedelta(minutes=5), parent_env=env)["state"] == "held"
+        )

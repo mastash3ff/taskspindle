@@ -668,6 +668,38 @@ WHERE json_extract(payload,'$.state') = 'quota'
   AND json_extract(payload,'$.window') IN ('weekly','monthly')
   AND julianday(json_extract(payload,'$.period_start')) <= julianday(json_extract(payload,'$.checked_at'))
   AND julianday(json_extract(payload,'$.checked_at')) < julianday(json_extract(payload,'$.reset_at'));
+-- Retain explicit native facts as a comparison baseline, never as a positive transition.
+INSERT INTO recovery_native_semantics(status_key,payload)
+SELECT provider, json_object(
+    'auth', json('true'),
+    'quota', json_object(
+        'available', json(CASE WHEN json_extract(payload,'$.used_percent') < 100
+                              THEN 'true' ELSE 'false' END),
+        'period', json_extract(payload,'$.period_start'),
+        'window', json_extract(payload,'$.window')
+    )
+)
+FROM (
+    SELECT provider, CASE WHEN json_valid(success_json) THEN success_json
+                          WHEN json_valid(result_json) THEN result_json ELSE '{}' END AS payload
+    FROM native_checks
+)
+WHERE json_extract(payload,'$.state') = 'quota'
+  AND json_type(payload,'$.used_percent') IN ('integer','real')
+  AND json_extract(payload,'$.used_percent') BETWEEN 0 AND 100
+  AND json_extract(payload,'$.window') IN ('weekly','monthly')
+  AND julianday(json_extract(payload,'$.period_start')) <= julianday(json_extract(payload,'$.checked_at'))
+  AND julianday(json_extract(payload,'$.checked_at')) < julianday(json_extract(payload,'$.reset_at'));
+INSERT INTO recovery_native_semantics(status_key,payload)
+SELECT provider, json_object('auth',json('false'))
+FROM (
+    SELECT provider, CASE WHEN json_valid(result_json) THEN result_json ELSE '{}' END AS payload
+    FROM native_checks
+)
+WHERE json_extract(payload,'$.state') = 'auth_required'
+  AND julianday(json_extract(payload,'$.checked_at')) IS NOT NULL
+ON CONFLICT(status_key) DO UPDATE
+SET payload = json_set(recovery_native_semantics.payload,'$.auth',json('false'));
 """
 
 MIGRATIONS: list[tuple[int, str]] = [
