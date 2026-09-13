@@ -402,6 +402,20 @@ def _print_quota_context(availability: dict[str, Any], *, indent: str) -> None:
 
 def _print_provider_recovery(availability: dict[str, Any], *, indent: str) -> None:
     """Print every decision-bearing recovery field from a cached availability projection."""
+    automatic = availability.get("automatic_recovery") or {}
+    if automatic.get("policy") == "hybrid":
+        print(f"{indent}Hybrid recovery: {automatic.get('state') or 'unknown'}")
+        print(f"{indent}Recovery retries remaining: {automatic.get('attempts_remaining', '-')}")
+        for key, label in (
+            ("next_attempt_at", "Next recovery attempt"),
+            ("hold_reason", "Recovery hold reason"),
+            ("active_task_id", "Recovery task"),
+            ("episode_id", "Recovery episode"),
+            ("evidence_revision", "Recovery evidence revision"),
+        ):
+            if automatic.get(key) is not None:
+                print(f"{indent}{label}: {automatic[key]}")
+        return
     recovery = availability.get("recovery") or {}
 
     def value(name: str) -> Any:
