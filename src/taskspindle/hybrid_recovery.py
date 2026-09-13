@@ -248,16 +248,22 @@ def status(
         for row in episodes
         if row["attempts_used"] >= 3 and _positive(row, evidence) <= row["consumed_revision"]
     ]
+    undated = [
+        row
+        for row in episodes
+        if (_time(row["observed_at"]) is None or _time(row["observed_at"]) > now)
+        and _positive(row, evidence) <= row["consumed_revision"]
+    ]
     dates = [_time(row["next_attempt_at"]) for row in episodes if row["attempts_used"] < 3]
     next_at = max((date for date in dates if date), default=None)
     state = (
         "held"
-        if held
+        if held or undated
         else "cooldown"
         if next_at and next_at > now
         else ("trial_ready" if episodes else "eligible")
     )
-    reason = "attempts_exhausted" if held else None
+    reason = "attempts_exhausted" if held else "invalid_refusal_timestamp" if undated else None
     if block:
         state, reason = "held", block
     if claim:

@@ -533,3 +533,29 @@ def test_migration_retains_valid_native_only_exhaustion_with_no_attempts(tmp_pat
         assert view["state"] == "trial_ready"
         assert view["attempts_used"] == 0
         assert view["episode_id"] is not None
+
+
+def test_migrated_undated_refusal_stays_held_until_relevant_positive_edge(tmp_path, monkeypatch):
+    from taskspindle import hybrid_recovery as hybrid
+    from taskspindle import store as store_module
+
+    path = tmp_path / "undated.db"
+    with monkeypatch.context() as before:
+        before.setattr(store_module, "MIGRATIONS", store_module.MIGRATIONS[:9])
+        with Store.open(path) as legacy:
+            legacy.set_provider_status("claude", "auth_expired", source="acp_error", observed_at="not-a-date")
+    with Store.open(path) as migrated:
+        view = provider_availability(migrated, profile(), now=NOW, parent_env={"HOME": "/nonexistent"})
+        assert view["automatic_recovery"]["state"] == "held"
+        assert view["automatic_recovery"]["attempts_used"] == 0
+        assert view["automatic_recovery"]["next_attempt_at"] is None
+        assert not view["retry_eligible"]
+        observe(migrated, "cached_auth", NOW, plan="max")
+        assert status(migrated, NOW)["state"] == "held"
+        observe(migrated, "auth_required", NOW + timedelta(minutes=5))
+        observe(migrated, "cached_auth", NOW + timedelta(minutes=10), plan="max")
+        now = NOW + timedelta(minutes=10)
+        assert status(migrated, now)["state"] == "trial_ready"
+        attempt(migrated, "undated-trial", now)
+        hybrid.finish(migrated, "undated-trial", "failed", now=now)
+        assert status(migrated, now + timedelta(days=365))["state"] == "held"
