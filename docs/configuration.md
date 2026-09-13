@@ -26,6 +26,36 @@ Their ids are reserved. You cannot redefine them in `config.toml`.
 personal login. Setup, authentication and the enforced worker policy are described in
 [antigravity.md](antigravity.md). An `agy`-derived profile cannot switch to API-key authentication.
 
+## `[provider_recovery]`
+
+Each exact profile defaults to `"manual"`. Enable `"hybrid"` to authorize bounded
+recovery using necessary tasks, without manual retry permits:
+
+```toml
+[provider_recovery]
+claude = "hybrid"
+grok = "hybrid"
+agy = "hybrid"
+```
+
+After an initial access refusal, retry cooldowns are 5, 15, and 60 minutes from
+the preceding refusal. Three failed retries hold the affected account/model
+indefinitely. New relevant positive native evidence permits one trial; another
+refusal returns to held. Only successful model access resolves the refusal.
+
+Native checks are cached for five minutes and never start inference or browser
+login. Fresh native denials and future quota resets still block admission.
+Unchanged login/catalog results, refresh timestamps, credential metadata alone,
+and elapsed reset times do not release an indefinite hold. Some providers do
+not expose enough native evidence to release every kind of hold automatically.
+
+Aliases need their own policy entry but share account trial capacity. Counters
+and claims survive restarts. `availability.automatic_recovery` is authoritative
+for hybrid admission; manual permits cannot override it. No synthetic probe,
+background model task, provider switch, or paid fallback is created by this policy.
+The caller may route necessary work to another eligible provider while preserving
+explicit provider/model constraints. Native extra usage remains a separate policy.
+
 ## `[native_overage]`
 
 Every exact profile defaults to `"observe_only"`. Setting an OAuth profile to

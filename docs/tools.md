@@ -81,12 +81,20 @@ Every provider includes a normalized `native_check`. Stable fields include `stat
 `version`, `checked_at`, `last_attempt_at`, `last_success_at`, `used_percent`, `window`,
 `period_start`, `reset_at`, `freshness`, `eligible_hint`, `checking`, `error_code`, `detail`, and a
 bounded `last_success`. Null fields remain explicit. The native result is account-unbound and
-separate from browser billing and task refusal evidence. Only a fresh, current Grok quota result
+separate from task refusal evidence. Only a fresh, current Grok quota result
 can set `eligible_hint`; explicit exhaustion adds a temporary new-task gate, while a passed reset,
 stale result, unsupported method, or failed check leaves quota unknown. It never clears an
 existing account/model refusal.
 
-Availability also carries `evidence_revision` and `recovery`. The revision identifies the exact
+Availability also carries `automatic_recovery`: `policy`, `state`, `attempts_used`,
+`attempts_remaining`, `next_attempt_at`, `hold_reason`, `active_task_id`, `episode_id`,
+and `evidence_revision`. Hybrid states are `eligible`, `cooldown`, `trial_ready`,
+`trial_running`, and `held`. Starts and continuations atomically claim an available
+trial; capability reads never reserve one. Honor this projection on hybrid profiles
+without arming a manual permit. See [recovery configuration](configuration.md#provider_recovery)
+for cooldowns and the evidence required to release a hold.
+
+For manual policy, availability also carries `evidence_revision` and `recovery`. The revision identifies the exact
 cached account and selected-model evidence plus effective quota restrictions. `recovery` reports
 the latest controlled attempt for that provider account: `state`, `permit_id`, provider and model
 scope, creation and expiry, bound task and outcome, whether a new attempt can be armed, the next
