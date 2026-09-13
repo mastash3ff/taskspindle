@@ -104,6 +104,16 @@ def record_native_evidence(store: Any, key: str, result: dict[str, Any], at: str
         start = _time(period)
         checked = _time(at)
         if start and end and checked and start <= checked < end:
+            if used == 100 and result.get("window") in {"weekly", "monthly"}:
+                existing = conn.execute(
+                    "SELECT 1 FROM recovery_episodes WHERE status_key=? AND scope=? AND model='' "
+                    "AND resolved_at IS NULL",
+                    (key, "quota:" + result["window"]),
+                ).fetchone()
+                if existing is None:
+                    # A diagnostic opens a budget but never consumes it or refreshes an existing
+                    # episode. The shared model-turn claim governs recovery once freshness lapses.
+                    record_refusal(store, key, "throttled", at, window=result["window"])
             current = {"available": used < 100, "period": period, "window": result.get("window")}
             previous = before.get("quota")
             if (

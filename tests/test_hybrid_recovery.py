@@ -454,3 +454,82 @@ def test_migration_preserves_model_family_quota_scope(tmp_path, monkeypatch):
     with Store.open(path) as migrated:
         assert status(migrated, NOW + timedelta(minutes=5), model="sonnet")["state"] == "eligible"
         assert status(migrated, NOW + timedelta(minutes=5), model="opus")["state"] == "trial_ready"
+
+
+def test_native_only_exhaustion_keeps_one_shared_trial_after_cache_expiry(store, tmp_path):
+    from taskspindle import hybrid_recovery as hybrid
+    from taskspindle.access_checks import native_fingerprint
+
+    grok = replace(providers.Profile(id="grok", auth="oauth", command=("grok",)), provider_recovery="hybrid")
+    alias = replace(grok, id="grok-alias", base="grok")
+    env = {"HOME": str(tmp_path)}
+    fingerprint = native_fingerprint(grok, env)
+    stamp = NOW.isoformat().replace("+00:00", "Z")
+    result = {
+        "state": "quota",
+        "checked_at": stamp,
+        "used_percent": 100,
+        "window": "monthly",
+        "period_start": "2026-09-01T00:00:00Z",
+        "reset_at": "2026-10-01T00:00:00Z",
+    }
+    assert store.claim_native_check("grok", fingerprint, "test", stamp, stamp, stamp)
+    store.finish_native_check("grok", fingerprint, "test", stamp, result)
+    view = hybrid.status(store, grok, now=NOW, parent_env=env)
+    assert view["state"] == "held"
+    assert view["attempts_used"] == 0
+    assert view["episode_id"] is not None
+    episode_id = view["episode_id"]
+    now = NOW + timedelta(minutes=5)
+    for index, delay in enumerate((0, 15, 60)):
+        now += timedelta(minutes=delay)
+        make_task(store, f"native-only{index}")
+        assert hybrid.admit(store, grok, f"native-only{index}", now=now, parent_env=env, prompting=True)
+        with Store.open(store.path) as sibling:
+            make_task(sibling, f"competing{index}")
+            with pytest.raises(TaskSpindleError):
+                hybrid.admit(sibling, alias, f"competing{index}", now=now, parent_env=env, prompting=True)
+        hybrid.finish(store, f"native-only{index}", "failed", now=now)
+    assert hybrid.status(store, grok, now=now, parent_env=env)["state"] == "held"
+    refreshed = (now + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    assert store.claim_native_check("grok", fingerprint, "refresh", refreshed, refreshed, refreshed)
+    store.finish_native_check("grok", fingerprint, "refresh", refreshed, result | {"checked_at": refreshed})
+    held = hybrid.status(store, grok, now=now + timedelta(days=30), parent_env=env)
+    assert held["state"] == "held"
+    assert held["episode_id"] == episode_id
+    assert held["attempts_used"] == 3
+
+
+def test_migration_retains_valid_native_only_exhaustion_with_no_attempts(tmp_path, monkeypatch):
+    from taskspindle import hybrid_recovery as hybrid
+    from taskspindle import store as store_module
+    from taskspindle.access_checks import native_fingerprint
+
+    grok = replace(providers.Profile(id="grok", auth="oauth", command=("grok",)), provider_recovery="hybrid")
+    env = {"HOME": str(tmp_path)}
+    path = tmp_path / "native-legacy.db"
+    stamp = NOW.isoformat().replace("+00:00", "Z")
+    fingerprint = native_fingerprint(grok, env)
+    with monkeypatch.context() as before:
+        before.setattr(store_module, "MIGRATIONS", store_module.MIGRATIONS[:9])
+        with Store.open(path) as legacy:
+            assert legacy.claim_native_check("grok", fingerprint, "test", stamp, stamp, stamp)
+            legacy.finish_native_check(
+                "grok",
+                fingerprint,
+                "test",
+                stamp,
+                {
+                    "state": "quota",
+                    "checked_at": stamp,
+                    "used_percent": 100,
+                    "window": "monthly",
+                    "period_start": "2026-09-01T00:00:00Z",
+                    "reset_at": "2026-10-01T00:00:00Z",
+                },
+            )
+    with Store.open(path) as migrated:
+        view = hybrid.status(migrated, grok, now=NOW + timedelta(days=30), parent_env=env)
+        assert view["state"] == "trial_ready"
+        assert view["attempts_used"] == 0
+        assert view["episode_id"] is not None

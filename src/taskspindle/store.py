@@ -652,6 +652,22 @@ INSERT OR IGNORE INTO recovery_episodes(episode_id, status_key, scope, model, qu
 SELECT 'legacy-quota:' || id, status_key, 'quota:' || window, COALESCE(model,''), scope, 'throttled',
        observed_at, strftime('%Y-%m-%dT%H:%M:%SZ', observed_at, '+5 minutes')
 FROM provider_quota_restrictions WHERE resolved_at IS NULL ORDER BY observed_at;
+INSERT OR IGNORE INTO recovery_episodes(episode_id,status_key,scope,model,refusal_kind,
+                                        observed_at,next_attempt_at)
+SELECT 'legacy-native:' || provider, provider, 'quota:' || json_extract(payload,'$.window'),
+       '', 'throttled', json_extract(payload,'$.checked_at'),
+       strftime('%Y-%m-%dT%H:%M:%SZ', json_extract(payload,'$.checked_at'), '+5 minutes')
+FROM (
+    SELECT provider, CASE WHEN json_valid(success_json) THEN success_json
+                          WHEN json_valid(result_json) THEN result_json ELSE '{}' END AS payload
+    FROM native_checks
+)
+WHERE json_extract(payload,'$.state') = 'quota'
+  AND json_type(payload,'$.used_percent') IN ('integer','real')
+  AND json_extract(payload,'$.used_percent') = 100
+  AND json_extract(payload,'$.window') IN ('weekly','monthly')
+  AND julianday(json_extract(payload,'$.period_start')) <= julianday(json_extract(payload,'$.checked_at'))
+  AND julianday(json_extract(payload,'$.checked_at')) < julianday(json_extract(payload,'$.reset_at'));
 """
 
 MIGRATIONS: list[tuple[int, str]] = [
