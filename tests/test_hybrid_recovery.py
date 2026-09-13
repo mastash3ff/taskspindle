@@ -222,6 +222,52 @@ def test_quota_window_without_account_status_obeys_budget_and_future_reset(store
     assert status(store, now, model="sonnet")["state"] == "eligible"
 
 
+@pytest.mark.parametrize(
+    "window,selected,want",
+    [
+        ("seven_day_opus", "sonnet", "eligible"),
+        ("seven_day_opus", "opus", "held"),
+        ("seven_day_sonnet", "opus", "eligible"),
+        ("seven_day_sonnet", "sonnet", "held"),
+        ("five_hour", "sonnet", "held"),
+        ("seven_day_opus", "unrecognized-model", "held"),
+    ],
+)
+def test_legacy_account_quota_reset_respects_selected_model_scope(store, window, selected, want):
+    store.mark_provider_healthy("claude", expected=store.get_provider_status("claude"))
+    reset = (NOW + timedelta(hours=1)).isoformat()
+    store.set_provider_status(
+        "claude", "throttled", source="acp_error", window=window, reset_at=reset, observed_at=NOW.isoformat()
+    )
+    store.insert_provider_window(
+        "claude",
+        window,
+        source="rate_limit_event",
+        status="rejected",
+        resets_at=reset,
+        observed_at=NOW.isoformat(),
+    )
+    view = status(store, NOW + timedelta(minutes=5), model=selected)
+    assert view["state"] == want
+    assert view["hold_reason"] == ("provider_reset_pending" if want == "held" else None)
+    if want == "eligible":
+        assert view["episode_id"] is None
+
+
+def test_auth_reset_remains_account_wide_even_with_family_window_metadata(store):
+    store.set_provider_status(
+        "claude",
+        "auth_expired",
+        source="acp_error",
+        window="seven_day_opus",
+        reset_at=(NOW + timedelta(hours=1)).isoformat(),
+        observed_at=NOW.isoformat(),
+    )
+    assert (
+        status(store, NOW + timedelta(minutes=5), model="sonnet")["hold_reason"] == "provider_reset_pending"
+    )
+
+
 def test_model_catalog_added_edge_releases_only_that_model_once(store):
     from taskspindle import hybrid_recovery as hybrid
 

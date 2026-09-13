@@ -218,7 +218,13 @@ def status(
     quota_view = quota.evaluate(store, profile, now, model, parent_env, defer_model)
     rows = [store.get_provider_status(key), store.get_provider_model_status(key, model) if model else None]
     if any(
-        row and row.get("reset_at") and (_time(row["reset_at"]) is None or _time(row["reset_at"]) > now)
+        row
+        and (
+            row.get("state") != "throttled"
+            or quota.window_applies(row.get("window"), model, defer_model=defer_model)
+        )
+        and row.get("reset_at")
+        and (_time(row["reset_at"]) is None or _time(row["reset_at"]) > now)
         for row in rows
     ):
         block = block or "provider_reset_pending"
