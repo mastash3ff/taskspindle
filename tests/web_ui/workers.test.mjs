@@ -149,7 +149,7 @@ test("hybrid recovery replaces manual retry controls with automatic state guidan
   };
   const held = __test__.availabilityCard({ id: "claude" }, {
     state: "auth_expired", next_action: "sign_in", recovery: manual,
-    automatic_recovery: { policy: "hybrid", state: "held", attempts_remaining: 0 },
+    automatic_recovery: { policy: "hybrid", state: "held", attempts_remaining: 0, hold_reason: "attempts_exhausted" },
   });
   assert.match(textOf(held), /Recovery is held until new relevant positive evidence is recorded/);
   assert.doesNotMatch(textOf(held), /Controlled retry available|Copy command|Sign in/);
@@ -159,7 +159,14 @@ test("hybrid recovery replaces manual retry controls with automatic state guidan
     state: "auth_expired", next_action: "retry", recovery: manual,
     automatic_recovery: { policy: "hybrid", state: "trial_ready", attempts_remaining: 1 },
   });
-  assert.match(textOf(trialReady), /New positive evidence permits one automatic trial when work is pending/);
+  assert.match(textOf(trialReady), /One automatic recovery trial is available when work is pending/);
+  assert.doesNotMatch(textOf(trialReady), /New positive evidence/);
+  const resetHeld = __test__.availabilityCard({ id: "claude" }, {
+    state: "throttled",
+    automatic_recovery: { policy: "hybrid", state: "held", attempts_remaining: 3, hold_reason: "provider_reset_pending" },
+  });
+  assert.match(textOf(resetHeld), /Recovery is blocked by the recorded hold reason/);
+  assert.doesNotMatch(textOf(resetHeld), /until new relevant positive evidence/);
   assert.doesNotMatch(textOf(trialReady), /Controlled retry available|Copy command|Retry a task/);
   assert.equal(nodes(trialReady, (node) => node.tag === "button").length, 0);
 });

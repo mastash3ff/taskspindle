@@ -83,8 +83,10 @@ function automaticRecovery(recovery) {
 }
 
 function automaticRecoveryNextAction(recovery) {
-  if (recovery.state === "held") return "Recovery is held until new relevant positive evidence is recorded.";
-  if (recovery.state === "trial_ready") return "New positive evidence permits one automatic trial when work is pending.";
+  if (recovery.state === "held") return recovery.hold_reason === "attempts_exhausted"
+    ? "Recovery is held until new relevant positive evidence is recorded."
+    : "Recovery is blocked by the recorded hold reason. Native checks may continue.";
+  if (recovery.state === "trial_ready") return "One automatic recovery trial is available when work is pending.";
   if (recovery.state === "trial_running") return "The automatic recovery trial is running.";
   if (recovery.state === "cooldown") return recovery.next_attempt_at
     ? `Automatic recovery is cooling down until ${formatDate(recovery.next_attempt_at)}.`
