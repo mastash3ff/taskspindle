@@ -28,6 +28,7 @@ from typing import Any
 
 from . import (
     auth_context,
+    hybrid_recovery,
     limits,
     native_overage,
     provider_recovery,
@@ -448,6 +449,8 @@ async def run_worker(
                 await heartbeat
         if running and run is not None:
             _complete_turn(run)
+            hybrid_recovery.finish(store, task_id, "failed", now=datetime.now(UTC),
+                                   code=(run.task.error or {}).get("code") or run.task.state.value)
             if run.revision == 1:
                 provider_recovery.finish(
                     store, task_id, "failed", now=datetime.now(UTC),
@@ -779,7 +782,8 @@ def _capture_model_status_at_start(run: _Run, profile: Profile) -> None:
 def _check_initial_auth_context(run: _Run, profile: Profile) -> str:
     """Guard preflight as well as prompting against a changed login location or metadata."""
     current = auth_context.fingerprint(profile, os.environ)
-    if run.revision == 1 or profile.native_overage == "provider_managed":
+    if (run.revision == 1 or profile.native_overage == "provider_managed"
+            or profile.provider_recovery == "hybrid"):
         expected = run.store.get_task_auth_context(run.task_id) or run.provider_auth_context_at_start
         if expected is not None and expected != current:
             raise _Failure(
@@ -796,15 +800,21 @@ def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
         settings = load_config(config_file)
         from dataclasses import replace
 
-        from .config import native_overage_policies
+        from .config import native_overage_policies, provider_recovery_policies
 
         selected = settings.get("native_overage", {})
         if isinstance(selected, dict):
             settings = dict(settings) | {
                 "native_overage": {profile.id: selected[profile.id]} if profile.id in selected else {}
             }
+        selected_recovery = settings.get("provider_recovery", {})
+        if isinstance(selected_recovery, dict):
+            settings = dict(settings) | {"provider_recovery": {
+                profile.id: selected_recovery[profile.id]
+            } if profile.id in selected_recovery else {}}
         profile = replace(
-            profile, native_overage=native_overage_policies(settings, {profile.id: profile})[profile.id]
+            profile, native_overage=native_overage_policies(settings, {profile.id: profile})[profile.id],
+            provider_recovery=provider_recovery_policies(settings, {profile.id: profile})[profile.id],
         )
     try:
         projection = native_overage.admit(
@@ -831,6 +841,13 @@ def _capture_and_validate_provider_status(run: _Run, profile: Profile) -> None:
         run.store, profile, now=datetime.now(UTC), model=model, parent_env=os.environ,
     )
     run.quota_fingerprints_at_start = quota_evidence["evidence_fingerprints"]
+    if profile.provider_recovery == "hybrid":
+        try:
+            hybrid_recovery.admit(run.store, profile, run.task_id, now=datetime.now(UTC), model=model,
+                                  parent_env=os.environ, prompting=True)
+        except TaskSpindleError as exc:
+            raise _Failure(exc.code, exc.message, details=exc.details) from exc
+        return
     # Availability selection applies to a newly launched managed task. Existing tasks keep their
     # established continuation/recovery behavior while still recording real provider outcomes.
     if run.revision != 1:
@@ -1250,8 +1267,12 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
             code=None if success else "NATIVE_REFUSAL",
         )
         run.native_service_succeeded = success
+        hybrid_recovery.finish(run.store, run.task_id, "succeeded" if success else "failed",
+                               now=datetime.now(UTC), code=None if success else "NATIVE_REFUSAL")
         return
     if rejected:
+        hybrid_recovery.finish(run.store, run.task_id, "failed", now=datetime.now(UTC),
+                               code=limits.PROVIDER_THROTTLED)
         if run.revision == 1:
             provider_recovery.finish(
                 run.store, run.task_id, "failed", now=datetime.now(UTC),
@@ -1285,6 +1306,7 @@ def _record_provider_health(run: _Run, profile: Profile, result: TurnResult) -> 
                 captured_auth_context=run.provider_auth_context_at_start,
             )
             run.store.set_provider_auth_context(key, current_context)
+            hybrid_recovery.finish(run.store, run.task_id, "succeeded", now=datetime.now(UTC))
             if run.revision == 1:
                 provider_recovery.finish(
                     run.store, run.task_id, "succeeded", now=datetime.now(UTC),

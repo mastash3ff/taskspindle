@@ -170,6 +170,7 @@ def test_catalog_reuses_home_and_never_returns_identity_or_stderr(paths, environ
     assert evidence == {
         "auth_method_id": "oauth-personal", "cached_credential": True,
         "model_count": 1, "protocol": "agy-cli", "version": "1.1.26",
+        "model_ids": ["gemini-4-pro", "claude-x"],
     }
 
 

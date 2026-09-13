@@ -180,9 +180,12 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
             "inspect, cross-review and explicitly accept what it produced. Start with "
             "capabilities; authorize a repository before starting a task in it; retrieve the "
             "whole diff and record an independent review before accept_task will run. When "
-            "cached refusal evidence offers controlled recovery, arm its exact evidence_revision "
-            "with provider_recovery only after the user explicitly authorizes that retry, then "
-            "pass that permit once to start_task."
+            "cached refusal evidence blocks work, inspect availability.automatic_recovery. "
+            "Hybrid policy admits necessary work after its bounded cooldowns and holds after "
+            "three failed trials until relevant new positive evidence permits one trial. "
+            "Do not launch synthetic probes. Under manual policy, arm the exact evidence_revision "
+            "with provider_recovery only after explicit user authorization and pass that permit "
+            "once to start_task. Manual permits cannot bypass hybrid policy."
         ),
     )
     log_path = orchestrator.paths.state_dir / "server.log"
@@ -218,9 +221,9 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         evidence_revision: str | None = None,
         permit_id: str | None = None,
     ) -> dict[str, Any]:
-        """Arm one controlled retry against an explicit cached evidence revision, or revoke an
-        armed permit. This never checks a provider, starts login, launches a browser, or runs
-        inference."""
+        """Under manual policy, arm one controlled retry against an explicit cached evidence
+        revision, or revoke an armed permit. Hybrid profiles use availability.automatic_recovery
+        and reject manual overrides. This tool never checks a provider or runs inference."""
         def body() -> dict[str, Any]:
             if action == "arm":
                 if (

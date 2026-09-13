@@ -46,10 +46,12 @@ def fingerprint(profile: Any) -> str:
 
 def current_profile(profile: Any, profiles: Mapping[str, Any], config_file: Path) -> Any:
     """Re-read policy on each boundary, including deletion of a prior opt-in."""
-    from .config import load_config, native_overage_policies
+    from .config import load_config, native_overage_policies, provider_recovery_policies
 
-    policies = native_overage_policies(load_config(config_file), profiles)
-    return replace(profile, native_overage=policies[profile.id])
+    settings = load_config(config_file)
+    policies = native_overage_policies(settings, profiles)
+    recovery = provider_recovery_policies(settings, profiles)
+    return replace(profile, native_overage=policies[profile.id], provider_recovery=recovery[profile.id])
 
 
 def normalize_observation(info: Mapping[str, Any]) -> dict[str, Any]:

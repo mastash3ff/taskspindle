@@ -589,6 +589,71 @@ CREATE TABLE native_overage_observations (
 );
 """
 
+_MIGRATION_10 = """
+CREATE TABLE recovery_episodes (
+    episode_id TEXT PRIMARY KEY,
+    status_key TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    quota_scope TEXT NOT NULL DEFAULT 'account',
+    refusal_kind TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    attempts_used INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    consumed_revision INTEGER NOT NULL DEFAULT 0,
+    resolved_at TEXT
+);
+CREATE UNIQUE INDEX recovery_episode_active ON recovery_episodes(status_key, scope, model)
+    WHERE resolved_at IS NULL;
+CREATE TABLE recovery_claims (
+    claim_id TEXT PRIMARY KEY,
+    status_key TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(id),
+    model TEXT,
+    episodes TEXT NOT NULL,
+    auth_context TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    outcome_code TEXT
+);
+CREATE UNIQUE INDEX recovery_claim_active ON recovery_claims(status_key)
+    WHERE state IN ('claimed', 'prompting');
+CREATE TABLE recovery_native_semantics (
+    status_key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+);
+CREATE TABLE recovery_evidence (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT,
+    status_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL
+);
+INSERT INTO recovery_episodes(episode_id, status_key, scope, model, quota_scope, refusal_kind,
+                              observed_at, next_attempt_at)
+SELECT 'legacy-account:' || provider, provider,
+       CASE WHEN state='throttled' THEN 'quota:' || COALESCE(window,'unknown') ELSE 'account' END,
+       CASE WHEN state='throttled' AND window='seven_day_opus' THEN 'opus'
+            WHEN state='throttled' AND window='seven_day_sonnet' THEN 'sonnet' ELSE '' END,
+       CASE WHEN state='throttled' AND window IN ('seven_day_opus','seven_day_sonnet')
+            THEN 'model_family' ELSE 'account' END,
+       state, observed_at,
+       strftime('%Y-%m-%dT%H:%M:%SZ', observed_at, '+5 minutes') FROM provider_status
+WHERE state IN ('auth_expired', 'access_denied', 'throttled');
+INSERT INTO recovery_episodes(episode_id, status_key, scope, model, refusal_kind,
+                              observed_at, next_attempt_at)
+SELECT 'legacy-model:' || provider || ':' || model, provider, 'model', model, state, observed_at,
+       strftime('%Y-%m-%dT%H:%M:%SZ', observed_at, '+5 minutes') FROM provider_model_status
+WHERE state = 'model_unavailable';
+INSERT OR IGNORE INTO recovery_episodes(episode_id, status_key, scope, model, quota_scope,
+                                        refusal_kind, observed_at, next_attempt_at)
+SELECT 'legacy-quota:' || id, status_key, 'quota:' || window, COALESCE(model,''), scope, 'throttled',
+       observed_at, strftime('%Y-%m-%dT%H:%M:%SZ', observed_at, '+5 minutes')
+FROM provider_quota_restrictions WHERE resolved_at IS NULL ORDER BY observed_at;
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -599,6 +664,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (7, _MIGRATION_7),
     (8, _MIGRATION_8),
     (9, _MIGRATION_9),
+    (10, _MIGRATION_10),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1616,6 +1682,9 @@ class Store:
                     source,
                 ),
             )
+            from .hybrid_recovery import record_refusal
+
+            record_refusal(self, provider, state, observed_at or now(), window=window)
 
     def set_provider_model_status(
         self,
@@ -1640,12 +1709,38 @@ class Store:
                 "source = excluded.source",
                 (provider, model, state, code, reason, observed_at or now(), task_id, source),
             )
+            from .hybrid_recovery import record_refusal
+
+            record_refusal(self, provider, state, observed_at or now(), model=model)
 
     def get_provider_status(self, provider: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT * FROM provider_status WHERE provider = ?", (provider,)
         ).fetchone()
         return dict(row) if row else None
+
+    def list_recovery_episodes(self, status_key: str) -> list[dict[str, Any]]:
+        if self.schema_version() < 10:
+            return []
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM recovery_episodes WHERE status_key=? AND resolved_at IS NULL", (status_key,)
+        )]
+
+    def active_recovery_claim(self, status_key: str) -> dict[str, Any] | None:
+        if self.schema_version() < 10:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM recovery_claims WHERE status_key=? AND state IN ('claimed', 'prompting')",
+            (status_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_recovery_evidence(self, status_key: str) -> list[dict[str, Any]]:
+        if self.schema_version() < 10:
+            return []
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM recovery_evidence WHERE status_key=? ORDER BY revision", (status_key,)
+        )]
 
     def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -1734,6 +1829,14 @@ class Store:
                         "AND (last_success_at IS NULL OR last_success_at < ?)",
                         (stamp, provider, model, stamp),
                     )
+            if clear_account and self.schema_version() >= 10:
+                conn.execute("UPDATE recovery_episodes SET resolved_at=? WHERE status_key=? "
+                             "AND scope='account' AND refusal_kind != 'throttled' AND resolved_at IS NULL",
+                             (stamp, provider))
+            if model and clear_model and self.schema_version() >= 10:
+                conn.execute("UPDATE recovery_episodes SET resolved_at=? WHERE status_key=? "
+                             "AND scope='model' AND model=? AND resolved_at IS NULL",
+                             (stamp, provider, model))
             return clear_account and (not model or clear_model)
 
     def list_provider_status(self) -> list[dict[str, Any]]:
@@ -1832,6 +1935,10 @@ class Store:
             row = conn.execute(
                 "SELECT * FROM provider_quota_restrictions WHERE id = ?", (cur.lastrowid,)
             ).fetchone()
+            from .hybrid_recovery import record_refusal
+
+            record_refusal(self, status_key, "throttled", stamp, window=window or period_key,
+                           model=model, quota_scope=scope)
             return dict(row)
 
     def list_quota_restrictions(
@@ -1876,6 +1983,18 @@ class Store:
                 "SELECT * FROM provider_quota_restrictions WHERE status_key = ? "
                 f"AND evidence_fingerprint IN ({marks}) ORDER BY id", (status_key, *unique),
             ).fetchall()
+            if self.schema_version() >= 10:
+                for row in rows:
+                    remaining = conn.execute(
+                        "SELECT 1 FROM provider_quota_restrictions WHERE status_key=? AND scope=? "
+                        "AND model IS ? AND window=? AND resolved_at IS NULL LIMIT 1",
+                        (status_key, row["scope"], row["model"], row["window"]),
+                    ).fetchone()
+                    if remaining is None:
+                        conn.execute("UPDATE recovery_episodes SET resolved_at=? WHERE status_key=? "
+                                     "AND scope=? AND quota_scope=? AND model=? AND resolved_at IS NULL",
+                                     (stamp, status_key, "quota:" + row["window"],
+                                      row["scope"], row["model"] or ""))
             return [dict(row) for row in rows]
 
     def get_active_quota_retry_claim(self, status_key: str) -> dict[str, Any] | None:
@@ -1899,6 +2018,10 @@ class Store:
         if not status_key or not task_id or not fingerprints:
             raise StoreError("quota retry claim requires status key, task and evidence")
         with self._guard(), self.transaction() as conn:
+            if self.schema_version() >= 10:
+                automatic = self.active_recovery_claim(status_key)
+                if automatic and automatic["task_id"] != task_id:
+                    return None
             own = conn.execute(
                 "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -2083,13 +2206,16 @@ class Store:
                                "AND lease_owner=?", (provider, fingerprint, owner)).fetchone()
             if row is None:
                 return False
-            success = result.get("state") == "quota"
+            success = result.get("state") in {"quota", "cached_auth", "catalog_access"}
             conn.execute("UPDATE native_checks SET attempt_at=?, result_json=?, success_at=?, "
                          "success_json=?, lease_owner=NULL, lease_until=NULL WHERE provider=? "
                          "AND fingerprint=? AND lease_owner=?",
                          (at, json.dumps(result), at if success else row["success_at"],
                           json.dumps(result) if success else row["success_json"],
                           provider, fingerprint, owner))
+            from .hybrid_recovery import record_native_evidence
+
+            record_native_evidence(self, provider, result, at)
             return True
 
     # -- provider windows -------------------------------------------------------------

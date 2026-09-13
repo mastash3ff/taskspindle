@@ -142,5 +142,6 @@ def agy_oauth_evidence(
     return {
         "auth_method_id": "oauth-personal", "cached_credential": True,
         "model_count": sum(model_id.startswith("gemini-") for model_id, _ in rows),
+        "model_ids": [model_id for model_id, _ in rows],
         "protocol": PROTOCOL, "version": ADAPTER_VERSION,
     }

@@ -6,6 +6,7 @@ add a temporary availability gate. Only allowlisted diagnostic projections are r
 
 from __future__ import annotations
 
+import json
 import subprocess
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -30,6 +31,7 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
         "account_binding": "unverified",
         "plan": None,
         "model_count": None,
+        "model_ids": None,
         "detail": "No approved native access check is available for this profile.",
     }
     if profile.auth != "oauth" or profile.secret_env or profile.family not in {"claude", "agy"}:
@@ -50,7 +52,7 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
                 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
                     if command != ["claude", "auth", "status"]:
                         raise ValueError("Unsupported native check command")
-                    return subprocess.run(
+                    completed = subprocess.run(
                         command,
                         env=env,
                         cwd=temporary,
@@ -60,6 +62,15 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
                         timeout=15,
                         check=False,
                     )
+                    try:
+                        payload = json.loads(completed.stdout or "")
+                    except ValueError:
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("loggedIn") is False:
+                        result.update(
+                            state="auth_required", detail="Claude reports no cached authentication."
+                        )
+                    return completed
 
                 evidence = providers.claude_oauth_evidence(run)
             plan = evidence.get("subscriptionType")
@@ -74,13 +85,25 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
                 ),
             )
         else:
-            evidence = agy_cli_adapter.agy_oauth_evidence(profile, parent_env, runner=subprocess.run)
+            def agy_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                from .agy_cli import _failure
+
+                completed = subprocess.run(command, **kwargs)
+                if command[-1] == "models" and completed.returncode != 0:
+                    failure = _failure((completed.stdout or "") + (completed.stderr or ""),
+                                       status="error", exit_code=completed.returncode)
+                    if failure.code == limits.PROVIDER_AUTH_EXPIRED:
+                        result.update(state="auth_required", detail="Antigravity requires authentication.")
+                return completed
+
+            evidence = agy_cli_adapter.agy_oauth_evidence(profile, parent_env, runner=agy_run)
             count = evidence.get("model_count")
             if type(count) is not int or count < 1:
                 return result
             result.update(
                 state="catalog_access",
                 model_count=count,
+                model_ids=evidence.get("model_ids"),
                 detail=(
                     "Antigravity listed its model catalog; "
                     "model-turn access and account binding are unverified."
@@ -92,7 +115,7 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
     return result
 
 
-# Grok diagnostics use a separate persistent cache; task evidence is never updated here.
+# Diagnostics share a persistent cache; task evidence is never updated here.
 NATIVE_TTL_S = 300
 
 
@@ -129,6 +152,10 @@ def native_fingerprint(profile: Profile, parent_env: Mapping[str, str]) -> str:
         metadata(grok_home / "config.toml"),
         metadata(Path(profile.env["GROK_CONFIG"])) if profile.env.get("GROK_CONFIG") else None,
     ]
+    if profile.family != "grok":
+        from .auth_context import fingerprint
+
+        payload = [profile.family, fingerprint(profile, parent_env), metadata(Path(executable))]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -140,6 +167,38 @@ def _grok_eligible(profile: Profile) -> bool:
         and bool(profile.command)
         and Path(profile.command[0]).name == "grok"
     )
+
+
+def _eligible(profile: Profile) -> bool:
+    return _grok_eligible(profile) or (
+        profile.family in {"claude", "agy"} and profile.auth == "oauth" and not profile.secret_env
+    )
+
+
+def _safe_native_result(value: Any, profile: Profile) -> dict[str, Any] | None:
+    if profile.family == "grok":
+        return _safe_grok_result(value)
+    if not isinstance(value, dict):
+        return None
+    from .grok_checks import parse_time
+
+    states = {"cached_auth", "catalog_access", "auth_required", "check_failed", "unsupported"}
+    if not isinstance(value.get("state"), str) or value["state"] not in states:
+        return None
+    checked = parse_time(value.get("checked_at"))
+    ids = value.get("model_ids")
+    ids = (sorted({item for item in ids if isinstance(item, str) and limits._model(item) == item})
+           if isinstance(ids, list) else None)
+    return {
+        "state": value["state"],
+        "source": "claude_auth_status" if profile.family == "claude" else "agy_models",
+        "checked_at": checked.isoformat().replace("+00:00", "Z") if checked else None,
+        "account_binding": "unverified",
+        "plan": value.get("plan") if value.get("plan") in ("pro", "max") else None,
+        "model_count": len(ids) if ids is not None else None,
+        "model_ids": ids,
+        "detail": "Cached native diagnostic evidence; model-turn access is unverified.",
+    }
 
 
 def _safe_grok_result(value: Any) -> dict[str, Any] | None:
@@ -226,8 +285,10 @@ def cached_native_check(
 
     current = now or datetime.now(UTC)
     result: dict[str, Any] = {
-        "state": "not_checked" if _grok_eligible(profile) else "unsupported",
-        "source": "grok_billing" if _grok_eligible(profile) else "unsupported",
+        "state": "not_checked" if _eligible(profile) else "unsupported",
+        "source": {"grok": "grok_billing", "claude": "claude_auth_status", "agy": "agy_models"}.get(
+            profile.family, "unsupported"
+        ) if _eligible(profile) else "unsupported",
         "version": None,
         "checked_at": None,
         "last_attempt_at": None,
@@ -235,6 +296,7 @@ def cached_native_check(
         "account_binding": "unverified",
         "plan": None,
         "model_count": None,
+        "model_ids": None,
         "used_percent": None,
         "window": None,
         "period_start": None,
@@ -247,7 +309,7 @@ def cached_native_check(
         "checking": False,
         "detail": "No current native quota observation is available.",
     }
-    if not _grok_eligible(profile):
+    if not _eligible(profile):
         return result
     reader = getattr(store, "get_native_check", None)
     row = reader(limits.status_key(profile)) if reader else None
@@ -255,15 +317,16 @@ def cached_native_check(
         profile, parent_env if parent_env is not None else os.environ
     ):
         return result
-    latest = _safe_grok_result(row.get("result_json"))
+    latest = _safe_native_result(row.get("result_json"), profile)
     if latest is not None:
         result.update({key: value for key, value in latest.items() if key in result})
     attempt, success = parse_time(row.get("attempt_at")), parse_time(row.get("success_at"))
-    prior = _safe_grok_result(row.get("success_json"))
+    prior = _safe_native_result(row.get("success_json"), profile)
     result.update(
         last_attempt_at=attempt.isoformat().replace("+00:00", "Z") if attempt else None,
         last_success_at=success.isoformat().replace("+00:00", "Z") if success else None,
-        last_success=prior if prior and prior["state"] == "quota" else None,
+        last_success=(prior if prior and prior["state"] in {"quota", "cached_auth", "catalog_access"}
+                      else None),
     )
     lease_end = parse_time(row.get("lease_until"))
     result["checking"] = bool(row.get("lease_owner") and lease_end and lease_end > current)
@@ -290,9 +353,7 @@ def refresh_native_check(store: Any, profile: Profile, parent_env: Mapping[str, 
     import uuid
     from datetime import timedelta
 
-    from .grok_checks import check_grok
-
-    if not _grok_eligible(profile):
+    if not _eligible(profile):
         return check_native_access(profile, parent_env)
     fingerprint = native_fingerprint(profile, parent_env)
     owner = uuid.uuid4().hex
@@ -311,7 +372,7 @@ def refresh_native_check(store: Any, profile: Profile, parent_env: Mapping[str, 
             iso(current + timedelta(seconds=40)),
             iso(current - timedelta(seconds=NATIVE_TTL_S)),
         ):
-            result = check_grok(profile, parent_env)
+            result = check_native_access(profile, parent_env)
             at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             # Silent native refresh can rotate auth metadata. Never attach the previous account's
             # success to new metadata; the next request invalidates and checks afresh.

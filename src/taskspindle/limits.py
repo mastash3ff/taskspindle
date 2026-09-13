@@ -389,6 +389,20 @@ def classify_acp_error(exc: AcpError, *, family: str, model: str | None = None) 
     raw_error_kind = data.get("errorKind") if isinstance(data, Mapping) else None
     error_kind = raw_error_kind if isinstance(raw_error_kind, str) else None
 
+    # These are normalized by the native AGY adapter from terminal diagnostics. ACP wire
+    # errors and arbitrary task/tool text cannot acquire this provenance from their wording.
+    if family == "agy" and "native_status" in cause and "exit_code" in cause:
+        kinds = {PROVIDER_AUTH_EXPIRED: "auth_expired", PROVIDER_THROTTLED: "throttled",
+                 PROVIDER_ACCESS_DENIED: "access_denied", "MODEL_UNAVAILABLE": "model_unavailable"}
+        state = kinds.get(exc.code)
+        if state:
+            return Classification(
+                PROVIDER_MODEL_UNAVAILABLE if state == "model_unavailable" else exc.code,
+                state, "unknown" if state == "throttled" else None, None, state == "throttled",
+                _SAFE_REASONS[state], scope="model" if state == "model_unavailable" else "account",
+                affected_model=_model(model) if state == "model_unavailable" else None,
+            )
+
     if rpc_code == -32000 or error_kind in AUTH_ERROR_KINDS:
         return Classification(
             PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False,

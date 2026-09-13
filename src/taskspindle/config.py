@@ -105,3 +105,19 @@ def native_overage_policies(settings: Mapping[str, Any], profiles: Mapping[str, 
         if profiles[name].auth != "oauth":
             raise ConfigError(f"native_overage.{name} requires a native OAuth profile")
     return {name: configured.get(name, "observe_only") for name in sorted(profiles)}
+
+
+def provider_recovery_policies(settings: Mapping[str, Any], profiles: Mapping[str, Any]) -> dict[str, str]:
+    """Recovery authority belongs to each exact configured OAuth profile."""
+    configured = settings.get("provider_recovery", {})
+    if not isinstance(configured, dict):
+        raise ConfigError("provider_recovery must be a table of exact profile policies")
+    unknown = set(configured) - set(profiles)
+    if unknown:
+        raise ConfigError(f"provider_recovery contains unknown provider(s): {', '.join(sorted(unknown))}")
+    for name, policy in configured.items():
+        if not isinstance(policy, str) or policy not in {"manual", "hybrid"}:
+            raise ConfigError(f"provider_recovery.{name} must be manual or hybrid")
+        if profiles[name].auth != "oauth":
+            raise ConfigError(f"provider_recovery.{name} requires a native OAuth profile")
+    return {name: configured.get(name, "manual") for name in sorted(profiles)}

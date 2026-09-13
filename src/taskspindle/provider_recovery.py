@@ -56,6 +56,12 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
     rows = [row for row in (account, selected) if row is not None]
     future_reset = any((_time(row.get("reset_at")) or now) > now for row in rows)
     exhausted = native.get("eligible_hint") is False
+    native_denial = native.get("freshness") == "fresh" and (
+        native.get("state") == "auth_required" or (
+            model is not None and native.get("state") == "catalog_access"
+            and isinstance(native.get("model_ids"), list) and model not in native["model_ids"]
+        )
+    )
     # A bare throttle is deliberately recoverable only through this one-shot permit.
     # A supplied future reset, or current fresh native exhaustion, is never bypassable.
     quota_future = [
@@ -106,8 +112,10 @@ def _evidence(store: Any, profile: Any, now: datetime, model: str | None, parent
             _time(row.get("observed_at")) is None or _time(row.get("observed_at")) > now for row in refusals
         )
     )
-    eligible = (bool(refusals) or recoverable_quota) and not (
-        restrictions["future_reset"] or exhausted or malformed
+    eligible = (
+        getattr(profile, "provider_recovery", "manual") == "manual"
+        and (bool(refusals) or recoverable_quota)
+        and not (restrictions["future_reset"] or exhausted or malformed or native_denial)
     )
     return {
         **identity,
@@ -229,6 +237,9 @@ def arm(
     model = model if model is not None else profile.model
     with store.transaction() as conn:
         evidence = _evidence(store, profile, now, model, parent_env)
+        active_reader = getattr(store, "active_recovery_claim", None)
+        if active_reader and active_reader(evidence["status_key"]):
+            _error("ACTIVE_ATTEMPT", "An automatic recovery attempt already owns this account.")
         if evidence_revision != evidence["evidence_revision"]:
             _error("EVIDENCE_CHANGED", "Availability evidence changed; inspect it before arming.")
         if not evidence["eligible"]:
@@ -316,6 +327,8 @@ def validate(
     task_id: str | None = None,
     parent_env: Any = None,
 ) -> dict[str, Any]:
+    if getattr(profile, "provider_recovery", "manual") != "manual":
+        _error("MANUAL_POLICY_REQUIRED", "Manual permits require the manual recovery policy.")
     model = model if model is not None else profile.model
     key = _scope(profile, model)
     row = store.get_recovery_permit(permit_id)
@@ -332,6 +345,10 @@ def validate(
     if (_time(row["expires_at"]) or now) <= now:
         _error("EXPIRED", "Recovery permit expired before prompt admission.")
     evidence = _evidence(store, profile, now, row["model"], parent_env)
+    active_reader = getattr(store, "active_recovery_claim", None)
+    active = active_reader(key) if active_reader else None
+    if active and active["task_id"] != task_id:
+        _error("ACTIVE_ATTEMPT", "An automatic recovery attempt already owns this account.")
     if not row.get("auth_context"):
         _error("AUTH_CONTEXT_UNBOUND", "Recovery permit predates auth-context binding; revoke and re-arm.")
     if row["auth_context"] != evidence["auth_context"]:

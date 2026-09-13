@@ -73,6 +73,29 @@ class ReadOnlyStore:
 
     # -- repositories -------------------------------------------------------------------
 
+    def list_recovery_episodes(self, status_key: str) -> list[dict[str, Any]]:
+        if self._conn is None or (self.schema_version() or 0) < 10:
+            return []
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM recovery_episodes WHERE status_key=? AND resolved_at IS NULL", (status_key,)
+        )]
+
+    def active_recovery_claim(self, status_key: str) -> dict[str, Any] | None:
+        if self._conn is None or (self.schema_version() or 0) < 10:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM recovery_claims WHERE status_key=? AND state IN ('claimed','prompting')",
+            (status_key,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_recovery_evidence(self, status_key: str) -> list[dict[str, Any]]:
+        if self._conn is None or (self.schema_version() or 0) < 10:
+            return []
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM recovery_evidence WHERE status_key=? ORDER BY revision", (status_key,)
+        )]
+
     def list_repositories(self) -> list[dict[str, Any]]:
         if self._conn is None:
             return []

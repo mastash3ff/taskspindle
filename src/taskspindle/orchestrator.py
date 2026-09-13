@@ -26,6 +26,7 @@ import taskspindle
 
 from . import (
     auth_context,
+    hybrid_recovery,
     integration,
     native_overage,
     provider_recovery,
@@ -685,7 +686,8 @@ class Orchestrator:
                     self.store, profile, now=self.clock(), model=model,
                     parent_env=self.parent_env, defer_model=model is None,
                 )
-                trial_fingerprints = quota_evidence["retry_fingerprints"]
+                trial_fingerprints = (quota_evidence["retry_fingerprints"]
+                                      if profile.provider_recovery == "manual" else [])
                 if trial_fingerprints:
                     holder = self.store.get_active_quota_retry_claim(limits_key(profile))
                     if holder is not None:
@@ -703,6 +705,9 @@ class Orchestrator:
                 self.store.set_task_auth_context(
                     record.id, auth_context.fingerprint(profile, self.parent_env),
                 )
+                if request.recovery_permit_id is None:
+                    hybrid_recovery.admit(self.store, profile, record.id, now=self.clock(), model=model,
+                                          parent_env=self.parent_env, defer_model=model is None)
                 if trial_fingerprints:
                     claimed = self.store.claim_quota_retry(
                         status_key=limits_key(profile), task_id=record.id,
@@ -732,7 +737,8 @@ class Orchestrator:
             except Exception:
                 # Filesystem/setup errors outside _prepare's classified exceptions still burn
                 # an already claimed permit. Never quietly leave a second attempt authorized.
-                if request.recovery_permit_id is not None or trial_fingerprints:
+                if (request.recovery_permit_id is not None or trial_fingerprints
+                        or profile.provider_recovery == "hybrid"):
                     self._fail(record.id, "PREPARATION_FAILED", "Task preparation failed.")
                 raise
             self.dispatch_queued()
@@ -1096,6 +1102,8 @@ class Orchestrator:
                     limit=self.concurrency.get(task.provider, 1),
                 ):
                     return False
+                hybrid_recovery.admit(self.store, profile, task.id, now=self.clock(), model=selected_model,
+                                      parent_env=self.parent_env, defer_model=selected_model is None)
                 self.store.update_task(task.id, None, unit_name=unit, boot_id=self.boot)
         except TaskSpindleError as exc:
             self._fail(task.id, exc.code, exc.message, exc.details, reason="dispatch failed")
@@ -1148,6 +1156,13 @@ class Orchestrator:
             record = require_task(self.store, task_id)
             view = task_view(record).model_dump(mode="json")
             turns = self.store.list_turns(task_id)
+            selected_profile = self.profiles.get(record.provider)
+            if selected_profile is not None:
+                view["automatic_recovery"] = hybrid_recovery.status(
+                    self.store, self._policy_profile(selected_profile), now=self.clock(),
+                    model=record.resolved_model or record.requested_model,
+                    parent_env=self.parent_env, task_id=record.id,
+                )
             view["native_overage"] = (
                 (native_overage.unknown() | (turns[-1].get("native_overage") or {}))
                 if turns
@@ -1319,7 +1334,8 @@ class Orchestrator:
             )
             with self.store.transaction():
                 profile = self._policy_profile(self.profiles[record.provider])
-                if failed_quota or profile.native_overage == "provider_managed":
+                if (failed_quota or profile.native_overage == "provider_managed"
+                        or profile.provider_recovery == "hybrid"):
                     require_provider_available(
                         self.store,
                         profile,
@@ -1331,6 +1347,12 @@ class Orchestrator:
                         ),
                         parent_env=self.parent_env,
                     )
+                hybrid_recovery.admit(
+                    self.store, profile, record.id, now=self.clock(),
+                    model=(self._quota_continuation_model(record) if failed_quota
+                           else record.resolved_model or record.requested_model or profile.model),
+                    parent_env=self.parent_env,
+                )
                 self.store.insert_turn(
                     task_id,
                     revision,
@@ -1346,7 +1368,8 @@ class Orchestrator:
                     task_id,
                     target,
                     reason=f"{kind.value} turn requested",
-                    native_quota_continuation=failed_quota,
+                    native_quota_continuation=failed_quota and profile.provider_recovery == "manual",
+                    provider_recovery_continuation=failed_quota and profile.provider_recovery == "hybrid",
                     expected_state_version=record.state_version,
                     **_AWAITING_DISPATCH,
                 )
@@ -1363,6 +1386,21 @@ class Orchestrator:
                 "AUTH_CONTEXT_CHANGED", "Quota continuation requires the original authentication context."
             )
         error = record.error or {}
+        if profile.provider_recovery == "hybrid":
+            if error.get("code") not in {
+                "PROVIDER_THROTTLED", "PROVIDER_UNAVAILABLE", "PROVIDER_AUTH_EXPIRED",
+                "PROVIDER_ACCESS_DENIED", "PROVIDER_MODEL_UNAVAILABLE", "RECOVERY_NOT_READY",
+                "RECOVERY_EVIDENCE_CHANGED",
+            }:
+                raise TaskSpindleError(
+                    ILLEGAL_TRANSITION, "Only a provider-access failure can recover this way."
+                )
+            require_provider_available(
+                self.store, profile, now=self.clock(), model=self._quota_continuation_model(record),
+                parent_env=self.parent_env,
+            )
+            self._require_retained_session(record)
+            return
         if error.get("code") not in {"PROVIDER_THROTTLED", "PROVIDER_UNAVAILABLE"}:
             raise TaskSpindleError(
                 ILLEGAL_TRANSITION, "Only an included-quota failure can continue under native overage."
@@ -1390,6 +1428,9 @@ class Orchestrator:
         )
         if view["eligibility"] != "overage":
             raise TaskSpindleError("NATIVE_OVERAGE_BLOCKED", view["admission_reason"])
+        self._require_retained_session(record)
+
+    def _require_retained_session(self, record: TaskRecord) -> None:
         if not record.session_id:
             raise TaskSpindleError(RESUME_UNAVAILABLE, "The failed task has no original session to resume.")
         workspace = record.worktree_path or record.scratch_repo

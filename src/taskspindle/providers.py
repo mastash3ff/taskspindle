@@ -156,6 +156,7 @@ class Profile:
     gateway_host: str | None = None
 
     native_overage: str = "observe_only"
+    provider_recovery: str = "manual"
 
     @property
     def family(self) -> str:
@@ -435,10 +436,12 @@ def load_profiles(
     from .auth_context import validate_contexts
 
     validate_contexts(profiles, parent_env if parent_env is not None else os.environ)
-    from .config import native_overage_policies
+    from .config import native_overage_policies, provider_recovery_policies
 
     policies = native_overage_policies(config, profiles)
-    return {name: replace(profile, native_overage=policies[name]) for name, profile in profiles.items()}
+    recovery = provider_recovery_policies(config, profiles)
+    return {name: replace(profile, native_overage=policies[name], provider_recovery=recovery[name])
+            for name, profile in profiles.items()}
 
 
 def profile_for_task(

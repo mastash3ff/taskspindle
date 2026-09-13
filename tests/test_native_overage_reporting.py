@@ -94,7 +94,7 @@ def test_readonly_schema8_and_missing_database_remain_unknown_without_migration(
         connection.execute("DROP TABLE native_overage_attempts")
         connection.execute("DROP TABLE native_overage_observations")
         connection.execute("ALTER TABLE turns DROP COLUMN native_overage")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 9")
+        connection.execute("DELETE FROM schema_migrations WHERE version >= 9")
     before = path.read_bytes()
     with ReadOnlyStore(path) as reader:
         assert reader.schema_version() == 8

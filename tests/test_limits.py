@@ -13,6 +13,23 @@ from taskspindle.providers import Profile
 from taskspindle.store import Store
 
 
+@pytest.mark.parametrize("text,state,code", [
+    ("not authenticated", "auth_expired", "PROVIDER_AUTH_EXPIRED"),
+    ("quota exceeded", "throttled", "PROVIDER_THROTTLED"),
+    ("unknown model", "model_unavailable", "PROVIDER_MODEL_UNAVAILABLE"),
+])
+def test_native_agy_terminal_error_preserves_provider_scope(text, state, code):
+    from taskspindle.agy_cli import _failure
+    from taskspindle.limits import classify_acp_error
+
+    error = _failure(text, status="error", exit_code=1)
+    classified = classify_acp_error(error, family="agy", model="gemini-pro")
+    assert classified.provider_state == state
+    assert classified.code == code
+    if state == "model_unavailable":
+        assert classified.scope == "model"
+        assert classified.affected_model == "gemini-pro"
+
 def error(message: str, *, rpc_code: int = -32603, data: dict | None = None) -> AcpError:
     return AcpError(
         "ACP_TURN_ERROR",
@@ -302,6 +319,7 @@ def test_availability_exposes_stale_account_evidence_without_claiming_success(tm
     assert availability["native_overage"]["eligibility"] == "unknown"
     assert availability["native_overage"]["policy"] == "observe_only"
     assert availability == {
+        "automatic_recovery": availability["automatic_recovery"],
         "native_overage": availability["native_overage"],
         "evidence_revision": availability["evidence_revision"],
         "recovery": availability["recovery"],

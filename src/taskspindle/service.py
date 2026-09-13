@@ -190,6 +190,7 @@ def transition(
     reason: str,
     expected_state_version: int | None = None,
     native_quota_continuation: bool = False,
+    provider_recovery_continuation: bool = False,
     **fields: Any,
 ) -> TaskRecord:
     """Move a task to ``to_state``, applying ``fields`` and the audit event atomically."""
@@ -206,7 +207,8 @@ def transition(
                 },
             )
         allowed = LEGAL_TRANSITIONS.get(record.state, frozenset())
-        if native_quota_continuation and record.state is TaskState.FAILED and to_state is TaskState.RESUMING:
+        if ((native_quota_continuation or provider_recovery_continuation)
+                and record.state is TaskState.FAILED and to_state is TaskState.RESUMING):
             allowed = frozenset({TaskState.RESUMING})
         if to_state not in allowed:
             raise TaskSpindleError(
@@ -246,9 +248,12 @@ def transition(
             {"from": record.state.value, "to": to_state.value, "reason": reason},
         )
         if to_state in {TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
+            from . import hybrid_recovery
             from .provider_recovery import finish
 
             error = fields.get("error") or {}
+            hybrid_recovery.finish(store, task_id, "failed", now=datetime.now(UTC),
+                                   code=error.get("code") or to_state.value)
             finish(
                 store,
                 task_id,
@@ -323,7 +328,7 @@ def provider_availability(
     defer_model: bool = False,
     task_id: str | None = None,
 ) -> dict[str, Any]:
-    from . import native_overage, quota
+    from . import hybrid_recovery, native_overage, quota
 
     view = _provider_availability(
         store, profile, now=now, model=model, parent_env=parent_env, defer_model=defer_model
@@ -341,6 +346,26 @@ def provider_availability(
             retry_eligible=True,
             reason="Standing policy permits a provider-enforced native overage attempt.",
         )
+    automatic = hybrid_recovery.status(store, profile, now=now, model=model, parent_env=parent_env,
+                                       task_id=task_id, defer_model=defer_model)
+    view["automatic_recovery"] = automatic
+    native_check = hybrid_recovery.cached_native_check(store, profile, parent_env, now=now)
+    native_block = hybrid_recovery._native_block(native_check, model if model is not None else profile.model)
+    if native_block in {"native_auth_required", "native_model_absent"}:
+        view.update(state="auth_expired" if native_block == "native_auth_required" else "access_denied",
+                    next_action="wait", retry_eligible=False, reason=native_block)
+    if automatic["state"] == "trial_running" and automatic["active_task_id"] != task_id:
+        view.update(state="access_denied", next_action="wait", retry_eligible=False,
+                    reason="Another task holds this account's recovery trial.")
+    if automatic["policy"] == "hybrid":
+        if automatic["state"] == "trial_ready" or (
+            automatic["state"] == "trial_running" and automatic["active_task_id"] == task_id
+            and not automatic["hold_reason"]
+        ):
+            view.update(state="unknown", next_action="start", retry_eligible=True)
+        elif automatic["state"] in {"held", "cooldown", "trial_running"}:
+            view.update(state="access_denied", next_action="wait", retry_eligible=False,
+                        reason=automatic["hold_reason"] or "Automatic recovery is pending.")
     return view
 
 
@@ -499,6 +524,9 @@ def model_availability(
         recovery = recovery_status(store, profile, now=now, model=model, parent_env=parent_env)
         result.append(
             {
+                "automatic_recovery": provider_availability(
+                    store, profile, now=now, model=model, parent_env=parent_env
+                )["automatic_recovery"],
                 "evidence_revision": recovery["evidence_revision"],
                 "recovery": recovery,
                 "state": state,

@@ -121,7 +121,7 @@ def test_schema_nine_preserves_historical_unknown(tmp_path, monkeypatch):
                 (task.id,),
             )
     with Store.open(path) as migrated:
-        assert migrated.schema_version() == 9
+        assert migrated.schema_version() == 10
         turn = migrated.list_turns("history")[0]
         assert turn["response"] == "retained"
         assert turn["native_overage"] is None

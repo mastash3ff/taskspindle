@@ -40,7 +40,7 @@ def status(plan="max"):
 
 def assert_safe(result):
     assert set(result) == {
-        "state", "source", "checked_at", "account_binding", "plan", "model_count", "detail",
+        "state", "source", "checked_at", "account_binding", "plan", "model_count", "model_ids", "detail",
     }
     assert result["account_binding"] == "unverified"
     assert datetime.fromisoformat(result["checked_at"]).utcoffset().total_seconds() == 0
@@ -111,7 +111,8 @@ def test_claude_failure_is_fixed_and_redacted(profiles, parent, monkeypatch, fai
 
     monkeypatch.setattr(access_checks.subprocess, "run", run)
     result = access_checks.check_native_access(profiles["claude"], parent)
-    assert result["state"] == "check_failed" and result["source"] == "claude_auth_status"
+    assert result["state"] == ("auth_required" if failure == "logged_out" else "check_failed")
+    assert result["source"] == "claude_auth_status"
     assert result["plan"] is None and result["model_count"] is None
     assert_safe(result)
     assert all(not directory.exists() for directory in temporary)
@@ -182,6 +183,7 @@ def test_agy_reuses_pin_and_cached_catalog_check_without_reading_token_or_persis
     assert commands == [[str(binary), "--version"], [str(binary), "models"]]
     assert result["state"] == "catalog_access" and result["source"] == "agy_models"
     assert result["model_count"] == 2 and result["plan"] is None
+    assert result["model_ids"] == ["gemini-private-one", "gemini-private-two"]
     assert_safe(result)
     assert all(not directory.exists() for directory in temporary)
     assert token.stat().st_mtime_ns == before.st_mtime_ns
@@ -227,3 +229,44 @@ def test_grok_dispatches_only_to_bounded_native_checker(profiles, parent, monkey
     expected = {"state": "unsupported", "error_code": "METHOD_UNAVAILABLE"}
     monkeypatch.setattr(grok_checks, "check_grok", lambda profile, env: expected)
     assert access_checks.check_native_access(profiles["grok"], parent) is expected
+
+
+@pytest.mark.parametrize("name", ["claude", "agy"])
+def test_native_cache_shared_between_clients_and_does_not_repeat_diagnostics(
+    profiles, parent, tmp_path, monkeypatch, name,
+):
+    from taskspindle.store import Store
+
+    profile = profiles[name]
+    if name == "agy":
+        agy_fixtures(profile, parent)
+
+    def run(argv, **kwargs):
+        output = (json.dumps(status()) if name == "claude" else
+                  "1.1.26" if argv[-1] == "--version" else "gemini-pro\tGemini Pro\n")
+        return subprocess.CompletedProcess(argv, 0, output, "PRIVATE_STDERR")
+
+    monkeypatch.setattr(access_checks.subprocess, "run", run)
+    with Store.open(tmp_path / "cache.db") as first:
+        initial = access_checks.refresh_native_check(first, profile, parent)
+    monkeypatch.setattr(access_checks.subprocess, "run", lambda *a, **kw: pytest.fail("cache missed"))
+    with Store.open(tmp_path / "cache.db") as second:
+        cached = access_checks.refresh_native_check(second, profile, parent)
+        assert cached["state"] == initial["state"]
+        assert cached["freshness"] == "fresh"
+        assert cached["last_success_at"] is not None
+
+
+def test_agy_explicit_auth_denial_is_distinct_from_malformed_catalog(profiles, parent, monkeypatch):
+    profile = profiles["agy"]
+    agy_fixtures(profile, parent)
+
+    def run(argv, **kwargs):
+        if argv[-1] == "--version":
+            return subprocess.CompletedProcess(argv, 0, "1.1.26", "")
+        return subprocess.CompletedProcess(argv, 1, "", "not authenticated PRIVATE_EMAIL")
+
+    monkeypatch.setattr(access_checks.subprocess, "run", run)
+    result = access_checks.check_native_access(profile, parent)
+    assert result["state"] == "auth_required"
+    assert "PRIVATE" not in json.dumps(result)
