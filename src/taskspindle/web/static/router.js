@@ -1,4 +1,4 @@
-const ROUTES = new Set(["overview", "tasks", "workers", "usage"]);
+const ROUTES = new Set(["overview", "tasks", "workers", "usage", "policy"]);
 
 export function parseHash(hash = location.hash) {
   const raw = (hash || "#/overview").replace(/^#\/?/, "");

@@ -15,6 +15,11 @@ test("routes preserve task ids, filters, and the providers alias", () => {
   assert.equal(parseHash("#/subscriptions").name, "workers");
 });
 
+test("the policy route is recognized and defaults unknown routes away from it", () => {
+  assert.equal(parseHash("#/policy").name, "policy");
+  assert.equal(parseHash("#/nonsense").name, "overview");
+});
+
 test("routeHref encodes task identity and query state", () => {
   assert.equal(routeHref("tasks", "task/17", { state: "RESULT_READY" }), "#/tasks/task%2F17?state=RESULT_READY");
 });

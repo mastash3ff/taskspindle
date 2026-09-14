@@ -3,8 +3,8 @@ import { badge, emptyState, h, metric, s, sectionHeading, table } from "../dom.j
 import { nativeOverageSummary } from "../native-overage.js";
 import { updateRouteQuery } from "../router.js";
 
-const GROUPS = ["provider", "day", "provider_day", "model", "mode", "repository_id"];
-const GROUP_LABELS = { provider: "Provider", day: "Day", provider_day: "Provider and day", model: "Model", mode: "Mode", repository_id: "Repository" };
+const GROUPS = ["provider", "day", "provider_day", "model", "role", "mode", "repository_id"];
+const GROUP_LABELS = { provider: "Provider", day: "Day", provider_day: "Provider and day", model: "Model", role: "Role", mode: "Mode", repository_id: "Repository" };
 const numeric = (value) => value == null || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
 const compact = (value) => new Intl.NumberFormat(undefined, { notation: Math.abs(value) >= 10000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value || 0);
 
@@ -59,7 +59,7 @@ function outcomeChart(rows) {
 }
 
 function usageTable(rows) {
-  const keys = ["provider", "day", "model", "mode", "repository_id"].filter((key) => rows.some((row) => key in row));
+  const keys = ["provider", "day", "model", "role", "mode", "repository_id"].filter((key) => rows.some((row) => key in row));
   const columns = [...keys, "turns", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "cost_estimate_usd"];
   const node = rows.length ? table(
     columns.map((column) => column === "repository_id" ? "Repository" : column.replaceAll("_", " ")),

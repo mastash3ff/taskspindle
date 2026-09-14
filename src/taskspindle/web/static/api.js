@@ -27,3 +27,20 @@ export async function getJSON(path, { signal, fresh = false, fallback = true } =
 
 export function peek(path) { return cache.get(path); }
 export function clearCache(path = null) { if (path) cache.delete(path); else cache.clear(); }
+
+async function sendJSON(method, path, body, csrfToken, { signal } = {}) {
+  const response = await fetch(path, {
+    method,
+    headers: { Accept: "application/json", "Content-Type": "application/json", "X-TaskSpindle-CSRF": csrfToken },
+    body: JSON.stringify(body),
+    cache: "no-store",
+    credentials: "same-origin",
+    signal,
+  });
+  const data = await parseResponse(response);
+  clearCache("/api/policy");
+  return data;
+}
+
+export async function putJSON(path, body, csrfToken, options = {}) { return sendJSON("PUT", path, body, csrfToken, options); }
+export async function postJSON(path, body, csrfToken, options = {}) { return sendJSON("POST", path, body, csrfToken, options); }

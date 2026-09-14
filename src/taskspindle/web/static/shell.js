@@ -5,9 +5,10 @@ import { renderOverview } from "./views/overview.js";
 import { renderTasks } from "./views/tasks.js";
 import { renderWorkers } from "./views/workers.js";
 import { renderUsage } from "./views/usage.js";
+import { renderPolicy } from "./views/policy.js";
 
-const renderers = { overview: renderOverview, tasks: renderTasks, workers: renderWorkers, usage: renderUsage };
-const POLL = { overview: 10_000, tasks: 5_000, workers: 15_000, usage: 30_000 };
+const renderers = { overview: renderOverview, tasks: renderTasks, workers: renderWorkers, usage: renderUsage, policy: renderPolicy };
+const POLL = { overview: 10_000, tasks: 5_000, workers: 15_000, usage: 30_000, policy: 30_000 };
 let generation = 0, controller = null, timer = null, currentRoute = null;
 const app = document.getElementById("app");
 const routeKey = (route) => `${route.name}/${route.id || ""}?${route.query.toString()}`;
@@ -44,6 +45,10 @@ function closeDrawer() {
 async function render(route = currentRoute, { polling = false } = {}) {
   if (!route) return;
   if (polling && document.hidden) return;
+  if (polling && app.firstElementChild?.dataset.holdPoll === "1") {
+    timer = setTimeout(() => render(parseHash(), { polling: true }), POLL[route.name]);
+    return;
+  }
   const ownGeneration = ++generation;
   if (controller) controller.abort();
   controller = new AbortController();
@@ -86,6 +91,7 @@ function setupCommand() {
   const destinations = [
     ["Overview", "Current activity and attention", routeHref("overview")], ["Tasks", "Execution ledger", routeHref("tasks")],
     ["Workers", "Access and model status", routeHref("workers")], ["Usage", "Tokens, outcomes, and limits", routeHref("usage")],
+    ["Policy", "Provider routing, shares, budgets", routeHref("policy")],
   ];
   const paint = () => {
     const q = input.value.trim().toLowerCase();
