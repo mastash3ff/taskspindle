@@ -475,3 +475,152 @@ def test_revoke_retry_reports_a_safe_error_without_a_traceback(
     assert error["code"] == "RECOVERY_NOT_FOUND"
     assert output.err == ""
     assert "traceback" not in output.out.lower()
+
+
+# -- policy ----------------------------------------------------------------------------
+
+
+def test_policy_show_json_reports_the_defaults(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "show", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["source"] == "defaults"
+    assert printed["revision"] == 0
+    assert "claude" in printed["policy"]["providers"]
+    assert "status" not in printed
+
+    assert cli.main(["policy", "show", "--status", "--json"]) == 0
+    with_status = json.loads(capsys.readouterr().out)
+    assert "status" in with_status
+    assert with_status["status"]["share_window"] == "week"
+
+
+def test_policy_show_without_json_prints_provider_and_role_tables(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "show"]) == 0
+    text = capsys.readouterr().out
+    assert "policy revision 0 (defaults)" in text
+    assert "providers" in text
+    assert "claude" in text
+    assert "roles" in text
+    assert "mechanic" in text
+
+
+def test_policy_set_round_trips_through_show(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["policy", "set", "providers.claude.target_share", "50"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["policy", "show", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["policy"]["providers"]["claude"]["target_share"] == 50
+    assert printed["revision"] == 1
+    assert printed["updated_by"] == "cli"
+
+    # A value that is not valid JSON falls back to the raw string.
+    assert cli.main(["policy", "set", "providers.claude.note", "a plain note"]) == 0
+    capsys.readouterr()
+    assert cli.main(["policy", "show", "--json"]) == 0
+    again = json.loads(capsys.readouterr().out)
+    assert again["policy"]["providers"]["claude"]["note"] == "a plain note"
+    assert again["revision"] == 2
+
+
+def test_policy_set_an_out_of_range_value_is_invalid_and_exits_one(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "set", "providers.claude.target_share", "150"]) == 1
+    err = capsys.readouterr().err
+    assert "providers.claude.target_share" in err
+
+
+def test_policy_set_an_unresolvable_path_is_invalid_and_exits_one(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "set", "providers.nobody.enabled", "true"]) == 1
+    err = capsys.readouterr().err
+    assert "no such path" in err
+
+
+def test_policy_export_and_import_round_trip(
+    home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "export"]) == 0
+    exported = capsys.readouterr().out
+    document = json.loads(exported)
+    assert document["version"] == 1
+
+    document["providers"]["claude"]["target_share"] = 25
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps(document), encoding="utf-8")
+
+    assert cli.main(["policy", "import", str(policy_file), "--if-revision", "0"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["policy", "show", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["policy"]["providers"]["claude"]["target_share"] == 25
+    assert printed["revision"] == 1
+    assert printed["source"] == "store"
+
+
+def test_policy_import_a_revision_conflict_exits_three(
+    home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "set", "providers.claude.target_share", "10"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["policy", "export"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    policy_file = tmp_path / "policy.json"
+    policy_file.write_text(json.dumps(document), encoding="utf-8")
+
+    assert cli.main(["policy", "import", str(policy_file), "--if-revision", "0"]) == 3
+    err = capsys.readouterr().err
+    assert "revision conflict" in err
+    assert "1" in err
+
+
+def test_policy_import_invalid_json_document_exits_one(
+    home: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"version": 1, "providers": {"claude": {"target_share": 999}}}))
+
+    assert cli.main(["policy", "import", str(bad)]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() != ""
+
+
+def test_policy_reset_restores_the_defaults_as_a_new_revision(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "set", "providers.claude.target_share", "50"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["policy", "reset"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["policy", "show", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["policy"]["providers"]["claude"]["target_share"] is None
+    assert printed["revision"] == 2
+    assert printed["updated_by"] == "cli"
+
+
+def test_policy_reset_a_revision_conflict_exits_three(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "reset", "--if-revision", "5"]) == 3
+    err = capsys.readouterr().err
+    assert "revision conflict" in err
+
+
+def test_policy_without_a_subcommand_prints_usage_and_exits_two(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        cli.main(["policy"])
+    assert raised.value.code == 2
+    assert "policy requires a subcommand" in capsys.readouterr().err

@@ -1,4 +1,4 @@
-"""The MCP server: eighteen tools, one envelope, no surprises.
+"""The MCP server: nineteen tools, one envelope, no surprises.
 
 Every tool returns the same shape whether it succeeded or not, so a caller never has to tell an
 exception from a result. Errors carry a stable code; an error TaskSpindle did not anticipate is
@@ -52,6 +52,7 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "task_status",
         "task_result",
         "usage_report",
+        "dispatch_policy",
     }
 )
 
@@ -75,6 +76,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "cancel_task",
     "cleanup_task",
     "usage_report",
+    "dispatch_policy",
 )
 
 
@@ -185,7 +187,9 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
             "three failed trials until relevant new positive evidence permits one trial. "
             "Do not launch synthetic probes. Under manual policy, arm the exact evidence_revision "
             "with provider_recovery only after explicit user authorization and pass that permit "
-            "once to start_task. Manual permits cannot bypass hybrid policy."
+            "once to start_task. Manual permits cannot bypass hybrid policy. Read dispatch_policy "
+            "(or the dispatch_policy block of capabilities) before choosing a provider; it is "
+            "advisory unless a budget is enforced."
         ),
     )
     log_path = orchestrator.paths.state_dir / "server.log"
@@ -475,6 +479,22 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         return call(
             "usage_report", lambda: orchestrator.usage_report(since, provider, group_by)
         )
+
+    @tool("dispatch_policy")
+    def dispatch_policy(action: str = "status") -> dict[str, Any]:
+        """Read the operator's dispatch policy: how work should be spread across providers, the
+        model/effort/brief for each role, and observed usage against targets and budgets.
+        action is get (the document) or status (the document plus computed status and the
+        file-managed [concurrency], [native_overage] and [provider_recovery] tables). Advisory
+        unless an enforced budget refuses start_task with POLICY_BUDGET_EXHAUSTED."""
+        def body() -> dict[str, Any]:
+            if action not in {"get", "status"}:
+                raise TaskSpindleError(
+                    INVALID_REQUEST, "dispatch_policy action must be get or status",
+                )
+            return orchestrator.dispatch_policy(action)
+
+        return call("dispatch_policy", body)
 
     return mcp
 

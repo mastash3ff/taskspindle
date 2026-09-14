@@ -29,6 +29,7 @@ from . import (
     hybrid_recovery,
     integration,
     native_overage,
+    policy,
     provider_recovery,
     providers,
     quota,
@@ -38,7 +39,14 @@ from . import (
     usage,
     worktrees,
 )
-from .config import Paths, concurrency_limits
+from .config import (
+    ConfigError,
+    Paths,
+    concurrency_limits,
+    load_config,
+    native_overage_policies,
+    provider_recovery_policies,
+)
 from .integration import Journal
 from .models import (
     ACTIVE_STATES,
@@ -69,6 +77,7 @@ from .service import (
     INVALID_REQUEST,
     MANUAL_RECOVERY_REQUIRED,
     METERED_NOT_ALLOWED,
+    POLICY_BUDGET_EXHAUSTED,
     RESUME_UNAVAILABLE,
     REVIEWER_NOT_INDEPENDENT,
     STALE_STATE_VERSION,
@@ -399,6 +408,8 @@ class Orchestrator:
         active: dict[str, int] = {}
         for lease in self.store.list_leases():
             active[lease["provider"]] = active.get(lease["provider"], 0) + 1
+        loaded_policy = policy.load(self.store, self.profiles)
+        policy_status = policy.status(self.store, loaded_policy, self.profiles, now)
         return {
             "execution": {
                 "platform": "linux",
@@ -406,6 +417,12 @@ class Orchestrator:
                 "state_dir": str(self.paths.state_dir.resolve()),
                 "config_file": str(self.paths.config_file.resolve()),
                 "wsl_distribution": self.parent_env.get("WSL_DISTRO_NAME"),
+            },
+            "dispatch_policy": {
+                **loaded_policy.describe(),
+                "share_window": loaded_policy.policy.share_window,
+                "roles": loaded_policy.policy.model_dump(mode="json")["roles"],
+                "under_target_order": policy_status["under_target_order"],
             },
             "providers": [
                 {
@@ -441,6 +458,7 @@ class Orchestrator:
                         "available": max(0, self.concurrency.get(profile.id, 1) - active.get(profile.id, 0)),
                     },
                     "windows": self.store.latest_provider_windows(limits_key(profile)),
+                    "policy": policy_status["providers"].get(profile.id),
                 }
                 for raw_profile in sorted(self.profiles.values(), key=lambda item: item.id)
                 for profile in [self._policy_profile(raw_profile)]
@@ -645,6 +663,26 @@ class Orchestrator:
 
     # -- starting work ---------------------------------------------------------------
 
+    def _require_policy_admission(self, profile: Profile) -> None:
+        """Refuse admission when the dispatch policy has an exhausted, enforced budget.
+
+        Pause (``enabled=false``) is advisory only and never refuses here; only an *enforced*
+        exhausted budget does. The policy is reloaded on every call so an edit saved between the
+        two admission checks of one ``start_task`` takes effect immediately.
+        """
+        loaded = policy.load(self.store, self.profiles)
+        status_report = policy.status(self.store, loaded, self.profiles, self.clock())
+        refusal = policy.admission_refusal(loaded, status_report, profile.id)
+        if refusal is None:
+            return
+        raise TaskSpindleError(
+            POLICY_BUDGET_EXHAUSTED,
+            f"{refusal['provider']} has an exhausted, enforced {refusal['window']} budget on "
+            f"{refusal['kind']} ({refusal['used']}/{refusal['limit']}).",
+            retryable=True,
+            details=refusal,
+        )
+
     def start_task(self, request: StartTaskRequest) -> dict[str, Any]:
         """Create, prepare and queue one task."""
         if request.ignore_provider_status:
@@ -655,6 +693,7 @@ class Orchestrator:
             )
         with self._cycle():
             profile = self._policy_profile(self._profile_for(request))
+            self._require_policy_admission(profile)
             model = request.model or profile.model
             if request.recovery_permit_id is None:
                 require_provider_available(
@@ -697,6 +736,7 @@ class Orchestrator:
                             "QUOTA_RETRY_PENDING", "Another task is testing this account's quota recovery.",
                             retryable=True, details={"task_id": holder["task_id"]},
                         )
+                self._require_policy_admission(profile)
                 record = create_task(
                     self.store,
                     request,
@@ -1229,6 +1269,38 @@ class Orchestrator:
                 profiles=self.profiles,
                 now=now,
             )
+        return result
+
+    def dispatch_policy(self, action: str = "status") -> dict[str, Any]:
+        """The dispatch policy document (``get``) or the document plus observed status and the
+        file-managed knobs read fresh from ``config.toml`` (``status``). Read-only: there is no
+        ``set`` here, the caller being steered does not rewrite its own steering."""
+        if action not in {"get", "status"}:
+            raise TaskSpindleError(
+                INVALID_REQUEST,
+                f"dispatch_policy action must be get or status: {action}",
+                details={"action": action, "known": ["get", "status"]},
+            )
+        loaded = policy.load(self.store, self.profiles)
+        result: dict[str, Any] = {
+            "policy": loaded.policy.model_dump(mode="json"),
+            **loaded.describe(),
+        }
+        if action == "status":
+            result["status"] = policy.status(self.store, loaded, self.profiles, self.clock())
+            try:
+                settings = load_config(self.paths.config_file)
+                result["file_managed"] = {
+                    "config_file": str(self.paths.config_file),
+                    "concurrency": concurrency_limits(settings, self.profiles),
+                    "native_overage": native_overage_policies(settings, self.profiles),
+                    "provider_recovery": provider_recovery_policies(settings, self.profiles),
+                }
+            except ConfigError as exc:
+                result["file_managed"] = {
+                    "config_file": str(self.paths.config_file),
+                    "error": str(exc),
+                }
         return result
 
     def task_diff(

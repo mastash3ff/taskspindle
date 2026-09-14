@@ -1,4 +1,4 @@
-"""The MCP surface: the eighteen tools, their annotations, and the envelope they all return."""
+"""The MCP surface: the nineteen tools, their annotations, and the envelope they all return."""
 
 from __future__ import annotations
 
@@ -52,16 +52,17 @@ def server(store: Store, paths: Paths):
     return build_server(orchestrator)
 
 
-async def test_the_eighteen_tools_are_exposed_with_honest_annotations(server) -> None:
+async def test_the_nineteen_tools_are_exposed_with_honest_annotations(server) -> None:
     async with Client(server) as client:
         tools = await client.list_tools()
 
     assert [tool.name for tool in tools] == list(TOOL_NAMES)
-    assert len(tools) == 18
+    assert len(tools) == 19
     read_only = {tool.name for tool in tools if tool.annotations.readOnlyHint}
     assert read_only == set(READ_ONLY_TOOLS)
     assert "task_diff" not in read_only
     assert "provider_recovery" not in read_only
+    assert "dispatch_policy" in read_only
 
 
 async def test_provider_recovery_validates_and_delegates_inside_the_envelope(
@@ -185,6 +186,31 @@ async def test_usage_report_and_the_diff_page_default_are_on_the_wire(server) ->
     assert result.data["result"]["usage"] == []
     assert result.data["result"]["turns"]["count"] == 0
     assert "cost_note" in result.data["result"]
+
+
+async def test_dispatch_policy_get_and_status(server) -> None:
+    async with Client(server) as client:
+        got = await client.call_tool("dispatch_policy", {"action": "get"})
+        status = await client.call_tool("dispatch_policy", {})
+
+    assert got.data["ok"] is True
+    assert "policy" in got.data["result"]
+    assert got.data["result"]["source"] == "defaults"
+    assert "status" not in got.data["result"]
+
+    assert status.data["ok"] is True
+    assert "status" in status.data["result"]
+    assert "file_managed" in status.data["result"]
+    assert status.data["result"]["file_managed"]["config_file"]
+    assert "concurrency" in status.data["result"]["file_managed"]
+
+
+async def test_dispatch_policy_rejects_a_bad_action(server) -> None:
+    async with Client(server) as client:
+        result = await client.call_tool("dispatch_policy", {"action": "set"})
+
+    assert result.data["ok"] is False
+    assert result.data["error"]["code"] == "INVALID_REQUEST"
 
 
 async def test_a_missing_task_is_reported_by_code(server) -> None:

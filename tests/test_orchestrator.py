@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from taskspindle import provider_recovery, repos, runner, service
+from taskspindle import policy, provider_recovery, repos, runner, service
 from taskspindle.config import Paths
 from taskspindle.models import (
     AcceptTaskRequest,
@@ -1371,3 +1371,228 @@ def test_failed_continuation_transition_does_not_leave_extra_pending_turn(harnes
     with pytest.raises(TaskSpindleError):
         harness.orchestrator.continue_task(task_id, record.state_version, "more checks")
     assert harness.orchestrator.store.list_turns(task_id) == before
+
+
+# -- dispatch policy ------------------------------------------------------------------------
+
+
+def test_capabilities_describes_the_dispatch_policy(harness: Harness) -> None:
+    capabilities = harness.orchestrator.capabilities()
+
+    dispatch_policy = capabilities["dispatch_policy"]
+    assert dispatch_policy["source"] == "defaults"
+    assert dispatch_policy["revision"] == 0
+    assert dispatch_policy["share_window"] == "week"
+    assert "under_target_order" in dispatch_policy
+    # role echo: the six roles the work-pool skill carried before the policy existed.
+    assert set(policy.DEFAULT_ROLES) <= set(dispatch_policy["roles"])
+    assert dispatch_policy["roles"]["mechanic"]["brief"]
+
+    provider_policy = capabilities["providers"][0]["policy"]
+    assert provider_policy["enabled"] is True
+    assert provider_policy["state"] == "active"
+
+
+def test_capabilities_sees_a_policy_saved_from_another_store_instance(
+    harness: Harness, paths: Paths
+) -> None:
+    """The policy is read fresh on every call; a rebuild of the orchestrator is not needed."""
+    before = harness.orchestrator.capabilities()["dispatch_policy"]
+    assert before["revision"] == 0
+
+    other = Store.open(paths.state_dir / "taskspindle.sqlite3")
+    try:
+        document = policy.defaults(harness.orchestrator.profiles)
+        policy.save(other, document, updated_by="test", if_revision=None, reason="cross-store")
+    finally:
+        other.close()
+
+    after = harness.orchestrator.capabilities()["dispatch_policy"]
+    assert after["revision"] == 1
+    assert after["source"] == "store"
+
+
+def test_start_task_with_role_stores_it_and_echoes_it_in_the_created_event(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+    started = harness.orchestrator.start_task(implement_request(repo, role="mechanic"))
+    task_id = started["task_id"]
+
+    record = harness.orchestrator.store.get_task(task_id)
+    assert record.role == "mechanic"
+    events = harness.orchestrator.store.list_events(task_id)
+    created = next(event for event in events if event["kind"] == "TASK_CREATED")
+    assert created["payload"]["role"] == "mechanic"
+
+
+def test_usage_report_groups_by_role(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+    started = harness.orchestrator.start_task(implement_request(repo, role="mechanic"))
+    task_id = started["task_id"]
+    store = harness.orchestrator.store
+    turn_id = store.list_turns(task_id)[0]["id"]
+    store.insert_turn_usage(
+        turn_id, task_id, AUTHOR,
+        model="fake-model", input_tokens=10, output_tokens=5,
+        cost_estimate_usd=0.001, cost_is_estimate=True, source="test",
+    )
+
+    report = harness.orchestrator.usage_report(group_by="role")
+
+    assert report["group_by"] == "role"
+    assert any(row.get("role") == "mechanic" for row in report["usage"])
+
+
+def _enforced_budget_policy(profiles, provider: str, *, enforce: bool = True) -> policy.DispatchPolicy:
+    document = policy.defaults(profiles)
+    document.providers[provider].budgets = {
+        "day": policy.Budget(turns=1, enforce=enforce)
+    }
+    return document
+
+
+def test_enforced_exhausted_budget_refuses_admission_before_availability_checks(
+    harness: Harness, make_repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import taskspindle.orchestrator as module
+
+    repo = make_repo()
+    build_candidate(harness, repo)  # records one turn for AUTHOR, exhausting a limit of one.
+
+    store = harness.orchestrator.store
+    document = _enforced_budget_policy(harness.orchestrator.profiles, AUTHOR)
+    policy.save(store, document, updated_by="test", if_revision=None, reason="test")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        module, "require_provider_available", lambda *a, **k: calls.append("called")
+    )
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.start_task(implement_request(repo))
+
+    assert excinfo.value.code == "POLICY_BUDGET_EXHAUSTED"
+    assert excinfo.value.retryable is True
+    assert excinfo.value.details["provider"] == AUTHOR
+    assert excinfo.value.details["kind"] == "turns"
+    assert excinfo.value.details["window"] == "day"
+    assert calls == []  # refused before the first availability check ran
+
+
+def test_enforced_exhausted_budget_refuses_admission_inside_the_transaction(
+    harness: Harness, make_repo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The policy can change between the two admission checks of one ``start_task`` call."""
+    import taskspindle.orchestrator as module
+
+    repo = make_repo()
+    build_candidate(harness, repo)  # records one turn for AUTHOR.
+
+    store = harness.orchestrator.store
+    profiles = harness.orchestrator.profiles
+    real_require_provider_available = module.require_provider_available
+    flipped = {"done": False}
+
+    def flip_after_first_availability_check(*args, **kwargs):
+        result = real_require_provider_available(*args, **kwargs)
+        if not flipped["done"]:
+            flipped["done"] = True
+            document = _enforced_budget_policy(profiles, AUTHOR)
+            policy.save(store, document, updated_by="test", if_revision=None, reason="flip")
+        return result
+
+    monkeypatch.setattr(module, "require_provider_available", flip_after_first_availability_check)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.start_task(implement_request(repo))
+
+    assert excinfo.value.code == "POLICY_BUDGET_EXHAUSTED"
+    assert flipped["done"] is True
+
+
+def test_advisory_exhausted_budget_does_not_refuse_admission(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    build_candidate(harness, repo)  # records one turn for AUTHOR.
+
+    store = harness.orchestrator.store
+    document = _enforced_budget_policy(harness.orchestrator.profiles, AUTHOR, enforce=False)
+    policy.save(store, document, updated_by="test", if_revision=None, reason="test")
+
+    started = harness.orchestrator.start_task(implement_request(repo))
+    assert started["state"] == TaskState.RESULT_READY.value
+
+
+def test_a_paused_provider_does_not_refuse_admission(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+
+    store = harness.orchestrator.store
+    document = policy.defaults(harness.orchestrator.profiles)
+    document.providers[AUTHOR].enabled = False
+    policy.save(store, document, updated_by="test", if_revision=None, reason="test")
+
+    started = harness.orchestrator.start_task(implement_request(repo))
+    assert started["state"] == TaskState.RESULT_READY.value
+
+
+def test_recovery_permit_requests_are_also_subject_to_an_enforced_budget(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    build_candidate(harness, repo)  # records one turn for AUTHOR, exhausting a limit of one.
+    store = harness.orchestrator.store
+    profile = harness.orchestrator.profiles[AUTHOR]
+
+    store.set_provider_status(
+        AUTHOR, "auth_expired", source="acp_error", reason="hit limit",
+    )
+    evidence = provider_recovery.status(
+        store, profile, now=harness.orchestrator.clock(), parent_env=harness.orchestrator.parent_env,
+    )
+    armed = harness.orchestrator.provider_recovery(
+        "arm", provider=AUTHOR, evidence_revision=evidence["evidence_revision"],
+    )
+
+    document = _enforced_budget_policy(harness.orchestrator.profiles, AUTHOR)
+    policy.save(store, document, updated_by="test", if_revision=None, reason="test")
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.start_task(
+            implement_request(repo, recovery_permit_id=armed["permit_id"])
+        )
+    assert excinfo.value.code == "POLICY_BUDGET_EXHAUSTED"
+
+
+def test_dispatch_policy_tool_get_and_status(harness: Harness) -> None:
+    got = harness.orchestrator.dispatch_policy("get")
+    assert got["source"] == "defaults"
+    assert "status" not in got
+    assert "policy" in got
+
+    status = harness.orchestrator.dispatch_policy("status")
+    assert "status" in status
+    assert status["file_managed"]["config_file"] == str(harness.orchestrator.paths.config_file)
+    assert "concurrency" in status["file_managed"]
+    assert "native_overage" in status["file_managed"]
+    assert "provider_recovery" in status["file_managed"]
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.dispatch_policy("bogus")
+    assert excinfo.value.code == service.INVALID_REQUEST
+
+
+def test_dispatch_policy_status_reports_a_broken_config_as_a_file_managed_error(
+    harness: Harness,
+) -> None:
+    config_file = harness.orchestrator.paths.config_file
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text('[concurrency]\nauthor = "not-an-int"\n', encoding="utf-8")
+
+    status = harness.orchestrator.dispatch_policy("status")
+
+    assert status["file_managed"]["config_file"] == str(config_file)
+    assert "error" in status["file_managed"]
+    assert "concurrency" not in status["file_managed"]
