@@ -423,6 +423,8 @@ def _group_key(row: Mapping[str, Any], mode_by_task: Mapping[str, str], group_by
         return {"provider": row["provider"], "model": row.get("model")}
     if group_by == "mode":
         return {"provider": row["provider"], "mode": mode_by_task.get(str(row["task_id"]))}
+    if group_by == "role":
+        return {"provider": row["provider"], "role": row.get("role")}
     raise ValueError(f"unknown group_by: {group_by!r}")
 
 

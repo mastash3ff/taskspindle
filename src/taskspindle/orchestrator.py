@@ -119,7 +119,9 @@ DIFF_PAGE_BYTES = worktrees.DEFAULT_DIFF_PAGE
 DIFF_PAGE_MAX_BYTES = worktrees.MAX_DIFF_PAGE
 
 #: The groupings ``usage_report`` accepts.
-USAGE_GROUP_BY: tuple[str, ...] = ("provider", "day", "provider_day", "model", "mode", "repository_id")
+USAGE_GROUP_BY: tuple[str, ...] = (
+    "provider", "day", "provider_day", "model", "mode", "role", "repository_id",
+)
 
 #: Inclusive bounds on a task's own timeout, mirroring ``StartTaskRequest``.
 TIMEOUT_BOUNDS = (60, 14400)

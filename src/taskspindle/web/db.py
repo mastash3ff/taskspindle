@@ -575,10 +575,62 @@ class ReadOnlyStore:
             params.append(task_id)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
-            "SELECT u.*, t.repository_id FROM turn_usage u JOIN tasks t ON t.id = u.task_id "
-            f"{where} ORDER BY u.id", params
+            f"SELECT u.*, t.repository_id{', t.role' if self._has_role else ''} "
+            f"FROM turn_usage u JOIN tasks t ON t.id = u.task_id {where} ORDER BY u.id", params
         ).fetchall()
         return [self._usage_row(row) for row in rows]
+
+    @property
+    def _has_role(self) -> bool:
+        return (self.schema_version() or 0) >= 11
+
+    def provider_turn_totals(self, *, since: str) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT k.provider AS provider, COUNT(t.id) AS turns, COUNT(u.id) AS telemetry_turns, "
+            "COALESCE(SUM(u.input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(u.output_tokens), 0) AS output_tokens "
+            "FROM turns t JOIN tasks k ON k.id = t.task_id LEFT JOIN turn_usage u ON u.turn_id = t.id "
+            "WHERE t.started_at >= ? GROUP BY k.provider ORDER BY k.provider",
+            (since,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- dispatch policy ----------------------------------------------------------------
+
+    @staticmethod
+    def _policy_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        raw = result.get("document")
+        try:
+            result["document"] = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            result["document"] = None
+        return result
+
+    def get_dispatch_policy(self) -> dict[str, Any] | None:
+        if self._conn is None or not self._has_role:
+            return None
+        return self._policy_row(self._conn.execute("SELECT * FROM dispatch_policy WHERE id = 1").fetchone())
+
+    def list_dispatch_policy_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        if self._conn is None or not self._has_role:
+            return []
+        rows = self._conn.execute(
+            "SELECT revision, fingerprint, updated_at, updated_by, reason FROM dispatch_policy_history "
+            "ORDER BY revision DESC LIMIT ?", (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dispatch_policy_revision(self, revision: int) -> dict[str, Any] | None:
+        if self._conn is None or not self._has_role:
+            return None
+        return self._policy_row(self._conn.execute(
+            "SELECT * FROM dispatch_policy_history WHERE revision = ?", (int(revision),)
+        ).fetchone())
 
     # -- provider windows -------------------------------------------------------------
 

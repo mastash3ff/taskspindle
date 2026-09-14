@@ -111,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     usage.add_argument(
         "--group-by",
         default="provider",
-        choices=("provider", "day", "provider_day", "model", "mode", "repository_id"),
+        choices=("provider", "day", "provider_day", "model", "mode", "role", "repository_id"),
         help="how to roll the token counts up (default: provider)",
     )
     usage.add_argument("--json", action="store_true", help="print the report as JSON")

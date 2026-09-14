@@ -260,6 +260,8 @@ class StartTaskRequest(BaseModel):
     ignore_provider_status: bool = False
     #: A single-use authorization bound to current refusal evidence and this new task.
     recovery_permit_id: str | None = Field(default=None, min_length=1, max_length=128)
+    #: The dispatch-policy role this task was assigned for; recorded for usage reporting only.
+    role: str | None = Field(default=None, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
     # implement only
     acceptance_criteria: str | None = None
     path_prefixes: list[str] | None = None
@@ -338,6 +340,7 @@ class TaskRecord(BaseModel):
     resolved_effort: str | None = None
     timeout_s: int = 1800
     allow_metered: bool = False
+    role: str | None = None
     acceptance_criteria: str | None = None
     path_prefixes: list[str] | None = None
     verification_commands: list[str] | None = None
@@ -424,6 +427,7 @@ class TaskView(BaseModel):
     requested_model: str | None = None
     resolved_model: str | None = None
     resolved_effort: str | None = None
+    role: str | None = None
     reported_model: str | None = None
     oauth_evidence: dict[str, Any] = Field(default_factory=dict)
     candidate_sha: str | None = None

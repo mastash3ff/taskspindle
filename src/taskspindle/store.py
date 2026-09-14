@@ -97,6 +97,15 @@ class ConstraintError(StoreError):
     """A write violated a schema constraint."""
 
 
+class PolicyRevisionConflict(StoreError):
+    """A dispatch policy write named a revision that is no longer current."""
+
+    def __init__(self, expected: int, actual: int) -> None:
+        super().__init__(f"dispatch policy is at revision {actual}, not {expected}")
+        self.expected = expected
+        self.actual = actual
+
+
 class StaleStateVersionError(StoreError):
     """An optimistic-concurrency check failed."""
 
@@ -702,6 +711,30 @@ ON CONFLICT(status_key) DO UPDATE
 SET payload = json_set(recovery_native_semantics.payload,'$.auth',json('false'));
 """
 
+_MIGRATION_11 = """
+CREATE TABLE dispatch_policy (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL,
+    document TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE dispatch_policy_history (
+    revision INTEGER PRIMARY KEY,
+    document TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    reason TEXT
+);
+
+ALTER TABLE tasks ADD COLUMN role TEXT;
+
+CREATE INDEX turns_started_idx ON turns(started_at);
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -713,6 +746,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (8, _MIGRATION_8),
     (9, _MIGRATION_9),
     (10, _MIGRATION_10),
+    (11, _MIGRATION_11),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -975,13 +1009,17 @@ class Store:
 
     def insert_task(self, record: TaskRecord) -> TaskRecord:
         data = record.model_dump()
-        values = [_encode(column, data[column]) for column in TASK_COLUMNS]
-        placeholders = ", ".join("?" for _ in TASK_COLUMNS)
         with self._guard(), self.transaction() as conn:
-            conn.execute(
-                f"INSERT INTO tasks({', '.join(TASK_COLUMNS)}) VALUES ({placeholders})",
-                values,
-            )
+            present = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            missing = [
+                column for column in TASK_COLUMNS if column not in present and data[column] is not None
+            ]
+            if missing:
+                raise StoreError(f"tasks table lacks columns for: {', '.join(missing)}")
+            columns = [column for column in TASK_COLUMNS if column in present]
+            values = [_encode(column, data[column]) for column in columns]
+            placeholders = ", ".join("?" for _ in columns)
+            conn.execute(f"INSERT INTO tasks({', '.join(columns)}) VALUES ({placeholders})", values)
         return record
 
     def get_task(self, task_id: str) -> TaskRecord | None:
@@ -2209,10 +2247,89 @@ class Store:
             params.append(task_id)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self._conn.execute(
-            "SELECT u.*, t.repository_id FROM turn_usage u JOIN tasks t ON t.id = u.task_id "
+            "SELECT u.*, t.repository_id, t.role FROM turn_usage u JOIN tasks t ON t.id = u.task_id "
             f"{where} ORDER BY u.id", params
         ).fetchall()
         return [self._usage_row(row) for row in rows]
+
+    def provider_turn_totals(self, *, since: str) -> list[dict[str, Any]]:
+        """Turns and summed prompt/completion tokens per provider for turns started at or after ``since``."""
+        rows = self._conn.execute(
+            "SELECT k.provider AS provider, COUNT(t.id) AS turns, COUNT(u.id) AS telemetry_turns, "
+            "COALESCE(SUM(u.input_tokens), 0) AS input_tokens, "
+            "COALESCE(SUM(u.output_tokens), 0) AS output_tokens "
+            "FROM turns t JOIN tasks k ON k.id = t.task_id LEFT JOIN turn_usage u ON u.turn_id = t.id "
+            "WHERE t.started_at >= ? GROUP BY k.provider ORDER BY k.provider",
+            (since,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- dispatch policy ----------------------------------------------------------------
+
+    @staticmethod
+    def _policy_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        result["document"] = _loads(result.get("document"))
+        return result
+
+    def get_dispatch_policy(self) -> dict[str, Any] | None:
+        """The current policy row with its document decoded, or None when defaults apply."""
+        row = self._conn.execute("SELECT * FROM dispatch_policy WHERE id = 1").fetchone()
+        return self._policy_row(row)
+
+    def save_dispatch_policy(
+        self,
+        document: str,
+        fingerprint: str,
+        *,
+        updated_by: str,
+        if_revision: int | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Replace the policy document atomically and record the revision in history.
+
+        ``document`` is canonical JSON text produced by :mod:`taskspindle.policy`. When
+        ``if_revision`` is given and differs from the stored revision (0 when no row exists),
+        nothing is written and :class:`PolicyRevisionConflict` is raised.
+        """
+        with self._guard(), self.transaction() as conn:
+            row = conn.execute("SELECT revision FROM dispatch_policy WHERE id = 1").fetchone()
+            current = int(row["revision"]) if row else 0
+            if if_revision is not None and if_revision != current:
+                raise PolicyRevisionConflict(if_revision, current)
+            revision = current + 1
+            stamp = now()
+            conn.execute(
+                "INSERT INTO dispatch_policy (id, revision, document, fingerprint, updated_at, updated_by) "
+                "VALUES (1, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET revision = excluded.revision, "
+                "document = excluded.document, fingerprint = excluded.fingerprint, "
+                "updated_at = excluded.updated_at, updated_by = excluded.updated_by",
+                (revision, document, fingerprint, stamp, updated_by),
+            )
+            conn.execute(
+                "INSERT INTO dispatch_policy_history "
+                "(revision, document, fingerprint, updated_at, updated_by, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                (revision, document, fingerprint, stamp, updated_by, reason),
+            )
+        saved = self.get_dispatch_policy()
+        assert saved is not None
+        return saved
+
+    def list_dispatch_policy_history(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT revision, fingerprint, updated_at, updated_by, reason FROM dispatch_policy_history "
+            "ORDER BY revision DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_dispatch_policy_revision(self, revision: int) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM dispatch_policy_history WHERE revision = ?", (int(revision),)
+        ).fetchone()
+        return self._policy_row(row)
 
     # -- native diagnostics: independent from task refusal evidence -------------------
 

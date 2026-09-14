@@ -68,9 +68,13 @@ def test_schema_three_upgrade_preserves_leases_and_history(tmp_path, monkeypatch
                 for table in ("tasks", "leases", "events", "repository_grants")
             }
     with Store.open(path) as store:
-        assert store.schema_version() == 10
+        assert store.schema_version() == 11
         for table, rows in before.items():
-            assert [dict(row) for row in store._conn.execute(f"SELECT * FROM {table}")] == rows
+            after = [dict(row) for row in store._conn.execute(f"SELECT * FROM {table}")]
+            if table == "tasks":
+                for row in after:
+                    assert row.pop("role") is None
+            assert after == rows
         other = make_task(store, "ts_000000000002")
         assert store.acquire_lease("claude", other.id, "new-unit", 456, "boot", limit=4)
 
@@ -99,7 +103,7 @@ def test_rollback_requires_drained_state_and_preserves_history(tmp_path, monkeyp
             assert columns["provider"]["pk"] == 1
     # A later intentional re-upgrade remains safe.
     with Store.open(path) as store:
-        assert store.schema_version() == 10
+        assert store.schema_version() == 11
 
 
 def _dispatch(args):

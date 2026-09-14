@@ -622,6 +622,7 @@ def create_task(
         prompt=request.prompt,
         requested_model=request.model,
         requested_effort=request.effort,
+        role=request.role,
         timeout_s=request.timeout_s,
         allow_metered=request.allow_metered,
         acceptance_criteria=request.acceptance_criteria,
@@ -643,6 +644,7 @@ def create_task(
                 "mode": record.mode.value,
                 "auth_mode": record.auth_mode.value,
                 "repository_id": record.repository_id,
+                "role": record.role,
             },
         )
     return record
@@ -955,6 +957,7 @@ def task_view(record: TaskRecord) -> TaskView:
         requested_model=record.requested_model,
         resolved_model=record.resolved_model,
         resolved_effort=record.resolved_effort,
+        role=record.role,
         reported_model=record.reported_model,
         oauth_evidence=record.oauth_evidence or {},
         candidate_sha=record.candidate_sha,

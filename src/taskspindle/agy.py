@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["ModelSelection", "ModelSelectionError", "resolve_model"]
+__all__ = ["ModelSelection", "ModelSelectionError", "resolve_model", "validate_selection"]
 
 _MODEL_ID = re.compile(
     r"gemini-(?P<version>[0-9]+(?:\.[0-9]+)*)-(?P<variant>[a-z][a-z0-9]*(?:-[a-z0-9]+)*)\Z"
@@ -144,6 +144,22 @@ def _requested_model(model: str | None) -> _Model | None:
             "Model must be a numeric Gemini ID with a variant slug and optional low/medium/high effort"
         )
     return parsed
+
+
+def validate_selection(model: str | None, effort: str | None) -> ModelSelection | None:
+    """Check a Gemini model/effort pair against the ID grammar without an advertised catalog.
+
+    Whether the model is actually offered is only known once a session advertises it; this
+    validates shape and effort consistency so a stored policy cannot carry an impossible pair.
+    """
+    if effort is not None and (not isinstance(effort, str) or effort not in _EFFORTS):
+        raise _invalid("Effort must be low, medium or high")
+    requested = _requested_model(model)
+    if requested is None:
+        return None
+    if requested.selection.effort and effort and requested.selection.effort != effort:
+        raise _invalid("Effort conflicts with the effort suffix of the model ID")
+    return ModelSelection(requested.selection.model_id, effort or requested.selection.effort)
 
 
 def resolve_model(
