@@ -29,6 +29,18 @@ def test_consult_without_repository_is_valid() -> None:
     request = StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="what shape?")
     assert request.repository is None
     assert request.timeout_s == 1800
+    assert request.role is None
+
+
+@pytest.mark.parametrize("role", ["Planner", "a" * 33, "-x", "has space", ""])
+def test_role_must_be_a_short_lowercase_key(role: str) -> None:
+    with pytest.raises(ValidationError):
+        StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="q", role=role)
+
+
+def test_role_is_recorded_as_given() -> None:
+    request = StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="q", role="code-reviewer_2")
+    assert request.role == "code-reviewer_2"
 
 
 @pytest.mark.parametrize(

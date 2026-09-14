@@ -143,8 +143,8 @@ def test_claude_configuration_model_precedes_the_session_file(
 
 
 def _seed(store: Store, provider: str, mode: Mode, *, state: TaskState, ms: int, tokens: int,
-          repository_id: str | None = None) -> str:
-    fields: dict[str, object] = {"provider": provider, "mode": mode, "prompt": "p"}
+          repository_id: str | None = None, role: str | None = None) -> str:
+    fields: dict[str, object] = {"provider": provider, "mode": mode, "prompt": "p", "role": role}
     if mode is Mode.IMPLEMENT:
         fields.update(
             repository="/r", acceptance_criteria="a", path_prefixes=["src"],
@@ -211,6 +211,23 @@ def test_report_rolls_up_tokens_outcomes_and_timings(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="group_by"):
         usage.report(store, group_by="colour", now=NOW)
     store.close()
+
+
+def test_report_groups_by_the_recorded_role(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _seed(store, "claude", Mode.CONSULT, state=TaskState.COMPLETED, ms=1000, tokens=100, role="explorer")
+    _seed(store, "claude", Mode.CONSULT, state=TaskState.COMPLETED, ms=1000, tokens=200, role="explorer")
+    _seed(store, "grok", Mode.CONSULT, state=TaskState.COMPLETED, ms=1000, tokens=300)
+    by_role = usage.report(store, group_by="role", now=NOW)["usage"]
+    assert [(row["provider"], row["role"], row["turns"], row["input_tokens"]) for row in by_role] == [
+        ("claude", "explorer", 2, 300), ("grok", None, 1, 300),
+    ]
+    assert store.get_task(by_role and _first_task_id(store)).role == "explorer"
+    store.close()
+
+
+def _first_task_id(store: Store) -> str:
+    return store.list_tasks(provider="claude", limit=1)[0].id
 
 
 def test_windows_report_never_exposes_a_legacy_provider_reason(tmp_path: Path) -> None:
