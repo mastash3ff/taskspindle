@@ -3,6 +3,8 @@
 `taskspindle web` serves a local operator console over HTTP. It presents the same tasks, turns,
 checks, reviews, cached worker status and usage rollups that the MCP tools and CLI read. The task
 database is opened `mode=ro`, so a dashboard bug cannot corrupt what a running worker is writing.
+The Policy page is the one exception: it edits the dispatch policy that steers Codex, through a
+narrowly guarded write path described below.
 
 ## Starting it
 
@@ -32,7 +34,17 @@ Every task read goes through a connection opened `sqlite3.connect(..., mode=ro)`
 `PRAGMA query_only=1`: a write attempt raises rather than mutating the database. The database file
 may not exist yet — `/api/health` says so, and every list renders empty instead of failing.
 Overview and Workers use only that cached state. Loading either page starts no provider process,
-native quota check, doctor probe, browser, or billing collection. All dashboard APIs are read-only.
+native quota check, doctor probe, browser, or billing collection.
+
+The Policy page is the dashboard's only write path. Its writes require: a loopback peer and
+matching `Host`; a same-origin `Origin`; the per-process `X-TaskSpindle-CSRF` header, whose token
+is served by the page's own GET; a JSON object body of at most 64 KiB; and a state database already
+at schema 11 — the dashboard never migrates, so an older database answers `503 POLICY_UNAVAILABLE`
+instead. Underneath that, the dashboard's write connection carries a SQLite authorizer that permits
+writes to only the two policy tables; every task table stays read-only even on that connection, so
+a bug in the Policy page cannot touch task history. Every other page and route remains exactly what
+it was: a read-only connection with `PRAGMA query_only=1`, no provider process, no native quota
+check, no doctor probe, no browser, no billing collection.
 
 ## What it shows
 
@@ -64,20 +76,27 @@ native quota check, doctor probe, browser, or billing collection. All dashboard 
   are read-only account diagnostics; they are not task charges or spending controls.
   Automatic recovery shows the configured policy, current state, remaining attempts, next attempt,
   hold reason, and any active task. Older runtime responses without that projection remain valid.
+- **Policy** — the dispatch policy document and its observed status: per-provider shares, budgets
+  and enable state; per-role briefs, provider preference, model/effort selections and timeouts; and
+  the read-only `[concurrency]`, `[native_overage]` and `[provider_recovery]` tables from
+  `config.toml` for context. The page holds a draft while you edit — polling pauses — validates
+  locally, and saves the whole document against the revision it was loaded from; every save is kept
+  in history. See [dispatch-policy.md](dispatch-policy.md#editing).
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
   choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
   counts, window telemetry notes, and the cost-estimate disclaimer. Billing classifications count
   all turns separately, including historical/tokenless unknown turns; native-overage observations
   never turn token estimates or account balances into reported task charges.
-The navigation order is **Overview**, **Tasks**, **Workers**, and **Usage**.
+The navigation order is **Overview**, **Tasks**, **Workers**, **Policy**, and **Usage**.
 `Ctrl+K` or `Cmd+K` opens navigation destinations and a GET-only finder over as many as 200
 recent tasks. Typing filters task ID, summary, repository, and state; arrow keys select a result,
 Enter opens it, and Escape closes the palette. Dark, light, and system themes persist under the browser-local
 `taskspindle-theme` preference; dark is the default. The responsive sidebar, focus handling, and
 status labels remain keyboard accessible.
 
-Overview polls every 10 seconds, Tasks and task detail every 5, Workers every 15, and Usage every
-30. Polling pauses while the tab is hidden. Request generations and
+Overview polls every 10 seconds, Tasks and task detail every 5, Workers every 15, Policy every 30 s,
+paused while the form holds an unsaved draft, and Usage every 30. Polling pauses while the tab is
+hidden. Request generations and
 `AbortController` reject stale responses, while the GET cache retains the last usable data when a
 refresh fails. A "last refreshed" stamp says how current the displayed data is.
 
@@ -91,11 +110,12 @@ and an `initialize` probe — matching `taskspindle doctor` without `--no-live`.
 
 ## JSON API
 
-Routes below are GET-only; other methods are `405`. Errors are JSON, never a traceback.
+Routes below are GET-only except the policy routes; other methods on a GET-only route are `405`.
+Errors are JSON, never a traceback.
 
 | Route | Returns |
 | --- | --- |
-| `/api/health` | task DB health; `read_only: true`, `task_database_read_only: true`, version |
+| `/api/health` | task DB health; `task_database_read_only: true`, `read_only: false`, `policy_writable`, `policy_schema_ready`, version |
 | `/api/overview?limit` | global task counts plus bounded active/attention rows; default `limit` 20, max 100 |
 | `/api/tasks?q&state&provider&mode&limit` | `{tasks: [...]}`, newest first, `limit` default 100, max 1000 |
 | `/api/tasks/{id}` | task, events, turns (with usage and transcript), checks, review, repository, worker log tail; `404` `TASK_NOT_FOUND` |
@@ -103,6 +123,19 @@ Routes below are GET-only; other methods are `405`. Errors are JSON, never a tra
 | `/api/providers` | per-profile availability, windows, cached `native_check`, sanitized provider status, cached doctor report; no probes |
 | `/api/doctor?live=1` | run the doctor report with explicit live probes |
 | `/api/usage?since&provider&group_by` | the same shape as `taskspindle usage --json`; `400` on a bad `since` or `group_by` |
+| `/api/policy` | GET: `{policy, revision, fingerprint, updated_at, updated_by, source, document_error, status, defaults, profiles, file_managed, writable, csrf_token}` |
+| `/api/policy` | PUT `{if_revision, policy}`: the GET payload after saving; `400 POLICY_INVALID` with `details.errors`, `409 POLICY_REVISION_CONFLICT` with `current_revision` |
+| `/api/policy/reset` | POST `{if_revision}`: the GET payload after saving the defaults |
+| `/api/policy/history?limit=50` | GET: `{history: [{revision, updated_at, updated_by, fingerprint, reason}]}` |
+| `/api/policy/history/{revision}` | GET: `{revision, policy, updated_at, updated_by, reason}`; `404 POLICY_REVISION_NOT_FOUND` |
+
+The policy `PUT` and `POST` routes are the dashboard's only mutating routes, and only they carry the
+guards described under [Trust model](#trust-model) — loopback peer and `Host`, same-origin `Origin`,
+the `X-TaskSpindle-CSRF` header, a bounded JSON body, and the schema-11 SQLite authorizer limiting
+writes to the two policy tables. `/api/health.read_only` reflects that: it is `false` because the
+process now has one write path, while `task_database_read_only` stays `true` because the task
+tables are never in it. `policy_writable` is false when the guards would refuse a write regardless
+of the request (for example, not bound to loopback); `policy_schema_ready` is false below schema 11.
 
 `/` serves the page itself; `/static/*` serves its packaged modules and styles. The console uses
 plain HTML, CSS, and JavaScript — no build step or CDN, and no request leaves the browser's own

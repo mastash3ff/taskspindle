@@ -1,6 +1,9 @@
 """A local dashboard over TaskSpindle task and worker state.
 
-Task data is always opened ``mode=ro`` (see :mod:`.db`), and the dashboard exposes no mutation API.
+Task data is always opened ``mode=ro`` (see :mod:`.db`). The dashboard's one mutation surface is
+the dispatch policy: loopback-gated ``/api/policy*`` routes write only the ``dispatch_policy`` and
+``dispatch_policy_history`` tables, through a SQLite connection an authorizer restricts to them
+(see :mod:`.app` and :mod:`.policy_store`).
 """
 
 from __future__ import annotations

@@ -342,7 +342,7 @@ def test_legacy_database_migrates_restrictions_with_zero_automatic_attempts(tmp_
                 observed_at=NOW.isoformat(),
             )
     with Store.open(path) as migrated:
-        assert migrated.schema_version() == 10
+        assert migrated.schema_version() == 11
         assert migrated.get_provider_status("claude")["state"] == "auth_expired"
         assert len(migrated.list_quota_restrictions("claude")) == 1
         assert status(migrated)["attempts_used"] == 0

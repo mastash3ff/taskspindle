@@ -38,6 +38,10 @@ produced.
 - **Usage you can see.** Every turn's token counts are recorded from the wire, with an estimated
   cost at published rates that is labelled as an estimate. `usage_report`, `taskspindle usage` and
   the dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
+- **Usage you can steer.** The dispatch policy — target shares, budgets, and per-role model and
+  effort — is operator data edited on the dashboard's Policy page or with `taskspindle policy`.
+  It is advisory unless a budget is explicitly enforced, and it never picks a provider itself:
+  Codex still names `provider` on every `start_task`. See [dispatch-policy.md](docs/dispatch-policy.md).
 
 ## Quick start
 
@@ -82,8 +86,9 @@ moved underneath you is refused rather than clobbered.
 | --- | --- |
 | [install.md](docs/install.md) | requirements, installing, XDG locations, uninstalling |
 | [codex-registration.md](docs/codex-registration.md) | registering the server, the timeouts, granting a repository |
-| [tools.md](docs/tools.md) | all eighteen tools, the envelope, controlled recovery, and acceptance rules |
+| [tools.md](docs/tools.md) | all nineteen tools, the envelope, controlled recovery, and acceptance rules |
 | [configuration.md](docs/configuration.md) | `config.toml`, `taskspindle discover`, and what second-class providers may not do |
+| [dispatch-policy.md](docs/dispatch-policy.md) | shares, budgets, per-role model/effort, and how Codex reads the dispatch policy |
 | [antigravity.md](docs/antigravity.md) | native AGY login reuse, model selection, containment and release gates |
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
@@ -100,9 +105,12 @@ supported in v0.2.0. Python 3.12+, Node 22+, git 2.38+. See
 
 ## Status
 
-v0.2.0 adds native Antigravity alongside Claude and Grok. API-key and gateway profiles remain
-configured second-class providers. See [the Antigravity guide](docs/antigravity.md) for cached
-authentication, model selection and isolation requirements.
+v0.5.0 adds an operator-editable dispatch policy — target shares, budgets, and per-role model and
+effort, edited on the dashboard's Policy page or with `taskspindle policy` and read fresh by Codex
+on every `capabilities()` call — alongside native Antigravity support and configured second-class
+providers from earlier releases. See [dispatch-policy.md](docs/dispatch-policy.md) and
+[the Antigravity guide](docs/antigravity.md) for cached authentication, model selection and
+isolation requirements.
 
 TaskSpindle is not affiliated with, endorsed by, or sponsored by OpenAI, Anthropic, Google, or xAI.
 

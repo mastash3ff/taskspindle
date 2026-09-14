@@ -1,7 +1,10 @@
 """The Starlette application behind ``taskspindle web``.
 
 Task, provider and usage data stays read-only: the task database is opened ``mode=ro`` (see
-:mod:`.db`) and task artifacts are only read.
+:mod:`.db`) and task artifacts are only read. The dispatch policy is the one exception: loopback-
+gated ``/api/policy*`` routes may write the ``dispatch_policy`` and ``dispatch_policy_history``
+tables through :mod:`.policy_store`, whose SQLite authorizer refuses every other table and every
+schema change.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from collections.abc import Awaitable, Callable
@@ -27,17 +31,23 @@ from starlette.staticfiles import StaticFiles
 
 import taskspindle
 
-from .. import access_checks, limits, native_overage, usage
-from ..config import Paths
+from .. import access_checks, limits, native_overage, policy, usage
+from ..config import ConfigError, Paths, concurrency_limits, load_config
+from ..config import native_overage_policies as file_native_overage_policies
+from ..config import provider_recovery_policies as file_provider_recovery_policies
 from ..doctor import run_doctor_async
 from ..providers import Profile
 from ..service import model_availability, provider_availability, task_view
+from ..store import PolicyRevisionConflict
 from .db import ReadOnlyStore
+from .policy_store import PolicyStore
+from .security import csrf_valid, no_store, read_json_object, same_origin, trusted_loopback
 
 __all__ = ["build_app"]
 
 _DOCTOR_CACHE_SECONDS = 60
 _WORKER_LOG_TAIL_LINES = 200
+_MAX_POLICY_BODY_BYTES = 65536
 
 Handler = Callable[[Request], Response | Awaitable[Response]]
 
@@ -126,10 +136,13 @@ def build_app(
     profiles: dict[str, Profile],
     *,
     clock: Callable[[], datetime] | None = None,
+    policy_store_factory: Callable[[], PolicyStore] | None = None,
 ) -> Starlette:
-    """Build the read-only dashboard application."""
+    """Build the dashboard application; only the dispatch policy routes ever write."""
     clock = clock or (lambda: datetime.now(UTC))
     db_path = paths.state_dir / "taskspindle.sqlite3"
+    policy_store_factory = policy_store_factory or (lambda: PolicyStore(db_path))
+    csrf_token = secrets.token_urlsafe(32)
     # The dashboard serves assets from an unpacked filesystem installation (including wheels).
     static_dir = importlib.resources.files("taskspindle.web") / "static"
 
@@ -170,16 +183,22 @@ def build_app(
     @_guard
     def health(request: Request) -> Response:
         with _store() as store:
-            return JSONResponse(
-                {
-                    "schema_version": store.schema_version(),
-                    "db_path": str(db_path),
-                    "db_exists": store.exists,
-                    "read_only": True,
-                    "task_database_read_only": True,
-                    "version": taskspindle.__version__,
-                }
-            )
+            schema_version = store.schema_version()
+            db_exists = store.exists
+        with policy_store_factory() as pstore:
+            policy_writable = pstore.available
+        return JSONResponse(
+            {
+                "schema_version": schema_version,
+                "db_path": str(db_path),
+                "db_exists": db_exists,
+                "read_only": False,
+                "task_database_read_only": True,
+                "policy_writable": policy_writable,
+                "policy_schema_ready": (schema_version or 0) >= 11,
+                "version": taskspindle.__version__,
+            }
+        )
 
     # -- tasks ------------------------------------------------------------------------
 
@@ -417,6 +436,155 @@ def build_app(
                 return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(report)
 
+    # -- dispatch policy --------------------------------------------------------------
+
+    def _policy_payload(now: datetime) -> dict[str, Any]:
+        with _store() as ro_store:
+            loaded = policy.load(ro_store, profiles)
+            status_report = policy.status(ro_store, loaded, profiles, now)
+        default_policy = policy.defaults(profiles)
+        try:
+            settings = load_config(paths.config_file)
+            file_managed: dict[str, Any] = {
+                "config_file": str(paths.config_file),
+                "concurrency": concurrency_limits(settings, profiles),
+                "native_overage": file_native_overage_policies(settings, profiles),
+                "provider_recovery": file_provider_recovery_policies(settings, profiles),
+            }
+        except ConfigError as exc:
+            file_managed = {"config_file": str(paths.config_file), "error": str(exc)}
+        with policy_store_factory() as pstore:
+            writable = pstore.available
+        profiles_out = [
+            {
+                "id": profile.id,
+                "family": profile.family,
+                "first_class": profile.first_class,
+                "auth": profile.auth,
+                "modes": sorted(profile.modes),
+            }
+            for profile in sorted(profiles.values(), key=lambda item: item.id)
+        ]
+        return {
+            "policy": loaded.policy.model_dump(mode="json"),
+            **loaded.describe(),
+            "status": status_report,
+            "defaults": default_policy.model_dump(mode="json"),
+            "profiles": profiles_out,
+            "file_managed": file_managed,
+            "writable": writable,
+            "csrf_token": csrf_token,
+        }
+
+    @_guard
+    def policy_get_endpoint(request: Request) -> Response:
+        if not trusted_loopback(request):
+            return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
+        return no_store(_policy_payload(clock()))
+
+    @_guard
+    async def policy_put_endpoint(request: Request) -> Response:
+        if not trusted_loopback(request):
+            return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
+        if not same_origin(request):
+            return no_store({"error": "ORIGIN_REQUIRED"}, status=403)
+        if not csrf_valid(request, csrf_token):
+            return no_store({"error": "CSRF_INVALID"}, status=403)
+        body, error = await read_json_object(request, _MAX_POLICY_BODY_BYTES)
+        if error is not None:
+            return error
+        if_revision = body.get("if_revision")
+        if not isinstance(if_revision, int) or isinstance(if_revision, bool) or if_revision < 0:
+            return no_store({"error": "INVALID_REQUEST"}, status=400)
+        document = body.get("policy")
+        with policy_store_factory() as pstore:
+            if not pstore.available:
+                return no_store({"error": "POLICY_UNAVAILABLE"}, status=503)
+            try:
+                parsed = policy.parse(document)
+            except policy.PolicyError as exc:
+                return no_store({"error": "POLICY_INVALID", "details": {"errors": exc.errors}}, status=400)
+            errors = policy.validate(parsed, profiles)
+            if errors:
+                return no_store({"error": "POLICY_INVALID", "details": {"errors": errors}}, status=400)
+            try:
+                pstore.save(
+                    policy.canonical_json(parsed),
+                    policy.fingerprint(parsed),
+                    updated_by="web",
+                    if_revision=if_revision,
+                )
+            except PolicyRevisionConflict as exc:
+                return no_store(
+                    {"error": "POLICY_REVISION_CONFLICT", "current_revision": exc.actual}, status=409
+                )
+        return no_store(_policy_payload(clock()))
+
+    @_guard
+    async def policy_reset_endpoint(request: Request) -> Response:
+        if not trusted_loopback(request):
+            return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
+        if not same_origin(request):
+            return no_store({"error": "ORIGIN_REQUIRED"}, status=403)
+        if not csrf_valid(request, csrf_token):
+            return no_store({"error": "CSRF_INVALID"}, status=403)
+        body, error = await read_json_object(request, _MAX_POLICY_BODY_BYTES)
+        if error is not None:
+            return error
+        if_revision = body.get("if_revision")
+        if not isinstance(if_revision, int) or isinstance(if_revision, bool) or if_revision < 0:
+            return no_store({"error": "INVALID_REQUEST"}, status=400)
+        with policy_store_factory() as pstore:
+            if not pstore.available:
+                return no_store({"error": "POLICY_UNAVAILABLE"}, status=503)
+            default_policy = policy.defaults(profiles)
+            try:
+                pstore.save(
+                    policy.canonical_json(default_policy),
+                    policy.fingerprint(default_policy),
+                    updated_by="web",
+                    if_revision=if_revision,
+                    reason="reset",
+                )
+            except PolicyRevisionConflict as exc:
+                return no_store(
+                    {"error": "POLICY_REVISION_CONFLICT", "current_revision": exc.actual}, status=409
+                )
+        return no_store(_policy_payload(clock()))
+
+    @_guard
+    def policy_history_endpoint(request: Request) -> Response:
+        raw_limit = request.query_params.get("limit", "50")
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            limit = 50
+        limit = max(1, min(limit, 200))
+        with _store() as store:
+            history = store.list_dispatch_policy_history(limit=limit)
+        return JSONResponse({"history": history})
+
+    @_guard
+    def policy_history_revision_endpoint(request: Request) -> Response:
+        try:
+            revision = int(request.path_params["revision"])
+        except ValueError:
+            return JSONResponse({"error": "POLICY_REVISION_NOT_FOUND"}, status_code=404)
+        with _store() as store:
+            row = store.get_dispatch_policy_revision(revision)
+        if row is None:
+            return JSONResponse({"error": "POLICY_REVISION_NOT_FOUND"}, status_code=404)
+        return JSONResponse(
+            {
+                "revision": row["revision"],
+                "policy": row["document"],
+                "updated_at": row["updated_at"],
+                "updated_by": row["updated_by"],
+                "reason": row["reason"],
+                "fingerprint": row["fingerprint"],
+            }
+        )
+
     routes = [
         Route("/", index, methods=["GET"]),
         Mount("/static", app=StaticFiles(directory=Path(str(static_dir))), name="static"),
@@ -428,6 +596,11 @@ def build_app(
         Route("/api/providers", providers_endpoint, methods=["GET"]),
         Route("/api/doctor", doctor_endpoint, methods=["GET"]),
         Route("/api/usage", usage_endpoint, methods=["GET"]),
+        Route("/api/policy", policy_get_endpoint, methods=["GET"]),
+        Route("/api/policy", policy_put_endpoint, methods=["PUT"]),
+        Route("/api/policy/reset", policy_reset_endpoint, methods=["POST"]),
+        Route("/api/policy/history", policy_history_endpoint, methods=["GET"]),
+        Route("/api/policy/history/{revision}", policy_history_revision_endpoint, methods=["GET"]),
     ]
     app = Starlette(routes=routes)
     app.state.doctor_cache = {"result": None, "at": 0.0, "checked_at": None}

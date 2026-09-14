@@ -75,6 +75,14 @@ prevent Claude/Grok from consuming extra usage already enabled on the provider
 account. `allow_metered` remains the separate API-key authorization gate.
 See [native extra usage](native-overage.md) for continuation, telemetry, and rollout.
 
+## Dispatch policy
+
+Target shares, budgets, per-role model and effort, and the rest of the dispatch policy live in the
+state database, not here. Edit them through the dashboard's Policy page or `taskspindle policy` —
+never in `config.toml`. The Policy page shows `[concurrency]`, `[native_overage]` and
+`[provider_recovery]` from this file read-only, for context alongside the policy they sit next to.
+See [dispatch-policy.md](dispatch-policy.md).
+
 ## `[providers.<id>]`
 
 Any other ACP-speaking stdio agent is a **configured, second-class profile**.
@@ -127,6 +135,11 @@ These are rules the code enforces, not advice:
 - **Attribution.** Every task records `auth_mode`, the requested and reported model, and — for a
   gateway — the *host* of `ANTHROPIC_BASE_URL` or `OPENAI_BASE_URL`, never the full URL and never
   the token. `task_result` shows all of it, so metered work is visible after the fact.
+- **The dispatch policy does not change any of this.** Never a default and never a fallback still
+  hold: the policy is advisory data the caller reads through `capabilities()` or `dispatch_policy()`
+  to decide which provider to name, not a mechanism that names one for it. An enforced, exhausted
+  budget can refuse admission with `POLICY_BUDGET_EXHAUSTED`, but it never retries elsewhere or
+  chooses on the caller's behalf. See [dispatch-policy.md](dispatch-policy.md).
 
 The child environment is built by allowlist, never by filtering the parent: a name reaches the
 agent only because TaskSpindle put it there. `HOME`, `LANG`, `LC_ALL`, `USER`, `LOGNAME`,

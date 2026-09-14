@@ -3,6 +3,9 @@
 # Every key is optional. Built-in providers are `claude`, `grok`, and `agy`, all OAuth-only.
 # AGY uses a separately pinned native CLI and its existing personal login; see docs/antigravity.md.
 #
+# Target shares, budgets, and per-role model/effort are NOT set here: edit them with
+# `taskspindle policy` or the dashboard's Policy page. See docs/dispatch-policy.md.
+#
 # Concurrent turns per provider default to one when omitted. Uncomment only after qualifying
 # useful overlapping jobs on this host. All MCP clients sharing the state database share these
 # limits; four each permits at most twelve external turns, not twelve per client.

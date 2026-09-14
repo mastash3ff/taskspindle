@@ -13,6 +13,8 @@ agy = 4
 An omitted provider stays at one. Keys identify loaded provider profiles; an unknown profile or
 an invalid limit is rejected. These are scheduling limits, not a claim about subscription quota.
 Provider refusals remain authoritative, and usage reports never infer unreported remaining quota.
+The dashboard's Policy page shows these limits read-only, alongside the dispatch policy that
+shares turns across providers within them; it never writes `config.toml`.
 
 ## Shared scheduling and isolation
 

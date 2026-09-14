@@ -1,6 +1,6 @@
 # Tool reference
 
-Eighteen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
+Nineteen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
 nothing else is: there is no side channel, no implicit action and no tool that decides on a
 candidate's behalf.
 
@@ -20,8 +20,9 @@ did not anticipate comes back as `INTERNAL` with nothing but the exception's cla
 `details`; its traceback goes to `state_dir/server.log`, not into the conversation, where it would
 leak paths and arguments.
 
-Read-only tools are annotated `readOnlyHint: true`. Six are: `doctor`,
-`list_repository_policies`, `list_tasks`, `task_status`, `task_result`, and `usage_report`.
+Read-only tools are annotated `readOnlyHint: true`. Seven are: `doctor`,
+`list_repository_policies`, `list_tasks`, `task_status`, `task_result`, `usage_report`, and
+`dispatch_policy`.
 **`task_diff` is not one of them**, and that is deliberate: handing a page of a diff over appends a
 receipt that later proves the whole candidate was inspected. `capabilities` also lacks the hint
 because its optional `check_providers` parameter writes a bounded native diagnostic cache. Calling
@@ -41,8 +42,22 @@ stored task outcomes, capacity, usage windows, and native diagnostic cache entri
 returning.
 
 ```json
-{"providers": [{"id": "grok", "first_class": true, "second_class": false, "auth": "oauth",
+{"dispatch_policy": {
+   "revision": 3, "fingerprint": "…", "updated_at": "…Z", "updated_by": "web",
+   "source": "store", "document_error": null, "share_window": "week",
+   "roles": {"planner": {"brief": "…", "provider_preference": ["claude", "grok", "agy"],
+             "selections": {"claude": {"model": "opus[1m]", "effort": "xhigh"}}, "timeout_s": null}},
+   "under_target_order": ["grok", "agy"]
+ },
+ "providers": [{"id": "grok", "first_class": true, "second_class": false, "auth": "oauth",
                 "modes": ["consult", "implement", "review"], "model": null, "gateway_host": null,
+                "policy": {"enabled": true, "state": "active", "enforced_exhaustion": false,
+                           "target_share": 30, "target_share_normalized": 0.3,
+                           "share_state": "under_target", "observed": {"…": "…"},
+                           "budgets": {"…": "…"}, "allowed_modes": null, "note": "",
+                           "advertised_models": ["grok-4.6"],
+                           "advertised_efforts": ["low", "medium", "high"],
+                           "models_without_effort": []},
                 "availability": {"state": "throttled", "status_key": "grok",
                                  "code": "PROVIDER_THROTTLED", "window": "five_hour",
                                  "reset_at": "2026-09-04T21:00:00Z",
@@ -68,6 +83,20 @@ returning.
 
 Read the `isolation` string before you trust anything to it. It says plainly that worktrees and
 allowlisted environments are containment by construction and not an OS sandbox.
+
+The top-level **`dispatch_policy`** block is the operator's dispatch policy: `revision`,
+`fingerprint`, `updated_at`, `updated_by`, `source` (`store` or `defaults`), `document_error`,
+`share_window`, the `roles` table (`brief`, `provider_preference`, `selections`, `timeout_s` per
+role) and `under_target_order`. `source` is `defaults` when nothing has been saved or the stored
+document no longer parses; `document_error` then says why. Each entry in `providers` carries a
+matching per-provider **`policy`** block: `enabled`, `state` (`paused`, `budget_exhausted` or
+`active`), `enforced_exhaustion`, `target_share`, `target_share_normalized`, `share_state`
+(`paused`, `untracked`, `under_target`, `on_target` or `over_target`), `observed` and `budgets` per
+window, `allowed_modes`, `note`, `advertised_models`, `advertised_efforts` and
+`models_without_effort`. It is read fresh on every call — an edit made in the dashboard or with
+`taskspindle policy` takes effect without restarting the MCP server. None of this selects a
+provider or changes admission by itself; see [dispatch-policy.md](dispatch-policy.md) for the full
+shape and [`dispatch_policy`](#dispatch_policy--read-only) below for the dedicated tool.
 
 `availability` is the one part of this answer that changes. `state` is `unknown` until a turn has
 run on the provider, `ok` after one that did, and `throttled` or `auth_expired` after one the
@@ -146,6 +175,22 @@ neither command performs provider checks, browser work, login, or inference.
 Returns `{"ok": bool, "checks": [{"name", "ok", "detail", "advisory"}]}`. `ok` ignores advisory
 checks. Same checks as the `taskspindle doctor` command.
 
+### `dispatch_policy` — read-only
+
+| Parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `action` | `get`\|`status` | `get` | which projection to return |
+
+`get` returns `{"policy", "revision", "fingerprint", "updated_at", "updated_by", "source",
+"document_error"}` — the same document `capabilities()` reads. `status` adds `status` (observed
+usage against the policy, per [dispatch-policy.md](dispatch-policy.md#status)) and
+`file_managed: {"config_file", "concurrency", "native_overage", "provider_recovery"}`, the
+`config.toml` tables the dashboard shows read-only alongside the policy.
+
+There is no `set` through MCP: the caller being steered does not rewrite its own steering. The
+policy is edited only through the dashboard's Policy page or `taskspindle policy`; see
+[dispatch-policy.md](dispatch-policy.md#editing).
+
 ## Repository policy
 
 A provider may work in a repository only while an active grant covers that repository, that
@@ -206,6 +251,7 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `verification_commands` | string[]\|null | `null` | **implement only, required**; may be `[]` |
 | `candidate_message` | string\|null | `null` | **implement only, required**; one line, ≤ 72 characters |
 | `review_target` | object\|null | `null` | **review only, required** |
+| `role` | string\|null | `null` | matches `^[a-z][a-z0-9_-]*$`, at most 32 characters; recorded on the task for reporting only, does not select a provider or change admission |
 
 `review_target` is either
 `{"kind": "candidate", "task_id": …, "candidate_sha": …}` — review another task's staged candidate —
@@ -465,13 +511,15 @@ can use any more — is deleted outright and the cleanup completes.
 | --- | --- | --- | --- |
 | `since` | string\|null | `null` | ISO-8601, or shorthand: `7d`, `24h`, `30m`, `90s` |
 | `provider` | string\|null | `null` | only this profile |
-| `group_by` | `provider`\|`day`\|`provider_day`\|`model`\|`mode`\|`repository_id` | `provider` | how the token counts are rolled up |
+| `group_by` | `provider`\|`day`\|`provider_day`\|`model`\|`mode`\|`repository_id`\|`role` | `provider` | how the token counts are rolled up |
 
 `repository_id` combines providers within each repository; repository-free turns share a `null`
 group. Buckets retain that stable ID and add `repository_path` (the registered display path or
 null). Tables display the path when available, otherwise the ID, and use "No repository" for
 the null group. Labels never change grouping identity. Individual `task_result.usage` entries
-also include `repository_id`. Existing provider and time filters apply.
+also include `repository_id`. `role` rolls token use up by provider and role, from the `role`
+recorded on `start_task`; a turn from a task started without `role` falls in a `null` group.
+Existing provider and time filters apply.
 
 Returns:
 
@@ -602,4 +650,5 @@ invalidates the review: get a new one.
 | `RECOVERY_NOT_AVAILABLE` | the permit has already been used or settled |
 | `RECOVERY_EXPIRED` | the permit expired before initial prompt admission |
 | `RECOVERY_INVALID_SCOPE` | the provider or model identifier is not safe and valid |
+| `POLICY_BUDGET_EXHAUSTED` | `start_task` refused (retryable): the named provider has an exhausted, enforced dispatch-policy budget; `details` carries `provider`, `window`, `kind`, `limit`, `used`, `window_start`, `policy_revision` |
 | `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |

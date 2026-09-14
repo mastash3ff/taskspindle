@@ -201,8 +201,10 @@ def test_health_reports_schema_and_db_state(tmp_path: Path) -> None:
     missing = client.get("/api/health").json()
     assert missing["db_exists"] is False
     assert missing["schema_version"] is None
-    assert missing["read_only"] is True
+    assert missing["read_only"] is False
     assert missing["task_database_read_only"] is True
+    assert missing["policy_writable"] is False
+    assert missing["policy_schema_ready"] is False
     assert "subscription_actions_enabled" not in missing
 
     _seed(paths)
@@ -210,6 +212,8 @@ def test_health_reports_schema_and_db_state(tmp_path: Path) -> None:
     assert present["db_exists"] is True
     assert present["schema_version"] == taskspindle.SCHEMA_VERSION
     assert present["db_path"] == str(paths.state_dir / "taskspindle.sqlite3")
+    assert present["policy_writable"] is True
+    assert present["policy_schema_ready"] is True
 
 
 def test_retired_subscription_api_is_not_routed(tmp_path: Path) -> None:

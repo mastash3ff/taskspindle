@@ -4,8 +4,8 @@
 
 ```
   Codex session                                  browser (localhost)
-        │  MCP over stdio (18 tools, one envelope)        │  taskspindle web:
-        ▼                                                 ▼  task database opened read-only
+        │  MCP over stdio (19 tools, one envelope)        │  taskspindle web:
+        ▼                                                 ▼  task tables read-only, policy tables writable
   taskspindle mcp ──────────────────────────────────────────────┐
   server.py: envelope, annotations, traceback → server.log      │
   service.py: Orchestrator — every rule lives here              │
@@ -37,7 +37,10 @@
   limits.py      what a refused turn means for its provider; never what to do about it
   provider_recovery.py  single-use authorization bound to cached refusal evidence
   usage.py       token counts per turn, the price table, the rolled-up report
-  web/           operator console: read-only task, worker, overview and usage projections
+  policy.py      dispatch policy: document, defaults, validation, status against observed usage
+  web/           operator console: read-only task, worker, overview and usage projections, plus
+                 security.py (the Policy write path's guards) and policy_store.py (its authorizer-
+                 limited SQLite connection)
 ```
 
 The MCP server never owns an ACP connection. It writes rows and starts units; the units talk to

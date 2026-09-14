@@ -14,7 +14,11 @@ create API clients, buy credits, change a billing cap, or configure automatic to
 Set policies in `[native_overage]` in `config.toml`. Entries use exact profile IDs,
 including aliases. Omitted entries default to `observe_only`. `allow_metered` remains
 an independent API-key-only gate; setting it false does not prove an OAuth turn was
-free. The dashboard observes policy and billing; it has no spending controls.
+free. The dashboard observes policy and billing; it has no spending controls. The
+dispatch policy's per-provider `budgets` are the same kind of thing: local turn/token
+counters this host recorded from its own turns, not a spending control — an enforced,
+exhausted one only refuses new admission on that provider, the same way `observe_only`
+does not touch provider account settings. See [dispatch-policy.md](dispatch-policy.md).
 
 A turn captures its policy fingerprint and authentication context. TaskSpindle
 rechecks pending authorization at dispatch and before prompting. Revocation prevents

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.5.0
+
+- **Dispatch policy.** A new `dispatch_policy` document (schema 11, with history) lets the
+  operator set target shares, budgets with optional enforcement, per-role provider preference
+  and model/effort selections, a pause per provider, and the advertised model/effort value lists.
+  It is read fresh on every `capabilities()` call, every `dispatch_policy` call and every
+  `start_task` admission — an edit takes effect without restarting the MCP server.
+- **Dashboard Policy page.** The dashboard's first write path: loopback peer and `Host`,
+  same-origin `Origin`, a per-process `X-TaskSpindle-CSRF` header, a bounded JSON body, and a
+  SQLite authorizer that limits the write connection to the two policy tables, so task tables
+  stay read-only.
+- **`dispatch_policy` tool and `capabilities` blocks.** A new read-only `dispatch_policy` tool
+  (`get`/`status`) and a `dispatch_policy` block plus per-provider `policy` block in
+  `capabilities()` project the policy and observed status to Codex.
+- **`role` on `start_task` and `usage_report(group_by="role")`.** `start_task` accepts an
+  optional `role`, recorded on the task for reporting; `usage_report` can roll usage up by
+  provider and role.
+- **`POLICY_BUDGET_EXHAUSTED`.** `start_task` refuses (retryably) admission on a provider whose
+  enforced budget is exhausted, until the window rolls.
+- **`taskspindle policy` CLI.** `show`, `export`, `import`, `set`, and `reset`, against the same
+  document and revision the dashboard and MCP tool read.
+- **Upgrade note.** The runtime directory is versioned by the package version, so re-run
+  `taskspindle setup` after upgrading and restart `taskspindle web`.
+
 ## v0.4.0
 
 - **Browser billing retired.** The subscription collector, browser helper, CLI commands,
