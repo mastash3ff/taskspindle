@@ -101,6 +101,13 @@ export function labeledValue(label, value, options = {}) {
   return h("div", { class: "labeled-value" }, h("dt", { text: label }), options.node ? h("dd", {}, options.node) : h("dd", { class: options.mono ? "mono" : "", text: shown }));
 }
 
+const SELECTABLE_INPUT_TYPES = new Set(["text", "search", "url", "tel", "password"]);
+
+function supportsSelection(element) {
+  if (element instanceof HTMLTextAreaElement) return true;
+  return element instanceof HTMLInputElement && SELECTABLE_INPUT_TYPES.has(element.type);
+}
+
 export function captureViewState(root) {
   const active = document.activeElement;
   const selection = window.getSelection();
@@ -120,7 +127,7 @@ export function captureViewState(root) {
   } : null;
   return {
     focusKey: root.contains(active) ? active.dataset.focusKey || active.id || null : null,
-    selection: active instanceof HTMLInputElement ? [active.selectionStart, active.selectionEnd] : null,
+    selection: supportsSelection(active) ? [active.selectionStart, active.selectionEnd] : null,
     scrollX: window.scrollX,
     scrollY: window.scrollY,
     scrollRegions: [...root.querySelectorAll("[data-scroll-key]")].map((el) => [el.dataset.scrollKey, el.scrollLeft, el.scrollTop]),
@@ -149,7 +156,7 @@ export function restoreViewState(root, state) {
     const active = [...root.querySelectorAll("[data-focus-key], [id]")].find((el) => (el.dataset.focusKey || el.id) === state.focusKey);
     if (active) {
       active.focus({ preventScroll: true });
-      if (state.selection && active instanceof HTMLInputElement) active.setSelectionRange(...state.selection);
+      if (state.selection && supportsSelection(active)) active.setSelectionRange(...state.selection);
     }
   }
   if (state.selectedText?.anchor && state.selectedText?.focus) {
