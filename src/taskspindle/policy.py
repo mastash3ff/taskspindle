@@ -34,6 +34,7 @@ __all__ = [
     "Selection",
     "canonical_json",
     "defaults",
+    "file_managed",
     "fingerprint",
     "load",
     "status",
@@ -436,6 +437,31 @@ def save(
         if_revision=if_revision,
         reason=reason,
     )
+
+
+# -- file-managed tables: shown beside the policy, never written by it ---------------------------
+
+
+def file_managed(config_file: Any, profiles: Mapping[str, Any]) -> dict[str, Any]:
+    """The ``config.toml`` tables the dashboard displays read-only, re-read on every call."""
+    from .config import (
+        ConfigError,
+        concurrency_limits,
+        load_config,
+        native_overage_policies,
+        provider_recovery_policies,
+    )
+
+    try:
+        settings = load_config(config_file)
+        return {
+            "config_file": str(config_file),
+            "concurrency": concurrency_limits(settings, profiles),
+            "native_overage": native_overage_policies(settings, profiles),
+            "provider_recovery": provider_recovery_policies(settings, profiles),
+        }
+    except ConfigError as exc:
+        return {"config_file": str(config_file), "error": str(exc)}
 
 
 # -- status: observed usage against the policy ---------------------------------------------------

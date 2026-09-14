@@ -40,12 +40,8 @@ from . import (
     worktrees,
 )
 from .config import (
-    ConfigError,
     Paths,
     concurrency_limits,
-    load_config,
-    native_overage_policies,
-    provider_recovery_policies,
 )
 from .integration import Journal
 from .models import (
@@ -1288,19 +1284,7 @@ class Orchestrator:
         }
         if action == "status":
             result["status"] = policy.status(self.store, loaded, self.profiles, self.clock())
-            try:
-                settings = load_config(self.paths.config_file)
-                result["file_managed"] = {
-                    "config_file": str(self.paths.config_file),
-                    "concurrency": concurrency_limits(settings, self.profiles),
-                    "native_overage": native_overage_policies(settings, self.profiles),
-                    "provider_recovery": provider_recovery_policies(settings, self.profiles),
-                }
-            except ConfigError as exc:
-                result["file_managed"] = {
-                    "config_file": str(self.paths.config_file),
-                    "error": str(exc),
-                }
+            result["file_managed"] = policy.file_managed(self.paths.config_file, self.profiles)
         return result
 
     def task_diff(

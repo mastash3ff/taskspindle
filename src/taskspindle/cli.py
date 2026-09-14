@@ -698,6 +698,7 @@ def _policy_show(*, status: bool, as_json: bool) -> int:
             }
             if status:
                 result["status"] = policy_module.status(store, loaded, profiles, datetime.now(UTC))
+                result["file_managed"] = policy_module.file_managed(resolve_paths().config_file, profiles)
     except (ConfigError, providers.ProfileError, OSError, ValueError) as exc:
         print(f"taskspindle policy: {exc}", file=sys.stderr)
         return 1

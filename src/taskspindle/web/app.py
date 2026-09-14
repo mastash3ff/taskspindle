@@ -32,9 +32,7 @@ from starlette.staticfiles import StaticFiles
 import taskspindle
 
 from .. import access_checks, limits, native_overage, policy, usage
-from ..config import ConfigError, Paths, concurrency_limits, load_config
-from ..config import native_overage_policies as file_native_overage_policies
-from ..config import provider_recovery_policies as file_provider_recovery_policies
+from ..config import Paths
 from ..doctor import run_doctor_async
 from ..providers import Profile
 from ..service import model_availability, provider_availability, task_view
@@ -443,16 +441,7 @@ def build_app(
             loaded = policy.load(ro_store, profiles)
             status_report = policy.status(ro_store, loaded, profiles, now)
         default_policy = policy.defaults(profiles)
-        try:
-            settings = load_config(paths.config_file)
-            file_managed: dict[str, Any] = {
-                "config_file": str(paths.config_file),
-                "concurrency": concurrency_limits(settings, profiles),
-                "native_overage": file_native_overage_policies(settings, profiles),
-                "provider_recovery": file_provider_recovery_policies(settings, profiles),
-            }
-        except ConfigError as exc:
-            file_managed = {"config_file": str(paths.config_file), "error": str(exc)}
+        file_managed = policy.file_managed(paths.config_file, profiles)
         with policy_store_factory() as pstore:
             writable = pstore.available
         profiles_out = [

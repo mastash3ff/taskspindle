@@ -539,6 +539,7 @@ function saveBar(data) {
     h("div", { class: "save-bar-status" }, h("strong", { text: dirty ? "Unsaved changes" : "No changes" }), h("span", { text: statusText })),
     saveConflict != null ? h("div", { class: "callout callout-danger" }, h("strong", { text: `Save refused: the server is at revision ${saveConflict}.` }), h("p", { text: "Reload to discard your draft, or keep editing and reload before saving again." })) : null,
     errorMessages.length ? h("div", { class: "callout callout-danger" }, h("strong", { text: "Save failed." }), errorMessages.map((msg) => h("p", { text: msg }))) : null,
+    dirty && errors.length ? h("div", { class: "callout callout-warning local-errors" }, h("strong", { text: "Fix before saving:" }), errors.map((err) => h("p", { text: `${(err.loc || []).join(".") || "document"}: ${err.msg}` }))) : null,
     h("div", { class: "save-bar-actions" }, saveBtn, discardBtn, resetBtn, historyDisclosure()),
     resetDialog,
   );
