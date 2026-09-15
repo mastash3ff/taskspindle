@@ -186,6 +186,7 @@ class _Doctor:
         self.node()
         self.adapter()
         self.grok_cli()
+        self.grok_sandbox_hooks()
         self.claude_oauth()
         if "agy" in self.profiles:
             self.agy_cli()
@@ -322,6 +323,31 @@ class _Doctor:
             if not reported.startswith(GROK_VERSION_PREFIX):
                 raise RuntimeError(f"{reported or 'nothing'} is not {GROK_VERSION_PREFIX}")
             return reported
+
+    def grok_sandbox_hooks(self) -> None:
+        """Advisory: a symlinked hook source makes grok refuse to start its sandbox at all.
+
+        Grok has no cheap, non-interactive command that exercises sandbox profile resolution --
+        ``grok doctor`` only checks terminal, clipboard and input support, never the sandbox --
+        so this looks directly at the one filesystem shape known to make it fail: a hook source
+        path under ``~/.grok/hooks`` that is a symlink rather than a real file. When that is
+        true, every task on this profile fails at the handshake with the same opaque
+        ``ACP_HANDSHAKE_FAILED``, and only the agent's own stderr says why.
+        """
+        home = Path(self.parent_env["HOME"]) if self.parent_env.get("HOME") else Path.home()
+        hooks_dir = home / ".grok" / "hooks"
+
+        @self.check("grok_sandbox_hooks", advisory=True)
+        def probe() -> str:
+            if not hooks_dir.is_dir():
+                return f"{hooks_dir} does not exist; nothing to check"
+            symlinked = sorted(entry.name for entry in hooks_dir.iterdir() if entry.is_symlink())
+            if symlinked:
+                raise RuntimeError(
+                    "grok refuses to start its sandbox when a hook source path is a symlink: "
+                    f"{', '.join(symlinked)} under {hooks_dir}"
+                )
+            return f"{hooks_dir} has no symlinked hook sources"
 
     def claude_oauth(self) -> None:
         @self.check("claude_oauth")

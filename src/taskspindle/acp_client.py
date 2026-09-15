@@ -56,8 +56,10 @@ __all__ = [
     "TurnCapture",
     "TurnResult",
     "error_cause",
+    "redact_agent_output",
     "safe_retry_summary",
     "sealed_env",
+    "stderr_tail",
 ]
 
 _CLIENT_INFO = Implementation(name="taskspindle", version=taskspindle.__version__)
@@ -104,6 +106,48 @@ def error_cause(exc: BaseException) -> dict[str, Any]:
         data = exc.data if isinstance(exc.data, dict) else None
         return {"rpc_code": exc.code, "rpc_message": str(exc), "rpc_data": data}
     return {"exception": type(exc).__name__, "message": str(exc)}
+
+
+#: Bytes kept from the tail of an agent's stderr file when it dies before or during the
+#: handshake -- enough for the last error lines without risking an unbounded read.
+_STDERR_TAIL_BYTES = 2048
+
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?<![\w-])([\"']?(?:[\w-]+[_-])?"
+    r"(?:api[_ -]?key|access[_ -]?key(?:[_ -]?id)?|access[_ -]?token|refresh[_ -]?token|"
+    r"client[_ -]?secret|token|secret|password|passwd|pwd)[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"\n]*(?:\"|$)|'[^'\n]*(?:'|$)|[^\s,;]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_AUTHORIZATION_VALUE = re.compile(r"\b(Bearer|Basic)[ \t]+[^\s,;\"'<>]+", re.IGNORECASE)
+
+
+def redact_agent_output(text: str) -> str:
+    """Strip common credential syntax from raw agent output before it is ever persisted."""
+    text = _PRIVATE_KEY_BLOCK.sub("[private key redacted]", text)
+    text = _AUTHORIZATION_VALUE.sub(r"\1 [redacted]", text)
+    text = _CREDENTIAL_ASSIGNMENT.sub(r"\1[redacted]", text)
+    return text
+
+
+def stderr_tail(path: Path, *, limit: int = _STDERR_TAIL_BYTES) -> str:
+    """The sanitized tail of an agent's stderr file, or ``""`` when there is nothing to show.
+
+    Read after the process has been torn down, so this sees everything it wrote. Bounded to
+    ``limit`` bytes so a runaway agent cannot inflate a failure's stored details.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - limit))
+            data = handle.read()
+    except OSError:
+        return ""
+    return redact_agent_output(data.decode("utf-8", errors="replace")).strip()
 
 
 def sealed_env(env: Mapping[str, str]) -> dict[str, str]:
@@ -333,7 +377,12 @@ class AcpWorker:
             )
         except OSError as exc:
             await self._stack.aclose()
-            raise AcpError("ACP_SPAWN_FAILED", f"could not launch {command!r}: {exc}") from exc
+            cause: dict[str, Any] = {}
+            if tail := stderr_tail(self._stderr_path):
+                cause["agent_stderr_tail"] = tail
+            raise AcpError(
+                "ACP_SPAWN_FAILED", f"could not launch {command!r}: {exc}", cause=cause
+            ) from exc
         except BaseException:
             await self._stack.aclose()
             raise
@@ -357,8 +406,14 @@ class AcpWorker:
                     if isinstance(exc, TimeoutError)
                     else f"initialize failed: {exc or type(exc).__name__}"
                 )
+                cause = error_cause(exc)
+                # The agent dying before or during the handshake never surfaces its own
+                # explanation through the wire protocol; its stderr is the only place that
+                # explanation exists, so carry it along for whoever classifies this failure.
+                if tail := stderr_tail(self._stderr_path):
+                    cause["agent_stderr_tail"] = tail
                 raise AcpError(
-                    "ACP_HANDSHAKE_FAILED", detail, cause=error_cause(exc)
+                    "ACP_HANDSHAKE_FAILED", detail, cause=cause
                 ) from exc
             raise
         self.init = _init_info(response)

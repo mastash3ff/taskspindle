@@ -25,6 +25,7 @@ from .providers import Profile, opposite_provider
 __all__ = [
     "ACCESS_ERROR_KINDS",
     "AUTH_ERROR_KINDS",
+    "GENERIC_ACP_FAILURE_MESSAGE",
     "MODEL_ERROR_KINDS",
     "PROVIDER_ACCESS_DENIED",
     "PROVIDER_AUTH_EXPIRED",
@@ -59,6 +60,10 @@ PROVIDER_ACCESS_DENIED = "PROVIDER_ACCESS_DENIED"
 PROVIDER_MODEL_UNAVAILABLE = "PROVIDER_MODEL_UNAVAILABLE"
 #: ``start_task`` refused because the provider is currently believed to be in one of the above.
 PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+
+#: What an ``AcpError`` means when nothing recognised it -- a person cannot act on this alone;
+#: the caller should prefer any more specific evidence it has (such as the agent's own stderr).
+GENERIC_ACP_FAILURE_MESSAGE = "The provider turn failed."
 
 #: ``errorKind`` values of the Claude Agent SDK (``SDKAssistantMessageError`` in
 #: ``@anthropic-ai/claude-agent-sdk`` ``sdk.d.ts``) that mean the seat cannot be used.
@@ -447,7 +452,7 @@ def classify_acp_error(exc: AcpError, *, family: str, model: str | None = None) 
         ):
             return classification
     return Classification(
-        exc.code, None, None, None, exc.code != "TURN_TIMEOUT", "The provider turn failed."
+        exc.code, None, None, None, exc.code != "TURN_TIMEOUT", GENERIC_ACP_FAILURE_MESSAGE
     )
 
 

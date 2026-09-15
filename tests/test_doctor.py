@@ -289,6 +289,40 @@ def test_a_missing_codex_registration_is_only_advisory(paths: Paths, tmp_path: P
     assert report["ok"] is True
 
 
+def test_no_grok_hooks_directory_is_a_clean_advisory(paths: Paths, tmp_path: Path) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    register_codex(tmp_path)
+    runner = RecordedRunner()
+
+    report = run(paths, tmp_path, runner)
+
+    check = by_name(report)["grok_sandbox_hooks"]
+    assert check["ok"] is True
+    assert check["advisory"] is True
+    assert report["ok"] is True
+
+
+def test_a_symlinked_grok_hook_source_is_flagged_as_an_advisory(paths: Paths, tmp_path: Path) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    register_codex(tmp_path)
+    hooks = tmp_path / ".grok" / "hooks"
+    hooks.mkdir(parents=True)
+    real = tmp_path / "elsewhere-guard-bash.json"
+    real.write_text("{}", encoding="utf-8")
+    (hooks / "guard-bash.json").symlink_to(real)
+    runner = RecordedRunner()
+
+    report = run(paths, tmp_path, runner)
+
+    check = by_name(report)["grok_sandbox_hooks"]
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert "symlink" in check["detail"]
+    assert "guard-bash.json" in check["detail"]
+    # Advisory: it never fails the overall result, even though it explains a real refusal to start.
+    assert report["ok"] is True
+
+
 def test_a_missing_api_key_secret_is_only_advisory(paths: Paths, tmp_path: Path) -> None:
     install_adapter(paths, taskspindle.ADAPTER_VERSION)
     register_codex(tmp_path)

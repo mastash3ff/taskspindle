@@ -17,7 +17,15 @@ from acp.connection import StreamDirection, StreamEvent
 from acp.schema import PermissionOption, ToolCallUpdate
 
 from taskspindle import limits
-from taskspindle.acp_client import AcpError, AcpWorker, PermissionPolicy, TurnCapture, sealed_env
+from taskspindle.acp_client import (
+    AcpError,
+    AcpWorker,
+    PermissionPolicy,
+    TurnCapture,
+    redact_agent_output,
+    sealed_env,
+    stderr_tail,
+)
 from taskspindle.providers import Profile, build_child_env, env_violations, session_options
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -506,6 +514,73 @@ async def test_spawning_a_missing_binary_fails_cleanly(tmp_path: Path) -> None:
             pass
 
     assert excinfo.value.code == "ACP_SPAWN_FAILED"
+
+
+async def test_an_agent_that_crashes_before_the_handshake_carries_its_stderr(
+    tmp_path: Path,
+) -> None:
+    stderr_line = (
+        "error: sandbox profile resolve failed: hook source path contains a symlink "
+        "component (retargetable): /home/user/.grok/hooks/guard-bash.json"
+    )
+    env = child_env(tmp_path)
+    script_path = tmp_path / "script.json"
+    script_path.write_text(
+        json.dumps({"crash_before_initialize": stderr_line}), encoding="utf-8",
+    )
+    env["TASKSPINDLE_FAKE_SCRIPT"] = str(script_path)
+    worker = AcpWorker(
+        command=AGENT_ARGV,
+        env=env,
+        cwd=tmp_path,
+        stderr_path=tmp_path / "agent.err",
+        policy=PermissionPolicy(allow_writes=False),
+    )
+
+    with pytest.raises(AcpError) as excinfo:
+        async with worker:
+            pass
+
+    assert excinfo.value.code == "ACP_HANDSHAKE_FAILED"
+    assert stderr_line in excinfo.value.cause["agent_stderr_tail"]
+
+
+# -- stderr redaction ------------------------------------------------------------------------
+
+
+def test_redact_agent_output_strips_common_credential_syntax() -> None:
+    text = (
+        "Authorization: Bearer sk-abc123.def456\n"
+        "token=ghp_verySecretToken\n"
+        'api_key: "sk-live-1234567890"\n'
+        "-----BEGIN PRIVATE KEY-----\nMIIBogIBAAJBAK...\n-----END PRIVATE KEY-----\n"
+        "safe line with no secrets"
+    )
+
+    redacted = redact_agent_output(text)
+
+    assert "sk-abc123.def456" not in redacted
+    assert "ghp_verySecretToken" not in redacted
+    assert "sk-live-1234567890" not in redacted
+    assert "MIIBogIBAAJBAK" not in redacted
+    assert "safe line with no secrets" in redacted
+
+
+def test_stderr_tail_is_bounded_and_redacts_secrets(tmp_path: Path) -> None:
+    path = tmp_path / "agent.stderr"
+    body = "x" * 5000 + "\ntoken=leaked-secret\nlast diagnostic line"
+    path.write_bytes(body.encode("utf-8"))
+
+    tail = stderr_tail(path, limit=2048)
+
+    assert len(tail) <= 2048
+    assert "leaked-secret" not in tail
+    assert tail.endswith("last diagnostic line")
+    assert "x" * 5000 not in tail
+
+
+def test_stderr_tail_of_a_missing_file_is_empty(tmp_path: Path) -> None:
+    assert stderr_tail(tmp_path / "no-such-file.stderr") == ""
 
 
 @pytest.mark.parametrize(("title", "kind", "expected"), [

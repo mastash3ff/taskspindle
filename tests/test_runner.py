@@ -656,6 +656,30 @@ async def test_cancelled_turn_is_not_evidence_that_a_previous_throttle_cleared(
     assert store.get_provider_status(PROVIDER) == observed
 
 
+@pytest.mark.parametrize("crash_key", ["crash_before_initialize", "initialize_stderr_exit"])
+async def test_agent_crash_before_handshake_surfaces_its_own_stderr(
+    store: Store, paths: Paths, script, crash_key: str,
+) -> None:
+    """An agent that dies before or during initialize (e.g. a sandbox setup failure) never gets
+    to explain itself over the wire; its stderr is the only place the real cause exists, and the
+    generic classifier message must not be the only thing recorded."""
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    stderr_line = (
+        "error: sandbox profile resolve failed: hook source path contains a symlink component "
+        "(retargetable): /home/user/.grok/hooks/guard-bash.json"
+    )
+    script_path = script({crash_key: stderr_line})
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.FAILED
+    final = store.get_task(task.id)
+    assert final.error["code"] == "ACP_HANDSHAKE_FAILED"
+    assert stderr_line in final.error["details"]["agent_stderr_tail"]
+    assert final.error["message"] == stderr_line
+    assert final.error["message"] != "The provider turn failed."
+
+
 @pytest.mark.parametrize("operation", ["initialize", "new"])
 @pytest.mark.parametrize("cancel_requested", [False, True])
 async def test_transport_close_during_startup_honors_only_requested_cancellation(
@@ -847,8 +871,40 @@ async def test_native_auth_failure_records_its_source_without_provider_output(
     assert status["source"] == "native_auth_check"
     assert status["state"] == "auth_expired"
     final = store.get_task(task.id)
+    # The original refusal's own code must survive -- not be swallowed into a generic
+    # WORKER_ERROR by an unrelated attribute mistake in how its details are carried forward.
+    assert final.error["code"] == "OAUTH_REJECTED"
     assert "private-provider-output" not in json.dumps(final.error)
     assert "private-provider-output" not in json.dumps(store.list_events(task.id))
+
+
+async def test_auth_context_race_during_native_auth_failure_is_recorded_not_masking(
+    store: Store, paths: Paths, script, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed auth context discovered while recording a native auth refusal is real, but it
+    must not replace that refusal's code -- the refusal is what happened; the race is a detail."""
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+
+    def refuse(*_args):
+        raise runner._Failure("OAUTH_REJECTED", "private-provider-output")
+
+    monkeypatch.setattr(runner, "_pre_spawn_evidence", refuse)
+
+    original_check = runner._check_initial_auth_context
+    calls = {"n": 0}
+
+    def flaky_check(run: object, profile: object) -> str:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise runner._Failure("AUTH_CONTEXT_CHANGED", "context moved mid-flight")
+        return original_check(run, profile)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runner, "_check_initial_auth_context", flaky_check)
+
+    assert await run_task(store, paths, task, script({})) is TaskState.FAILED
+    final = store.get_task(task.id)
+    assert final.error["code"] == "OAUTH_REJECTED"
+    assert final.error["details"]["auth_context_note"] == "context moved mid-flight"
 
 
 async def test_a_turn_that_runs_clears_the_throttle_and_records_its_usage(

@@ -31,8 +31,10 @@ Script keys::
      "capture_mode_to": "/path/mode.txt",  # write the mode id session/set_mode received
      "refuse_mode": true,                  # ... or refuse session/set_mode with an error
      "ask_switch_mode": true,              # ask permission for a "switch_mode" tool call
-     "fail_kind": "auth" | "rate_limit" | "usage_limit" | "usage_limit_prefix" | "overloaded"}
-                                           # raise a shaped RequestError from prompt
+     "fail_kind": "auth" | "rate_limit" | "usage_limit" | "usage_limit_prefix" | "overloaded",
+     "crash_before_initialize": "line",    # write a line to stderr, exit before the handshake
+     "{operation}_stderr_exit": "line"}    # write a line to stderr, then crash mid-operation
+                                           # ("initialize", "new", "load", ...)
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ import asyncio
 import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +159,11 @@ class FakeAgent:
         if started := self.script.get(f"started_{operation}_to"):
             Path(started).write_text(str(os.getpid()), encoding="utf-8")
         await asyncio.sleep(float(self.script.get(f"{operation}_delay", 0)))
+        if stderr_line := self.script.get(f"{operation}_stderr_exit"):
+            # A real agent that cannot start (e.g. a sandbox setup failure) explains itself only
+            # on stderr, then dies without ever answering the RPC in flight.
+            print(str(stderr_line), file=sys.stderr, flush=True)
+            os._exit(1)
         if self.script.get(f"{operation}_fail"):
             raise RequestError.auth_required({"reason": "scripted refusal"})
 
@@ -332,7 +340,13 @@ class FakeAgent:
 
 
 def main() -> None:
-    asyncio.run(acp.run_agent(FakeAgent(load_script())))
+    script = load_script()
+    if stderr_line := script.get("crash_before_initialize"):
+        # Simulates an agent whose process starts and immediately refuses to run (a sandbox
+        # profile it cannot satisfy, for instance): it never reads a byte of the ACP transport.
+        print(str(stderr_line), file=sys.stderr, flush=True)
+        sys.exit(1)
+    asyncio.run(acp.run_agent(FakeAgent(script)))
 
 
 if __name__ == "__main__":

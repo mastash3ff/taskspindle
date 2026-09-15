@@ -545,7 +545,17 @@ async def _run_turn(
                 return providers.default_runner(command, env=run.child_env)
         evidence = _pre_spawn_evidence(profile, selected_oauth_runner)
     except _Failure as failure:
-        _check_initial_auth_context(run, profile)
+        # The auth-context check can itself refuse (the login location or metadata changed while
+        # evidence was being gathered). That is real, but it must never replace *this* failure's
+        # code -- the evidence-gathering refusal is what actually happened; a changed context is
+        # at most a contributing detail.
+        try:
+            _check_initial_auth_context(run, profile)
+        except _Failure as context_failure:
+            failure.body["details"] = {
+                **failure.body.get("details", {}),
+                "auth_context_note": context_failure.body["message"],
+            }
         state = "access_denied" if failure.code == limits.PROVIDER_ACCESS_DENIED else "auth_expired"
         safe = {
             "access_denied": "The provider denied account access.",
@@ -556,7 +566,9 @@ async def _run_turn(
             profile,
             limits.Classification(failure.code, state, None, None, False, safe, source="native_auth_check"),
         )
-        raise _Failure(failure.code, safe, retryable=False, details=failure.details) from failure
+        raise _Failure(
+            failure.code, safe, retryable=False, details=failure.body.get("details"),
+        ) from failure
     _check_initial_auth_context(run, profile)
     workspace = _workspace(run)
 
@@ -623,9 +635,27 @@ async def _run_turn(
             retries if isinstance(retries, int) and not isinstance(retries, bool)
             and 0 <= retries <= 100_000 else None
         )
+        stderr_tail = exc.cause.get("agent_stderr_tail")
+        stderr_tail = stderr_tail if isinstance(stderr_tail, str) and stderr_tail else None
+        message = verdict.reason
+        # An agent that dies before or during the handshake never gets to explain itself over
+        # the wire; when the classifier had nothing better to say, its own stderr -- the only
+        # place the real cause exists (e.g. a sandbox setup failure) -- is more useful to a
+        # person than the generic reason, and it may be a permanent, environmental cause the
+        # classifier's "retryable" default does not know to distrust.
+        if (
+            exc.code in ("ACP_SPAWN_FAILED", "ACP_HANDSHAKE_FAILED")
+            and stderr_tail
+            and message in (limits.GENERIC_ACP_FAILURE_MESSAGE, "initialize failed: Connection closed")
+        ):
+            first_line = next(
+                (line.strip() for line in stderr_tail.splitlines() if line.strip()), None,
+            )
+            if first_line:
+                message = first_line
         raise _Failure(
             verdict.code,
-            verdict.reason,
+            message,
             retryable=verdict.retryable,
             details={
                 "provider": run.task.provider,
@@ -635,6 +665,7 @@ async def _run_turn(
                 "acp_code": exc.code,
                 "rpc_data": limits.safe_rpc_data(exc.cause.get("rpc_data")),
                 "transport_retries": safe_retries,
+                "agent_stderr_tail": stderr_tail,
                 "last_retry": limits.safe_retry_summary(exc.cause.get("last_retry"), trusted_summary=True),
             },
         ) from exc
