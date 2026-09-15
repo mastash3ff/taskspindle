@@ -225,10 +225,12 @@ def review_candidate(harness: Harness, repo: Path, task_id: str) -> str:
 
 
 def accept_request(
-    harness: Harness, repo: Path, task_id: str, review_task_id: str
+    harness: Harness, repo: Path, task_id: str, review_task_id: str, **overrides: object
 ) -> AcceptTaskRequest:
+    """An accept request with every opt-in gate on, so the existing mandatory-gate tests below
+    still exercise them; a test of the default (everything off) passes its own overrides."""
     status = harness.orchestrator.task_status(task_id)
-    return AcceptTaskRequest(
+    fields: dict[str, object] = dict(
         task_id=task_id,
         expected_state_version=status["state_version"],
         candidate_sha=status["candidate_sha"],
@@ -237,7 +239,12 @@ def accept_request(
         expected_target_head=repos.current_head(repo),
         review_task_id=review_task_id,
         commit_message="Add the thing",
+        require_review=True,
+        require_diff_receipts=True,
+        require_root_stability=True,
     )
+    fields.update(overrides)
+    return AcceptTaskRequest(**fields)
 
 
 # -- starting and dispatching ------------------------------------------------------------------
@@ -404,6 +411,47 @@ def test_accepting_without_a_review_is_refused(harness: Harness, make_repo) -> N
         harness.orchestrator.accept_task(accept_request(harness, repo, task_id, "ts_absent"))
 
     assert excinfo.value.code == service.REVIEW_REQUIRED
+
+
+def test_default_accept_needs_no_review_and_no_diff_receipts(harness: Harness, make_repo) -> None:
+    """Every non-safety gate defaults off: an unreviewed, unread candidate is still acceptable."""
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+
+    accepted = harness.orchestrator.accept_task(
+        accept_request(
+            harness, repo, task_id, None,
+            require_review=False, require_diff_receipts=False, require_root_stability=False,
+            diff_digest=None,
+        )
+    )
+
+    assert accepted["state"] == TaskState.ACCEPTING.value
+
+
+def test_default_accept_refuses_the_candidates_own_failed_checks(
+    harness: Harness, make_repo
+) -> None:
+    """``rerun_verification`` left off still refuses a candidate whose own checks failed."""
+    repo = make_repo()
+    authorize(harness, repo)
+    started = harness.orchestrator.start_task(
+        implement_request(repo, verification_commands=["false"])
+    )
+    task_id = str(started["task_id"])
+    assert harness.orchestrator.task_status(task_id)["check_summary"]["ok"] is False
+    whole_diff(harness, task_id)
+    review_task_id = review_candidate(harness, repo, task_id)
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.accept_task(
+            accept_request(
+                harness, repo, task_id, review_task_id, rerun_verification=False
+            )
+        )
+
+    assert excinfo.value.code == service.CHECKS_FAILED
+    assert harness.orchestrator.task_status(task_id)["state"] == TaskState.RESULT_READY.value
 
 
 # -- reviewing and accepting ---------------------------------------------------------------------
@@ -852,9 +900,39 @@ def test_an_unknown_provider_is_an_invalid_request(harness: Harness, make_repo) 
     assert excinfo.value.details["code"] == "PROFILE_UNKNOWN"
 
 
+def test_by_default_a_root_mutation_is_advisory_not_blocking(
+    harness: Harness, make_repo, script
+) -> None:
+    """Without ``require_root_stability`` a ROOT_MUTATION warning is recorded, not enforced."""
+    repo = make_repo()
+    harness.orchestrator.profiles[AUTHOR] = fake_profile(
+        AUTHOR,
+        script(
+            {
+                "response": "and a note in the root",
+                "write": {"path": "src/new.txt", "content": "hello\n"},
+                "write_abs": {"path": str(repo / "intruder.txt"), "content": "sneaky\n"},
+            }
+        ),
+    )
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+    review_task_id = review_candidate(harness, repo, task_id)
+    assert harness.orchestrator.task_status(task_id)["warnings"] == [
+        "ROOT_MUTATION:intruder.txt"
+    ]
+
+    accepted = harness.orchestrator.accept_task(
+        accept_request(harness, repo, task_id, review_task_id, require_root_stability=False)
+    )
+
+    assert accepted["state"] == TaskState.ACCEPTING.value
+
+
 def test_an_acknowledged_root_mutation_stops_blocking_acceptance(
     harness: Harness, make_repo, script
 ) -> None:
+    """``require_root_stability=True`` blocks acceptance exactly as the old mandatory gate did."""
     repo = make_repo()
     harness.orchestrator.profiles[AUTHOR] = fake_profile(
         AUTHOR,
@@ -905,16 +983,22 @@ def integrate_by_hand(repo: Path) -> str:
 
 
 def manual_integration(
-    harness: Harness, task_id: str, head: str
+    harness: Harness, task_id: str, head: str, **overrides: object
 ) -> RecordIntegrationRequest:
+    """A ``manual_integration`` request with the review and diff gates on, matching
+    ``accept_request``'s default; a test of the opt-in-off default passes its own overrides."""
     status = harness.orchestrator.task_status(task_id)
-    return RecordIntegrationRequest(
+    fields: dict[str, object] = dict(
         task_id=task_id,
         expected_state_version=status["state_version"],
         kind="manual_integration",
         resulting_head=head,
         summary="cherry-picked it by hand",
+        require_review=True,
+        require_diff_receipts=True,
     )
+    fields.update(overrides)
+    return RecordIntegrationRequest(**fields)
 
 
 def test_a_manual_integration_records_the_head_it_landed_at(

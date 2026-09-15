@@ -114,30 +114,31 @@ def run_accept(
         return _abandon(store, task, exc.code, {"message": str(exc)})
 
     staged = replace(journal, phase="staged")
-    results = integration.run_verification(
-        identity.toplevel,
-        list(task.verification_commands or []),
-        timeout_s=min(task.timeout_s, MAX_VERIFICATION_S),
-        env=check_env(parent_env),
-    )
-    for result in results:
-        store.insert_check(
-            task_id,
-            task.candidate_revision,
-            CheckRecord(
-                command=f"{ROOT_CHECK_PREFIX}{result.command}",
-                exit_code=result.exit_code,
-                ok=result.ok,
-                duration_ms=result.duration_ms,
-                stdout_tail=result.stdout_tail,
-                stderr_tail=result.stderr_tail,
-            ),
+    if _rerun_verification(store, task):
+        results = integration.run_verification(
+            identity.toplevel,
+            list(task.verification_commands or []),
+            timeout_s=min(task.timeout_s, MAX_VERIFICATION_S),
+            env=check_env(parent_env),
         )
-    failed = [result.command for result in results if not result.ok]
-    if failed:
-        integration.abort_staged(identity, journal=staged)
-        store.clear_journal(task_id)
-        return _abandon(store, task, "CHECKS_FAILED", {"commands": failed})
+        for result in results:
+            store.insert_check(
+                task_id,
+                task.candidate_revision,
+                CheckRecord(
+                    command=f"{ROOT_CHECK_PREFIX}{result.command}",
+                    exit_code=result.exit_code,
+                    ok=result.ok,
+                    duration_ms=result.duration_ms,
+                    stdout_tail=result.stdout_tail,
+                    stderr_tail=result.stderr_tail,
+                ),
+            )
+        failed = [result.command for result in results if not result.ok]
+        if failed:
+            integration.abort_staged(identity, journal=staged)
+            store.clear_journal(task_id)
+            return _abandon(store, task, "CHECKS_FAILED", {"commands": failed})
 
     head = integration.commit_staged(
         identity,
@@ -178,6 +179,18 @@ def _commit_message(store: Store, task: TaskRecord) -> str:
             if message:
                 return str(message)
     return task.candidate_message or f"Accept candidate {task.candidate_sha}"
+
+
+def _rerun_verification(store: Store, task: TaskRecord) -> bool:
+    """Whether the accepting request asked the root to rerun the candidate's own checks.
+
+    Default is to trust the worker's ``check_summary`` -- the orchestrator's gate already refused
+    ``CHECKS_FAILED`` before this unit was ever started -- and skip running anything here.
+    """
+    for event in reversed(store.list_events(task.id)):
+        if event["kind"] == EventKind.ACCEPT_REQUESTED.value:
+            return bool((event["payload"] or {}).get("rerun_verification", False))
+    return False
 
 
 def _conflict(store: Store, task: TaskRecord, conflicts: list[str]) -> str:

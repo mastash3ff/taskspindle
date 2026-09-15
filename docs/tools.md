@@ -431,32 +431,50 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `task_id` | string | the implement task holding the candidate |
 | `expected_state_version` | int | the version you last saw |
 | `candidate_sha` | string | the candidate you inspected |
-| `diff_digest` | string | its diff digest |
+| `diff_digest` | string\|null | its diff digest; needed only with `require_diff_receipts` |
 | `inspection_summary` | string | what you concluded, in your own words; not empty |
 | `expected_target_head` | string | the repository HEAD you are applying onto |
-| `review_task_id` | string | the review task covering this candidate |
+| `review_task_id` | string\|null | the review task covering this candidate, if any |
 | `commit_message` | string | one line, ≤ 72 characters |
 | `dispositions` | object[] | `{"finding_id", "disposition", "reason"}` |
+| `require_diff_receipts` | bool | default `false`; see below |
+| `require_review` | bool | default `false`; see below |
+| `rerun_verification` | bool | default `false`; see below |
+| `require_root_stability` | bool | default `false`; see below |
 
-**Every precondition, in the order they are checked:**
+**Every gate that is not about repository safety is opt-in, defaulting to off.** The merge-tree
+probe, the integration journal, the scope (`path_prefixes`) check and `state_version` are never
+optional. The rest are:
 
-1. The task is in `RESULT_READY`.
-2. `expected_state_version` matches.
-3. `candidate_sha` matches the task's current candidate — otherwise `CANDIDATE_MISMATCH`.
-4. `diff_digest` matches that candidate's diff — otherwise `CANDIDATE_MISMATCH`.
-5. The whole diff has been retrieved — otherwise `DIFF_NOT_FULLY_RETRIEVED`.
-6. A review exists for `review_task_id` — otherwise `REVIEW_REQUIRED`.
-7. That review covers this task and this `candidate_sha` — otherwise `REVIEW_STALE`.
-8. The reviewer's provider differs from the author's — otherwise `REVIEWER_NOT_INDEPENDENT`.
-9. Every blocking or critical finding has an explicit override — otherwise `REVIEW_BLOCKED`.
-10. The candidate's own verification commands all passed — otherwise `CHECKS_FAILED`.
-11. The candidate carries no `SCOPE_VIOLATION` warning, and no unacknowledged `ROOT_MUTATION`
-    warning — otherwise `ACCEPT_BLOCKED`, with the blocking warnings in `details.warnings`.
+- **`require_diff_receipts`** — `diff_digest` must match the candidate's, and every byte of the
+  diff must have been retrieved through `task_diff` (`CANDIDATE_MISMATCH`,
+  `DIFF_NOT_FULLY_RETRIEVED`). Off by default: an accepting session that read the candidate some
+  other way is not forced to also page through `task_diff`.
+- **`require_review`** — a review must exist for `review_task_id`, cover this task and
+  `candidate_sha`, come from a different provider than the author, and have every blocking or
+  critical finding disposed (`REVIEW_REQUIRED`, `REVIEW_STALE`, `REVIEWER_NOT_INDEPENDENT`,
+  `REVIEW_BLOCKED`). Off by default, but **naming a `review_task_id` is always checked**, required
+  or not: a stale or self review is never accepted quietly just because it was optional. With
+  `require_review` off, a named review's undisposed blocking findings do not refuse the
+  acceptance; they are recorded as a `REVIEW_BLOCKED:<finding ids>` warning on the task instead.
+- **`rerun_verification`** — the accept unit reruns `verification_commands` in the root repository
+  and that run decides `CHECKS_FAILED`. Off by default: the candidate's own `check_summary.ok`
+  from the worker is trusted instead, and a candidate whose own checks failed is refused
+  `CHECKS_FAILED` immediately, before anything is journalled or a unit is started.
+- **`require_root_stability`** — an unacknowledged `ROOT_MUTATION` warning blocks acceptance
+  (`ACCEPT_BLOCKED`) until `record_integration` clears it with `root_mutation_acknowledged`. Off
+  by default: the warning is still recorded on the task, but does not by itself refuse
+  acceptance. See [architecture.md](architecture.md) for what does and does not still count as a
+  mutation now that a sibling task's own prior accept is excluded.
+
+`SCOPE_VIOLATION` always blocks (`ACCEPT_BLOCKED`, with the blocking warnings in
+`details.warnings`), whatever the flags say.
 
 Only then does the task move to `ACCEPTING`, the intent get journalled, and a detached unit start.
 `accept_task` returns as soon as that unit is launched: poll `task_status` for `ACCEPTED`, or for a
 return to `RESULT_READY` with a new warning. What the unit does — merge-tree probe, root apply,
-verification in the root, commit — is in [architecture.md](architecture.md).
+verification in the root (when `rerun_verification` asked for it), commit — is in
+[architecture.md](architecture.md).
 
 Errors also include `UNIT_START_FAILED` (retryable; nothing touched the repository) and
 `STALE_STATE_VERSION`.
@@ -472,22 +490,25 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `kind` | `conflict_resolved`\|`manual_integration`\|`root_mutation_acknowledged` | — |
 | `summary` | string | what you did, for the audit trail |
 | `resulting_head` | string\|null | required except for `root_mutation_acknowledged` |
+| `require_diff_receipts` | bool | default `false`; same meaning as on `accept_task` |
+| `require_review` | bool | default `false`; same meaning as on `accept_task` |
+| `rerun_verification` | bool | default `false`; requires the recorded `check_summary.ok` instead of trusting it, since a hand-made integration has no root rerun to fall back on |
+| `require_root_stability` | bool | default `false`; same meaning as on `accept_task` |
 
 What you did by hand, written into the record. `conflict_resolved` and `manual_integration` move
 the task straight to `ACCEPTED` at `resulting_head` and require the task to be in `RESULT_READY`.
-`root_mutation_acknowledged` moves nothing: it clears the `ROOT_MUTATION` warning that was blocking
-acceptance, so somebody has signed for what the agent did outside its worktree.
+`root_mutation_acknowledged` moves nothing: it clears the `ROOT_MUTATION` warning that a
+`require_root_stability` acceptance of this candidate revision would otherwise block on.
 
-A hand-made integration skips the checks and probe gates — you ran the merge and the checks
-yourself — but not the gates that prove the candidate was looked at. `conflict_resolved` and
-`manual_integration` still require the whole diff to have been retrieved
-(`DIFF_NOT_FULLY_RETRIEVED`), an independent review covering this candidate (`REVIEW_REQUIRED`,
-`REVIEW_STALE`, `REVIEWER_NOT_INDEPENDENT`), no `SCOPE_VIOLATION` warning and no unacknowledged
-`ROOT_MUTATION` warning (`ACCEPT_BLOCKED`), and a `resulting_head` that exists in the repository
-and differs from the candidate's base (`INVALID_REQUEST`).
+A hand-made integration always skips the probe (you ran the merge yourself) and always requires a
+`resulting_head` that exists in the repository and differs from the candidate's base
+(`INVALID_REQUEST`), and never skips `SCOPE_VIOLATION` (`ACCEPT_BLOCKED`). The checks gate,
+diff-receipt gate, review gate and root-stability gate are the same opt-in flags `accept_task`
+uses, all off by default; a review that is found is still checked for being bound to this
+candidate and independent of its author, whether or not `require_review` asked for one.
 Errors: `TASK_NOT_FOUND`, `STALE_STATE_VERSION`, `INVALID_REQUEST`, `ILLEGAL_TRANSITION`,
 `DIFF_NOT_FULLY_RETRIEVED`, `REVIEW_REQUIRED`, `REVIEW_STALE`, `REVIEWER_NOT_INDEPENDENT`,
-`ACCEPT_BLOCKED`.
+`CHECKS_FAILED`, `ACCEPT_BLOCKED`.
 
 ### `reject_task`
 
@@ -605,7 +626,7 @@ the kernel refuses the write itself.
 - `severity`: `low`, `medium`, `high` or `critical`.
 - `line` is 1-based. Finding ids must be non-empty and unique. No extra fields are accepted.
 
-**Disposition rules**, enforced by `accept_task`:
+**Disposition rules**, enforced by `accept_task` when `require_review` is set:
 
 | Review says | What acceptance requires |
 | --- | --- |
@@ -615,11 +636,14 @@ the kernel refuses the write itself.
 | `BLOCK` with no findings | nothing can be overridden, so acceptance is refused outright |
 | `CONCERN` | *every* finding needs some disposition |
 
+Without `require_review`, a named review's undisposed blocking findings do not refuse acceptance;
+they land as a warning on the task instead, so they stay visible without forcing the ritual.
+Naming a finding that does not exist is `INVALID_REQUEST` either way.
+
 A disposition is `{"finding_id", "disposition", "reason"}` where `disposition` is `fixed`,
 `accepted_risk`, `not_applicable` or `overridden`. Every disposition except `fixed` needs a
-non-empty reason. Naming a finding that does not exist is `INVALID_REQUEST`. Each `overridden`
-disposition is written to the event log as a `REVIEW_OVERRIDE`, so a decision to ship over a
-reviewer's objection is a matter of record.
+non-empty reason. Each `overridden` disposition is written to the event log as a
+`REVIEW_OVERRIDE`, so a decision to ship over a reviewer's objection is a matter of record.
 
 A review is bound to `(task_id, candidate_sha)`. A repair produces a new candidate, which
 invalidates the review: get a new one.

@@ -1676,7 +1676,10 @@ def _check_root(run: _Run) -> None:
     except GitError as exc:  # pragma: no cover - the root repository was resolved just above
         run.log.write(f"root snapshot failed: {exc.code}")
         return
-    changed = repos.compare_snapshots(before, after)
+    landed_heads = run.store.list_landed_heads(run.task.repository_id)
+    changed = repos.compare_snapshots(
+        before, after, toplevel=root.toplevel, landed_heads=landed_heads
+    )
     if changed:
         run.warn(
             f"ROOT_MUTATION:{','.join(changed)}",

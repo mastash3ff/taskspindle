@@ -54,10 +54,13 @@ def seed_accepting(
     path: str = "src/new.txt",
     verification: list[str] | None = None,
     commit_message: str = "Add the thing",
+    rerun_verification: bool = True,
 ) -> TaskRecord:
     """Build a real candidate commit and put its task in ACCEPTING with a journal.
 
     This is what the orchestrator leaves behind when ``accept_task`` has passed every gate.
+    ``rerun_verification`` defaults on here because this module exists to exercise the accept
+    unit's own root-verification mechanics; a caller testing the opposite passes it explicitly.
     """
     identity = repos.resolve_repository(repo)
     repository_id = "repo_seed"
@@ -111,7 +114,11 @@ def seed_accepting(
     store.append_event(
         record.id,
         EventKind.ACCEPT_REQUESTED,
-        {"candidate_sha": candidate.sha, "commit_message": commit_message},
+        {
+            "candidate_sha": candidate.sha,
+            "commit_message": commit_message,
+            "rerun_verification": rerun_verification,
+        },
     )
     store.write_journal(
         record.id, "probing", target_head=repos.current_head(repo), candidate_sha=candidate.sha
@@ -144,6 +151,26 @@ def test_a_clean_candidate_lands_as_one_commit(store: Store, paths: Paths, make_
     assert store.read_journal(task.id) is None
     checks = [check.command for check in store.list_checks(task.id, 1)]
     assert checks == [f"{ROOT_CHECK_PREFIX}true"]
+
+
+def test_by_default_the_root_does_not_rerun_verification(
+    store: Store, paths: Paths, make_repo
+) -> None:
+    """Without ``rerun_verification`` the accept unit trusts the worker's own checks and commits
+    straight from staged, even when a root rerun of the same commands would have failed."""
+    repo = make_repo()
+    task = seed_accepting(
+        store, paths, repo, verification=["false"], rerun_verification=False
+    )
+    before = repos.current_head(repo)
+
+    outcome = run_accept(store, task.id, paths=paths, parent_env=ENV)
+
+    assert outcome == "accepted"
+    final = store.get_task(task.id)
+    assert final.state is TaskState.ACCEPTED
+    assert final.target_head != before
+    assert store.list_checks(task.id, 1) == []
 
 
 def test_a_conflicting_candidate_leaves_the_repository_untouched(

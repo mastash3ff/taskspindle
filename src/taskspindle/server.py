@@ -413,9 +413,14 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
     @tool(
         "accept_task",
         _describe(
-            "Accept a candidate into the repository. Requires the full diff to have been "
-            "retrieved, an independent review, and a disposition for every blocking or critical "
-            "finding.",
+            "Accept a candidate into the repository. The merge-tree probe, the integration "
+            "journal, the scope check and state_version are always enforced; retrieving the "
+            "full diff, an independent review with a disposition for every blocking or critical "
+            "finding, rerunning verification in the root, and refusing an unacknowledged root "
+            "mutation are opt-in via require_diff_receipts, require_review, "
+            "rerun_verification and require_root_stability, all off by default. A review that "
+            "is named is always checked as bound to this candidate and independent of its "
+            "author, whether or not it was required.",
             AcceptTaskRequest,
         ),
     )
@@ -428,10 +433,12 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
     @tool(
         "record_integration",
         _describe(
-            "Record what you did by hand: conflict_resolved, manual_integration (both still "
-            "require the whole diff and an independent review, and a resulting_head that exists "
-            "in the repository), or root_mutation_acknowledged, which clears the warning "
-            "blocking an acceptance of this candidate revision.",
+            "Record what you did by hand: conflict_resolved and manual_integration need a "
+            "resulting_head that exists in the repository, always; the same opt-in gates as "
+            "accept_task (require_diff_receipts, require_review, rerun_verification, "
+            "require_root_stability), all off by default, apply here too. "
+            "root_mutation_acknowledged clears the warning that a require_root_stability "
+            "acceptance of this candidate revision would otherwise block on.",
             RecordIntegrationRequest,
         ),
     )

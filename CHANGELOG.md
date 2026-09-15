@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Acceptance gates that are not about repository safety are opt-in, off by default.**
+  `accept_task` and `record_integration` keep the merge-tree probe, the integration journal, the
+  `path_prefixes` scope check and `state_version` mandatory, but retrieving the whole diff
+  (`require_diff_receipts`), an independent review with every blocking finding disposed
+  (`require_review`), rerunning verification in the root instead of trusting the worker's own
+  `check_summary` (`rerun_verification`), and refusing an unacknowledged `ROOT_MUTATION`
+  (`require_root_stability`) are now each their own flag, all defaulting to `false`. A named
+  `review_task_id` is still always checked as bound to the candidate and independent of its
+  author, whether or not `require_review` asked for one; its undisposed blocking findings become
+  a warning instead of a refusal when it did not.
+- **A sibling task's own accept no longer looks like a root mutation.** `ROOT_MUTATION` no longer
+  fires for a root HEAD move that consists entirely of commits TaskSpindle itself landed in that
+  repository (an accepted task's `target_head`), bounded to a 50-commit chain; an operator's own
+  commit, a reset, or a longer or unresolvable chain is still reported. Working-tree dirtiness is
+  unaffected.
+
 ## v0.5.1
 
 Fixes from the 2026-09-15 audit (`docs/audit-2026-09-15.md`) and the provider readiness hotfix.

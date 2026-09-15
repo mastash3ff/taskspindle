@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +29,10 @@ __all__ = [
     "run_git",
     "snapshot_root",
 ]
+
+#: Longest HEAD-move chain :func:`compare_snapshots` will look at to clear a mutation: past this,
+#: the chain is treated as unexplained rather than walked in full.
+HEAD_CHAIN_LIMIT = 50
 
 #: Config overrides forced onto every invocation so that user or system configuration cannot
 #: change line endings, run hooks, or block on a signing key.
@@ -224,16 +228,55 @@ def snapshot_root(toplevel: Path) -> RootSnapshot:
     return RootSnapshot(head=current_head(toplevel), branch=current_branch(toplevel), dirty=dirty)
 
 
-def compare_snapshots(before: RootSnapshot, after: RootSnapshot) -> list[str]:
-    """Return the paths that differ between two snapshots, ``"HEAD"`` first if HEAD moved."""
+def compare_snapshots(
+    before: RootSnapshot,
+    after: RootSnapshot,
+    *,
+    toplevel: Path | None = None,
+    landed_heads: Collection[str] = (),
+) -> list[str]:
+    """Return the paths that differ between two snapshots, ``"HEAD"`` first if HEAD moved.
+
+    A HEAD move is not reported when ``toplevel`` and ``landed_heads`` are given and every commit
+    between the two heads is one TaskSpindle itself landed in this repository -- an accept for a
+    sibling task moves the root the same way an intruder would, and the two are indistinguishable
+    from the snapshots alone. Working-tree dirtiness is always reported regardless.
+    """
     changed = sorted(
         path
         for path in set(before.dirty) | set(after.dirty)
         if before.dirty.get(path) != after.dirty.get(path)
     )
     if before.head != after.head:
+        if toplevel is not None and _head_move_is_self_landed(
+            toplevel, before.head, after.head, landed_heads
+        ):
+            return changed
         return ["HEAD", *changed]
     return changed
+
+
+def _head_move_is_self_landed(
+    toplevel: Path, before_head: str, after_head: str, landed_heads: Collection[str]
+) -> bool:
+    """True when every commit the HEAD move added is one of ``landed_heads``.
+
+    Bounded to :data:`HEAD_CHAIN_LIMIT` commits: a chain longer than that, or one ``git rev-list``
+    cannot walk (an unrelated history, a hard reset backward), is never cleared.
+    """
+    if not landed_heads:
+        return False
+    proc = run_git(
+        ["rev-list", f"--max-count={HEAD_CHAIN_LIMIT + 1}", f"{before_head}..{after_head}"],
+        cwd=toplevel,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    commits = _text(proc).splitlines()
+    if not commits or len(commits) > HEAD_CHAIN_LIMIT:
+        return False
+    return all(commit in landed_heads for commit in commits)
 
 
 def normalize_prefixes(prefixes: Sequence[str]) -> tuple[str, ...]:

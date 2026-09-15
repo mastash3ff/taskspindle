@@ -8,12 +8,17 @@ produced.
 
 - **Three modes.** `consult` asks a question, `review` reads and reports, `implement` writes code
   in its own worktree. Only `implement` can produce something you can accept.
-- **Nothing lands by accident.** A candidate is a commit on a ref of its own, never on a branch you
-  use. Accepting it requires that you retrieved the whole diff, that an independent reviewer looked
-  at that exact candidate, that every blocking finding has an explicit override with a reason, and
-  that the candidate's own verification commands pass — in your repository, before the commit.
-- **Independent review.** Codex explicitly selects a different built-in provider to review a
-  candidate. Self-review and aliases of the author's family are refused, including at acceptance.
+- **Nothing lands outside a real repository boundary.** A candidate is a commit on a ref of its
+  own, never on a branch you use, and `accept_task` always runs the merge-tree probe, journals the
+  apply, keeps it inside the task's declared `path_prefixes`, and checks `state_version`. Whether
+  you must also have retrieved the whole diff, gotten an independent review with every blocking
+  finding disposed, rerun verification in the root, or acknowledged a root-repository mutation
+  before it lands is up to you: each is its own opt-in flag on `accept_task`, off by default, so
+  the ritual is there when you want it and out of the way when you do not.
+- **A named review is never trusted blindly.** Reviews are optional by default, but a
+  `review_task_id` you *do* name is always checked as bound to that exact candidate and from a
+  provider genuinely independent of the author — a self-review or a stale one is refused whether
+  or not you asked for review to be required.
 - **Durable workers.** Each turn runs as a transient systemd user unit, so the MCP server can exit,
   crash or restart without taking the work with it. Every continuation reloads the agent's session
   explicitly rather than starting a new conversation and hoping.

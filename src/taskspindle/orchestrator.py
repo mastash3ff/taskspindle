@@ -1644,14 +1644,24 @@ class Orchestrator:
             unit = units.accept_unit_name(request.task_id)
             with self.store.transaction():
                 record = check_acceptance(self.store, request)
-                # The bound review may predate a profile change or the family-level rule.
-                # Recheck before writing the journal or changing the candidate's state.
-                review = self.store.get_review_for(request.review_task_id)
-                assert review is not None  # check_acceptance established this in this transaction.
-                self._require_independent(
-                    record, review["provider"], require_task(self.store, request.review_task_id),
+                # The bound review may predate a profile change or the family-level rule. A
+                # review is only required when the request asks for one, but a review that *is*
+                # named -- required or not -- is rechecked before writing the journal or changing
+                # the candidate's state.
+                if request.review_task_id:
+                    review = self.store.get_review_for(request.review_task_id)
+                    assert review is not None  # check_acceptance established this already.
+                    self._require_independent(
+                        record,
+                        review["provider"],
+                        require_task(self.store, request.review_task_id),
+                    )
+                _accept_gates(
+                    self.store,
+                    record,
+                    require_checks=not request.rerun_verification,
+                    require_root_stability=request.require_root_stability,
                 )
-                _accept_gates(self.store, record)
                 self.store.write_journal(
                     record.id,
                     "probing",
@@ -1704,10 +1714,13 @@ class Orchestrator:
         """Record what a person did by hand: a resolved conflict, a manual merge, or a mutation.
 
         A hand-made integration skips the checks and probe gates -- Codex ran the merge and the
-        checks itself -- but not the gates that prove the candidate was *looked at*: the whole
-        diff has been retrieved, an independent review covers this candidate, it stayed inside its
-        declared scope, and any mutation of the root repository has been acknowledged. The head it
-        claims to have landed at must also exist in the repository and differ from the base.
+        checks itself, unless ``rerun_verification`` asks the candidate's own check summary to be
+        trusted instead of skipped -- and never skips scope. Retrieving the whole diff
+        (``require_diff_receipts``), an independent review of this candidate (``require_review``),
+        and stability of the root HEAD (``require_root_stability``) are the same opt-in gates
+        ``accept_task`` uses, all off by default; a review that *is* found is still checked for
+        being bound to this candidate and independent of its author. The head it claims to have
+        landed at must exist in the repository and differ from the base, always.
         """
         with self._cycle():
             record = require_task(self.store, request.task_id)
@@ -1737,12 +1750,19 @@ class Orchestrator:
                     f"task {record.id} is {record.state.value}, not RESULT_READY",
                     details={"task_id": record.id, "from": record.state.value},
                 )
-            require_diff_retrieved(self.store, record)
-            review = require_independent_review(self.store, record)
-            self._require_independent(
-                record, review["provider"], require_task(self.store, review["review_task_id"]),
+            if request.require_diff_receipts:
+                require_diff_retrieved(self.store, record)
+            review = require_independent_review(self.store, record, required=request.require_review)
+            if review is not None:
+                self._require_independent(
+                    record, review["provider"], require_task(self.store, review["review_task_id"]),
+                )
+            _accept_gates(
+                self.store,
+                record,
+                require_checks=request.rerun_verification,
+                require_root_stability=request.require_root_stability,
             )
-            _accept_gates(self.store, record, require_checks=False)
             head = self._resolve_head(record, request.resulting_head)
             payload["resulting_head"] = head
             payload["warnings"] = list(record.warnings or [])
@@ -2024,13 +2044,23 @@ _CONTINUATIONS: dict[tuple[TaskState, Mode], tuple[TurnKind, TaskState]] = {
 }
 
 
-def _accept_gates(store: Store, record: TaskRecord, *, require_checks: bool = True) -> None:
+def _accept_gates(
+    store: Store,
+    record: TaskRecord,
+    *,
+    require_checks: bool = True,
+    require_root_stability: bool = False,
+) -> None:
     """The gates that need the candidate's own evidence, not just the review.
 
     They run before anything moves, so a refusal leaves the task exactly as it was.
-    ``require_checks`` is dropped for a hand-made integration: Codex ran the checks itself. The
-    scope and root-mutation gates are not dropped -- what the agent did outside the ground it was
-    given is not something a manual merge has answered for.
+    ``require_checks`` is dropped for a hand-made integration, or when the caller asked the
+    accept unit to rerun verification in the root instead of trusting the worker's own
+    ``check_summary``. The scope gate is never dropped: what the agent did outside its granted
+    paths is not something a manual merge, or an opt-out of the other gates, has answered for.
+    ``require_root_stability`` makes an unacknowledged ``ROOT_MUTATION`` block acceptance instead
+    of only being recorded -- it defaults off because a task's own prior accept moving the root
+    HEAD is common and, once TaskSpindle's own landed commits are excluded, not a mutation at all.
     """
     summary = record.check_summary or {}
     if require_checks and summary.get("ok") is not True:
@@ -2046,7 +2076,7 @@ def _accept_gates(store: Store, record: TaskRecord, *, require_checks: bool = Tr
         if warning.startswith(f"{EventKind.SCOPE_VIOLATION.value}:")
         or warning == EventKind.SCOPE_VIOLATION.value
     ]
-    if _unacknowledged_root_mutation(store, record, warnings):
+    if require_root_stability and _unacknowledged_root_mutation(store, record, warnings):
         blocking.extend(
             warning for warning in warnings if warning.startswith(EventKind.ROOT_MUTATION.value)
         )

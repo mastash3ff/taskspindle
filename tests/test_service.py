@@ -247,6 +247,8 @@ def record_review(
 
 
 def accept_request(record, review_task_id: str, **overrides: object) -> AcceptTaskRequest:
+    """An accept request with the opt-in gates on, so the mandatory-gate tests below still
+    exercise them; a test of the default (everything off) passes its own overrides."""
     fields: dict[str, object] = {
         "task_id": record.id,
         "expected_state_version": record.state_version,
@@ -257,6 +259,8 @@ def accept_request(record, review_task_id: str, **overrides: object) -> AcceptTa
         "review_task_id": review_task_id,
         "dispositions": [],
         "commit_message": "Add the widget",
+        "require_review": True,
+        "require_diff_receipts": True,
     }
     fields.update(overrides)
     return AcceptTaskRequest(**fields)
@@ -379,6 +383,75 @@ def test_concern_verdict_needs_a_disposition_for_every_finding(store: Store) -> 
         dispositions=[FindingDisposition(finding_id="f1", disposition=Disposition.FIXED)],
     )
     assert service.validate_acceptance(store, request).state is TaskState.ACCEPTING
+
+
+def default_accept_request(record, **overrides: object) -> AcceptTaskRequest:
+    """An accept request with every opt-in gate left off, and no review or diff digest named."""
+    fields: dict[str, object] = {
+        "task_id": record.id,
+        "expected_state_version": record.state_version,
+        "candidate_sha": CANDIDATE,
+        "inspection_summary": "read the whole diff",
+        "expected_target_head": "head1",
+        "commit_message": "Add the widget",
+    }
+    fields.update(overrides)
+    return AcceptTaskRequest(**fields)
+
+
+def test_default_acceptance_needs_no_review_or_diff_receipts(store: Store) -> None:
+    """With every opt-in gate left at its default of off, a bare candidate is acceptable."""
+    record = new_task(store)
+    force_state(store, record.id, TaskState.RUNNING)
+    record = transition(
+        store,
+        record.id,
+        TaskState.RESULT_READY,
+        reason="candidate staged",
+        candidate_sha=CANDIDATE,
+        diff_digest=DIGEST,
+        diff_size=100,
+    )
+    # Nothing retrieved the diff, and no review exists at all.
+    updated = service.validate_acceptance(store, default_accept_request(record))
+    assert updated.state is TaskState.ACCEPTING
+
+
+def test_default_acceptance_still_refuses_a_self_review_when_one_is_named(store: Store) -> None:
+    """``require_review`` being off does not make a named self-review acceptable."""
+    record = ready_candidate(store)
+    review_id = record_review(store, record.id, provider="claude")
+    with pytest.raises(TaskSpindleError) as excinfo:
+        service.validate_acceptance(
+            store, default_accept_request(record, review_task_id=review_id)
+        )
+    assert excinfo.value.code == service.REVIEWER_NOT_INDEPENDENT
+
+
+def test_default_acceptance_still_refuses_a_stale_named_review(store: Store) -> None:
+    """``require_review`` being off does not make a named review of a different candidate stick."""
+    record = ready_candidate(store)
+    review_id = record_review(store, record.id, candidate_sha="older")
+    with pytest.raises(TaskSpindleError) as excinfo:
+        service.validate_acceptance(
+            store, default_accept_request(record, review_task_id=review_id)
+        )
+    assert excinfo.value.code == service.REVIEW_STALE
+
+
+def test_unrequired_review_blocking_findings_become_a_warning_not_a_refusal(store: Store) -> None:
+    """A BLOCK review named without ``require_review`` does not refuse; it warns instead."""
+    record = ready_candidate(store)
+    finding = ReviewFinding(
+        id="f1", severity=Severity.HIGH, path="src/a.py", line=3,
+        evidence="unsafe", remedy="guard it",
+    )
+    review_id = record_review(store, record.id, verdict=Verdict.BLOCK, findings=[finding])
+    updated = service.validate_acceptance(
+        store, default_accept_request(record, review_task_id=review_id)
+    )
+    assert updated.state is TaskState.ACCEPTING
+    assert updated.warnings == [f"{service.REVIEW_BLOCKED}:f1"]
 
 
 def test_views_and_results(store: Store) -> None:

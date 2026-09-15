@@ -731,19 +731,25 @@ def require_diff_retrieved(store: Store, record: TaskRecord) -> None:
         )
 
 
-def require_independent_review(store: Store, record: TaskRecord) -> dict[str, Any]:
-    """Refuse unless some other provider has reviewed *this* candidate, and return that review.
+def require_independent_review(
+    store: Store, record: TaskRecord, *, required: bool = True
+) -> dict[str, Any] | None:
+    """Return the latest review of *this* candidate, refusing unless one qualifies.
 
     This is the review gate without the request: an integration a person made by hand names no
-    review task, but the candidate still may not land unreviewed.
+    review task, but a review it does find still may not be a self-review. ``required`` is what
+    makes the *absence* of a review a refusal; a review that is found is always checked for
+    independence, whether or not one was required, so a self-review is never accepted silently.
     """
     review = store.latest_review_for_subject(record.id, record.candidate_sha or "")
     if review is None:
-        raise TaskSpindleError(
-            REVIEW_REQUIRED,
-            f"no review covers candidate {record.candidate_sha} of task {record.id}",
-            details={"task_id": record.id, "candidate_sha": record.candidate_sha},
-        )
+        if required:
+            raise TaskSpindleError(
+                REVIEW_REQUIRED,
+                f"no review covers candidate {record.candidate_sha} of task {record.id}",
+                details={"task_id": record.id, "candidate_sha": record.candidate_sha},
+            )
+        return None
     if review["provider"] == record.provider:
         raise TaskSpindleError(
             REVIEWER_NOT_INDEPENDENT,
@@ -769,7 +775,13 @@ def validate_acceptance(store: Store, request: AcceptTaskRequest) -> TaskRecord:
 
 
 def check_acceptance(store: Store, request: AcceptTaskRequest) -> TaskRecord:
-    """Every accept precondition the store can decide, and no writes at all."""
+    """Every accept precondition the store can decide, and no writes at all.
+
+    ``require_diff_receipts`` and ``require_review`` are opt-in: a caller that does not ask for
+    them gets a lighter check, but a review that *is* named is always validated as bound to this
+    candidate and independent of its author -- naming a stale or self review is never quietly
+    accepted just because it was not required.
+    """
     with store.transaction():
         record = require_task(store, request.task_id)
         if record.state is not TaskState.RESULT_READY:
@@ -799,44 +811,69 @@ def check_acceptance(store: Store, request: AcceptTaskRequest) -> TaskRecord:
                     "actual": record.candidate_sha,
                 },
             )
-        if record.diff_digest != request.diff_digest:
-            raise TaskSpindleError(
-                CANDIDATE_MISMATCH,
-                "the diff digest does not match the candidate",
-                details={
-                    "task_id": record.id,
-                    "expected": request.diff_digest,
-                    "actual": record.diff_digest,
-                },
-            )
-        require_diff_retrieved(store, record)
-        review = store.get_review_for(request.review_task_id)
-        if review is None:
+        if request.require_diff_receipts:
+            if record.diff_digest != request.diff_digest:
+                raise TaskSpindleError(
+                    CANDIDATE_MISMATCH,
+                    "the diff digest does not match the candidate",
+                    details={
+                        "task_id": record.id,
+                        "expected": request.diff_digest,
+                        "actual": record.diff_digest,
+                    },
+                )
+            require_diff_retrieved(store, record)
+        review = _bound_review(store, record, request)
+        if review is not None:
+            findings = [ReviewFinding(**finding) for finding in review["findings"]]
+            verdict = Verdict(review["verdict"])
+            if request.require_review:
+                _check_dispositions(record.id, verdict, findings, request)
+            else:
+                _check_unknown_dispositions(record.id, findings, request)
+    return record
+
+
+def _bound_review(
+    store: Store, record: TaskRecord, request: AcceptTaskRequest
+) -> dict[str, Any] | None:
+    """The review named by the request, refusing unless it actually covers this candidate.
+
+    Absence is only an error when ``require_review`` asks for one; a review that *is* named is
+    checked regardless, so a stale or self review is never accepted just because it was optional.
+    """
+    if not request.review_task_id:
+        if request.require_review:
             raise TaskSpindleError(
                 REVIEW_REQUIRED,
-                f"no review recorded for task {request.review_task_id}",
-                details={"review_task_id": request.review_task_id},
+                f"no review covers candidate {record.candidate_sha} of task {record.id}",
+                details={"task_id": record.id, "candidate_sha": record.candidate_sha},
             )
-        if review["subject_task_id"] != record.id or review["candidate_sha"] != request.candidate_sha:
-            raise TaskSpindleError(
-                REVIEW_STALE,
-                "the review does not cover this candidate",
-                details={
-                    "review_task_id": request.review_task_id,
-                    "subject_task_id": review["subject_task_id"],
-                    "candidate_sha": review["candidate_sha"],
-                },
-            )
-        if review["provider"] == record.provider:
-            raise TaskSpindleError(
-                REVIEWER_NOT_INDEPENDENT,
-                "the reviewer must be a different provider from the author",
-                details={"provider": record.provider, "review_task_id": request.review_task_id},
-            )
-        findings = [ReviewFinding(**finding) for finding in review["findings"]]
-        verdict = Verdict(review["verdict"])
-        _check_dispositions(record.id, verdict, findings, request)
-    return record
+        return None
+    review = store.get_review_for(request.review_task_id)
+    if review is None:
+        raise TaskSpindleError(
+            REVIEW_REQUIRED,
+            f"no review recorded for task {request.review_task_id}",
+            details={"review_task_id": request.review_task_id},
+        )
+    if review["subject_task_id"] != record.id or review["candidate_sha"] != request.candidate_sha:
+        raise TaskSpindleError(
+            REVIEW_STALE,
+            "the review does not cover this candidate",
+            details={
+                "review_task_id": request.review_task_id,
+                "subject_task_id": review["subject_task_id"],
+                "candidate_sha": review["candidate_sha"],
+            },
+        )
+    if review["provider"] == record.provider:
+        raise TaskSpindleError(
+            REVIEWER_NOT_INDEPENDENT,
+            "the reviewer must be a different provider from the author",
+            details={"provider": record.provider, "review_task_id": request.review_task_id},
+        )
+    return review
 
 
 def apply_acceptance(
@@ -845,12 +882,33 @@ def apply_acceptance(
     *,
     unit_name: str | None = None,
 ) -> TaskRecord:
-    """Move a checked task to ACCEPTING and record what the acceptance claimed."""
+    """Move a checked task to ACCEPTING and record what the acceptance claimed.
+
+    When a review was named but not required, its unresolved blocking findings did not refuse
+    the acceptance in :func:`check_acceptance`; they are recorded here as a warning instead, so
+    they stay visible on the task.
+    """
     fields: dict[str, Any] = {"target_head": request.expected_target_head}
     if unit_name is not None:
         fields["unit_name"] = unit_name
     with store.transaction():
         record = require_task(store, request.task_id)
+        if not request.require_review and request.review_task_id:
+            review = store.get_review_for(request.review_task_id)
+            if (
+                review is not None
+                and review["subject_task_id"] == record.id
+                and review["candidate_sha"] == request.candidate_sha
+            ):
+                findings = [ReviewFinding(**finding) for finding in review["findings"]]
+                verdict = Verdict(review["verdict"])
+                unresolved = _undisposed_finding_ids(verdict, findings, request)
+                if unresolved:
+                    marker = f"{REVIEW_BLOCKED}:{','.join(unresolved)}"
+                    warnings = list(record.warnings or [])
+                    if marker not in warnings:
+                        warnings.append(marker)
+                    fields["warnings"] = warnings
         updated = transition(
             store,
             record.id,
@@ -869,6 +927,7 @@ def apply_acceptance(
                 "review_task_id": request.review_task_id,
                 "inspection_summary": request.inspection_summary,
                 "commit_message": request.commit_message,
+                "rerun_verification": request.rerun_verification,
                 "dispositions": [disposition.model_dump(mode="json") for disposition in request.dispositions],
             },
         )
@@ -886,6 +945,57 @@ def apply_acceptance(
     return updated
 
 
+def _check_unknown_dispositions(
+    task_id: str, findings: list[ReviewFinding], request: AcceptTaskRequest
+) -> None:
+    """Refuse dispositions naming a finding the review does not have.
+
+    This is checked whether or not a review is required: a disposition is either input about a
+    real finding or a mistake, and that much is never optional.
+    """
+    by_id = {finding.id for finding in findings}
+    unknown = sorted({item.finding_id for item in request.dispositions} - by_id)
+    if unknown:
+        raise TaskSpindleError(
+            INVALID_REQUEST,
+            f"dispositions name findings that do not exist: {', '.join(unknown)}",
+            details={"task_id": task_id, "finding_ids": unknown},
+        )
+
+
+def _undisposed_finding_ids(
+    verdict: Verdict, findings: list[ReviewFinding], request: AcceptTaskRequest
+) -> list[str]:
+    """Every finding a disposition rule would require that the request left unresolved.
+
+    A ``BLOCK`` verdict with no findings at all is reported under the verdict's own name, since
+    there is nothing to override. Order is verdict-empty marker, then blocking/critical findings,
+    then the rest of a ``CONCERN`` review's findings, each only once.
+    """
+    dispositions = {item.finding_id: item for item in request.dispositions}
+    must_override = {
+        finding.id
+        for finding in findings
+        if verdict is Verdict.BLOCK or finding.severity is Severity.CRITICAL
+    }
+    unresolved: list[str] = []
+    if verdict is Verdict.BLOCK and not findings:
+        unresolved.append(verdict.value)
+    unresolved.extend(
+        finding_id
+        for finding_id in sorted(must_override)
+        if finding_id not in dispositions
+        or dispositions[finding_id].disposition is not Disposition.OVERRIDDEN
+    )
+    if verdict is Verdict.CONCERN:
+        unresolved.extend(
+            finding.id
+            for finding in findings
+            if finding.id not in dispositions and finding.id not in unresolved
+        )
+    return unresolved
+
+
 def _check_dispositions(
     task_id: str,
     verdict: Verdict,
@@ -893,46 +1003,27 @@ def _check_dispositions(
     request: AcceptTaskRequest,
 ) -> None:
     """Enforce the disposition rules for a verdict and its findings."""
-    by_id = {finding.id: finding for finding in findings}
-    dispositions = {item.finding_id: item for item in request.dispositions}
-    unknown = sorted(set(dispositions) - set(by_id))
-    if unknown:
-        raise TaskSpindleError(
-            INVALID_REQUEST,
-            f"dispositions name findings that do not exist: {', '.join(unknown)}",
-            details={"task_id": task_id, "finding_ids": unknown},
-        )
-    must_override = {
-        finding.id
-        for finding in findings
-        if verdict is Verdict.BLOCK or finding.severity is Severity.CRITICAL
-    }
+    _check_unknown_dispositions(task_id, findings, request)
+    unresolved = _undisposed_finding_ids(verdict, findings, request)
     if verdict is Verdict.BLOCK and not findings:
         raise TaskSpindleError(
             REVIEW_BLOCKED,
             "the review verdict is BLOCK and lists no finding that could be overridden",
             details={"task_id": task_id, "verdict": verdict.value},
         )
-    unhandled = sorted(
-        finding_id
-        for finding_id in must_override
-        if finding_id not in dispositions
-        or dispositions[finding_id].disposition is not Disposition.OVERRIDDEN
-    )
-    if unhandled:
+    blocking = [finding_id for finding_id in unresolved if finding_id != verdict.value]
+    if verdict is not Verdict.CONCERN and blocking:
         raise TaskSpindleError(
             REVIEW_BLOCKED,
             "every blocking or critical finding needs an explicit override with a reason",
-            details={"task_id": task_id, "verdict": verdict.value, "finding_ids": unhandled},
+            details={"task_id": task_id, "verdict": verdict.value, "finding_ids": sorted(blocking)},
         )
-    if verdict is Verdict.CONCERN:
-        undisposed = sorted(finding.id for finding in findings if finding.id not in dispositions)
-        if undisposed:
-            raise TaskSpindleError(
-                REVIEW_BLOCKED,
-                "every finding of a CONCERN review needs a disposition",
-                details={"task_id": task_id, "verdict": verdict.value, "finding_ids": undisposed},
-            )
+    if verdict is Verdict.CONCERN and blocking:
+        raise TaskSpindleError(
+            REVIEW_BLOCKED,
+            "every finding of a CONCERN review needs a disposition",
+            details={"task_id": task_id, "verdict": verdict.value, "finding_ids": sorted(blocking)},
+        )
 
 
 # -- projections --------------------------------------------------------------------

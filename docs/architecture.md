@@ -116,9 +116,10 @@ memory: the SQLite database is the only channel, and a signal is the only interr
 
 ## Acceptance
 
-`accept_task` checks its preconditions ([tools.md](tools.md) lists all eleven), writes an
-integration journal, moves the task to `ACCEPTING` and starts
-`taskspindle-accept-<task>.service`. Then it returns. The unit does the rest:
+`accept_task` checks its preconditions ([tools.md](tools.md) has the full list: the safety ones
+always run, the rest are opt-in flags on the request), writes an integration journal, moves the
+task to `ACCEPTING` and starts `taskspindle-accept-<task>.service`. Then it returns. The unit does
+the rest:
 
 1. **Probe.** `git merge-tree --write-tree --merge-base=<base> <target> <candidate>` merges in
    memory. It reads and writes neither the index nor the working tree, so it is safe to run against
@@ -130,11 +131,13 @@ integration journal, moves the task to `ACCEPTING` and starts
    *before* git is allowed to touch anything, so a crash mid-apply is always recognisable. The
    apply is `git cherry-pick --no-commit <candidate>` in the root, which first requires the root to
    be clean and its HEAD to still be at the journalled target.
-3. **Verify in the root.** The task's own `verification_commands` run again, this time against the
-   applied tree in the real repository, in an environment holding only `HOME`, `PATH`, `LANG`,
-   `TERM=dumb` and `CI=1`. A check that needs a credential is a check that does not belong in an
-   automated acceptance. Results are recorded with a `[root]` prefix so they are distinguishable
-   from the worktree run.
+3. **Verify in the root, if asked to.** With `rerun_verification` set on the request, the task's
+   own `verification_commands` run again, this time against the applied tree in the real
+   repository, in an environment holding only `HOME`, `PATH`, `LANG`, `TERM=dumb` and `CI=1`. A
+   check that needs a credential is a check that does not belong in an automated acceptance.
+   Results are recorded with a `[root]` prefix so they are distinguishable from the worktree run.
+   Without `rerun_verification` this step does nothing: the worker's own `check_summary.ok` was
+   already required before the unit was ever started, and nothing reruns it.
 4. **Commit.** The journal moves to `committing`, then `git commit -m <the message the accepting
    session signed for>`, then `committed`. Author and committer come from the repository's own
    configuration: the commit belongs to you, not to TaskSpindle. The `committing` phase is what
@@ -165,11 +168,21 @@ Four things a task can do that TaskSpindle records rather than hides.
 - **`ROOT_MUTATION`** — the agent changed the root repository, outside its worktree. TaskSpindle
   snapshots the root's HEAD, branch and dirty state before dispatch and compares afterwards. Every
   task with a repository behind it is checked this way, `consult` and `review` included; only a
-  repository-less consult, which has no root, is not. The warning blocks acceptance — and a
-  `record_integration` of a hand-made merge — until someone calls `record_integration` with
-  `root_mutation_acknowledged`, which is written to the event log with their summary. If the
-  snapshot cannot be read the check did not run, and that is recorded as `ROOT_CHECK_SKIPPED`
-  rather than passed.
+  repository-less consult, which has no root, is not. A working-tree change is always reported.
+  A HEAD move is not, when every commit between the snapshot's HEAD and the new one (bounded to 50
+  commits) is one TaskSpindle itself landed in that repository -- a `target_head` recorded by an
+  `ACCEPTED` task, whether from `accept_task`'s own commit or a `record_integration` of a
+  hand-made merge. That is the ordinary case of a sibling task's own accept moving the root while
+  this one is still running, and it is not a mutation to report. Anything else about the HEAD --
+  an operator's own commit, a reset, a rebase, a chain longer than 50 commits, or one `git
+  rev-list` cannot walk -- still is.
+  The warning itself is always recorded; whether it also blocks acceptance is opt-in.
+  `accept_task` and `record_integration` refuse an unacknowledged `ROOT_MUTATION`
+  (`ACCEPT_BLOCKED`) only when the request sets `require_root_stability`, which defaults to
+  `false`. Either way, someone can call `record_integration` with `root_mutation_acknowledged` to
+  clear it, written to the event log with their summary and bound to the candidate revision it was
+  signed for. If the snapshot cannot be read the check did not run, and that is recorded as
+  `ROOT_CHECK_SKIPPED` rather than passed.
 - **`DELEGATION_ATTEMPT`** — the agent asked for a subagent, team or delegation tool. A request is
   recognised by the tool's name (`Agent`, `Task`, `TeamCreate`, `SendMessage`) or by the words
   *agent*, *subagent* or *team* standing alone in its title; a file name such as `agent.py` or a

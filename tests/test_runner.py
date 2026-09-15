@@ -347,6 +347,73 @@ async def test_a_write_into_the_root_repository_is_a_root_mutation(
     assert EventKind.ROOT_MUTATION.value in event_kinds(store, task.id)
 
 
+async def test_a_sibling_tasks_own_accept_does_not_flag_root_mutation(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    """The root HEAD moving because another task's own accept landed there is not a mutation."""
+    repo = make_repo()
+    task = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=repo)
+    repository_id = task.repository_id
+    assert repository_id is not None
+
+    # Another task's accept lands a commit in the repository while this one is still running.
+    (repo / "landed.txt").write_text("from another task's own accept\n")
+    repos.run_git(["add", "-A"], cwd=repo)
+    repos.run_git(["commit", "-q", "-m", "Land another candidate"], cwd=repo)
+    landed_head = repos.current_head(repo)
+    sibling = service.create_task(
+        store,
+        StartTaskRequest(
+            provider=PROVIDER,
+            mode=Mode.IMPLEMENT,
+            prompt="do another thing",
+            repository=str(repo),
+            acceptance_criteria="it exists",
+            path_prefixes=["src"],
+            verification_commands=["true"],
+            candidate_message="Land another candidate",
+            timeout_s=60,
+        ),
+        repository_id=repository_id,
+        auth_mode=AuthMode.OAUTH,
+    )
+    store.update_task(sibling.id, None, state=TaskState.ACCEPTED, target_head=landed_head)
+
+    script_path = script(
+        {"response": "added the file", "write": {"path": "src/new.txt", "content": "hello\n"}}
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.RESULT_READY
+    final = store.get_task(task.id)
+    assert not final.warnings
+    assert EventKind.ROOT_MUTATION.value not in event_kinds(store, task.id)
+
+
+async def test_an_unaccounted_commit_to_the_root_is_still_a_root_mutation(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    """A root HEAD move no accepted task accounts for is still reported, HEAD move included."""
+    repo = make_repo()
+    task = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=repo)
+
+    (repo / "surprise.txt").write_text("nobody's accept did this\n")
+    repos.run_git(["add", "-A"], cwd=repo)
+    repos.run_git(["commit", "-q", "-m", "An unrelated commit"], cwd=repo)
+
+    script_path = script(
+        {"response": "added the file", "write": {"path": "src/new.txt", "content": "hello\n"}}
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.RESULT_READY
+    final = store.get_task(task.id)
+    assert final.warnings == ["ROOT_MUTATION:HEAD"]
+    assert EventKind.ROOT_MUTATION.value in event_kinds(store, task.id)
+
+
 async def test_failing_verification_still_records_the_candidate(
     store: Store, paths: Paths, make_repo, script
 ) -> None:

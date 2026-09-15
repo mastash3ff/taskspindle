@@ -519,19 +519,36 @@ class FindingDisposition(BaseModel):
 
 
 class AcceptTaskRequest(BaseModel):
-    """Arguments of the ``accept_task`` tool."""
+    """Arguments of the ``accept_task`` tool.
+
+    Every gate that is not about repository safety is opt-in, defaulting to off: a caller states
+    what it wants enforced. The merge-tree probe, the integration journal, the scope
+    (``path_prefixes``) check and ``state_version`` are never optional.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     task_id: str
     expected_state_version: int
     candidate_sha: str
-    diff_digest: str
+    #: Required, and checked against the candidate, only when ``require_diff_receipts`` is set.
+    diff_digest: str | None = None
     inspection_summary: str
     expected_target_head: str
-    review_task_id: str
+    #: The review covering this candidate. Optional when ``require_review`` is False; when named
+    #: it is still checked for being bound to this candidate and independent of its author.
+    review_task_id: str | None = None
     dispositions: list[FindingDisposition] = Field(default_factory=list)
     commit_message: str
+    #: Require a named, independent review whose blocking findings are all disposed.
+    require_review: bool = False
+    #: Require the diff digest to match and every byte of it to have been retrieved.
+    require_diff_receipts: bool = False
+    #: Run the candidate's verification commands again in the root repository, and let that run
+    #: decide ``CHECKS_FAILED`` instead of the worker's own ``check_summary``.
+    rerun_verification: bool = False
+    #: Block acceptance on an unacknowledged ``ROOT_MUTATION`` warning instead of just recording it.
+    require_root_stability: bool = False
 
     @field_validator("inspection_summary")
     @classmethod
@@ -547,7 +564,10 @@ class AcceptTaskRequest(BaseModel):
 
 
 class RecordIntegrationRequest(BaseModel):
-    """Arguments of the ``record_integration`` tool."""
+    """Arguments of the ``record_integration`` tool.
+
+    The same opt-in gates as :class:`AcceptTaskRequest`, off by default.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -556,6 +576,10 @@ class RecordIntegrationRequest(BaseModel):
     kind: Literal["conflict_resolved", "manual_integration", "root_mutation_acknowledged"]
     resulting_head: str | None = None
     summary: str
+    require_review: bool = False
+    require_diff_receipts: bool = False
+    rerun_verification: bool = False
+    require_root_stability: bool = False
 
 
 class DiffPage(BaseModel):

@@ -26,6 +26,7 @@ from .models import (
     EventKind,
     ReviewOutput,
     TaskRecord,
+    TaskState,
 )
 
 
@@ -1051,6 +1052,20 @@ class Store:
             f"SELECT * FROM tasks{where} ORDER BY created_at DESC, id DESC LIMIT ?", params
         ).fetchall()
         return [TaskRecord.from_row(row) for row in rows]
+
+    def list_landed_heads(self, repository_id: str) -> list[str]:
+        """Every commit head TaskSpindle itself landed in this repository.
+
+        An accepted task's ``target_head`` is set both by an ``accept_task`` commit and by a
+        ``record_integration`` of a hand-made merge, so this one column covers both: the set a
+        root HEAD move can be checked against to tell TaskSpindle's own work from an intruder's.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT target_head FROM tasks "
+            "WHERE repository_id = ? AND state = ? AND target_head IS NOT NULL",
+            (repository_id, TaskState.ACCEPTED.value),
+        ).fetchall()
+        return [str(row["target_head"]) for row in rows]
 
     def update_task(
         self,
