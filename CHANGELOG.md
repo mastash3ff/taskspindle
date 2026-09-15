@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Vendor versions are minimums, not pins.** Antigravity runs from PATH (or
+  `TASKSPINDLE_AGY_SOURCE`) and must be at least `AGY_MIN_VERSION`; builds newer than
+  `AGY_TESTED_MAX` are advisory. The private CLI copy and its digest are gone. The Claude ACP
+  adapter's setup and doctor checks accept an installed version at or above the pin and no
+  longer reject a symlinked launcher that resolves to an executable. A new vendor release is a
+  one-line constant change instead of an outage.
+
 - **Acceptance gates that are not about repository safety are opt-in, off by default.**
   `accept_task` and `record_integration` keep the merge-tree probe, the integration journal, the
   `path_prefixes` scope check and `state_version` mandatory, but retrieving the whole diff

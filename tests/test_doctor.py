@@ -246,6 +246,42 @@ def test_an_adapter_at_the_wrong_version_is_flagged(paths: Paths, tmp_path: Path
     assert taskspindle.ADAPTER_VERSION in check["detail"]
 
 
+def test_an_adapter_newer_than_pinned_is_accepted_as_advisory(paths: Paths, tmp_path: Path) -> None:
+    """A vendor release bumping the installed adapter past the pin must never veto readiness."""
+    install_adapter(paths, "999.0.0")
+    runner = RecordedRunner()
+
+    report = run(paths, tmp_path, runner)
+
+    check = by_name(report)["adapter"]
+    assert check["ok"] is True
+    assert check["advisory"] is False
+    assert "999.0.0" in check["detail"]
+    assert "newer than tested" in check["detail"]
+    assert report["ok"] is True
+
+
+def test_a_symlinked_launcher_that_resolves_to_an_executable_is_accepted(
+    paths: Paths, tmp_path: Path
+) -> None:
+    """Only an npm-linked symlink that still needs its own ``node`` on PATH is the problem --
+    a symlink that resolves to something already pinned and runnable is fine."""
+    install_adapter(paths, taskspindle.ADAPTER_VERSION, pin_node=True)
+    launcher = paths.runtime_dir / "node_modules" / ".bin" / "claude-agent-acp"
+    real = tmp_path / "elsewhere" / "claude-agent-acp-shim"
+    real.parent.mkdir(parents=True)
+    real.write_text(f'#!/bin/sh\nexec "{FAKE_NODE}" "entry.js" "$@"\n', encoding="utf-8")
+    real.chmod(0o755)
+    launcher.unlink()
+    launcher.symlink_to(real)
+    runner = RecordedRunner()
+
+    report = run(paths, tmp_path, runner)
+
+    check = by_name(report)["adapter"]
+    assert check["ok"] is True
+
+
 def test_an_unpinned_launcher_is_flagged_even_at_the_right_adapter_version(
     paths: Paths, tmp_path: Path
 ) -> None:

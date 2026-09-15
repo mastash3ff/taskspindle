@@ -8,34 +8,37 @@ checks below pass.
 
 ## Installation and authentication
 
-Install and sign in to the official CLI, then provision its qualified version:
+Install and sign in to the official CLI, then confirm it meets the qualified minimum version:
 
 ```sh
 taskspindle setup --provider agy
 taskspindle auth agy
 ```
 
-Setup pins CLI 1.1.26 and its installed companion binaries in TaskSpindle's versioned
-runtime. Workers launch the pinned executable directly. TaskSpindle forces
-`AGY_CLI_DISABLE_AUTO_UPDATE=true` for version/catalog checks and inside each worker
-namespace, preventing the CLI's own background updater from replacing the pin.
-The separately installed daily terminal CLI keeps its existing update behavior.
+There is no private copy: workers run whichever `agy` TaskSpindle resolves from `PATH` (the
+same one an interactive login already runs), falling back to `~/.local/bin/agy` if PATH does
+not have one. `TASKSPINDLE_AGY_SOURCE` is an explicit override of that resolution -- set by the
+codex-runtime deploy script, for example -- but it is never required.
+
+TaskSpindle enforces a minimum version (`AGY_MIN_VERSION`) and refuses an older CLI outright. A
+CLI newer than the last build TaskSpindle was actually tested against (`AGY_TESTED_MAX`) is
+still accepted, not refused -- a vendor release is a one-line constant bump here, not an
+outage -- and is reported as an advisory note by `taskspindle doctor` rather than a failure.
+`taskspindle setup --provider agy` re-runs this check; it copies nothing and pins no version
+of its own. TaskSpindle forces `AGY_CLI_DISABLE_AUTO_UPDATE=true` for version/catalog checks and
+inside each worker namespace, preventing the CLI's own background updater from replacing the
+resolved binary mid-check or mid-turn.
+
 Authentication checks query the catalog with cached native
 credentials; they never open the task database or submit a model prompt. If the
 cache is unavailable, run interactive `agy` in the same WSL account to sign in.
 
-Older TaskSpindle installations did not disable native self-update during startup
-checks. A version mismatch must remain a failure; the versioned directory name alone
-does not prove the executable's version. Preserve the mismatched binary and any
-timestamped `.old` file before repair, verify the retained executable reports the
-qualified version with updates disabled, and stage that verified code through setup
-into a separate reviewed runtime. Do not change the version constant to accept drift,
-copy credentials, or replace the user's separately installed daily CLI.
-
 Credentials remain at their original native path and are mounted read-only into
 private worker state. No tokens are copied into TaskSpindle, no API key is
 forwarded, and no account or provider is substituted after an auth/quota error.
-The ordinary user D-Bus environment is included in the environment allowlist.
+The ordinary user D-Bus environment is included in the environment allowlist. A worker's
+isolated launch also mounts the resolved binary's real companion directory
+(`~/.gemini/antigravity-cli/bin`) read-only, exactly as it mounts the binary itself.
 
 ## Models and lifecycle
 

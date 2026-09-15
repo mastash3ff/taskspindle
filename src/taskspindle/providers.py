@@ -2,9 +2,9 @@
 
 A *profile* is everything TaskSpindle needs to launch one ACP agent: the argv, the environment it
 is allowed to see, how it authenticates, and which task modes it may serve. Three profiles are
-built in and first class -- ``claude`` (the pinned ``claude-agent-acp`` adapter) and ``grok`` (the
-native ``grok agent ... stdio`` endpoint), plus Google's pinned native Antigravity CLI (``agy``),
-all OAuth-only. Anything else is a configured,
+built in and first class -- ``claude`` (the pinned ``claude-agent-acp`` adapter), ``grok`` (the
+native ``grok agent ... stdio`` endpoint), and the vendor's native Antigravity CLI (``agy``),
+resolved from ``PATH`` rather than a private copy, all OAuth-only. Anything else is a configured,
 second-class profile from ``[providers.<id>]`` in ``config.toml``.
 
 The child environment is built by *allowlist*, never by filtering the parent: a name reaches the
@@ -101,8 +101,10 @@ GROK_COMPAT_ENV: dict[str, str] = {
     for source in ("SKILLS", "RULES", "AGENTS", "MCPS", "HOOKS", "SESSIONS")
 }
 
-#: Native CLI 1.1.26 checks this exact value before spawning its background updater. Version
-#: and catalog probes run outside the worker mount namespace, so every AGY child needs it.
+#: The native CLI checks this exact value before spawning its background updater. Version and
+#: catalog probes run outside the worker mount namespace, so every AGY child needs it -- the
+#: same PATH-resolved binary a task launches must not self-update between the version check
+#: and the sandboxed run.
 AGY_PIN_ENV: dict[str, str] = {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
 
 _GROK_DEFAULT_MODEL = "grok-4.6"
@@ -263,15 +265,22 @@ def _grok_command(model: str, effort: str) -> tuple[str, ...]:
 
 def builtin_profiles(
     runtime_dir: Path, *, home: Path, state_dir: Path, data_dir: Path | None = None,
+    parent_env: Mapping[str, str] | None = None,
 ) -> dict[str, Profile]:
     """The built-in OAuth profiles.
 
     ``state_dir`` is required (beyond the brief's signature) because the ``grok`` profile's
     ``GROK_CONFIG`` must point at the overlay that disables hooks, skills, MCPs and subagents;
     the path is derived here, and :func:`write_grok_overlay` puts the file there.
+
+    ``agy``'s command is resolved from ``parent_env`` (or ``os.environ`` when omitted) at every
+    call: it is never a private copy, so this never fails just because the vendor CLI is not
+    installed on this machine yet -- that surfaces later, at :func:`launch_command` time or in
+    ``taskspindle doctor``.
     """
     from .agy_cli_adapter import adapter_command
 
+    resolved_env = parent_env if parent_env is not None else os.environ
     claude_env = {"CLAUDE_CONFIG_DIR": str(home / ".claude")}
     grok_env = {
         "GROK_DISABLE_API_KEY_AUTH": "true",
@@ -300,7 +309,7 @@ def builtin_profiles(
             first_class=True,
         ),
         "agy": Profile(
-            id="agy", auth="oauth", command=adapter_command(runtime_dir),
+            id="agy", auth="oauth", command=adapter_command(home, parent_env=resolved_env),
             env={},
             first_class=True,
         ),
@@ -425,7 +434,9 @@ def load_profiles(
 ) -> dict[str, Profile]:
     """Built-in profiles plus every ``[providers.<id>]`` table in ``config``."""
     write_grok_overlay(state_dir)
-    profiles = builtin_profiles(runtime_dir, home=home, state_dir=state_dir, data_dir=data_dir)
+    profiles = builtin_profiles(
+        runtime_dir, home=home, state_dir=state_dir, data_dir=data_dir, parent_env=parent_env,
+    )
     providers = config.get("providers") or {}
     if not isinstance(providers, dict):
         raise ProfileError("PROFILE_INVALID", "providers must be a table")
@@ -537,15 +548,24 @@ def reviewer_independent(author: Profile, reviewer: Profile) -> bool:
 
 
 def adapter_metadata(profile: Profile) -> dict[str, str | None]:
-    """Pinned adapter identity, distinct from a model reported by a task's provider."""
-    if profile.family == "agy":
-        from .agy_cli_adapter import ADAPTER_ID, ADAPTER_VERSION, PROTOCOL
+    """Adapter identity and its qualified version floor, distinct from a task's reported model.
 
-        return {"protocol": PROTOCOL, "package": ADAPTER_ID, "version": ADAPTER_VERSION}
+    ``version`` is the qualified minimum, not a live probe of the binary actually resolved on
+    this machine -- this call takes no environment or runner. A newer installed build is
+    accepted (see :data:`taskspindle.agy_cli_adapter.AGY_TESTED_MAX`); whether one is in use is
+    reported live by ``taskspindle doctor``, not here.
+    """
+    if profile.family == "agy":
+        from .agy_cli_adapter import ADAPTER_ID, AGY_MIN_VERSION, AGY_TESTED_MAX, PROTOCOL
+
+        return {
+            "protocol": PROTOCOL, "package": ADAPTER_ID, "version": AGY_MIN_VERSION,
+            "min_version": AGY_MIN_VERSION, "tested_up_to": AGY_TESTED_MAX,
+        }
     if profile.family == "claude":
         return {
             "protocol": "acp", "package": taskspindle.ADAPTER_PACKAGE,
-            "version": taskspindle.ADAPTER_VERSION,
+            "version": taskspindle.ADAPTER_VERSION, "min_version": taskspindle.ADAPTER_VERSION,
         }
     return {"protocol": "acp", "package": None, "version": None}
 

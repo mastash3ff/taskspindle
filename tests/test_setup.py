@@ -206,8 +206,20 @@ def test_a_config_directory_that_already_exists_keeps_its_permissions(tmp_path: 
 
 
 def test_an_adapter_at_the_wrong_version_is_refused(paths: Paths) -> None:
-    with pytest.raises(SetupError, match=taskspindle.ADAPTER_VERSION):
+    with pytest.raises(SetupError, match="not at least the pinned"):
         install_runtime(paths, runner=FakeNpm(version="0.1.0"), parent_env={"PATH": "/usr/bin"})
+
+
+def test_an_adapter_newer_than_pinned_is_accepted(paths: Paths) -> None:
+    """A vendor release bumping the installed package past the pin is not an outage."""
+    newer = "999.0.0"
+    report = install_runtime(paths, runner=FakeNpm(version=newer), parent_env={"PATH": "/usr/bin"})
+    assert report["adapter_version"] == newer
+
+
+def test_an_unparsable_adapter_version_is_refused(paths: Paths) -> None:
+    with pytest.raises(SetupError, match="not at least the pinned"):
+        install_runtime(paths, runner=FakeNpm(version="not-a-version"), parent_env={"PATH": "/usr/bin"})
 
 
 def test_a_failed_npm_reports_its_own_last_line(paths: Paths) -> None:

@@ -20,6 +20,10 @@ unit, so most of the requirements are things it launches rather than things it b
   `~/.grok/auth.json` present. Its version label is informational, not an allowlist.
   The real read-only sandbox launch must initialize and advertise session loading
   and a supported OAuth authentication method.
+- **Antigravity CLI (`agy`), if you use that provider**, logged in interactively, resolved from
+  `PATH` (or `~/.local/bin/agy`). Only a minimum version is enforced; a newer build than
+  TaskSpindle has been tested with is accepted and reported as advisory, not blocking. See
+  [antigravity.md](antigravity.md).
 
 TaskSpindle never logs you in and never copies a credential. Both provider CLIs hold their own
 sessions; TaskSpindle only asks them whether they have one.
@@ -90,19 +94,19 @@ and the detached units alike.
 | --- | --- | --- |
 | Grok | Uses the daily CLI; a new version or changed version banner does not veto readiness | Actual sandboxed ACP initialization, session-loading and OAuth capabilities; task-time permission and model checks |
 | Claude | Worker uses the managed, locked ACP adapter/SDK and pinned Node; daily CLI supplies cached auth diagnostics | Explicit JSON output; extra fields ignored, required OAuth fields validated; live managed-adapter initialization |
-| AGY | Worker uses a private executable and companion binaries; an updated daily CLI does not replace an existing installation | Owned executable/companion checks, cached model catalog and task-time stream/permission checks |
+| AGY | Worker runs whichever `agy` is resolved from PATH (or `~/.local/bin/agy`); only a minimum version is enforced, and a newer build is accepted as advisory | Minimum-version check, cached model catalog and task-time stream/permission checks |
 
 Run `taskspindle doctor` after an update to inspect actual launch readiness. Version output
 alone cannot prove compatibility. Missing required protocol features, unsafe paths, changed
 authentication context, or quota/billing restrictions still block the affected operation.
 There is no automatic provider substitution, credential rebinding, or paid fallback.
 
-Managed adapter pins are reproducible installation boundaries, not restrictions on daily
-Claude or AGY versions. Do not overwrite an active runtime or fall back to PATH if a pin is
-damaged. AGY's first installation into an empty runtime still needs its qualified source
-build; a newer daily binary is not silently adopted. Explicit `setup` rebuilds Claude from
-the shipped lock, so drain active workers before provisioning. Automatic adoption of new
-managed adapter versions is separate from tolerating daily CLI updates.
+Claude's managed adapter pin is a reproducible installation boundary: `setup` rebuilds it from
+the shipped lock, so drain active workers before provisioning, and a version below the pin is
+refused (a newer one is accepted as advisory). AGY has no such installation boundary -- there is
+nothing for `setup --provider agy` to build or replace, only a minimum version to confirm -- so
+every daily CLI update takes effect on the next launch automatically; a release below the
+enforced minimum is what actually blocks a task.
 
 ### TaskSpindle releases
 

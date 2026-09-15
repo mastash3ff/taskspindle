@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -83,6 +84,15 @@ class Check:
 
     def as_dict(self) -> dict[str, Any]:
         return {"name": self.name, "ok": self.ok, "detail": self.detail, "advisory": self.advisory}
+
+
+def _newer_than_tested(name: str, reported: str, tested_up_to: str) -> str:
+    """One consistent wording for a build past the newest one TaskSpindle has been tested with.
+
+    Never blocking: a version above a floor is accepted everywhere in this module, and this
+    is only ever appended to an otherwise-successful check's detail.
+    """
+    return f"{name} {reported} is newer than tested ({tested_up_to}); accepted, compatibility unverified"
 
 
 def _version(text: str) -> tuple[int, ...]:
@@ -306,19 +316,31 @@ class _Doctor:
         def probe() -> str:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             found = str(payload.get("version", ""))
-            if found != taskspindle.ADAPTER_VERSION:
+            try:
+                found_version = _version(found) if found else None
+            except ValueError:
+                found_version = None
+            pinned_version = _version(taskspindle.ADAPTER_VERSION)
+            if found_version is None or found_version < pinned_version:
                 raise RuntimeError(
                     f"{taskspindle.ADAPTER_PACKAGE} is at {found or 'no version'}, "
-                    f"not the pinned {taskspindle.ADAPTER_VERSION}"
+                    f"not at least the pinned {taskspindle.ADAPTER_VERSION}"
                 )
             pinned = providers.pinned_node(self.paths.runtime_dir)
-            if launcher.is_symlink() or pinned is None:
+            if pinned is None:
                 raise RuntimeError("launcher not pinned; run taskspindle setup")
-            if not launcher.is_file():
-                raise RuntimeError(f"{launcher} is missing")
+            # A symlinked launcher is fine as long as it resolves to something runnable; only an
+            # npm-linked symlink that still needs its own ``node`` on PATH -- unreadable, missing,
+            # or lacking the pinned node's path in its contents -- is the actual problem.
+            if not launcher.is_file() or not os.access(launcher, os.X_OK):
+                raise RuntimeError(f"{launcher} is missing or not executable")
             if str(pinned) not in launcher.read_text(encoding="utf-8"):
                 raise RuntimeError("launcher not pinned; run taskspindle setup")
-            return f"{taskspindle.ADAPTER_PACKAGE} {found} at {manifest.parent}"
+            detail = f"{taskspindle.ADAPTER_PACKAGE} {found} at {manifest.parent}"
+            if found_version > pinned_version:
+                note = _newer_than_tested(taskspindle.ADAPTER_PACKAGE, found, taskspindle.ADAPTER_VERSION)
+                detail += f"; {note}"
+            return detail
 
     def grok_cli(self) -> None:
         # A daily CLI update may change the version label or its formatting without
@@ -442,13 +464,21 @@ class _Doctor:
         return checks
 
     def agy_cli(self) -> None:
-        from .agy_cli_adapter import validate_cli_profile, verify_cli_version
+        from .agy_cli_adapter import (
+            AGY_TESTED_MAX,
+            newer_than_tested,
+            validate_cli_profile,
+            verify_cli_version,
+        )
 
         @self.check("agy_cli")
         def binary_probe() -> str:
             binary = validate_cli_profile(self.profiles["agy"])
             version = verify_cli_version(binary, runner=self.runner, parent_env=self.parent_env)
-            return f"pinned native Antigravity CLI {version}"
+            detail = f"native Antigravity CLI {version} at {binary}"
+            if newer_than_tested(version):
+                detail += f"; {_newer_than_tested('Antigravity CLI', version, AGY_TESTED_MAX)}"
+            return detail
 
         @self.check("agy_sandbox")
         def sandbox_probe() -> str:

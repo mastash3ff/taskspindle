@@ -663,9 +663,15 @@ async def _run_turn(
             if native:
                 catalog = await cli_model_catalog(agent.command, run.child_env, workspace)
                 _configure_native_agy(run, profile, catalog)
-                from .agy_cli_adapter import ADAPTER_VERSION
+                from .agy_cli_adapter import AGY_MIN_VERSION, verify_cli_version
 
-                run.agent_info = {"name": "antigravity-cli", "version": ADAPTER_VERSION}
+                try:
+                    observed = await asyncio.to_thread(
+                        verify_cli_version, Path(agent.command[0]), parent_env=run.child_env
+                    )
+                except Exception:
+                    observed = f">={AGY_MIN_VERSION}"
+                run.agent_info = {"name": "antigravity-cli", "version": observed}
                 evidence = {"auth": "oauth", "auth_method_id": "cached_native_cli",
                             "source": "authenticated_model_catalog"}
                 run.task = run.store.update_task(

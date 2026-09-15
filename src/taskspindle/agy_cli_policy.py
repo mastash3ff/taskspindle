@@ -1,4 +1,4 @@
-"""Filesystem and static tool policy for the pinned native AGY CLI.
+"""Filesystem and static tool policy for the native AGY CLI, resolved from PATH.
 
 This launcher must run inside TaskSpindle's control-group-killed systemd unit.
 The CLI and its descendants inherit a private mount/PID namespace. Native token
@@ -214,9 +214,14 @@ def prepare_launch(
     mount("--bind", projects, native_home / "config" / "projects")
     mount("--ro-bind", settings, native_home / "antigravity-cli" / "settings.json")
     mount("--ro-bind", credential, credential)
-    pinned_bin = binary.parent / "bin"
-    if pinned_bin.is_dir():
-        mount("--ro-bind", pinned_bin, native_home / "antigravity-cli" / "bin")
+    # The vendor CLI is resolved from PATH now, not a private copy alongside a companion
+    # directory TaskSpindle laid out itself: its real companions live at their native location
+    # under the user's own HOME, exactly where an interactive login already put them.
+    companion_bin = native_home / "antigravity-cli" / "bin"
+    if companion_bin.is_dir():
+        if companion_bin.is_symlink():
+            raise ValueError("Antigravity companion executable directory must not be a symlink")
+        mount("--ro-bind", companion_bin, native_home / "antigravity-cli" / "bin")
     argv.extend(("--clearenv", "--setenv", "HOME", str(home), "--setenv", "USER",
                  pwd.getpwuid(os.getuid()).pw_name, "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
                  "--setenv", "LANG", "C.UTF-8"))
@@ -235,6 +240,6 @@ def prepare_launch(
         "verification_commands_external": len(verification_commands), "shell_tools": False,
         "declared_tools": list(tools), "implicit_tools_require_monitoring": ["manage_task"],
         "future_control_paths_require_native_deny_rules": True,
-        "pinned_companion_bin": str(pinned_bin) if pinned_bin.is_dir() else None,
+        "companion_bin": str(companion_bin) if companion_bin.is_dir() else None,
     }, indent=2) + "\n")
     return tuple(argv)

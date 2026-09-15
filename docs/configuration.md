@@ -22,7 +22,8 @@ The released Claude and Grok profiles use OAuth:
 
 Their ids are reserved. You cannot redefine them in `config.toml`.
 
-**`agy`** is an OAuth-only profile using Google's separately pinned native CLI and its existing
+**`agy`** is an OAuth-only profile using the vendor's native Antigravity CLI, resolved from
+`PATH` (a minimum version is enforced; a newer build is accepted, advisory) and its existing
 personal login. Setup, authentication and the enforced worker policy are described in
 [antigravity.md](antigravity.md). An `agy`-derived profile cannot switch to API-key authentication.
 

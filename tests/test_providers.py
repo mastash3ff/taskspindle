@@ -56,9 +56,11 @@ def _dirs(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _builtins(tmp_path: Path) -> dict[str, Profile]:
+def _builtins(tmp_path: Path, *, parent_env: dict[str, str] | None = None) -> dict[str, Profile]:
     dirs = _dirs(tmp_path)
-    return builtin_profiles(dirs["runtime_dir"], home=dirs["home"], state_dir=dirs["state_dir"])
+    return builtin_profiles(
+        dirs["runtime_dir"], home=dirs["home"], state_dir=dirs["state_dir"], parent_env=parent_env,
+    )
 
 
 # -- built-ins -----------------------------------------------------------------------------------
@@ -553,13 +555,19 @@ def test_daily_cli_updates_do_not_retarget_managed_worker_commands(tmp_path: Pat
     daily.mkdir(parents=True)
     for name in ("claude", "agy", "claude-agent-acp"):
         (daily / name).write_text("old daily CLI")
-    before = _builtins(tmp_path)
+    # An empty PATH forces agy's PATH lookup to miss, so it deterministically falls back to
+    # ``~/.local/bin/agy`` -- exactly ``daily`` here -- rather than whatever this machine has.
+    env = {"PATH": "", "HOME": str(_dirs(tmp_path)["home"])}
+    before = _builtins(tmp_path, parent_env=env)
     for name in ("claude", "agy", "claude-agent-acp"):
         (daily / name).write_text("new daily CLI")
-    after = _builtins(tmp_path)
+    after = _builtins(tmp_path, parent_env=env)
     for name in ("claude", "agy"):
         assert before[name].command == after[name].command
-        assert Path(after[name].command[0]).is_relative_to(_dirs(tmp_path)["runtime_dir"])
+    assert Path(after["claude"].command[0]).is_relative_to(_dirs(tmp_path)["runtime_dir"])
+    # AGY is never copied into the managed runtime: it stays resolved at its real, mutable
+    # daily-CLI location, which is exactly why its content is free to change underneath it.
+    assert after["agy"].command == (str(daily / "agy"),)
 
 
 @pytest.mark.parametrize("plan", ["pro", "max"])

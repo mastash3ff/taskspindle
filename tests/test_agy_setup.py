@@ -306,12 +306,17 @@ def test_cli_auth_does_not_open_state_store(paths, profile, monkeypatch, capsys,
 def test_custom_runtime_keeps_credential_home_in_configured_data_dir(paths, tmp_path):
     from taskspindle import providers
 
+    # agy's command no longer depends on ``runtime_dir`` at all -- it is resolved from
+    # ``home``/``PATH``, so a controlled environment keeps this deterministic regardless of
+    # what is actually installed on the machine running the test.
+    home = tmp_path / "user"
+    env = {"PATH": "/usr/bin:/bin"}
     profiles = providers.load_profiles(
-        {}, runtime_dir=tmp_path / "custom-adapters", home=tmp_path / "user",
-        state_dir=paths.state_dir, data_dir=paths.data_dir,
+        {}, runtime_dir=tmp_path / "custom-adapters", home=home,
+        state_dir=paths.state_dir, data_dir=paths.data_dir, parent_env=env,
     )
     assert profiles["agy"].env == {}
-    assert profiles["agy"].command == agy_cli_adapter.adapter_command(tmp_path / "custom-adapters")
+    assert profiles["agy"].command == agy_cli_adapter.adapter_command(home, parent_env=env)
 
 
 async def test_doctor_checks_cache_and_initialize_without_starting_login(paths, profile, monkeypatch):

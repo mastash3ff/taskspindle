@@ -1,7 +1,7 @@
 """Installing the pinned adapter runtime, and nothing else.
 
 ``taskspindle setup`` puts one Node package on disk: the ``claude-agent-acp`` build the ``claude``
-profile launches, at the exact version :data:`taskspindle.ADAPTER_VERSION` pins. It copies the
+profile launches, at least the version :data:`taskspindle.ADAPTER_VERSION` pins. It copies the
 packaged ``package.json`` and ``package-lock.json`` into a versioned runtime directory and runs
 ``npm ci`` there, so the tree that ends up installed is the one the lock file describes and not
 whatever the registry offers today.
@@ -11,9 +11,10 @@ rewrites ``node_modules/.bin/claude-agent-acp`` from the ``npm``-linked symlink 
 ``#!/usr/bin/env node``) into a shim that execs that node directly. A worker unit's PATH is
 short and has no ``node`` on it at all; the shim needs none.
 
-``taskspindle setup --provider agy`` pins a verified copy of the installed native Linux CLI.
-Setup never logs in, reads or copies a credential, or edits Codex's configuration. Antigravity
-login stays with the terminal CLI; ``taskspindle auth agy`` checks its cached login.
+``taskspindle setup --provider agy`` confirms the native Antigravity CLI resolved from PATH (see
+:mod:`taskspindle.agy_cli_adapter`) meets the qualified minimum version; nothing is copied. Setup
+never logs in, reads or copies a credential, or edits Codex's configuration. Antigravity login
+stays with the terminal CLI; ``taskspindle auth agy`` checks its cached login.
 """
 
 from __future__ import annotations
@@ -211,8 +212,22 @@ def _run_npm(runtime_dir: Path, npm: str, runner: Runner, parent_env: Mapping[st
         raise SetupError(f"{npm} {NPM_ARGS[0]} exited {proc.returncode}: {detail}")
 
 
+def _dotted_version(text: str) -> tuple[int, ...]:
+    """Parse a dotted-integer version string; anything else is a ``ValueError``."""
+    parts = text.strip().split(".")
+    if not parts or not all(part.isdigit() for part in parts):
+        raise ValueError(f"not a dotted version number: {text!r}")
+    return tuple(int(part) for part in parts)
+
+
 def _verify_adapter(runtime_dir: Path) -> str:
-    """Confirm the installed adapter is the pinned one and that its executable is linked."""
+    """Confirm the installed adapter meets the pinned minimum and that its executable is linked.
+
+    A newer installed version is accepted, not refused -- only older-than-pinned or unparsable
+    is a failure. The install this function checks is the one ``npm ci`` just produced from
+    TaskSpindle's own locked ``package.json``, so "newer" here means a version bump landed in a
+    still-active runtime directory, not a change of source.
+    """
     manifest = runtime_dir / "node_modules" / taskspindle.ADAPTER_PACKAGE / "package.json"
     try:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -221,10 +236,14 @@ def _verify_adapter(runtime_dir: Path) -> str:
     except ValueError as exc:
         raise SetupError(f"{manifest} is not valid JSON: {exc}") from exc
     found = str(payload.get("version", ""))
-    if found != taskspindle.ADAPTER_VERSION:
+    try:
+        found_version = _dotted_version(found) if found else None
+    except ValueError:
+        found_version = None
+    if found_version is None or found_version < _dotted_version(taskspindle.ADAPTER_VERSION):
         raise SetupError(
             f"{taskspindle.ADAPTER_PACKAGE} installed at {found or 'no version'}, "
-            f"not the pinned {taskspindle.ADAPTER_VERSION}"
+            f"not at least the pinned {taskspindle.ADAPTER_VERSION}"
         )
     executable = runtime_dir / "node_modules" / ".bin" / ADAPTER_BIN
     if not executable.exists():
@@ -438,70 +457,50 @@ def install_agy_runtime(
     paths: Paths, *, source: Path | None = None, runner: Runner = subprocess.run,
     parent_env: Mapping[str, str] = os.environ,
 ) -> dict[str, Any]:
-    """Copy the exact installed native build into the runtime; never copy its credentials."""
-    from .agy_cli_adapter import ADAPTER_ID, ADAPTER_VERSION, adapter_command, verify_cli_version
+    """Confirm the Antigravity CLI resolved from PATH meets the qualified minimum; copy nothing.
+
+    There is no more private copy: a vendor release used to be an outage here (an exact-version
+    pin that every new build would fail), so this now only enforces a floor
+    (:data:`taskspindle.agy_cli_adapter.AGY_MIN_VERSION`) and reports, advisory, when the
+    resolved build is newer than the last one TaskSpindle was actually tested against
+    (:data:`taskspindle.agy_cli_adapter.AGY_TESTED_MAX`).
+    """
+    from .agy_cli_adapter import (
+        ADAPTER_ID,
+        AGY_TESTED_MAX,
+        newer_than_tested,
+        resolve_binary,
+        verify_cli_version,
+    )
     from .providers import ProfileError
 
     if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
         raise SetupError("Antigravity CLI setup currently supports Linux x86-64 only")
     if not parent_env.get("HOME"):
         raise SetupError("HOME is required to locate the installed Antigravity CLI")
-    source = source or Path(parent_env["HOME"]) / ".local/bin/agy"
-    destination = paths.runtime_dir / ADAPTER_ID / ADAPTER_VERSION
-    binary = destination / "agy"
-    installed = destination.exists()
+    if paths.runtime_dir.exists() and (
+        paths.runtime_dir.is_symlink()
+        or not paths.runtime_dir.is_dir()
+        or paths.runtime_dir.stat().st_uid != os.getuid()
+    ):
+        raise SetupError(f"Antigravity runtime directory must not be a symlink: {paths.runtime_dir}")
+    home = Path(parent_env["HOME"])
+    binary = source or resolve_binary(home, parent_env=parent_env)
     try:
-        for directory in (paths.runtime_dir, destination.parent, destination):
-            if directory.is_symlink():
-                raise SetupError(f"Antigravity runtime directory must not be a symlink: {directory}")
-            if directory.exists() and (not directory.is_dir() or directory.stat().st_uid != os.getuid()):
-                raise SetupError(f"Antigravity runtime directory must be owned by this user: {directory}")
-        if installed:
-            verify_cli_version(binary, runner=runner, parent_env=parent_env)
-            companions = destination / "bin"
-            if (companions.is_symlink() or not companions.is_dir()
-                    or companions.stat().st_uid != os.getuid() or companions.stat().st_mode & 0o022):
-                raise SetupError(
-                    "incomplete Antigravity CLI pin: companion bin directory is missing or unsafe"
-                )
-            for companion in companions.iterdir():
-                if (companion.is_symlink() or not companion.is_file()
-                        or companion.stat().st_uid != os.getuid() or companion.stat().st_mode & 0o022):
-                    raise SetupError("Antigravity pinned companions must be regular owned executables")
-        else:
-            # Verify before touching the destination; an updated daily CLI cannot silently
-            # change the build that a qualified TaskSpindle release executes.
-            verify_cli_version(source, runner=runner, parent_env=parent_env)
-            _private(paths.runtime_dir)
-            _private(destination.parent)
-            with tempfile.TemporaryDirectory(prefix=".agy-cli-install-", dir=destination.parent) as raw:
-                staging = Path(raw) / ADAPTER_VERSION
-                staging.mkdir(mode=0o700)
-                target = staging / "agy"
-                shutil.copyfile(source, target)
-                target.chmod(0o700)
-                verify_cli_version(target, runner=runner, parent_env=parent_env)
-                companion_source = Path(parent_env["HOME"]) / ".gemini/antigravity-cli/bin"
-                companion_target = staging / "bin"
-                companion_target.mkdir(mode=0o700)
-                if companion_source.is_symlink():
-                    raise SetupError("Antigravity companion executable directory must not be a symlink")
-                if companion_source.exists():
-                    for companion in companion_source.iterdir():
-                        if (companion.is_symlink() or not companion.is_file()
-                                or companion.stat().st_uid != os.getuid()):
-                            raise SetupError("Antigravity companion executables must be regular owned files")
-                        shutil.copyfile(companion, companion_target / companion.name)
-                        (companion_target / companion.name).chmod(0o700)
-                staging.rename(destination)
+        version = verify_cli_version(binary, runner=runner, parent_env=parent_env)
+        _private(paths.runtime_dir)
         _private(paths.state_dir)
         _private(paths.data_dir)
         created = _write_config(paths.config_file)
     except (OSError, ProfileError) as exc:
         raise SetupError(f"Antigravity CLI setup failed: {exc}") from exc
+    advisory = (
+        f"{version} is newer than the tested {AGY_TESTED_MAX}; accepted, compatibility unverified"
+        if newer_than_tested(version) else None
+    )
     return {
-        "provider": "agy", "adapter_package": ADAPTER_ID, "adapter_version": ADAPTER_VERSION,
-        "runtime_dir": str(paths.runtime_dir), "adapter_dir": str(destination),
-        "command": list(adapter_command(paths.runtime_dir)), "already_installed": installed,
+        "provider": "agy", "adapter_package": ADAPTER_ID, "adapter_version": version,
+        "tested_up_to": AGY_TESTED_MAX, "advisory": advisory,
+        "runtime_dir": str(paths.runtime_dir), "command": [str(binary)],
         "config_file": str(paths.config_file), "created_config": created,
     }

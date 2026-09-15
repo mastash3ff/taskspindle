@@ -59,6 +59,31 @@ def test_policy_is_private_and_does_not_copy_auth(layout) -> None:
     assert metadata["verification_commands_external"] == 1
 
 
+def test_launch_binds_the_real_companion_directory_read_only(layout) -> None:
+    """The resolved binary is no longer bundled with a copy of its companions: TaskSpindle binds
+    whatever is really at ``~/.gemini/antigravity-cli/bin``, the same place an interactive login
+    already put it, not something derived from the binary's own (now PATH-resolved) location."""
+    home, _, task = layout
+    companions = home / ".gemini" / "antigravity-cli" / "bin"
+    companions.mkdir(parents=True)
+    (companions / "webm_encoder").write_bytes(b"companion fixture")
+    argv = launch(layout)
+    index = argv.index(str(companions))
+    assert argv[index - 1] == "--ro-bind"
+    assert argv[index + 1] == str(home / ".gemini" / "antigravity-cli" / "bin")
+    metadata = json.loads((task / "agy-cli-launch.json").read_text())
+    assert metadata["companion_bin"] == str(companions)
+
+
+def test_launch_rejects_a_symlinked_companion_directory(layout) -> None:
+    home, _, _ = layout
+    real = home.parent / "elsewhere-bin"
+    real.mkdir()
+    (home / ".gemini" / "antigravity-cli" / "bin").symlink_to(real, target_is_directory=True)
+    with pytest.raises(ValueError, match="companion executable directory must not be a symlink"):
+        launch(layout)
+
+
 def test_native_namespace_forces_auto_updates_off_after_environment_reset(layout) -> None:
     argv = launch(layout)
     result = _run_inside(argv, "import json, os; print(json.dumps({'value': "

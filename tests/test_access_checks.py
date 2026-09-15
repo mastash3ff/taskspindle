@@ -13,8 +13,12 @@ from taskspindle import access_checks, agy_cli_adapter, providers
 
 @pytest.fixture
 def profiles(tmp_path):
+    # A PATH with no ``agy`` on it makes resolution deterministically fall back to
+    # ``home/.local/bin/agy`` under ``tmp_path`` -- never whatever is really installed on the
+    # machine running the tests.
     return providers.builtin_profiles(
         tmp_path / "runtime", home=tmp_path / "home", state_dir=tmp_path / "state",
+        parent_env={"PATH": "/usr/bin:/bin"},
     )
 
 
