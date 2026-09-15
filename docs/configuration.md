@@ -100,9 +100,11 @@ Any other ACP-speaking stdio agent is a **configured, second-class profile**.
 
 `secret_env` is a list of variable *names*. The value is read from the environment the MCP server
 was launched in, at the moment the agent process starts, and is passed to that process only. It is
-never written to the store, never logged, never returned by a tool. `doctor` reports each name as
-present or absent and nothing more. `secret_env` on an `auth = "oauth"` profile is a configuration
-error: an OAuth seat has no key to pass.
+never written to the store, never logged, never returned by a tool, and never placed on a
+`systemd-run` command line or in a unit property: for the worker's lifetime it lives in a 0600
+`EnvironmentFile` inside that task's state directory, readable only by the account running
+TaskSpindle. `doctor` reports each name as present or absent and nothing more. `secret_env` on an
+`auth = "oauth"` profile is a configuration error: an OAuth seat has no key to pass.
 
 A profile with `base` inherits that built-in's environment before its own `env` is applied. A
 `grok`-derived profile carries its model and effort on the argv; a `claude`-derived one passes them
@@ -186,6 +188,12 @@ No `base`, so the profile declares its own argv and inherits none of either buil
 agent that speaks ACP 0.12 over stdio can be configured this way; whether it honours a permission
 denial or a cancel is between you and that agent. Harnesses with no ACP stdio endpoint are out of
 scope: there is no other transport.
+
+## `[ai_policy]`
+
+An optional fixed-argv adapter for Codex AI-mode policies, invoked by the dashboard's Policy page. The
+adapter is not required — if the table is absent or incomplete, the dashboard reports it unavailable
+and does not invent a command. See [dashboard.md](dashboard.md) for the adapter protocol, configuration, and hosts.
 
 ## Finding agents to configure
 

@@ -278,6 +278,23 @@ def test_repository_usage_prints_the_repository_label(home: Path, capsys, displa
     assert "123" in output
 
 
+def test_usage_with_group_by_role_includes_the_role_column(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from taskspindle.models import Mode, TaskState
+    from taskspindle.store import Store
+    from tests.test_usage import _seed
+
+    with Store.open(cli.resolve_paths().state_dir / "taskspindle.sqlite3") as store:
+        _seed(store, "claude", Mode.CONSULT, state=TaskState.COMPLETED,
+              ms=1000, tokens=123, role="explorer")
+    assert cli.main(["usage", "--group-by", "role"]) == 0
+    output = capsys.readouterr().out
+    assert "role" in output
+    assert "explorer" in output
+    assert "123" in output
+
+
 def test_concurrency_rollback_cli_is_explicit_and_preserves_records(home, capsys, monkeypatch):
     from taskspindle import store as store_module
     from taskspindle.models import TaskState

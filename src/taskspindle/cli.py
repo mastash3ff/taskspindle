@@ -222,7 +222,10 @@ def main(argv: list[str] | None = None) -> int:
                          probe=args.probe)
     if args.command == "web":
         return _web(args.host, args.port, open_browser=args.open)
-    return _accept(args.task)
+    if args.command == "accept":
+        return _accept(args.task)
+    parser.error(f"unrecognized command: {args.command}")
+    return 2
 
 
 def _rollback_concurrency(database: str) -> int:
@@ -594,10 +597,23 @@ def _usage(since: str | None, provider: str | None, group_by: str, *, as_json: b
 
 def _print_usage(report: dict[str, Any]) -> None:
     """A few fixed-width tables; the JSON form carries everything."""
-    keys = [
-        key for key in ("provider", "day", "model", "mode", "repository_id")
-        if any(key in row for row in report["usage"])
-    ]
+    # Collect all keys present in any row, preserving a sensible order for known keys
+    known_key_order = ("provider", "day", "provider_day", "model", "mode", "role", "repository_id")
+    present_keys: set[str] = set()
+    for row in report["usage"]:
+        present_keys.update(row.keys())
+    # Remove metadata keys that are not display columns
+    present_keys.discard("turns")
+    present_keys.discard("input_tokens")
+    present_keys.discard("output_tokens")
+    present_keys.discard("cache_read_tokens")
+    present_keys.discard("cache_write_tokens")
+    present_keys.discard("cost_estimate_usd")
+    present_keys.discard("priced_turns")
+    present_keys.discard("repository_path")
+    # Build key list in known order, then append unknown keys
+    keys = [key for key in known_key_order if key in present_keys]
+    keys.extend(sorted(present_keys - set(known_key_order)))
     columns = [*("repository" if key == "repository_id" else key for key in keys),
                "turns", "input", "output", "cache_read", "cache_write", "est_usd"]
     rows = [

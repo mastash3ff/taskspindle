@@ -40,7 +40,7 @@
 #   effort      reasoning effort, where the agent understands one.
 #   modes       narrows the modes this profile may serve; defaults to all three.
 #
-# Neither example below was tested live in v0.1.0.
+# The examples below have not been tested live.
 
 # A Claude adapter pointed at a local LiteLLM gateway. The gateway host is recorded on every
 # task so metered work is visible in task_result; the token itself is not.
@@ -58,3 +58,16 @@
 #command = ["opencode", "acp"]
 #modes = ["consult", "review"]
 #secret_env = ["OPENAI_API_KEY"]
+
+# Recovery after a provider refusal. `manual` (the default) waits for an explicit permit;
+# `hybrid` retries on the server's own schedule. See docs/configuration.md.
+#[provider_recovery]
+#claude = "manual"
+#grok = "manual"
+#agy = "manual"
+
+# Optional adapter the dashboard's Policy page calls to switch the Codex AI mode.
+# See docs/dashboard.md.
+#[ai_policy]
+#command = ["/absolute/path/to/ai-policy", "adapter"]
+#hosts = ["windows", "wsl"]

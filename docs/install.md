@@ -6,8 +6,7 @@ TaskSpindle drives other people's command line tools and puts every worker in a 
 unit, so most of the requirements are things it launches rather than things it bundles.
 
 - **Linux with a systemd user manager**, or **WSL2 with systemd enabled**. `systemctl --user
-  is-system-running` must answer `running` or `degraded`. macOS and Windows are not supported in
-  v0.2.0; see [platforms.md](platforms.md).
+  is-system-running` must answer `running` or `degraded`. macOS and Windows are not supported; see [platforms.md](platforms.md).
 - **Python 3.12 or newer.**
 - **Node 22 or newer**, with `npm`. The Claude adapter is a Node program.
 - **git 2.38 or newer.** Acceptance probes a merge with `git merge-tree --write-tree`, which needs
@@ -26,7 +25,7 @@ sessions; TaskSpindle only asks them whether they have one.
 ## Install
 
 ```sh
-uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.2.0"
+uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.5.0"
 taskspindle setup
 taskspindle doctor
 ```
@@ -55,6 +54,9 @@ the run fail. `taskspindle doctor --json` prints the same report as JSON, and
 `taskspindle doctor --no-live` skips the two checks that start a process (a transient systemd unit
 and a Grok ACP handshake).
 
+TaskSpindle also has `taskspindle worker` and `taskspindle accept` subcommands, invoked by systemd
+units for detached work and acceptance — not for interactive use.
+
 Registering the server with Codex is a separate, deliberate step:
 [codex-registration.md](codex-registration.md).
 
@@ -79,7 +81,7 @@ and the detached units alike.
 ## Upgrading
 
 ```sh
-uv tool upgrade taskspindle    # or: uv tool install --force "git+...@v0.2.0"
+uv tool upgrade taskspindle    # or: uv tool install --force "git+...@v0.5.0"
 taskspindle setup
 taskspindle doctor
 ```

@@ -46,7 +46,7 @@ produced.
 ## Quick start
 
 ```sh
-uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.1.0"
+uv tool install "git+https://github.com/mastash3ff/taskspindle@v0.5.0"
 taskspindle setup
 taskspindle doctor
 codex mcp add taskspindle -- taskspindle mcp
@@ -100,7 +100,7 @@ moved underneath you is refused rather than clobbered.
 ## Supported platforms
 
 Linux with a systemd user manager, and WSL2 with systemd enabled. macOS and Windows are not
-supported in v0.2.0. Python 3.12+, Node 22+, git 2.38+. See
+supported. Python 3.12+, Node 22+, git 2.38+. See
 [docs/platforms.md](docs/platforms.md).
 
 ## Status
