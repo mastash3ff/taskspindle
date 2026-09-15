@@ -1,14 +1,15 @@
 """The Starlette application behind ``taskspindle web``.
 
 Task, provider and usage data stays read-only: the task database is opened ``mode=ro`` (see
-:mod:`.db`) and task artifacts are only read. The dispatch policy is the one exception: loopback-
-gated ``/api/policy*`` routes may write the ``dispatch_policy`` and ``dispatch_policy_history``
-tables through :mod:`.policy_store`, whose SQLite authorizer refuses every other table and every
-schema change.
+:mod:`.db`) and task artifacts are only read. Mutating routes are loopback-gated: ``/api/policy*``
+may write the ``dispatch_policy`` and ``dispatch_policy_history`` tables through :mod:`.policy_store`,
+whose SQLite authorizer refuses every other table and every schema change; ``/api/ai-policy`` invokes
+the optional fixed-argv adapter from ``config.toml`` and never writes the database or that file.
 """
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import importlib.resources
 import inspect
@@ -18,7 +19,7 @@ import re
 import secrets
 import sqlite3
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,8 @@ from ..doctor import run_doctor_async
 from ..providers import Profile
 from ..service import model_availability, provider_availability, task_view
 from ..store import PolicyRevisionConflict
+from . import ai_policy
+from .ai_policy import AdapterFactory
 from .db import ReadOnlyStore
 from .policy_store import PolicyStore
 from .security import csrf_valid, no_store, read_json_object, same_origin, trusted_loopback
@@ -46,6 +49,7 @@ __all__ = ["build_app"]
 _DOCTOR_CACHE_SECONDS = 60
 _WORKER_LOG_TAIL_LINES = 200
 _MAX_POLICY_BODY_BYTES = 65536
+_MAX_AI_POLICY_BODY_BYTES = 65536
 
 Handler = Callable[[Request], Response | Awaitable[Response]]
 
@@ -135,12 +139,15 @@ def build_app(
     *,
     clock: Callable[[], datetime] | None = None,
     policy_store_factory: Callable[[], PolicyStore] | None = None,
+    ai_policy_adapter_factory: AdapterFactory | None = None,
 ) -> Starlette:
-    """Build the dashboard application; only the dispatch policy routes ever write."""
+    """Build the dashboard application; task tables stay read-only."""
     clock = clock or (lambda: datetime.now(UTC))
     db_path = paths.state_dir / "taskspindle.sqlite3"
     policy_store_factory = policy_store_factory or (lambda: PolicyStore(db_path))
+    adapter_factory = ai_policy_adapter_factory or ai_policy.default_adapter_factory
     csrf_token = secrets.token_urlsafe(32)
+    ai_policy_lock = asyncio.Lock()
     # The dashboard serves assets from an unpacked filesystem installation (including wheels).
     static_dir = importlib.resources.files("taskspindle.web") / "static"
 
@@ -574,6 +581,92 @@ def build_app(
             }
         )
 
+    # -- Codex AI policy (fixed adapter; no database write) --------------------------------
+
+    def _ai_policy_setup() -> tuple[tuple[str, ...], Any, str]:
+        config, missing_error = ai_policy.load_ai_policy_config(paths.config_file)
+        hosts = config.hosts if config is not None else ai_policy.HOSTS
+        command = config.command if config is not None else None
+        return hosts, adapter_factory(command), missing_error
+
+    async def _ai_policy_invoke(
+        adapter: Any,
+        payload: dict[str, Any],
+        hosts: Sequence[str],
+        *,
+        require_results: bool,
+        missing_error: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
+        requested = list(payload.get("hosts", hosts))
+        if adapter is None:
+            results = (
+                [{"host": host, "ok": False, "error": missing_error} for host in requested]
+                if require_results
+                else None
+            )
+            return ai_policy.unavailable_hosts(requested, missing_error), results
+        try:
+            raw = await adapter(payload)
+            return ai_policy.parse_adapter_payload(
+                raw,
+                requested,
+                require_results=require_results,
+                requested_mode=payload.get("mode") if require_results else None,
+            )
+        except ai_policy.AdapterError as exc:
+            results = (
+                [{"host": host, "ok": False, "error": exc.code} for host in requested]
+                if require_results
+                else None
+            )
+            return ai_policy.unavailable_hosts(requested, exc.code), results
+
+    @_guard
+    async def ai_policy_get_endpoint(request: Request) -> Response:
+        if not trusted_loopback(request):
+            return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
+        hosts, adapter, missing_error = _ai_policy_setup()
+        async with ai_policy_lock:
+            host_rows, _results = await _ai_policy_invoke(
+                adapter,
+                {"action": "status", "hosts": list(hosts)},
+                hosts,
+                require_results=False,
+                missing_error=missing_error,
+            )
+        return no_store(ai_policy.http_payload(host_rows, csrf_token))
+
+    @_guard
+    async def ai_policy_put_endpoint(request: Request) -> Response:
+        if not trusted_loopback(request):
+            return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
+        if not same_origin(request):
+            return no_store({"error": "ORIGIN_REQUIRED"}, status=403)
+        if not csrf_valid(request, csrf_token):
+            return no_store({"error": "CSRF_INVALID"}, status=403)
+        body, error = await read_json_object(request, _MAX_AI_POLICY_BODY_BYTES)
+        if error is not None:
+            return error
+        hosts, adapter, missing_error = _ai_policy_setup()
+        parsed, request_error = ai_policy.parse_use_request(body, hosts)
+        if parsed is None:
+            return no_store({"error": request_error}, status=400)
+        stdin = {
+            "action": "use",
+            "hosts": parsed["hosts"],
+            "mode": parsed["mode"],
+            "expected_revisions": parsed["expected_revisions"],
+        }
+        async with ai_policy_lock:
+            host_rows, results = await _ai_policy_invoke(
+                adapter, stdin, parsed["hosts"], require_results=True, missing_error=missing_error
+            )
+        payload = ai_policy.http_payload(host_rows, csrf_token, results)
+        if not ai_policy.apply_succeeded(results, host_rows, parsed["mode"]):
+            payload["error"] = "AI_POLICY_APPLY_FAILED"
+            return no_store(payload, status=409)
+        return no_store(payload)
+
     routes = [
         Route("/", index, methods=["GET"]),
         Mount("/static", app=StaticFiles(directory=Path(str(static_dir))), name="static"),
@@ -590,6 +683,8 @@ def build_app(
         Route("/api/policy/reset", policy_reset_endpoint, methods=["POST"]),
         Route("/api/policy/history", policy_history_endpoint, methods=["GET"]),
         Route("/api/policy/history/{revision}", policy_history_revision_endpoint, methods=["GET"]),
+        Route("/api/ai-policy", ai_policy_get_endpoint, methods=["GET"]),
+        Route("/api/ai-policy", ai_policy_put_endpoint, methods=["PUT"]),
     ]
     app = Starlette(routes=routes)
     app.state.doctor_cache = {"result": None, "at": 0.0, "checked_at": None}

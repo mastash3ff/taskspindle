@@ -1,9 +1,9 @@
 """A local dashboard over TaskSpindle task and worker state.
 
-Task data is always opened ``mode=ro`` (see :mod:`.db`). The dashboard's one mutation surface is
-the dispatch policy: loopback-gated ``/api/policy*`` routes write only the ``dispatch_policy`` and
-``dispatch_policy_history`` tables, through a SQLite connection an authorizer restricts to them
-(see :mod:`.app` and :mod:`.policy_store`).
+Task data is always opened ``mode=ro`` (see :mod:`.db`). Loopback-gated ``/api/policy*`` routes
+write only the ``dispatch_policy`` and ``dispatch_policy_history`` tables, through a SQLite
+connection an authorizer restricts to them (see :mod:`.app` and :mod:`.policy_store`). Loopback-gated
+``/api/ai-policy`` invokes a fixed adapter from ``config.toml`` and does not write the database.
 """
 
 from __future__ import annotations

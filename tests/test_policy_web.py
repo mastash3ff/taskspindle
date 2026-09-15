@@ -404,3 +404,514 @@ def test_policy_store_authorizer_blocks_writes_outside_the_two_policy_tables(tmp
 
     with sqlite3.connect(db_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+# -- Codex AI policy (fixed adapter; no database write) ---------------------------------------
+
+VALID_AI_BODY = json.dumps(
+    {"mode": "native", "hosts": ["windows"], "expected_revisions": {"windows": "r1"}}
+)
+HUGE_AI_BODY = json.dumps(
+    {"mode": "native", "hosts": ["windows"], "expected_revisions": {"windows": "x" * 70_000}}
+)
+
+
+def _ai_client(
+    paths: Paths,
+    factory=None,
+    *,
+    peer: str = "127.0.0.1",
+    base_url: str = TRUSTED_ORIGIN,
+) -> TestClient:
+    app = build_app(paths, PROFILES, ai_policy_adapter_factory=factory)
+    return TestClient(app, base_url=base_url, client=(peer, 50000))
+
+
+def _ai_csrf(client: TestClient) -> str:
+    response = client.get("/api/ai-policy")
+    assert response.status_code == 200
+    return response.json()["csrf_token"]
+
+
+def _host_row(
+    host: str,
+    *,
+    mode: str = "ensemble",
+    status: str = "configured",
+    revision: str = "r1",
+    error: str | None = None,
+) -> dict:
+    row = {
+        "host": host,
+        "mode": mode,
+        "status": status,
+        "revision": revision,
+        "checks": [{"name": "ready", "ok": True, "detail": "ok"}],
+    }
+    if error:
+        row["error"] = error
+    return row
+
+
+def _fake_factory(handler):
+    def factory(_command):
+        async def run(payload):
+            return handler(payload)
+
+        return run
+
+    return factory
+
+
+def test_ai_policy_get_missing_adapter_is_unavailable_without_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    spawned: list[object] = []
+
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        spawned.append(1)
+        raise AssertionError("missing adapter must not spawn")
+
+    monkeypatch.setattr("taskspindle.web.ai_policy.asyncio.create_subprocess_exec", forbidden)
+    client = _ai_client(paths)
+    response = client.get("/api/ai-policy")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    body = response.json()
+    assert body["applies_to"] == "new_sessions"
+    assert isinstance(body["csrf_token"], str) and body["csrf_token"]
+    statuses = {row["host"]: row["status"] for row in body["hosts"]}
+    assert statuses == {"windows": "unavailable", "wsl": "unavailable"}
+    assert all(row.get("error") == "ADAPTER_UNAVAILABLE" for row in body["hosts"])
+    assert spawned == []
+    assert not (paths.state_dir / "taskspindle.sqlite3").exists()
+
+
+def test_ai_policy_get_from_non_loopback_peer_is_refused(tmp_path: Path) -> None:
+    client = _ai_client(_paths(tmp_path), peer="203.0.113.5")
+    response = client.get("/api/ai-policy")
+    assert response.status_code == 403
+    assert response.json() == {"error": "LOOPBACK_REQUIRED"}
+    assert "csrf_token" not in response.json()
+
+
+def test_ai_policy_get_returns_adapter_status(tmp_path: Path) -> None:
+    def handler(payload: dict) -> dict:
+        assert payload == {"action": "status", "hosts": ["windows", "wsl"]}
+        return {"hosts": [_host_row("windows"), _host_row("wsl", mode="native", revision="r2")]}
+
+    client = _ai_client(_paths(tmp_path), _fake_factory(handler))
+    body = client.get("/api/ai-policy").json()
+    assert body["applies_to"] == "new_sessions"
+    assert body["hosts"][0]["mode"] == "ensemble"
+    assert body["hosts"][1]["mode"] == "native"
+    assert "results" not in body
+
+
+def test_ai_policy_put_applies_mode_for_new_sessions_only(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    def handler(payload: dict) -> dict:
+        calls.append(payload)
+        if payload["action"] == "status":
+            return {"hosts": [_host_row("windows"), _host_row("wsl")]}
+        return {
+            "hosts": [
+                _host_row("windows", mode=payload["mode"], revision="r2"),
+                _host_row("wsl", mode=payload["mode"], revision="r2"),
+            ],
+            "results": [{"host": "windows", "ok": True}, {"host": "wsl", "ok": True}],
+        }
+
+    paths = _paths(tmp_path)
+    paths.config_file.write_text("[ai_policy]\ncommand = [\"/usr/bin/true\"]\n", encoding="utf-8")
+    before = paths.config_file.read_bytes()
+    client = _ai_client(paths, _fake_factory(handler))
+    token = _ai_csrf(client)
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(token),
+        json={
+            "mode": "native",
+            "hosts": ["windows", "wsl"],
+            "expected_revisions": {"windows": "r1", "wsl": "r1"},
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applies_to"] == "new_sessions"
+    assert [row["ok"] for row in body["results"]] == [True, True]
+    assert all(row["mode"] == "native" for row in body["hosts"])
+    assert calls[-1]["action"] == "use"
+    assert "command" not in calls[-1]
+    assert paths.config_file.read_bytes() == before
+    assert not (paths.state_dir / "taskspindle.sqlite3").exists()
+
+
+def test_ai_policy_put_stale_revision_returns_failed_result_with_fresh_status(tmp_path: Path) -> None:
+    def handler(payload: dict) -> dict:
+        if payload["action"] == "status":
+            return {"hosts": [_host_row("windows", revision="fresh")]}
+        assert payload["expected_revisions"] == {"windows": "stale"}
+        return {
+            "hosts": [_host_row("windows", mode="ensemble", revision="fresh")],
+            "results": [{"host": "windows", "ok": False, "error": "STALE_REVISION"}],
+        }
+
+    client = _ai_client(_paths(tmp_path), _fake_factory(handler))
+    token = _ai_csrf(client)
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(token),
+        json={"mode": "native", "hosts": ["windows"], "expected_revisions": {"windows": "stale"}},
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "AI_POLICY_APPLY_FAILED"
+    assert body["hosts"][0]["revision"] == "fresh"
+    assert body["hosts"][0]["status"] == "configured"
+    assert body["results"] == [{"host": "windows", "ok": False, "error": "STALE_REVISION"}]
+    assert body.get("ok") is not True
+
+
+def test_ai_policy_put_partial_failure_preserves_fresh_state_and_does_not_claim_success(
+    tmp_path: Path,
+) -> None:
+    def handler(payload: dict) -> dict:
+        if payload["action"] == "status":
+            return {"hosts": [_host_row("windows"), _host_row("wsl")]}
+        return {
+            "hosts": [
+                _host_row("windows", mode="native", revision="r2"),
+                _host_row("wsl", mode="ensemble", status="update_failed", revision="r1", error="WSL_FAILED"),
+            ],
+            "results": [
+                {"host": "windows", "ok": True},
+                {"host": "wsl", "ok": False, "error": "WSL_FAILED"},
+            ],
+        }
+
+    client = _ai_client(_paths(tmp_path), _fake_factory(handler))
+    token = _ai_csrf(client)
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(token),
+        json={
+            "mode": "native",
+            "hosts": ["windows", "wsl"],
+            "expected_revisions": {"windows": "r1", "wsl": "r1"},
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "AI_POLICY_APPLY_FAILED"
+    by_host = {row["host"]: row for row in body["hosts"]}
+    assert by_host["windows"]["mode"] == "native" and by_host["windows"]["revision"] == "r2"
+    assert by_host["wsl"]["status"] == "update_failed"
+    assert {row["host"]: row["ok"] for row in body["results"]} == {"windows": True, "wsl": False}
+
+
+def test_use_payload_without_host_coverage_is_not_success() -> None:
+    from taskspindle.web.ai_policy import apply_succeeded, parse_adapter_payload
+
+    hosts, results = parse_adapter_payload(
+        {"hosts": [], "results": [{"host": "windows", "ok": True}]},
+        ["windows"],
+        require_results=True,
+        requested_mode="native",
+    )
+    assert hosts[0]["host"] == "windows"
+    assert hosts[0]["status"] == "unavailable"
+    assert results is not None and results[0]["ok"] is False
+    assert apply_succeeded(results, hosts, "native") is False
+
+
+def test_use_payload_rejects_success_when_mode_or_status_does_not_match_request() -> None:
+    from taskspindle.web.ai_policy import apply_succeeded, parse_adapter_payload
+
+    hosts, results = parse_adapter_payload(
+        {
+            "hosts": [_host_row("windows", mode="ensemble")],
+            "results": [{"host": "windows", "ok": True}],
+        },
+        ["windows"],
+        require_results=True,
+        requested_mode="native",
+    )
+    assert hosts[0]["mode"] == "ensemble"
+    assert results is not None and results[0]["ok"] is False
+    assert apply_succeeded(results, hosts, "native") is False
+
+
+def test_ai_policy_put_empty_hosts_with_ok_result_is_not_success(tmp_path: Path) -> None:
+    def handler(payload: dict) -> dict:
+        if payload["action"] == "status":
+            return {"hosts": [_host_row("windows")]}
+        return {"hosts": [], "results": [{"host": "windows", "ok": True}]}
+
+    client = _ai_client(_paths(tmp_path), _fake_factory(handler))
+    token = _ai_csrf(client)
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(token),
+        json={"mode": "native", "hosts": ["windows"], "expected_revisions": {"windows": "r1"}},
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "AI_POLICY_APPLY_FAILED"
+    assert body["hosts"][0]["status"] == "unavailable"
+    assert body["results"][0]["ok"] is False
+
+
+def test_ai_policy_put_malformed_contract_is_unavailable_not_success(tmp_path: Path) -> None:
+    def handler(payload: dict) -> dict:
+        if payload["action"] == "status":
+            return {"hosts": [_host_row("windows")]}
+        return {"hosts": "not-a-list"}
+
+    client = _ai_client(_paths(tmp_path), _fake_factory(handler))
+    token = _ai_csrf(client)
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(token),
+        json={"mode": "native", "hosts": ["windows"], "expected_revisions": {"windows": "r1"}},
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"] == "AI_POLICY_APPLY_FAILED"
+    assert body["hosts"][0]["status"] == "unavailable"
+    assert body["hosts"][0]["error"] == "ADAPTER_INVALID"
+    assert body["results"][0]["ok"] is False
+
+
+def test_ai_policy_put_rejects_browser_argv_and_does_not_call_adapter(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    def handler(payload: dict) -> dict:
+        calls.append(payload)
+        return {"hosts": [_host_row("windows")]}
+
+    client = _ai_client(_paths(tmp_path), _fake_factory(handler))
+    token = _ai_csrf(client)
+    calls.clear()
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(token),
+        json={
+            "mode": "native",
+            "hosts": ["windows"],
+            "expected_revisions": {"windows": "r1"},
+            "command": ["/bin/true"],
+        },
+    )
+    assert response.status_code == 400
+    assert response.json() == {"error": "INVALID_REQUEST"}
+    assert calls == []
+
+
+def test_ai_policy_relative_command_is_not_executed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    paths.config_file.write_text("[ai_policy]\ncommand = [\"relative-adapter\"]\n", encoding="utf-8")
+    spawned: list[object] = []
+
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        spawned.append(1)
+        raise AssertionError("relative command must not spawn")
+
+    monkeypatch.setattr("taskspindle.web.ai_policy.asyncio.create_subprocess_exec", forbidden)
+    client = _ai_client(paths)
+    body = client.get("/api/ai-policy").json()
+    assert body["hosts"][0]["status"] == "unavailable"
+    assert body["hosts"][0]["error"] == "ADAPTER_CONFIG_INVALID"
+    assert spawned == []
+
+
+@pytest.mark.parametrize(
+    (
+        "case", "peer", "base_url", "origin", "token", "content_type", "content",
+        "expected_status", "expected_error",
+    ),
+    [
+        ("remote peer", "203.0.113.5", TRUSTED_ORIGIN, TRUSTED_ORIGIN, "good",
+         "application/json", VALID_AI_BODY, 403, "LOOPBACK_REQUIRED"),
+        ("cross origin", "127.0.0.1", TRUSTED_ORIGIN, "http://localhost:8765", "good",
+         "application/json", VALID_AI_BODY, 403, "ORIGIN_REQUIRED"),
+        ("missing origin", "127.0.0.1", TRUSTED_ORIGIN, None, "good",
+         "application/json", VALID_AI_BODY, 403, "ORIGIN_REQUIRED"),
+        ("bad csrf", "127.0.0.1", TRUSTED_ORIGIN, TRUSTED_ORIGIN, "wrong",
+         "application/json", VALID_AI_BODY, 403, "CSRF_INVALID"),
+        ("wrong content type", "127.0.0.1", TRUSTED_ORIGIN, TRUSTED_ORIGIN, "good",
+         "text/plain", "plain body", 415, "JSON_REQUIRED"),
+        ("body over 64 KiB", "127.0.0.1", TRUSTED_ORIGIN, TRUSTED_ORIGIN, "good",
+         "application/json", HUGE_AI_BODY, 413, "REQUEST_TOO_LARGE"),
+    ],
+)
+def test_ai_policy_put_rejects_invalid_security_context(
+    tmp_path: Path,
+    case: str,
+    peer: str,
+    base_url: str,
+    origin: str | None,
+    token: str,
+    content_type: str,
+    content: str,
+    expected_status: int,
+    expected_error: str,
+) -> None:
+    del case
+    paths = _paths(tmp_path)
+    config = paths.config_file
+    config.write_text("[ai_policy]\ncommand = [\"/usr/bin/true\"]\n", encoding="utf-8")
+    before = config.read_bytes()
+    factory = _fake_factory(lambda payload: {"hosts": [_host_row("windows")]})
+    client = _ai_client(paths, factory, peer=peer, base_url=base_url)
+    if token == "good":
+        token = _ai_csrf(client) if peer == "127.0.0.1" and "127.0.0.1" in base_url else "unused"
+    headers = {"X-TaskSpindle-CSRF": token, "Content-Type": content_type}
+    if origin is not None:
+        headers["Origin"] = origin
+    response = client.put("/api/ai-policy", headers=headers, content=content)
+    assert response.status_code == expected_status
+    assert response.json() == {"error": expected_error}
+    assert config.read_bytes() == before
+
+
+def test_ai_policy_configured_adapter_uses_stdin_stdout_json_without_a_shell(tmp_path: Path) -> None:
+    import sys
+
+    from taskspindle.web.ai_policy import invoke_configured_adapter
+
+    script = tmp_path / "adapter.py"
+    script.write_text(
+        "import json, sys\n"
+        "req = json.load(sys.stdin)\n"
+        "assert req['action'] == 'status'\n"
+        "json.dump({'hosts': [{'host': 'windows', 'mode': 'ensemble', 'status': 'configured',"
+        " 'revision': 'r1', 'checks': [{'name': 'ready', 'ok': True, 'detail': 'ok'}]}]}, sys.stdout)\n",
+        encoding="utf-8",
+    )
+    source = Path("src/taskspindle/web/ai_policy.py").read_text(encoding="utf-8")
+    assert "shell=True" not in source
+    assert "create_subprocess_shell" not in source
+
+    async def _run() -> dict:
+        return await invoke_configured_adapter(
+            (sys.executable, str(script)), {"action": "status", "hosts": ["windows"]}
+        )
+
+    import asyncio
+
+    payload = asyncio.run(_run())
+    assert payload["hosts"][0]["status"] == "configured"
+
+
+@pytest.mark.asyncio
+async def test_ai_policy_nonzero_exit_rejects_valid_success_json(tmp_path: Path) -> None:
+    import sys
+
+    from taskspindle.web.ai_policy import AdapterError, invoke_configured_adapter
+
+    script = tmp_path / "nonzero.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'hosts': [{'host': 'windows', 'mode': 'ensemble', 'status': 'configured',"
+        " 'revision': 'r1', 'checks': []}]}, sys.stdout)\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AdapterError) as caught:
+        await invoke_configured_adapter((sys.executable, str(script)), {"action": "status"})
+    assert caught.value.code == "ADAPTER_INVALID"
+
+
+def test_ai_policy_nonzero_adapter_cannot_yield_http_success(tmp_path: Path) -> None:
+    import sys
+
+    paths = _paths(tmp_path)
+    script = tmp_path / "nonzero-http.py"
+    script.write_text(
+        "import json, sys\n"
+        "json.dump({'hosts': [{'host': 'windows', 'mode': 'ensemble', 'status': 'configured',"
+        " 'revision': 'r1', 'checks': []}], 'results': [{'host': 'windows', 'ok': True}]},"
+        " sys.stdout)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    command = json.dumps([sys.executable, str(script)])
+    paths.config_file.write_text(
+        f"[ai_policy]\ncommand = {command}\nhosts = [\"windows\"]\n", encoding="utf-8"
+    )
+    client = _ai_client(paths)
+    body = client.get("/api/ai-policy").json()
+    assert body["hosts"][0]["status"] == "unavailable"
+    assert body["hosts"][0]["error"] == "ADAPTER_INVALID"
+    assert body.get("ok") is not True
+
+    response = client.put(
+        "/api/ai-policy",
+        headers=_headers(body["csrf_token"]),
+        json={"mode": "native", "hosts": ["windows"], "expected_revisions": {"windows": "r1"}},
+    )
+    assert response.status_code == 409
+    put_body = response.json()
+    assert put_body["error"] == "AI_POLICY_APPLY_FAILED"
+    assert put_body["results"][0]["ok"] is False
+    assert put_body["hosts"][0]["status"] != "configured"
+
+
+@pytest.mark.asyncio
+async def test_ai_policy_adapter_timeout_does_not_return_success(tmp_path: Path) -> None:
+    import sys
+
+    from taskspindle.web.ai_policy import AdapterError, invoke_configured_adapter
+
+    script = tmp_path / "slow.py"
+    script.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+    with pytest.raises(AdapterError) as caught:
+        await invoke_configured_adapter((sys.executable, str(script)), {"action": "status"}, timeout=0.05)
+    assert caught.value.code == "ADAPTER_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_ai_policy_adapter_cancel_stops_the_process(tmp_path: Path) -> None:
+    import asyncio
+    import sys
+
+    from taskspindle.web.ai_policy import invoke_configured_adapter
+
+    script = tmp_path / "cancel.py"
+    script.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+    task = asyncio.create_task(
+        invoke_configured_adapter((sys.executable, str(script)), {"action": "status"}, timeout=10)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_stop_adapter_falls_back_when_killpg_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import os
+    import sys
+
+    from taskspindle.web import ai_policy as ai_policy_mod
+    from taskspindle.web.ai_policy import AdapterError, invoke_configured_adapter
+
+    script = tmp_path / "killpg.py"
+    script.write_text("import time\ntime.sleep(5)\n", encoding="utf-8")
+
+    def missing_killpg(*_args: object, **_kwargs: object) -> None:
+        raise AttributeError("killpg")
+
+    monkeypatch.setattr(os, "killpg", missing_killpg)
+    monkeypatch.setattr(ai_policy_mod.os, "killpg", missing_killpg)
+    with pytest.raises(AdapterError) as caught:
+        await invoke_configured_adapter((sys.executable, str(script)), {"action": "status"}, timeout=0.05)
+    assert caught.value.code == "ADAPTER_UNAVAILABLE"

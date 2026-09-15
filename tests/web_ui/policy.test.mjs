@@ -66,13 +66,16 @@ globalThis.requestAnimationFrame = () => {};
 
 const policyModule = await import("../../src/taskspindle/web/static/views/policy.js");
 const { renderPolicy, __test__ } = policyModule;
-const { applyPath, isDirty, localValidate, orderByUnderTarget, errorsByLoc, normalizeTargets } = __test__;
+const { applyPath, isDirty, localValidate, orderByUnderTarget, errorsByLoc, normalizeTargets, resetDraft } = __test__;
+const aiPolicyModule = await import("../../src/taskspindle/web/static/ai-policy.js");
+const { resetAiPolicyUi, isAiPolicyApplying } = aiPolicyModule;
 
 const find = (node, predicate) => {
   const result = predicate(node) ? [node] : [];
   return result.concat(...(node.children || []).map((child) => find(child, predicate)));
 };
 const byFocusKey = (root, key) => find(root, (node) => node.dataset?.focusKey === key)[0];
+const textOf = (node) => (node?.textContent || "") + (node?.children || []).map(textOf).join("");
 
 // -- pure helpers ---------------------------------------------------------------------
 
@@ -185,6 +188,8 @@ function fixture(overrides = {}) {
 }
 
 test("rendering a policy fixture then editing a field marks the draft dirty and holds polling", async () => {
+  resetDraft();
+  resetAiPolicyUi();
   globalThis.fetch = async (path) => {
     if (String(path).startsWith("/api/policy")) return new Response(JSON.stringify(fixture()), { status: 200 });
     return new Response("{}", { status: 404 });
@@ -200,4 +205,104 @@ test("rendering a policy fixture then editing a field marks the draft dirty and 
   assert.equal(node.dataset.holdPoll, "1");
   const updatedNumber = byFocusKey(node, "policy-claude-share-number");
   assert.equal(updatedNumber.value, "75");
+});
+
+function aiFixture() {
+  return {
+    hosts: [
+      { host: "windows", mode: "ensemble", status: "configured", revision: "r1", checks: [] },
+      { host: "wsl", mode: "ensemble", status: "configured", revision: "r1", checks: [] },
+    ],
+    applies_to: "new_sessions",
+    csrf_token: "tok",
+  };
+}
+
+test("Codex AI mode controls stay independent of the dispatch policy draft", async () => {
+  resetDraft();
+  resetAiPolicyUi();
+  const puts = [];
+  globalThis.fetch = async (path, init = {}) => {
+    if (String(path) === "/api/ai-policy" && init.method === "PUT") {
+      puts.push(JSON.parse(init.body));
+      const applied = aiFixture();
+      applied.hosts = applied.hosts.map((row) => ({ ...row, mode: "native", revision: "r2" }));
+      applied.results = [{ host: "windows", ok: true }, { host: "wsl", ok: true }];
+      return new Response(JSON.stringify(applied), { status: 200 });
+    }
+    if (String(path).startsWith("/api/ai-policy")) return new Response(JSON.stringify(aiFixture()), { status: 200 });
+    if (String(path).startsWith("/api/policy")) return new Response(JSON.stringify(fixture()), { status: 200 });
+    return new Response("{}", { status: 404 });
+  };
+  const node = await renderPolicy({ query: new URLSearchParams() }, { toast: () => {}, refresh: () => { throw new Error("AI apply must not refresh the dispatch draft"); } });
+  assert.equal(node.dataset.holdPoll, undefined);
+
+  const native = byFocusKey(node, "ai-policy-mode-native");
+  assert.ok(native, "expected the Native radio");
+  native.checked = true;
+  native.listeners.change();
+  assert.equal(node.dataset.holdPoll, undefined);
+
+  const shareNumber = byFocusKey(node, "policy-claude-share-number");
+  shareNumber.value = "75";
+  shareNumber.listeners.change();
+  assert.equal(node.dataset.holdPoll, "1");
+
+  const apply = byFocusKey(node, "ai-policy-apply");
+  assert.ok(apply);
+  await apply.listeners.click();
+  assert.equal(node.dataset.holdPoll, "1");
+  assert.equal(byFocusKey(node, "policy-claude-share-number").value, "75");
+  assert.deepEqual(puts[0].mode, "native");
+  assert.deepEqual(puts[0].hosts, ["windows", "wsl"]);
+});
+
+test("AI apply holds polling and ignores a stale GET that finishes after apply", async () => {
+  resetDraft();
+  resetAiPolicyUi();
+  let releasePut;
+  let releaseGet;
+  const putGate = new Promise((resolve) => { releasePut = resolve; });
+  const getGate = new Promise((resolve) => { releaseGet = resolve; });
+  let getCount = 0;
+  globalThis.fetch = async (path, init = {}) => {
+    if (String(path) === "/api/ai-policy" && init.method === "PUT") {
+      await putGate;
+      return new Response(JSON.stringify({
+        ...aiFixture(),
+        hosts: [
+          { host: "windows", mode: "native", status: "configured", revision: "applied", checks: [{ name: "post-apply", ok: true, detail: "ok" }] },
+          { host: "wsl", mode: "native", status: "configured", revision: "applied", checks: [{ name: "post-apply", ok: true, detail: "ok" }] },
+        ],
+        results: [{ host: "windows", ok: true }, { host: "wsl", ok: true }],
+      }), { status: 200 });
+    }
+    if (String(path).startsWith("/api/ai-policy")) {
+      getCount += 1;
+      if (getCount > 1) await getGate;
+      const revision = getCount === 1 ? "r1" : "stale-poll";
+      return new Response(JSON.stringify({
+        ...aiFixture(),
+        hosts: [
+          { host: "windows", mode: "ensemble", status: "configured", revision, checks: [] },
+          { host: "wsl", mode: "ensemble", status: "configured", revision, checks: [] },
+        ],
+      }), { status: 200 });
+    }
+    if (String(path).startsWith("/api/policy")) return new Response(JSON.stringify(fixture()), { status: 200 });
+    return new Response("{}", { status: 404 });
+  };
+  const first = await renderPolicy({ query: new URLSearchParams() }, { toast: () => {}, refresh: () => {} });
+  const stalePoll = renderPolicy({ query: new URLSearchParams() }, { toast: () => {}, refresh: () => {} });
+  const applyDone = byFocusKey(first, "ai-policy-apply").listeners.click();
+  assert.equal(isAiPolicyApplying(), true);
+  assert.equal(first.dataset.holdPoll, "1");
+  releaseGet();
+  const pollNode = await stalePoll;
+  assert.doesNotMatch(textOf(pollNode), /stale-poll/);
+  assert.doesNotMatch(textOf(pollNode), /post-apply/);
+  releasePut();
+  await applyDone;
+  assert.match(textOf(pollNode), /post-apply/);
+  assert.doesNotMatch(textOf(pollNode), /stale-poll/);
 });

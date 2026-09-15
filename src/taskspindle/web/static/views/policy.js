@@ -1,3 +1,4 @@
+import { aiPolicyEpoch, isAiPolicyApplying, renderAiPolicyCard } from "../ai-policy.js";
 import { getJSON, postJSON, putJSON } from "../api.js";
 import { badge, captureViewState, formatDate, h, labeledValue, relativeTime, restoreViewState, safeJSON, sectionHeading } from "../dom.js";
 
@@ -15,6 +16,7 @@ let saveConflict = null;
 let saving = false;
 let mountedRoot = null;
 let currentData = null;
+let currentAiData = null;
 let currentContext = null;
 let currentErrorsByLoc = new Map();
 
@@ -128,7 +130,13 @@ function normalizeTargets(providers = {}) {
   return result;
 }
 
-export const __test__ = { applyPath, isDirty, localValidate, orderByUnderTarget, errorsByLoc, normalizeTargets };
+function resetDraft() {
+  draftState = null;
+  saveErrors = [];
+  saveConflict = null;
+}
+
+export const __test__ = { applyPath, isDirty, localValidate, orderByUnderTarget, errorsByLoc, normalizeTargets, resetDraft };
 
 // -- draft lifecycle ------------------------------------------------------------------
 
@@ -231,7 +239,7 @@ function switchControl(label, checked, focusKey, onChange, disabled = false) {
 
 function pageHeading(stale, writable) {
   return h("div", { class: "page-heading" },
-    h("div", {}, h("span", { class: "eyebrow", text: "Dispatch policy" }), h("h1", { text: "Policy" }), h("p", { text: "Provider routing, target shares, budgets, and the model and effort each role uses on each provider." })),
+    h("div", {}, h("span", { class: "eyebrow", text: "Dispatch policy" }), h("h1", { text: "Policy" }), h("p", { text: "Codex AI mode for new sessions, then provider routing, target shares, budgets, and the model and effort each role uses on each provider." })),
     stale ? badge("stale", "Cached data") : null,
   );
 }
@@ -547,28 +555,57 @@ function saveBar(data) {
 
 // -- top-level view ---------------------------------------------------------------------
 
+function unavailableAiPolicy(csrfToken) {
+  return {
+    hosts: [
+      { host: "windows", mode: null, status: "unavailable", revision: null, checks: [], error: "ADAPTER_UNAVAILABLE" },
+      { host: "wsl", mode: null, status: "unavailable", revision: null, checks: [], error: "ADAPTER_UNAVAILABLE" },
+    ],
+    applies_to: "new_sessions",
+    csrf_token: csrfToken || "",
+  };
+}
+
 function buildView(data, _context) {
   currentErrorsByLoc = errorsByLoc(saveErrors);
   const writable = data.writable !== false;
   const heading = pageHeading(data.stale, writable);
-  if (!writable) return h("div", { class: "view policy-view", dataset: { stale: String(Boolean(data.stale)) } }, heading, unwritableCallout());
+  const aiCard = renderAiPolicyCard(currentAiData, {
+    toast: currentContext?.toast,
+    paint,
+    onAiPolicy(next) { currentAiData = next; },
+  });
+  const holdPoll = isDirty(draftState?.base, draftState?.draft) || isAiPolicyApplying();
+  if (!writable) {
+    const blocked = h("div", { class: "view policy-view", dataset: { stale: String(Boolean(data.stale)) } }, heading, aiCard, unwritableCallout());
+    if (holdPoll) blocked.dataset.holdPoll = "1";
+    return blocked;
+  }
   const profiles = orderedProfiles(data.profiles || []);
   const driftNode = draftState.serverDrift ? driftCallout(draftState.serverDrift) : null;
   const cards = h("div", { class: "policy-grid" }, profiles.map((profile) => providerCard(profile, draftState.draft, data.status, draftState.window)));
   const matrix = h("section", { class: "panel" }, sectionHeading("Roles", "Preference, selections, and timeout"), roleMatrix(draftState.draft.roles || {}, profiles), addRoleControl(draftState.draft.roles || {}));
   const view = h("div", { class: "view policy-view", dataset: { stale: String(Boolean(data.stale)) } },
-    heading, h("div", { class: "filter-bar" }, windowSelector()), driftNode, cards, matrix, fileManagedPanel(data.file_managed), saveBar(data),
+    heading, aiCard, h("div", { class: "filter-bar" }, windowSelector()), driftNode, cards, matrix, fileManagedPanel(data.file_managed), saveBar(data),
   );
-  if (isDirty(draftState.base, draftState.draft)) view.dataset.holdPoll = "1";
+  if (holdPoll) view.dataset.holdPoll = "1";
   return view;
 }
 
 export async function renderPolicy(route, context = {}) {
   const { signal } = context;
-  const { data, stale } = await getJSON("/api/policy", { signal, fresh: true });
+  const fetchEpoch = aiPolicyEpoch();
+  const policyRequest = getJSON("/api/policy", { signal, fresh: true });
+  const aiRequest = getJSON("/api/ai-policy", { signal, fresh: true }).catch(() => null);
+  const { data, stale } = await policyRequest;
+  const aiResult = await aiRequest;
   syncDraftState(data);
   currentContext = context;
   currentData = { ...data, stale };
+  const aiStale = isAiPolicyApplying() || fetchEpoch !== aiPolicyEpoch();
+  if (!aiStale) {
+    currentAiData = aiResult ? { ...aiResult.data, stale: aiResult.stale } : unavailableAiPolicy(data.csrf_token);
+  }
   const node = buildView(currentData, currentContext);
   mountedRoot = node;
   return node;

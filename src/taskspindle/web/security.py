@@ -1,9 +1,10 @@
 """Loopback, origin, CSRF and body-size guards shared by the dashboard's mutating routes.
 
 Every check here is defense in depth around a single fact: the dashboard binds to loopback and
-its only write surface is the dispatch policy. A request must resolve to the local machine at the
-TCP and HTTP layers, come from the page the dashboard itself served, and carry the per-process
-CSRF token that page received, before its body is even read.
+its mutating surfaces are the dispatch policy and the optional Codex AI-policy adapter. A request
+must resolve to the local machine at the TCP and HTTP layers, come from the page the dashboard
+itself served, and carry the per-process CSRF token that page received, before its body is even
+read.
 """
 
 from __future__ import annotations

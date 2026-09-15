@@ -3,8 +3,9 @@
 `taskspindle web` serves a local operator console over HTTP. It presents the same tasks, turns,
 checks, reviews, cached worker status and usage rollups that the MCP tools and CLI read. The task
 database is opened `mode=ro`, so a dashboard bug cannot corrupt what a running worker is writing.
-The Policy page is the one exception: it edits the dispatch policy that steers Codex, through a
-narrowly guarded write path described below.
+The Policy page is the mutating exception: it edits the dispatch policy that steers Codex, and it
+can ask a fixed Codex AI-mode adapter (when one is configured) to switch Ensemble or Native for
+new sessions. Both paths are narrowly guarded as described below.
 
 ## Starting it
 
@@ -36,15 +37,34 @@ may not exist yet — `/api/health` says so, and every list renders empty instea
 Overview and Workers use only that cached state. Loading either page starts no provider process,
 native quota check, doctor probe, browser, or billing collection.
 
-The Policy page is the dashboard's only write path. Its writes require: a loopback peer and
-matching `Host`; a same-origin `Origin`; the per-process `X-TaskSpindle-CSRF` header, whose token
-is served by the page's own GET; a JSON object body of at most 64 KiB; and a state database already
-at schema 11 — the dashboard never migrates, so an older database answers `503 POLICY_UNAVAILABLE`
-instead. Underneath that, the dashboard's write connection carries a SQLite authorizer that permits
-writes to only the two policy tables; every task table stays read-only even on that connection, so
-a bug in the Policy page cannot touch task history. Every other page and route remains exactly what
-it was: a read-only connection with `PRAGMA query_only=1`, no provider process, no native quota
-check, no doctor probe, no browser, no billing collection.
+The Policy page holds the dashboard's mutating routes. Dispatch-policy writes require: a loopback
+peer and matching `Host`; a same-origin `Origin`; the per-process `X-TaskSpindle-CSRF` header, whose
+token is served by the page's own GET; a JSON object body of at most 64 KiB; and a state database
+already at schema 11 — the dashboard never migrates, so an older database answers
+`503 POLICY_UNAVAILABLE` instead. Underneath that, the dashboard's write connection carries a SQLite
+authorizer that permits writes to only the two policy tables; every task table stays read-only even
+on that connection, so a bug in the Policy page cannot touch task history.
+
+`GET`/`PUT /api/ai-policy` uses the same loopback peer and `Host` checks; `PUT` also requires
+same-origin `Origin`, the process CSRF token, and a JSON object body of at most 64 KiB. The browser
+cannot supply an executable, argv, or filesystem path. The only process the dashboard will spawn is
+the optional trusted adapter from TaskSpindle's existing `config.toml`:
+
+```toml
+[ai_policy]
+command = ["/absolute/executable", "fixed arg"]
+hosts = ["windows", "wsl"]
+```
+
+`command` is a fixed argv (never a shell). `hosts` names the Codex hosts the adapter may address.
+A missing or invalid table, or a missing executable, is reported as `unavailable` per host — the
+dashboard does not invent a command, does not call a provider, and does not write `config.toml` or
+the task database. Status and apply results come from the adapter's JSON stdout. Changes apply to
+new Codex sessions only.
+
+Every other page and route remains exactly what it was: a read-only connection with
+`PRAGMA query_only=1`, no provider process, no native quota check, no doctor probe, no browser, no
+billing collection.
 
 ## What it shows
 
@@ -76,12 +96,19 @@ check, no doctor probe, no browser, no billing collection.
   are read-only account diagnostics; they are not task charges or spending controls.
   Automatic recovery shows the configured policy, current state, remaining attempts, next attempt,
   hold reason, and any active task. Older runtime responses without that projection remain valid.
-- **Policy** — the dispatch policy document and its observed status: per-provider shares, budgets
-  and enable state; per-role briefs, provider preference, model/effort selections and timeouts; and
-  the read-only `[concurrency]`, `[native_overage]` and `[provider_recovery]` tables from
-  `config.toml` for context. The page holds a draft while you edit — polling pauses — validates
-  locally, and saves the whole document against the revision it was loaded from; every save is kept
-  in history. See [dispatch-policy.md](dispatch-policy.md#editing).
+- **Policy** — at the top, an independent Codex AI mode card (Ensemble or Native, host Both /
+  Windows / WSL, Apply) with per-host `configured`, `needs repair`, `unavailable`, `update failed`,
+  or mixed state. Ensemble is TaskSpindle-first with native fallback; Native turns external
+  integration off and retains Codex subagents. Apply talks to `/api/ai-policy` and does not dirty
+  the dispatch-policy draft; a successful apply names the mode and tells you to start a new Codex
+  conversation. Routine integrity checks stay collapsed; failures stay visible. Below that, the
+  dispatch policy document and its
+  observed status: per-provider shares, budgets and enable state; per-role briefs, provider
+  preference, model/effort selections and timeouts; and the read-only `[concurrency]`,
+  `[native_overage]` and `[provider_recovery]` tables from `config.toml` for context. The dispatch
+  editor holds a draft while you edit — polling pauses — validates locally, and saves the whole
+  document against the revision it was loaded from; every save is kept in history. See
+  [dispatch-policy.md](dispatch-policy.md#editing).
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
   choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
   counts, window telemetry notes, and the cost-estimate disclaimer. Billing classifications count
@@ -110,8 +137,8 @@ and an `initialize` probe — matching `taskspindle doctor` without `--no-live`.
 
 ## JSON API
 
-Routes below are GET-only except the policy routes; other methods on a GET-only route are `405`.
-Errors are JSON, never a traceback.
+Routes below are GET-only except the policy and AI-policy routes; other methods on a GET-only
+route are `405`. Errors are JSON, never a traceback.
 
 | Route | Returns |
 | --- | --- |
@@ -128,14 +155,26 @@ Errors are JSON, never a traceback.
 | `/api/policy/reset` | POST `{if_revision}`: the GET payload after saving the defaults |
 | `/api/policy/history?limit=50` | GET: `{history: [{revision, updated_at, updated_by, fingerprint, reason}]}` |
 | `/api/policy/history/{revision}` | GET: `{revision, policy, updated_at, updated_by, reason}`; `404 POLICY_REVISION_NOT_FOUND` |
+| `/api/ai-policy` | GET: `{hosts, applies_to: "new_sessions", csrf_token}` from the configured adapter (`action: "status"`). Missing adapter: per-host `unavailable`. `Cache-Control: no-store`. Loopback peer and `Host` required. |
+| `/api/ai-policy` | PUT `{mode, hosts, expected_revisions}`: `{hosts, results, applies_to: "new_sessions", csrf_token}` after `action: "use"`. `409 AI_POLICY_APPLY_FAILED` when any host fails (including a stale revision); the body still carries fresh per-host status. Never a top-level success when any host failed. |
 
-The policy `PUT` and `POST` routes are the dashboard's only mutating routes, and only they carry the
-guards described under [Trust model](#trust-model) — loopback peer and `Host`, same-origin `Origin`,
-the `X-TaskSpindle-CSRF` header, a bounded JSON body, and the schema-11 SQLite authorizer limiting
-writes to the two policy tables. `/api/health.read_only` reflects that: it is `false` because the
-process now has one write path, while `task_database_read_only` stays `true` because the task
-tables are never in it. `policy_writable` is false when the guards would refuse a write regardless
-of the request (for example, not bound to loopback); `policy_schema_ready` is false below schema 11.
+The policy `PUT`/`POST` routes and `PUT /api/ai-policy` are the dashboard's mutating routes, and
+only they carry the guards described under [Trust model](#trust-model) — loopback peer and `Host`,
+same-origin `Origin` and the `X-TaskSpindle-CSRF` header on writes, and a bounded JSON body.
+Dispatch-policy writes also use the schema-11 SQLite authorizer limiting writes to the two policy
+tables. AI-policy writes never touch those tables or `config.toml`; they send JSON to the configured
+adapter on stdin and read JSON on stdout. `/api/health.read_only` reflects that: it is `false`
+because the process has mutating routes, while `task_database_read_only` stays `true` because the
+task tables are never in them. `policy_writable` is false when the dispatch-policy guards would
+refuse a write regardless of the request (for example, not bound to loopback);
+`policy_schema_ready` is false below schema 11.
+
+The AI-policy adapter contract is stdin
+`{action: "status"|"use", hosts, mode (use only), expected_revisions (required for use)}` and
+stdout `{hosts: [{host, mode, status, revision, checks, error?}], results?: [{host, ok, error?}]}`.
+`status` is `configured`, `needs_repair`, `unavailable`, or `update_failed`. A stale
+`expected_revisions` value becomes a failed result with the adapter's fresh host status. Partial
+apply errors keep that fresh per-host state and never claim that every host succeeded.
 
 `/` serves the page itself; `/static/*` serves its packaged modules and styles. The console uses
 plain HTML, CSS, and JavaScript — no build step or CDN, and no request leaves the browser's own

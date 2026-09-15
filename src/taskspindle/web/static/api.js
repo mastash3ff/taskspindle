@@ -38,7 +38,7 @@ async function sendJSON(method, path, body, csrfToken, { signal } = {}) {
     signal,
   });
   const data = await parseResponse(response);
-  clearCache("/api/policy");
+  clearCache(path);
   return data;
 }
 

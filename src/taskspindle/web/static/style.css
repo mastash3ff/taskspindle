@@ -124,6 +124,16 @@ textarea.policy-note { width: 100%; min-height: 64px; padding: .55rem .65rem; bo
 .save-bar .callout { width: 100%; margin-top: 0; }
 .history-list { margin: .6rem 0 0; padding: 0; list-style: none; display: grid; gap: .4rem; }
 .history-list li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .5rem; padding: .5rem .6rem; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-raised); font-size: .8rem; }
+.ai-policy-card { display: grid; gap: .85rem; }
+.ai-policy-fieldset { margin: 0; padding: 0; border: 0; }
+.ai-policy-fieldset legend { color: var(--muted); font-size: .7rem; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+.radio-row { display: flex; flex-wrap: wrap; gap: .55rem 1rem; margin: .35rem 0 .15rem; }
+.radio-option { display: inline-flex; align-items: center; gap: .45rem; color: var(--text); font-size: .9rem; font-weight: 650; cursor: pointer; }
+.radio-option input { accent-color: var(--teal); }
+.ai-policy-hosts { display: grid; gap: .45rem; margin: .55rem 0 0; padding: 0; list-style: none; }
+.ai-policy-host { display: flex; flex-wrap: wrap; align-items: center; gap: .55rem .8rem; padding: .55rem .7rem; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-raised); }
+.ai-policy-host .panel-note { margin: 0; }
+.ai-policy-check-failures { margin: 0; padding: .35rem .7rem; border-left: 3px solid var(--red); border-radius: 3px 8px 8px 3px; background: var(--red-wash); }
 @media (max-width: 430px) {
   .save-bar { flex-direction: column; align-items: stretch; }
   .save-bar-actions { justify-content: stretch; }

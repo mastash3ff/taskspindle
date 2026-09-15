@@ -42,6 +42,30 @@ test("putJSON sends the CSRF header and same-origin credentials, and clears the 
   assert.equal(refetched.data.marker, "stale-cache-check");
 });
 
+test("putJSON to AI policy clears only that cache", async () => {
+  clearCache();
+  globalThis.fetch = async () => new Response(JSON.stringify({ revision: 1, marker: "policy" }), { status: 200 });
+  await getJSON("/api/policy", { fresh: true });
+  globalThis.fetch = async () => new Response(JSON.stringify({ hosts: [], marker: "ai" }), { status: 200 });
+  await getJSON("/api/ai-policy", { fresh: true });
+
+  globalThis.fetch = async (path) => {
+    if (path === "/api/ai-policy") return new Response(JSON.stringify({ hosts: [], marker: "ai-written" }), { status: 200 });
+    return new Response("{}", { status: 500 });
+  };
+  await putJSON("/api/ai-policy", { mode: "native", hosts: ["windows"], expected_revisions: { windows: "r1" } }, "csrf");
+
+  globalThis.fetch = async (path) => {
+    if (path === "/api/policy") return new Response(JSON.stringify({ marker: "policy-should-stay-cached" }), { status: 200 });
+    return new Response(JSON.stringify({ marker: "ai-refetch" }), { status: 200 });
+  };
+  const policyCached = await getJSON("/api/policy");
+  assert.equal(policyCached.cached, true);
+  assert.equal(policyCached.data.marker, "policy");
+  const aiFresh = await getJSON("/api/ai-policy", { fresh: true });
+  assert.equal(aiFresh.data.marker, "ai-refetch");
+});
+
 test("putJSON surfaces server errors as APIError with status and payload", async () => {
   clearCache();
   globalThis.fetch = async () => new Response(JSON.stringify({ error: "POLICY_REVISION_CONFLICT", current_revision: 11 }), { status: 409 });

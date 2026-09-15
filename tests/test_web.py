@@ -640,6 +640,28 @@ def test_non_get_methods_are_refused(tmp_path: Path) -> None:
     assert client.delete("/api/tasks").status_code == 405
 
 
+def test_ai_policy_get_does_not_create_or_write_the_task_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    db_path = paths.state_dir / "taskspindle.sqlite3"
+    monkeypatch.setattr(
+        "taskspindle.web.app.provider_availability",
+        lambda *args, **kwargs: pytest.fail("AI policy must not call providers"),
+    )
+    client = TestClient(
+        build_app(paths, PROFILES),
+        base_url="http://127.0.0.1:8765",
+        client=("127.0.0.1", 50000),
+    )
+    response = client.get("/api/ai-policy")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applies_to"] == "new_sessions"
+    assert all(row["status"] == "unavailable" for row in body["hosts"])
+    assert not db_path.exists()
+
+
 def test_read_only_store_raises_on_any_write(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     _seed(paths)
