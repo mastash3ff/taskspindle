@@ -369,6 +369,158 @@ def test_live_probes_can_be_skipped(
     assert all(argv[0] != "grok" or argv[1] == "--version" for argv in live.calls)
 
 
+@pytest.mark.parametrize("reported", [
+    "grok 1.0.13", "grok 1.0.30", "grok 1.0.30 (04b7ffed98c6)",
+    "grok 1.0.31", "grok 2.0.0-beta+build", "Grok CLI v3.0.0 (new format)", "",
+])
+def test_grok_version_labels_do_not_gate_compatibility(paths: Paths, tmp_path: Path, reported: str) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    runner = RecordedRunner({**HEALTHY, "grok": (0, f"{reported}\n")})
+
+    report = run(paths, tmp_path, runner)
+    check = by_name(report)["grok_cli"]
+
+    assert report["ok"] is True
+    assert check["ok"] is True
+    assert check["advisory"] is True
+    assert "informational only" in check["detail"]
+    assert "requires a live probe" in check["detail"]
+
+
+@pytest.mark.parametrize("answer,compatible", [
+    (HANDSHAKE, True),
+    (InitInfo(load_session=False, auth_method_ids=("cached_token",), agent_info={}), False),
+    (InitInfo(load_session=True, auth_method_ids=("api_key",), agent_info={}), False),
+    (RuntimeError("sandbox startup failed"), False),
+])
+def test_updated_grok_is_judged_by_actual_capabilities(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer, compatible: bool,
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    auth = tmp_path / ".grok/auth.json"
+    auth.parent.mkdir()
+    auth.touch()
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", _fake_probe(answer))
+    runner = RecordedRunner({**HEALTHY, "/bin/sh": (0, "grok 9.0.0 preview")})
+
+    report = run(paths, tmp_path, runner, profiles={"grok": profile("grok")}, live_probes=True)
+
+    assert report["ok"] is compatible
+    assert by_name(report)["grok_acp"]["ok"] is compatible
+    assert by_name(report)["grok_acp"]["advisory"] is False
+    assert ("/bin/sh", "--version") in runner.calls
+    assert ("grok", "--version") not in runner.calls
+
+
+def test_failed_version_diagnostic_does_not_override_working_grok(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    auth = tmp_path / ".grok/auth.json"
+    auth.parent.mkdir()
+    auth.touch()
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", _fake_probe(HANDSHAKE))
+    report = run(paths, tmp_path, RecordedRunner(), profiles={"grok": profile("grok")}, live_probes=True)
+    assert by_name(report)["grok_cli"]["ok"] is False
+    assert by_name(report)["grok_cli"]["advisory"] is True
+    assert report["ok"] is True
+
+
+def test_missing_grok_executable_is_still_a_hard_failure(paths: Paths, tmp_path: Path) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    missing = str(tmp_path / "missing-grok")
+    report = run(paths, tmp_path, RecordedRunner(),
+                 profiles={"grok": profile("grok", command=(missing,))})
+    assert by_name(report)["grok_cli"]["advisory"] is True
+    assert by_name(report)["profile_grok_command"]["ok"] is False
+    assert by_name(report)["profile_grok_command"]["advisory"] is False
+    assert report["ok"] is False
+
+
+@pytest.mark.parametrize("answer,compatible", [
+    (InitInfo(load_session=False, auth_method_ids=(), agent_info={"name": "claude-adapter"}), True),
+    (InitInfo(load_session=False, auth_method_ids=("api_key",), agent_info={}), True),
+    (RuntimeError("adapter protocol changed"), False), (None, False),
+])
+def test_builtin_claude_adapter_gets_a_live_capability_check(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, answer, compatible: bool,
+) -> None:
+    install_adapter(paths, taskspindle.ADAPTER_VERSION)
+    auth = tmp_path / ".grok/auth.json"
+    auth.parent.mkdir()
+    auth.touch()
+
+    async def init(self, selected, workspace):
+        response = HANDSHAKE if selected.family == "grok" else answer
+        return await _fake_probe(response)(self, selected, workspace)
+
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", init)
+    report = run(paths, tmp_path, RecordedRunner(), live_probes=True,
+                 profiles={"claude": profile("claude", first_class=True), "grok": profile("grok")})
+    check = by_name(report)["acp_claude"]
+    assert check["ok"] is compatible
+    assert check["advisory"] is False
+    assert report["ok"] is compatible
+    if answer is None:
+        assert check["detail"].startswith("protocol:")
+
+
+def test_no_live_skips_claude_initialization_and_agy_catalog(
+    paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*args, **kwargs):
+        pytest.fail("no-live must not run this probe")
+
+    monkeypatch.setattr(doctor._Doctor, "_init_probe", forbidden)
+    monkeypatch.setattr(doctor._Doctor, "agy_oauth", forbidden)
+    report = run(paths, tmp_path, RecordedRunner(), profiles={
+        "claude": profile("claude", first_class=True), "agy": profile("agy", first_class=True),
+    })
+    assert "acp_claude" not in by_name(report)
+    assert "agy_oauth" not in by_name(report)
+
+
+@pytest.mark.parametrize("family", ["grok", "claude", "agy", "shell"])
+async def test_initialize_uses_grok_consult_launch_and_preserves_other_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str,
+) -> None:
+    selected = profile(family, command=("/bin/sh", "agent", "acp"))
+    launch_calls = []
+    worker_options = []
+    launch_command = doctor.providers.launch_command
+
+    def record_launch(selected_profile, mode):
+        launch_calls.append((selected_profile, mode))
+        return launch_command(selected_profile, mode)
+
+    class Worker:
+        def __init__(self, **options):
+            worker_options.append(options)
+            self.init = HANDSHAKE
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(doctor.providers, "launch_command", record_launch)
+    monkeypatch.setattr(doctor, "AcpWorker", Worker)
+
+    assert await doctor.probe_initialize(selected, {"HOME": str(tmp_path)}, tmp_path) is HANDSHAKE
+
+    assert len(worker_options) == 1
+    if family == "grok":
+        assert launch_calls == [(selected, "consult")]
+        assert worker_options[0]["command"] == (
+            "/bin/sh", *doctor.providers.GROK_READ_ONLY_FLAGS, "agent", "acp",
+        )
+        assert worker_options[0]["command"] != selected.command
+    else:
+        assert launch_calls == []
+        assert worker_options[0]["command"] == selected.command
+
+
 def test_a_configured_profile_is_probed_for_an_acp_handshake(
     paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

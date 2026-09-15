@@ -56,7 +56,7 @@ def test_claude_exact_command_uses_selected_environment_and_removes_temporary_fi
     temporary = []
 
     def run(argv, **kwargs):
-        assert argv == ["claude", "auth", "status"]
+        assert argv == ["claude", "auth", "status", "--json"]
         assert kwargs["stdin"] == subprocess.DEVNULL
         assert kwargs["capture_output"] is True and kwargs["text"] is True and kwargs["check"] is False
         assert kwargs["timeout"] == 15

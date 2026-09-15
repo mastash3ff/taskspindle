@@ -12,12 +12,14 @@ unit, so most of the requirements are things it launches rather than things it b
 - **git 2.38 or newer.** Acceptance probes a merge with `git merge-tree --write-tree`, which needs
   that version to behave the way TaskSpindle relies on.
 - **Codex CLI**, which is what talks to the MCP server.
-- **Claude Code, logged in to a Pro or Max subscription.** `claude auth status` must report
+- **Claude Code, logged in to a Pro or Max subscription.** `claude auth status --json` must report
   `loggedIn: true`, `authMethod: claude.ai`, `subscriptionType: pro` or `max`, and
   `apiProvider: firstParty`.
   TaskSpindle reads those four fields and nothing else out of the payload.
-- **Grok CLI 1.0.13**, logged in at grok.com, with `~/.grok/auth.json` present. The version is
-  pinned to a prefix because the ACP endpoint and config keys were verified against that build.
+- **Grok CLI with compatible ACP capabilities**, logged in at grok.com, with
+  `~/.grok/auth.json` present. Its version label is informational, not an allowlist.
+  The real read-only sandbox launch must initialize and advertise session loading
+  and a supported OAuth authentication method.
 
 TaskSpindle never logs you in and never copies a credential. Both provider CLIs hold their own
 sessions; TaskSpindle only asks them whether they have one.
@@ -51,8 +53,10 @@ fresh machine tells you everything that is missing rather than the first thing t
 
 `[warn]` marks an advisory check: it describes a setup that is merely convenient and never makes
 the run fail. `taskspindle doctor --json` prints the same report as JSON, and
-`taskspindle doctor --no-live` skips the two checks that start a process (a transient systemd unit
-and a Grok ACP handshake).
+`taskspindle doctor --no-live` skips launch probes, including the transient systemd unit,
+Grok and Claude ACP initialization, and AGY cached catalog access. It still runs bounded
+local diagnostics such as version and cached-auth commands. A passing `--no-live` report
+does not establish protocol compatibility or model-turn access.
 
 TaskSpindle also has `taskspindle worker` and `taskspindle accept` subcommands, invoked by systemd
 units for detached work and acceptance — not for interactive use.
@@ -79,6 +83,28 @@ mode `0700`.
 and the detached units alike.
 
 ## Upgrading
+
+### Daily provider CLI updates
+
+| Provider | Update boundary | Compatibility evidence |
+| --- | --- | --- |
+| Grok | Uses the daily CLI; a new version or changed version banner does not veto readiness | Actual sandboxed ACP initialization, session-loading and OAuth capabilities; task-time permission and model checks |
+| Claude | Worker uses the managed, locked ACP adapter/SDK and pinned Node; daily CLI supplies cached auth diagnostics | Explicit JSON output; extra fields ignored, required OAuth fields validated; live managed-adapter initialization |
+| AGY | Worker uses a private executable and companion binaries; an updated daily CLI does not replace an existing installation | Owned executable/companion checks, cached model catalog and task-time stream/permission checks |
+
+Run `taskspindle doctor` after an update to inspect actual launch readiness. Version output
+alone cannot prove compatibility. Missing required protocol features, unsafe paths, changed
+authentication context, or quota/billing restrictions still block the affected operation.
+There is no automatic provider substitution, credential rebinding, or paid fallback.
+
+Managed adapter pins are reproducible installation boundaries, not restrictions on daily
+Claude or AGY versions. Do not overwrite an active runtime or fall back to PATH if a pin is
+damaged. AGY's first installation into an empty runtime still needs its qualified source
+build; a newer daily binary is not silently adopted. Explicit `setup` rebuilds Claude from
+the shipped lock, so drain active workers before provisioning. Automatic adoption of new
+managed adapter versions is separate from tolerating daily CLI updates.
+
+### TaskSpindle releases
 
 ```sh
 uv tool upgrade taskspindle    # or: uv tool install --force "git+...@v0.5.0"

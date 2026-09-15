@@ -38,6 +38,7 @@ from .providers import Profile
 from .setup import ADAPTER_BIN
 
 __all__ = [
+    "GROK_TESTED_VERSIONS",
     "GROK_VERSION_PREFIX",
     "MIN_GIT",
     "MIN_NODE",
@@ -53,8 +54,11 @@ MIN_GIT = (2, 38)
 #: The oldest Node the pinned adapter is supported on.
 MIN_NODE = (22,)
 
-#: The Grok CLI build whose ACP endpoint and config keys TaskSpindle was written against.
-GROK_VERSION_PREFIX = "grok 1.0.13"
+#: Historical smoke-tested versions, retained as metadata rather than an admission allowlist.
+GROK_TESTED_VERSIONS = ("1.0.13", "1.0.30")
+
+#: Legacy exported name; readiness is established by protocol capabilities, not this label.
+GROK_VERSION_PREFIX = f"grok {GROK_TESTED_VERSIONS[0]}"
 
 #: ``systemctl --user is-system-running`` answers TaskSpindle can work with.
 _HEALTHY_SYSTEMD = frozenset({"running", "degraded"})
@@ -104,7 +108,10 @@ async def probe_initialize(
     env = providers.build_child_env(profile, parent_env, task_tmp=workspace / "tmp")
     (workspace / "tmp").mkdir(parents=True, exist_ok=True)
     worker = AcpWorker(
-        command=profile.command,
+        command=(
+            providers.launch_command(profile, "consult")
+            if profile.family == "grok" else profile.command
+        ),
         env=env,
         cwd=workspace,
         stderr_path=workspace / "agent.stderr",
@@ -314,15 +321,20 @@ class _Doctor:
             return f"{taskspindle.ADAPTER_PACKAGE} {found} at {manifest.parent}"
 
     def grok_cli(self) -> None:
-        @self.check("grok_cli")
+        # A daily CLI update may change the version label or its formatting without
+        # changing ACP. Executable presence and the real sandboxed handshake are
+        # checked separately; version output must never veto a working provider.
+        @self.check("grok_cli", advisory=True)
         def probe() -> str:
-            proc = self.run(["grok", "--version"])
+            profile = self.profiles.get("grok")
+            command = profile.command[0] if profile else "grok"
+            proc = self.run([command, "--version"])
             if proc.returncode != 0:
                 raise RuntimeError(f"grok --version exited {proc.returncode}")
             reported = (proc.stdout or "").strip()
-            if not reported.startswith(GROK_VERSION_PREFIX):
-                raise RuntimeError(f"{reported or 'nothing'} is not {GROK_VERSION_PREFIX}")
-            return reported
+            label = " ".join(reported.split())[:200] or "version unavailable"
+            return (f"{command} --version: {label}; informational only; "
+                    "ACP compatibility requires a live probe")
 
     def grok_sandbox_hooks(self) -> None:
         """Advisory: a symlinked hook source makes grok refuse to start its sandbox at all.
@@ -386,13 +398,13 @@ class _Doctor:
     async def _configured_acp(self) -> list[Check]:
         """Ask every configured profile's agent to initialize, in a directory of its own.
 
-        A first-class provider already has a check of its own -- ``claude_oauth`` and
-        ``grok_acp`` -- so this is the answer for the profiles that come from ``config.toml``,
-        which until now were only ever checked for a command on PATH.
+        Claude's cached OAuth claim is separate from its managed adapter's ability
+        to initialize. Probe that adapter too, independent of the daily CLI version.
+        Grok and native AGY have their own protocol-specific checks.
         """
         checks: list[Check] = []
         for profile_id, profile in sorted(self.profiles.items()):
-            if profile.first_class:
+            if profile.first_class and profile.family != "claude":
                 continue
             if profile.family == "agy":
                 from .agy_cli_adapter import agy_oauth_evidence
@@ -419,6 +431,12 @@ class _Doctor:
             except Exception as exc:
                 checks.append(Check(name, False, f"unreachable: {type(exc).__name__}: {exc}"))
                 continue
+            if init is None:
+                checks.append(Check(name, False, "protocol: agent did not return initialize capabilities"))
+                continue
+            # Initialization only: Claude does not inherit Grok's load-session or
+            # auth-method requirements here. OAuth is checked separately, and
+            # session mode/model/permissions are verified at actual task startup.
             agent = (init.agent_info.get("name") if init else None) or profile.command[0]
             checks.append(Check(name, True, f"configured: {agent} answered initialize"))
         return checks

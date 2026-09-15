@@ -97,7 +97,7 @@ def claude_like(script_path: Path) -> Profile:
 
 async def run_as_claude(store, paths, task, script_path: Path) -> TaskState:
     def cached_oauth(command: list[str]) -> subprocess.CompletedProcess[str]:
-        assert command == ["claude", "auth", "status"]
+        assert command == ["claude", "auth", "status", "--json"]
         return subprocess.CompletedProcess(
             command,
             0,
