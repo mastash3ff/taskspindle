@@ -522,6 +522,46 @@ GOOD_STATUS = {
 }
 
 
+def test_claude_auth_requests_json_and_tolerates_additive_cli_fields() -> None:
+    calls = []
+
+    def updated_cli(command):
+        calls.append(command)
+        return _completed({**GOOD_STATUS, "cliVersion": "99.0.0", "newField": {"unknown": True}})
+
+    evidence = claude_oauth_evidence(updated_cli)
+    assert calls == [["claude", "auth", "status", "--json"]]
+    assert evidence == {key: GOOD_STATUS[key] for key in (
+        "loggedIn", "authMethod", "subscriptionType", "apiProvider",
+    )}
+
+
+@pytest.mark.parametrize("returncode", [0, 2])
+def test_claude_changed_json_flag_contract_fails_with_redacted_diagnostics(returncode: int) -> None:
+    def incompatible_cli(command):
+        return subprocess.CompletedProcess(command, returncode, "PRIVATE_OUTPUT", "PRIVATE_USAGE")
+
+    with pytest.raises(ProfileError) as error:
+        claude_oauth_evidence(incompatible_cli)
+    assert error.value.code == "OAUTH_REJECTED"
+    assert "claude auth status --json" in str(error.value)
+    assert "PRIVATE" not in str(error.value)
+
+
+def test_daily_cli_updates_do_not_retarget_managed_worker_commands(tmp_path: Path) -> None:
+    daily = tmp_path / "home/.local/bin"
+    daily.mkdir(parents=True)
+    for name in ("claude", "agy", "claude-agent-acp"):
+        (daily / name).write_text("old daily CLI")
+    before = _builtins(tmp_path)
+    for name in ("claude", "agy", "claude-agent-acp"):
+        (daily / name).write_text("new daily CLI")
+    after = _builtins(tmp_path)
+    for name in ("claude", "agy"):
+        assert before[name].command == after[name].command
+        assert Path(after[name].command[0]).is_relative_to(_dirs(tmp_path)["runtime_dir"])
+
+
 @pytest.mark.parametrize("plan", ["pro", "max"])
 def test_claude_oauth_evidence_is_redacted(plan: str) -> None:
     evidence = claude_oauth_evidence(lambda _command: _completed({**GOOD_STATUS, "subscriptionType": plan}))

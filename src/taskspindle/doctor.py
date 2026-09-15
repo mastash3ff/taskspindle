@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import shutil
 import subprocess
 import tempfile
@@ -55,10 +54,10 @@ MIN_GIT = (2, 38)
 #: The oldest Node the pinned adapter is supported on.
 MIN_NODE = (22,)
 
-#: Exact Grok CLI builds with verified ACP compatibility.
+#: Historical smoke-tested versions, retained as metadata rather than an admission allowlist.
 GROK_TESTED_VERSIONS = ("1.0.13", "1.0.30")
 
-#: Legacy exported name; readiness uses exact tested versions, never prefix matching.
+#: Legacy exported name; readiness is established by protocol capabilities, not this label.
 GROK_VERSION_PREFIX = f"grok {GROK_TESTED_VERSIONS[0]}"
 
 #: ``systemctl --user is-system-running`` answers TaskSpindle can work with.
@@ -321,21 +320,20 @@ class _Doctor:
             return f"{taskspindle.ADAPTER_PACKAGE} {found} at {manifest.parent}"
 
     def grok_cli(self) -> None:
-        @self.check("grok_cli")
+        # A daily CLI update may change the version label or its formatting without
+        # changing ACP. Executable presence and the real sandboxed handshake are
+        # checked separately; version output must never veto a working provider.
+        @self.check("grok_cli", advisory=True)
         def probe() -> str:
-            proc = self.run(["grok", "--version"])
+            profile = self.profiles.get("grok")
+            command = profile.command[0] if profile else "grok"
+            proc = self.run([command, "--version"])
             if proc.returncode != 0:
                 raise RuntimeError(f"grok --version exited {proc.returncode}")
             reported = (proc.stdout or "").strip()
-            match = re.fullmatch(
-                r"grok ([0-9]+\.[0-9]+\.[0-9]+)(?: \([0-9a-fA-F]{12}\))?", reported,
-            )
-            if match is None or match[1] not in GROK_TESTED_VERSIONS:
-                raise RuntimeError(
-                    f"{reported or 'nothing'} is not a tested Grok CLI build "
-                    f"({', '.join(GROK_TESTED_VERSIONS)})"
-                )
-            return reported
+            label = " ".join(reported.split())[:200] or "version unavailable"
+            return (f"{command} --version: {label}; informational only; "
+                    "ACP compatibility requires a live probe")
 
     def claude_oauth(self) -> None:
         @self.check("claude_oauth")
@@ -374,13 +372,13 @@ class _Doctor:
     async def _configured_acp(self) -> list[Check]:
         """Ask every configured profile's agent to initialize, in a directory of its own.
 
-        A first-class provider already has a check of its own -- ``claude_oauth`` and
-        ``grok_acp`` -- so this is the answer for the profiles that come from ``config.toml``,
-        which until now were only ever checked for a command on PATH.
+        Claude's cached OAuth claim is separate from its managed adapter's ability
+        to initialize. Probe that adapter too, independent of the daily CLI version.
+        Grok and native AGY have their own protocol-specific checks.
         """
         checks: list[Check] = []
         for profile_id, profile in sorted(self.profiles.items()):
-            if profile.first_class:
+            if profile.first_class and profile.family != "claude":
                 continue
             if profile.family == "agy":
                 from .agy_cli_adapter import agy_oauth_evidence
@@ -407,6 +405,12 @@ class _Doctor:
             except Exception as exc:
                 checks.append(Check(name, False, f"unreachable: {type(exc).__name__}: {exc}"))
                 continue
+            if init is None:
+                checks.append(Check(name, False, "protocol: agent did not return initialize capabilities"))
+                continue
+            # Initialization only: Claude does not inherit Grok's load-session or
+            # auth-method requirements here. OAuth is checked separately, and
+            # session mode/model/permissions are verified at actual task startup.
             agent = (init.agent_info.get("name") if init else None) or profile.command[0]
             checks.append(Check(name, True, f"configured: {agent} answered initialize"))
         return checks

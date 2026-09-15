@@ -122,13 +122,25 @@ def test_setup_copies_only_code_and_reuses_pin_after_daily_cli_changes(paths, en
     assert paths.config_file.read_text() == "# existing\n"
     assert not (paths.data_dir / "agy-home").exists()
     assert target.stat().st_mode & 0o777 == 0o700
+    original_stat = target.stat()
     source.write_bytes(b"later daily CLI")
     companion.write_bytes(b"later encoder")
+    calls = []
+
+    def updated_daily_runner(argv, **kwargs):
+        # The daily CLI now reports a different version. Reuse must not even probe it.
+        assert Path(argv[0]) == target
+        calls.append(tuple(argv))
+        return runner_with()(argv, **kwargs)
+
     assert setup.install_agy_runtime(
-        paths, runner=runner_with(), parent_env=environment,
+        paths, runner=updated_daily_runner, parent_env=environment,
     )["already_installed"] is True
+    assert calls == [(str(target), "--version")]
     assert target.read_bytes() == b"qualified build"
     assert (target.parent / "bin/webm_encoder").read_bytes() == b"qualified encoder"
+    assert target.stat().st_ino == original_stat.st_ino
+    assert target.stat().st_mtime_ns == original_stat.st_mtime_ns
 
 
 def test_setup_wrong_version_fails_before_installing(paths, environment):

@@ -655,6 +655,9 @@ def _rejected(field_name: str, detail: str) -> ProfileError:
     return ProfileError("OAUTH_REJECTED", f"claude auth status: {field_name} {detail}")
 
 
+CLAUDE_AUTH_STATUS_COMMAND = ("claude", "auth", "status", "--json")
+
+
 def claude_oauth_evidence(
     run: Callable[[list[str]], subprocess.CompletedProcess[str]] = default_runner,
 ) -> dict[str, Any]:
@@ -664,20 +667,20 @@ def claude_oauth_evidence(
     allowed fields; identity, credentials, and provider output never reach the result or errors.
     """
     try:
-        completed = run(["claude", "auth", "status"])
+        completed = run(list(CLAUDE_AUTH_STATUS_COMMAND))
     except OSError as exc:
-        raise ProfileError("OAUTH_REJECTED", "could not run claude auth status") from exc
+        raise ProfileError("OAUTH_REJECTED", "could not run claude auth status --json") from exc
     except subprocess.SubprocessError as exc:
-        raise ProfileError("OAUTH_REJECTED", "claude auth status failed") from exc
+        raise ProfileError("OAUTH_REJECTED", "claude auth status --json failed") from exc
 
     if completed.returncode != 0:
-        raise ProfileError("OAUTH_REJECTED", f"claude auth status exited {completed.returncode}")
+        raise ProfileError("OAUTH_REJECTED", f"claude auth status --json exited {completed.returncode}")
     try:
         payload = json.loads(completed.stdout or "")
     except ValueError as exc:
-        raise ProfileError("OAUTH_REJECTED", "claude auth status did not return JSON") from exc
+        raise ProfileError("OAUTH_REJECTED", "claude auth status --json did not return JSON") from exc
     if not isinstance(payload, dict):
-        raise ProfileError("OAUTH_REJECTED", "claude auth status did not return a JSON object")
+        raise ProfileError("OAUTH_REJECTED", "claude auth status --json did not return a JSON object")
 
     if payload.get("loggedIn") is not True:
         raise _rejected("loggedIn", "is not true")

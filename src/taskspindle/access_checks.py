@@ -50,7 +50,7 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
                 env.update(NO_BROWSER="1", CI="1", TERM="dumb", TMPDIR=temporary)
 
                 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
-                    if command != ["claude", "auth", "status"]:
+                    if command != list(providers.CLAUDE_AUTH_STATUS_COMMAND):
                         raise ValueError("Unsupported native check command")
                     completed = subprocess.run(
                         command,

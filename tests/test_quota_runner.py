@@ -107,7 +107,7 @@ async def test_claude_preflight_uses_the_worker_login_environment(store, paths, 
 
     monkeypatch.setattr(providers, "default_runner", auth_check)
     assert await run_task(store, paths, task, script_path, profile=profile) is TaskState.COMPLETED
-    assert called == [["claude", "auth", "status"]]
+    assert called == [["claude", "auth", "status", "--json"]]
 
 
 async def test_grok_preflight_checks_the_worker_custom_auth_directory(store, paths, script, monkeypatch):
