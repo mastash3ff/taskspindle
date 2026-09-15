@@ -280,6 +280,34 @@ async def test_an_implement_turn_records_a_candidate(
     assert turn["stop_reason"] == "end_turn"
 
 
+async def test_an_implement_turn_writes_a_settled_progress_file(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    repo = make_repo()
+    task = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=repo)
+    script_path = script(
+        {
+            "response": "added the file, a bit more than the bare minimum text",
+            "write": {"path": "src/new.txt", "content": "hello\n"},
+        }
+    )
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.RESULT_READY
+    progress_path = paths.state_dir / "tasks" / task.id / "progress.json"
+    assert progress_path.exists()
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert progress["phase"] == "settled"
+    assert progress["tool_calls"] >= 1
+    assert progress["text_chars"] > 0
+    assert progress["permission_requests"] >= 1
+    assert progress["violations"] == 0
+    assert isinstance(progress["revision"], int) and progress["revision"] >= 1
+    assert progress["updated_at"]
+    assert progress["last_event_at"]
+
+
 async def test_a_write_outside_the_declared_prefixes_is_a_scope_violation(
     store: Store, paths: Paths, make_repo, script
 ) -> None:

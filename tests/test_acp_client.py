@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -60,6 +60,7 @@ async def running_agent(
     script: dict[str, Any] | None = None,
     *,
     allow_writes: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> AsyncIterator[AcpWorker]:
     env = child_env(tmp_path)
     if script is not None:
@@ -72,6 +73,7 @@ async def running_agent(
         cwd=tmp_path,
         stderr_path=tmp_path / "agent.err",
         policy=PermissionPolicy(allow_writes=allow_writes),
+        on_progress=on_progress,
     )
     async with worker as running:
         yield running
@@ -603,3 +605,43 @@ async def test_adapter_tool_denial_without_permission_callback(
         result = await worker.prompt(session, "attempt", timeout=10)
     assert result.capture.permission_events == []
     assert result.capture.violations == expected
+
+
+# -- progress --------------------------------------------------------------------------------
+
+
+async def test_on_progress_fires_with_increasing_counters(tmp_path: Path) -> None:
+    snapshots: list[dict[str, Any]] = []
+    script = {
+        "response": "a longer scripted answer than the others in this file",
+        "write": {"path": "out/note.txt", "content": "written"},
+    }
+    async with running_agent(
+        tmp_path, script, allow_writes=True, on_progress=snapshots.append,
+    ) as worker:
+        session_id = await worker.new_session()
+        result = await worker.prompt(session_id, "go", timeout=10)
+
+    assert len(snapshots) >= 2
+    assert snapshots[-1]["tool_calls"] >= 1
+    assert snapshots[-1]["text_chars"] == len(result.text)
+    assert snapshots[-1]["permission_requests"] >= 1
+    assert snapshots[-1]["last_tool_title"] == "Write file"
+    # Every counter only ever grows across the sequence of calls for one turn.
+    for key in ("tool_calls", "tool_call_updates", "text_chars", "thought_chunks", "permission_requests"):
+        values = [snapshot[key] for snapshot in snapshots]
+        assert values == sorted(values)
+
+
+async def test_on_progress_never_breaks_the_turn(tmp_path: Path) -> None:
+    def failing_hook(_: dict[str, Any]) -> None:
+        raise RuntimeError("a progress hook that misbehaves")
+
+    async with running_agent(
+        tmp_path, {"response": "still fine"}, on_progress=failing_hook,
+    ) as worker:
+        session_id = await worker.new_session()
+        result = await worker.prompt(session_id, "go", timeout=10)
+
+    assert result.text == "still fine"
+    assert result.stop_reason == "end_turn"

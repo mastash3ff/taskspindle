@@ -105,7 +105,7 @@ def fake(tmp_path, **config):
     return (sys.executable, str(script), str(scenario))
 
 
-def worker(tmp_path, *, prior_usage=None, on_session=None, mode=None, **config):
+def worker(tmp_path, *, prior_usage=None, on_session=None, mode=None, on_progress=None, **config):
     return AgyCliWorker(
         fake(tmp_path, **config),
         {},
@@ -114,6 +114,7 @@ def worker(tmp_path, *, prior_usage=None, on_session=None, mode=None, **config):
         on_session,
         prior_usage=prior_usage,
         mode=mode,
+        on_progress=on_progress,
     )
 
 
@@ -403,6 +404,31 @@ async def test_tool_events_and_intermediate_messages_survive_final_answer(tmp_pa
     assert result.text == "The answer."
     assert result.capture.text == ["Inspecting the file.\n", "The answer."]
     assert result.capture.tool_calls[0]["tool_info"] == info
+
+
+async def test_on_progress_fires_with_increasing_counters(tmp_path):
+    info = {"name": "read_file", "parameters": {"path": "README.md"}, "output": "contents"}
+    snapshots = []
+    agent = worker(
+        tmp_path,
+        on_progress=snapshots.append,
+        actions=[
+            initial(),
+            step("Inspecting the file.\n"),
+            step("", index=2, step_type="tool", tool_name="read_file", tool_info=info),
+            step("The answer.", index=3),
+            terminal("The answer."),
+        ],
+    )
+    result = await prompt(agent)
+
+    assert result.text == "The answer."
+    assert len(snapshots) >= 2
+    assert snapshots[-1]["tool_calls"] >= 1
+    assert snapshots[-1]["text_chars"] == len("Inspecting the file.\nThe answer.")
+    for key in ("tool_calls", "tool_call_updates", "text_chars", "thought_chunks"):
+        values = [snapshot[key] for snapshot in snapshots]
+        assert values == sorted(values)
 
 
 async def test_observed_delegation_is_recorded(tmp_path):

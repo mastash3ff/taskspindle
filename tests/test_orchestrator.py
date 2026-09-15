@@ -335,6 +335,51 @@ def test_the_diff_is_paged_and_every_page_is_receipted(harness: Harness, make_re
     ) == []
 
 
+def test_task_status_reports_the_worker_progress_file(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+
+    status = harness.orchestrator.task_status(task_id)
+
+    progress_path = harness.orchestrator.paths.state_dir / "tasks" / task_id / "progress.json"
+    on_disk = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert status["progress"] == on_disk
+    assert status["progress"]["phase"] == "settled"
+    assert status["timeout_s"] == 60
+    assert status["elapsed_s"] is not None and status["elapsed_s"] >= 0
+    assert status["heartbeat_age_s"] is not None and status["heartbeat_age_s"] >= 0
+    assert status["progress_age_s"] is not None and status["progress_age_s"] >= 0
+
+
+def test_task_status_progress_is_null_before_any_turn_has_run(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.defer()
+
+    task_id = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    status = harness.orchestrator.task_status(task_id)
+
+    assert status["state"] == TaskState.QUEUED.value
+    assert status["progress"] is None
+    assert status["elapsed_s"] is None
+    assert status["heartbeat_age_s"] is None
+    assert status["progress_age_s"] is None
+    assert status["timeout_s"] == 60
+
+
+def test_task_status_tolerates_a_corrupt_progress_file(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    progress_path = harness.orchestrator.paths.state_dir / "tasks" / task_id / "progress.json"
+    progress_path.write_text("not json", encoding="utf-8")
+
+    status = harness.orchestrator.task_status(task_id)
+
+    assert status["progress"] is None
+    assert status["progress_age_s"] is None
+    assert status["state"] == TaskState.RESULT_READY.value
+
+
 def test_accepting_a_partly_read_candidate_is_refused(harness: Harness, make_repo) -> None:
     repo = make_repo()
     task_id = build_candidate(harness, repo)

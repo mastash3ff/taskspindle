@@ -319,6 +319,20 @@ carries `evidence` and `manual_action` — see [recovery.md](recovery.md). Error
 require the version you last saw, and answer `STALE_STATE_VERSION` if something moved underneath
 you.
 
+**Telling a stuck worker from a slow one.** `heartbeat_at` alone only proves the worker process is
+alive; it advances on a fixed interval whether or not the agent is doing anything. `task_status`
+also returns `progress`: the running worker's own `progress.json`, or `null` when the task has no
+turn in flight, no such file yet, or the file could not be parsed (never an error). When present
+it has `revision` (increments on every rewrite), `phase` (`"prompting"`, `"verifying"`,
+`"collapsing"`, or `"settled"`), `updated_at`, `tool_calls`, `tool_call_updates`, `text_chars`,
+`thought_chunks`, `permission_requests`, `violations`, `last_tool_title`, and `last_event_at` (the
+timestamp of the last agent activity of any kind, which can lag `updated_at`). Alongside it,
+`task_status` computes `elapsed_s` (seconds since `started_at`, or `null` before the turn starts),
+`heartbeat_age_s` (seconds since `heartbeat_at`, or `null`), `progress_age_s` (seconds since
+`progress.updated_at`, or `null` with no `progress`), and `timeout_s` (the task's own timeout).
+A heartbeat that keeps advancing while `progress` does not, for longer than a few minutes, is a
+stuck worker: cancel it.
+
 ### `task_result` — read-only
 
 `task_id`. Returns `{"task_id", "state", "response", "checks": [{"command", "exit_code", "ok",

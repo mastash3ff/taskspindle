@@ -25,6 +25,7 @@ from .acp_client import (
     AcpError,
     TurnCapture,
     TurnResult,
+    progress_snapshot,
 )
 
 _LINE_LIMIT = 1024 * 1024
@@ -262,6 +263,7 @@ class AgyCliWorker:
         *,
         prior_usage: Mapping[str, Any] | None = None,
         mode: str | None = None,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if mode not in {None, "consult", "review", "implement"}:
             raise ValueError("Unsupported AGY worker mode")
@@ -272,6 +274,9 @@ class AgyCliWorker:
         self.on_session = on_session
         self.prior_usage = _usage(prior_usage) if prior_usage is not None else None
         self.mode = mode
+        #: Told the turn's running counters on every observed step; see
+        #: :func:`taskspindle.acp_client.progress_snapshot`. A raising callback never breaks the turn.
+        self.on_progress = on_progress
         self.cumulative_usage: dict[str, int] | None = None
         self.last_result: TurnResult | None = None
         self.session_id: str | None = None
@@ -371,6 +376,13 @@ class AgyCliWorker:
         )
         raise AcpError("POLICY_VIOLATION", "AGY emitted activity outside the worker's fixed tool policy.")
 
+    def _emit_progress(self) -> None:
+        """Tell ``on_progress`` the turn's running counters. Never lets a bad hook fail the turn."""
+        if self.on_progress is None:
+            return
+        with contextlib.suppress(Exception):
+            self.on_progress(progress_snapshot(self._capture))
+
     async def _event(self, event: dict[str, Any]) -> None:
         if self._terminal is not None:
             raise _protocol("AGY emitted output after its terminal result.")
@@ -416,6 +428,7 @@ class AgyCliWorker:
                             raise _protocol("AGY emitted invalid tool details.")
                         tool[key] = step[key]
                 self._capture.tool_calls.append(tool)
+            self._emit_progress()
             self._guard_tool(step)
         elif kind == "result":
             result = event.get("result")

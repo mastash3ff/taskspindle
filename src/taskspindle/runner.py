@@ -20,6 +20,7 @@ import json
 import os
 import signal
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -78,6 +79,10 @@ __all__ = [
 
 #: How often the worker proves it is alive, in seconds.
 HEARTBEAT_INTERVAL_S = 5.0
+
+#: How often ``progress.json`` is rewritten from agent activity, in seconds. A phase change or
+#: turn end always writes regardless of this throttle -- see :class:`_ProgressWriter`.
+PROGRESS_WRITE_INTERVAL_S = 2.0
 
 #: Verification never runs longer than this, whatever the task's own timeout is.
 MAX_VERIFICATION_S = 1800
@@ -290,6 +295,8 @@ class _Run:
     quota_fingerprints_at_start: list[str] = field(default_factory=list)
     native_service_succeeded: bool = False
     policy_config_seen: bool = False
+    #: Rewrites ``progress.json`` from agent activity; ``None`` only before it is constructed.
+    progress: _ProgressWriter | None = None
 
     @property
     def task_id(self) -> str:
@@ -324,6 +331,73 @@ def _carried_warnings(warnings: list[str] | None) -> list[str]:
 
 def _task_dir(paths: Paths, task_id: str) -> Path:
     return paths.state_dir / "tasks" / task_id
+
+
+# -- progress ---------------------------------------------------------------------------------
+
+
+#: A progress counter snapshot has not been observed yet, and every count starts at zero.
+_INITIAL_PROGRESS_COUNTERS: dict[str, Any] = {
+    "tool_calls": 0,
+    "tool_call_updates": 0,
+    "text_chars": 0,
+    "thought_chunks": 0,
+    "permission_requests": 0,
+    "violations": 0,
+    "last_tool_title": None,
+}
+
+
+class _ProgressWriter:
+    """Rewrites ``<task dir>/progress.json`` so a coordinator can tell stuck from slow.
+
+    One instance per turn. ``on_progress`` is handed to :class:`~taskspindle.acp_client.AcpWorker`
+    or :class:`~taskspindle.agy_cli.AgyCliWorker` as their progress callback; it never raises, so an
+    agent that reports activity constantly cannot break the turn on that account. Writes are
+    throttled to :data:`PROGRESS_WRITE_INTERVAL_S` except at a phase change or turn end, which
+    always write so the file never goes stale while something real happened.
+    """
+
+    def __init__(self, run: _Run) -> None:
+        self._run = run
+        self._path = run.dir / "progress.json"
+        self._revision = 0
+        self._last_write_at = 0.0
+        self._phase = "prompting"
+        self._counters: dict[str, Any] = dict(_INITIAL_PROGRESS_COUNTERS)
+        self._last_event_at: str | None = None
+
+    def set_phase(self, phase: str) -> None:
+        """Record a phase transition and always rewrite the file."""
+        self._phase = phase
+        self._write(force=True)
+
+    def on_progress(self, snapshot: Mapping[str, Any]) -> None:
+        """The callback handed to the agent worker: merge counters, then write if it is time."""
+        self._counters.update(snapshot)
+        self._last_event_at = now()
+        self._write(force=False)
+
+    def _write(self, *, force: bool) -> None:
+        clock = time.monotonic()
+        if not force and clock - self._last_write_at < PROGRESS_WRITE_INTERVAL_S:
+            return
+        self._last_write_at = clock
+        self._revision += 1
+        payload = {
+            "revision": self._revision,
+            "phase": self._phase,
+            "updated_at": now(),
+            **self._counters,
+            "last_event_at": self._last_event_at,
+        }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            self._run.log.write(f"progress write failed: {exc}")
 
 
 def _pending_turn(store: Store, task_id: str) -> dict[str, Any] | None:
@@ -398,6 +472,7 @@ async def run_worker(
             continuation_model=(pending.get("native_overage") or {}).get("continuation_model"),
             warnings=_carried_warnings(task.warnings),
         )
+        run.progress = _ProgressWriter(run)
         log.write(f"start task={task_id} state={task.state.value} kind={kind.value} boot={boot}")
 
         stamp = now()
@@ -581,6 +656,7 @@ async def _run_turn(
         stderr_path=stderr_path,
         policy=_permission_policy(profile, task, workspace),
         late_update_grace=LATE_UPDATE_GRACE_S.get(profile.family, 0.0),
+        on_progress=run.progress.on_progress if run.progress is not None else None,
     )
     try:
         async with worker as agent:
@@ -721,6 +797,7 @@ def _native_agy_worker(run: _Run, profile: Profile, workspace: Path, stderr_path
     return AgyCliWorker(
         command=command, env=run.child_env, cwd=workspace, stderr_path=stderr_path,
         on_session=remember_session, prior_usage=prior_usage, mode=run.task.mode.value,
+        on_progress=run.progress.on_progress if run.progress is not None else None,
     )
 
 
@@ -1111,6 +1188,8 @@ async def _prompt(
     run: _Run, agent: AcpWorker | AgyCliWorker, cancel_event: asyncio.Event, *, native: bool = False,
 ) -> TurnResult:
     """Send the turn, racing it against a cancel request."""
+    if run.progress is not None:
+        run.progress.set_phase("prompting")
     if run.profile is not None:
         _capture_model_status_at_start(run, run.profile)
     session_id = run.session_id or ""
@@ -1475,6 +1554,8 @@ async def _finalize_implement(run: _Run, workspace: Path, result: TurnResult) ->
     task = run.task
     identity = _identity(workspace)
     revision = task.candidate_revision + 1
+    if run.progress is not None:
+        run.progress.set_phase("collapsing")
     try:
         if task.provider_family == "agy":
             forbidden = _agy_control_changes(workspace, task.base_head or "HEAD")
@@ -1532,6 +1613,8 @@ async def _finalize_implement(run: _Run, workspace: Path, result: TurnResult) ->
 
 async def _run_checks(run: _Run, workspace: Path, revision: int) -> dict[str, Any]:
     commands = run.task.verification_commands or []
+    if run.progress is not None:
+        run.progress.set_phase("verifying")
     # Off the event loop: verification can run for as long as the task's own timeout, and the
     # heartbeat has to keep beating while it does.
     results = await asyncio.to_thread(
@@ -1649,6 +1732,8 @@ def _settle_cancelled(run: _Run) -> TaskState:
 
 def _settle(run: _Run, state: TaskState, reason: str, **fields: Any) -> TaskState:
     """Write the transcript, then move the task to its final state for this turn."""
+    if run.progress is not None:
+        run.progress.set_phase("settled")
     transcript = _write_transcript(run)
     if transcript is not None:
         fields["transcript_path"] = str(transcript)

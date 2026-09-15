@@ -99,6 +99,7 @@ async def test_native_controls_in_new_directories_cannot_become_candidates(make_
     run = SimpleNamespace(
         task=SimpleNamespace(provider_family="agy", base_head=before, candidate_revision=0),
         warn=lambda *args: warnings.append(args),
+        progress=None,
     )
 
     def collapse(*args, **kwargs):

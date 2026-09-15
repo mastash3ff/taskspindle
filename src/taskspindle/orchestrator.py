@@ -1276,7 +1276,35 @@ class Orchestrator:
             if record.state is TaskState.RECOVERY_AMBIGUOUS:
                 view["evidence"] = self._last_recovery(task_id)
                 view["manual_action"] = MANUAL_ACTION
+            progress = self._read_progress(task_id)
+            moment = self.clock()
+            view["progress"] = progress
+            view["elapsed_s"] = _seconds_since(record.started_at, moment)
+            view["heartbeat_age_s"] = _seconds_since(record.heartbeat_at, moment)
+            view["progress_age_s"] = (
+                _seconds_since(progress.get("updated_at"), moment) if progress else None
+            )
+            view["timeout_s"] = record.timeout_s
         return view
+
+    def _read_progress(self, task_id: str) -> dict[str, Any] | None:
+        """The worker's ``progress.json`` for this task, parsed defensively.
+
+        A stuck worker looks like a heartbeat that keeps advancing while ``progress`` does not,
+        for longer than a few minutes -- see docs/tools.md. Never an error: a missing or corrupt
+        file is a normal state (no turn has run yet, or the worker crashed mid-write) and this is
+        a diagnostic convenience, not a fact ``task_status`` must have to answer.
+        """
+        path = self.paths.state_dir / "tasks" / task_id / "progress.json"
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
 
     def _last_recovery(self, task_id: str) -> dict[str, Any]:
         for event in reversed(self.store.list_events(task_id)):
@@ -1947,6 +1975,22 @@ class Orchestrator:
                 "details": {"task_id": record.id, "retained": retained},
             },
         }
+
+
+def _seconds_since(stamp: str | None, moment: datetime) -> float | None:
+    """Seconds between an ISO-8601 timestamp and ``moment``, or ``None`` with no timestamp.
+
+    Used by :meth:`Orchestrator.task_status` for ``elapsed_s``, ``heartbeat_age_s`` and
+    ``progress_age_s``: a coordinator polling those needs a number to compare against its own
+    poll interval, not another timestamp to parse itself.
+    """
+    if not isinstance(stamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (moment - parsed).total_seconds()
 
 
 class _Placement:
