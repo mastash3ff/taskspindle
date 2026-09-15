@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.0
 
 - **Provider refusal, quota, recovery, and native-overage machinery collapses to one rule.**
   `provider_status` (per provider: `ok | throttled | auth_expired | access_denied |
