@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -38,6 +39,7 @@ from .providers import Profile
 from .setup import ADAPTER_BIN
 
 __all__ = [
+    "GROK_TESTED_VERSIONS",
     "GROK_VERSION_PREFIX",
     "MIN_GIT",
     "MIN_NODE",
@@ -53,8 +55,11 @@ MIN_GIT = (2, 38)
 #: The oldest Node the pinned adapter is supported on.
 MIN_NODE = (22,)
 
-#: The Grok CLI build whose ACP endpoint and config keys TaskSpindle was written against.
-GROK_VERSION_PREFIX = "grok 1.0.13"
+#: Exact Grok CLI builds with verified ACP compatibility.
+GROK_TESTED_VERSIONS = ("1.0.13", "1.0.30")
+
+#: Legacy exported name; readiness uses exact tested versions, never prefix matching.
+GROK_VERSION_PREFIX = f"grok {GROK_TESTED_VERSIONS[0]}"
 
 #: ``systemctl --user is-system-running`` answers TaskSpindle can work with.
 _HEALTHY_SYSTEMD = frozenset({"running", "degraded"})
@@ -104,7 +109,10 @@ async def probe_initialize(
     env = providers.build_child_env(profile, parent_env, task_tmp=workspace / "tmp")
     (workspace / "tmp").mkdir(parents=True, exist_ok=True)
     worker = AcpWorker(
-        command=profile.command,
+        command=(
+            providers.launch_command(profile, "consult")
+            if profile.family == "grok" else profile.command
+        ),
         env=env,
         cwd=workspace,
         stderr_path=workspace / "agent.stderr",
@@ -319,8 +327,14 @@ class _Doctor:
             if proc.returncode != 0:
                 raise RuntimeError(f"grok --version exited {proc.returncode}")
             reported = (proc.stdout or "").strip()
-            if not reported.startswith(GROK_VERSION_PREFIX):
-                raise RuntimeError(f"{reported or 'nothing'} is not {GROK_VERSION_PREFIX}")
+            match = re.fullmatch(
+                r"grok ([0-9]+\.[0-9]+\.[0-9]+)(?: \([0-9a-fA-F]{12}\))?", reported,
+            )
+            if match is None or match[1] not in GROK_TESTED_VERSIONS:
+                raise RuntimeError(
+                    f"{reported or 'nothing'} is not a tested Grok CLI build "
+                    f"({', '.join(GROK_TESTED_VERSIONS)})"
+                )
             return reported
 
     def claude_oauth(self) -> None:

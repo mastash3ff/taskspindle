@@ -335,6 +335,79 @@ def test_live_probes_can_be_skipped(
     assert all(argv[0] != "grok" or argv[1] == "--version" for argv in live.calls)
 
 
+@pytest.mark.parametrize("reported", [
+    "grok 1.0.13", "grok 1.0.30", "grok 1.0.30 (04b7ffed98c6)",
+])
+def test_grok_doctor_accepts_exact_tested_versions(paths: Paths, tmp_path: Path, reported: str) -> None:
+    runner = RecordedRunner({**HEALTHY, "grok": (0, f"{reported}\n")})
+
+    check = by_name(run(paths, tmp_path, runner))["grok_cli"]
+
+    assert check["ok"] is True
+    assert check["detail"] == reported
+
+
+@pytest.mark.parametrize("reported", [
+    "grok 1.0.130", "grok 1.0.300", "grok 1.0.29", "grok 1.0.31", "grok 2.0.0",
+    "grok 1.0.30-beta", "grok 1.0.30.1", "grok 01.0.30", "grok 1.0.30 extra",
+    "grok v1.0.30", "other 1.0.30", "grok 1.0.30\ngrok 1.0.13", "",
+    "grok 1.0.130 (04b7ffed98c6)", "grok 1.0.31 (04b7ffed98c6)",
+    "grok 1.0.30 ()", "grok 1.0.30 (04b7ffed98cg)", "grok 1.0.30 (04b7ffed98c6",
+    "grok 1.0.30 (04b7ffed98c)", "grok 1.0.30 (04b7ffed98c60)",
+    "grok 1.0.30(04b7ffed98c6)", "grok 1.0.30 (04b7ffed98c6) extra",
+])
+def test_grok_doctor_rejects_unknown_or_malformed_versions(
+    paths: Paths, tmp_path: Path, reported: str,
+) -> None:
+    runner = RecordedRunner({**HEALTHY, "grok": (0, reported)})
+
+    check = by_name(run(paths, tmp_path, runner))["grok_cli"]
+
+    assert check["ok"] is False
+    assert "not a tested Grok CLI build (1.0.13, 1.0.30)" in check["detail"]
+
+
+@pytest.mark.parametrize("family", ["grok", "claude", "agy", "shell"])
+async def test_initialize_uses_grok_consult_launch_and_preserves_other_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, family: str,
+) -> None:
+    selected = profile(family, command=("/bin/sh", "agent", "acp"))
+    launch_calls = []
+    worker_options = []
+    launch_command = doctor.providers.launch_command
+
+    def record_launch(selected_profile, mode):
+        launch_calls.append((selected_profile, mode))
+        return launch_command(selected_profile, mode)
+
+    class Worker:
+        def __init__(self, **options):
+            worker_options.append(options)
+            self.init = HANDSHAKE
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(doctor.providers, "launch_command", record_launch)
+    monkeypatch.setattr(doctor, "AcpWorker", Worker)
+
+    assert await doctor.probe_initialize(selected, {"HOME": str(tmp_path)}, tmp_path) is HANDSHAKE
+
+    assert len(worker_options) == 1
+    if family == "grok":
+        assert launch_calls == [(selected, "consult")]
+        assert worker_options[0]["command"] == (
+            "/bin/sh", *doctor.providers.GROK_READ_ONLY_FLAGS, "agent", "acp",
+        )
+        assert worker_options[0]["command"] != selected.command
+    else:
+        assert launch_calls == []
+        assert worker_options[0]["command"] == selected.command
+
+
 def test_a_configured_profile_is_probed_for_an_acp_handshake(
     paths: Paths, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
