@@ -13,6 +13,7 @@ reads that state and only then calls :meth:`UnitBackend.reset_failed`.
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -62,6 +63,17 @@ COMMAND_TIMEOUT = 30.0
 
 #: Names copied into a unit's environment, plus every ``XDG_*`` name the parent has.
 _UNIT_ENV_NAMES = ("PATH", "HOME", "LANG", "DBUS_SESSION_BUS_ADDRESS")
+
+#: The one non-``_UNIT_ENV_NAMES``/``XDG_*`` name that is still not a secret.
+_TASKSPINDLE_CONFIG_ENV = "TASKSPINDLE_CONFIG"
+
+#: Unit name prefixes, also used in reverse to recover a task id from a unit name.
+_WORKER_UNIT_PREFIX = "taskspindle-worker-"
+_ACCEPT_UNIT_PREFIX = "taskspindle-accept-"
+
+#: Name of the ``EnvironmentFile`` written next to a unit's task, holding names ``start`` was not
+#: told are safe to put on argv or in ``systemctl show`` output -- API keys and tokens above all.
+_ENV_FILE_NAME = "unit.env"
 
 UnitKind = Literal["active", "success", "oom", "signal", "exit", "not_found", "unknown"]
 
@@ -231,7 +243,22 @@ class SystemdUserBackend(UnitBackend):
 
         ``--collect`` is deliberately absent: the unit must survive its own death so that
         :meth:`show` can still say how it died.
+
+        Only the names :func:`_is_public_env_name` calls safe -- ``PATH``, ``HOME``, ``LANG``,
+        ``DBUS_SESSION_BUS_ADDRESS``, every ``XDG_*`` name and ``TASKSPINDLE_CONFIG`` -- go on the
+        command line as ``--setenv``, where ``ps`` and ``systemctl show -p Environment`` can still
+        show them for diagnosis. Everything else, API keys and tokens above all, is written to a
+        0600 ``EnvironmentFile`` in the unit's task directory instead: ``systemd-run``'s argv ends
+        up in ``/proc/<pid>/cmdline`` for any local user to read while it runs, and the properties
+        it sets are echoed back by ``systemctl show`` for as long as the unit is loaded, but
+        neither reads the *contents* of an ``EnvironmentFile``.
         """
+        public_env = {name: value for name, value in env.items() if _is_public_env_name(name)}
+        secret_env = {name: value for name, value in env.items() if not _is_public_env_name(name)}
+        all_properties = dict(properties)
+        if secret_env:
+            env_file = _write_environment_file(working_dir, unit, secret_env)
+            all_properties["EnvironmentFile"] = str(env_file)
         command = [
             "systemd-run",
             "--user",
@@ -239,8 +266,8 @@ class SystemdUserBackend(UnitBackend):
             f"--unit={unit}",
             f"--slice={SLICE}",
             f"--working-directory={working_dir}",
-            *(f"--setenv={name}={value}" for name, value in sorted(env.items())),
-            *(f"--property={name}={value}" for name, value in sorted(properties.items())),
+            *(f"--setenv={name}={value}" for name, value in sorted(public_env.items())),
+            *(f"--property={name}={value}" for name, value in sorted(all_properties.items())),
             "--",
             *argv,
         ]
@@ -295,12 +322,69 @@ class SystemdUserBackend(UnitBackend):
 
 def worker_unit_name(task_id: str) -> str:
     """The unit a task's worker runs as. Task ids are already unique, so this is too."""
-    return f"taskspindle-worker-{task_id}"
+    return f"{_WORKER_UNIT_PREFIX}{task_id}"
 
 
 def accept_unit_name(task_id: str) -> str:
     """The unit a task's accept runs as."""
-    return f"taskspindle-accept-{task_id}"
+    return f"{_ACCEPT_UNIT_PREFIX}{task_id}"
+
+
+def _task_id_for_unit(unit: str) -> str:
+    """Recover the task id a worker or accept unit name was built from.
+
+    A unit that matches neither shape (the ``--real-systemd`` selftest, say) has no task and no
+    task directory; it is used as its own key instead so its env file still lands somewhere.
+    """
+    for prefix in (_WORKER_UNIT_PREFIX, _ACCEPT_UNIT_PREFIX):
+        if unit.startswith(prefix):
+            return unit[len(prefix) :]
+    return unit
+
+
+def _is_public_env_name(name: str) -> bool:
+    """Names safe to put on the ``systemd-run`` command line and in ``systemctl show`` output.
+
+    Everything else -- API keys and tokens above all -- goes into the ``EnvironmentFile`` instead,
+    where neither ``/proc/<pid>/cmdline`` nor ``systemctl show -p Environment`` can see it.
+    """
+    return name in _UNIT_ENV_NAMES or name.startswith("XDG_") or name == _TASKSPINDLE_CONFIG_ENV
+
+
+def _quote_environment_value(value: str) -> str:
+    """Quote one value for an ``EnvironmentFile`` line, per ``systemd.exec``'s quoting rules."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _render_environment_file(env: Mapping[str, str]) -> str:
+    """Render ``env`` as ``systemd.exec``'s ``EnvironmentFile`` syntax: one ``NAME=value`` a line.
+
+    A value containing a newline cannot be represented as a single line and is refused outright,
+    rather than silently split, truncated or escaped into something that no longer matches what
+    the caller set.
+    """
+    lines = []
+    for name, value in sorted(env.items()):
+        if "\n" in name or "\r" in name or "\n" in value or "\r" in value:
+            raise UnitError(
+                "UNIT_START_FAILED",
+                f"environment variable {name!r} contains a newline and cannot be written to an "
+                "EnvironmentFile",
+            )
+        lines.append(f"{name}={_quote_environment_value(value)}")
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def _write_environment_file(working_dir: Path, unit: str, env: Mapping[str, str]) -> Path:
+    """Write ``env`` to ``<working_dir>/tasks/<task_id>/unit.env``, 0600 in a 0700 directory."""
+    content = _render_environment_file(env)
+    task_dir = working_dir / "tasks" / _task_id_for_unit(unit)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(task_dir, 0o700)
+    path = task_dir / _ENV_FILE_NAME
+    path.write_text(content, encoding="utf-8")
+    os.chmod(path, 0o600)
+    return path
 
 
 def worker_argv(task_id: str) -> list[str]:

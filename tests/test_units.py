@@ -79,6 +79,9 @@ def test_start_builds_the_systemd_run_command(tmp_path: Path) -> None:
     assert "--setenv=TASKSPINDLE_CONFIG=/cfg/config.toml" in argv
     assert "--property=MemoryMax=3G" in argv
     assert "--property=OOMPolicy=kill" in argv
+    # Nothing here needed hiding, so no EnvironmentFile was written or referenced.
+    assert not any(arg.startswith("--property=EnvironmentFile=") for arg in argv)
+    assert not (tmp_path / "tasks").exists()
     # A failed unit must stay loaded so that its post-mortem state can still be read.
     assert "--collect" not in argv
     assert argv[argv.index("--") + 1 :] == [
@@ -88,6 +91,52 @@ def test_start_builds_the_systemd_run_command(tmp_path: Path) -> None:
         "--task",
         "ts_1",
     ]
+
+
+def test_start_writes_secret_env_to_an_environment_file_instead_of_argv(tmp_path: Path) -> None:
+    """Secret values must never land on argv or in a unit property; only their file may hold them."""
+    runner = RecordingRunner()
+    backend = SystemdUserBackend(runner=runner)
+
+    backend.start(
+        "taskspindle-worker-ts_1",
+        worker_argv("ts_1"),
+        working_dir=tmp_path,
+        env={
+            "HOME": "/home/tester",
+            "TASKSPINDLE_CONFIG": "/cfg/config.toml",
+            "ANTHROPIC_API_KEY": "sk-secret-value",
+        },
+        properties=WORKER_PROPERTIES,
+    )
+
+    argv = runner.calls[0]
+    assert not any("sk-secret-value" in arg for arg in argv)
+    assert not any(arg.startswith("--setenv=ANTHROPIC_API_KEY") for arg in argv)
+
+    env_file_args = [arg for arg in argv if arg.startswith("--property=EnvironmentFile=")]
+    assert len(env_file_args) == 1
+    env_file_path = Path(env_file_args[0].removeprefix("--property=EnvironmentFile="))
+
+    assert env_file_path == tmp_path / "tasks" / "ts_1" / "unit.env"
+    assert oct(env_file_path.stat().st_mode)[-3:] == "600"
+    assert oct(env_file_path.parent.stat().st_mode)[-3:] == "700"
+    content = env_file_path.read_text(encoding="utf-8")
+    assert 'ANTHROPIC_API_KEY="sk-secret-value"' in content
+    assert "sk-secret-value" not in " ".join(argv)
+
+
+def test_start_refuses_a_secret_value_containing_a_newline(tmp_path: Path) -> None:
+    backend = SystemdUserBackend(runner=RecordingRunner())
+
+    with pytest.raises(UnitError):
+        backend.start(
+            "taskspindle-worker-ts_1",
+            worker_argv("ts_1"),
+            working_dir=tmp_path,
+            env={"ANTHROPIC_API_KEY": "line-one\nline-two"},
+            properties=WORKER_PROPERTIES,
+        )
 
 
 def test_show_kill_stop_and_reset_failed_use_systemctl_user() -> None:
