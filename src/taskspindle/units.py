@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 
 __all__ = [
+    "ENV_FILE_NAME",
     "WORKER_PROPERTIES",
     "CommandRunner",
     "SystemdUserBackend",
@@ -73,7 +74,7 @@ _ACCEPT_UNIT_PREFIX = "taskspindle-accept-"
 
 #: Name of the ``EnvironmentFile`` written next to a unit's task, holding names ``start`` was not
 #: told are safe to put on argv or in ``systemctl show`` output -- API keys and tokens above all.
-_ENV_FILE_NAME = "unit.env"
+ENV_FILE_NAME = "unit.env"
 
 UnitKind = Literal["active", "success", "oom", "signal", "exit", "not_found", "unknown"]
 
@@ -381,7 +382,7 @@ def _write_environment_file(working_dir: Path, unit: str, env: Mapping[str, str]
     task_dir = working_dir / "tasks" / _task_id_for_unit(unit)
     task_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(task_dir, 0o700)
-    path = task_dir / _ENV_FILE_NAME
+    path = task_dir / ENV_FILE_NAME
     path.write_text(content, encoding="utf-8")
     os.chmod(path, 0o600)
     return path

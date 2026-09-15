@@ -36,7 +36,7 @@ from taskspindle.orchestrator import Orchestrator
 from taskspindle.providers import Profile
 from taskspindle.service import TaskSpindleError
 from taskspindle.store import Store
-from tests.fakes.units import ACTIVE, SUCCESS, FakeUnitBackend
+from tests.fakes.units import ACTIVE, EXITED, SUCCESS, FakeUnitBackend
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT = "boot-under-test"
@@ -1045,12 +1045,13 @@ def test_a_repair_that_loses_the_lease_waits_instead_of_being_reconciled_away(
     authorize(harness, repo)
     harness.defer()
     first = harness.orchestrator.start_task(implement_request(repo))["task_id"]
-    harness.orchestrator.start_task(implement_request(repo))
+    second = harness.orchestrator.start_task(implement_request(repo))["task_id"]
     harness.run_pending()  # the first task finishes and gives the lease back
     assert harness.orchestrator.task_status(first)["state"] == TaskState.RESULT_READY.value
-    # Reading the status dispatched the second task, so the provider's lease is busy again.
-    second = harness.orchestrator.store.get_lease(AUTHOR)["task_id"]
-    assert second != first
+    # Reading status must not dispatch the queued second task; an explicit dispatch does.
+    assert harness.orchestrator.store.get_lease(AUTHOR, second) is None
+    assert harness.orchestrator.dispatch_queued() == [second]
+    assert harness.orchestrator.store.get_lease(AUTHOR, second) is not None
 
     status = harness.orchestrator.task_status(first)
     repairing = harness.orchestrator.continue_task(first, status["state_version"], "again")
@@ -1307,6 +1308,126 @@ def test_stale_dispatch_snapshot_cannot_restart_finished_task(harness, make_repo
     before = list(harness.backend.started)
     assert harness.orchestrator._start_worker(stale) is False
     assert harness.backend.started == before
+
+
+def test_read_only_tools_never_dispatch_a_queued_task(harness, make_repo):
+    """T2: doctor's kin -- list_repository_policies, list_tasks, task_status, task_result and
+    usage_report -- must reconcile but never start a unit. Only start_task, continue_task and an
+    explicit dispatch_queued() may act on the runnable queue.
+    """
+    harness.orchestrator.concurrency = {AUTHOR: 1, REVIEWER: 1}
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    first = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    second = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    # start_task's own cycle dispatches: the first got a unit, the second is stuck behind it.
+    assert harness.pending == [first]
+    assert harness.orchestrator.store.get_task(second).state == TaskState.QUEUED
+    assert harness.orchestrator.store.get_lease(AUTHOR, second) is None
+    before = list(harness.backend.started)
+
+    harness.orchestrator.list_repository_policies()
+    harness.orchestrator.list_tasks()
+    harness.orchestrator.task_status(second)
+    harness.orchestrator.task_result(second)
+    harness.orchestrator.usage_report()
+
+    assert harness.backend.started == before
+    assert harness.orchestrator.store.get_task(second).state == TaskState.QUEUED
+    assert harness.orchestrator.store.get_lease(AUTHOR, second) is None
+
+    # Freeing capacity and asking explicitly is what picks the queued task up.
+    harness._run(harness.pending.pop(0))
+    assert harness.orchestrator.dispatch_queued() == [second]
+
+
+def test_cycle_never_masks_the_bodys_error_with_a_dispatch_failure(harness):
+    """T2: dispatch_queued's recovery pass still runs when the body raised, but an exception from
+    that pass must never replace the body's own -- the caller asked about its own tool call, not
+    about an unrelated task queued behind it.
+    """
+
+    def explode() -> list[str]:
+        raise RuntimeError("dispatch blew up")
+
+    harness.orchestrator.dispatch_queued = explode  # type: ignore[method-assign]
+
+    with pytest.raises(TaskSpindleError) as excinfo:
+        harness.orchestrator.cancel_task("does-not-exist", 1)
+
+    assert excinfo.value.code == service.TASK_NOT_FOUND
+    log_path = harness.orchestrator.paths.state_dir / "server.log"
+    assert log_path.exists()
+    assert "RuntimeError" in log_path.read_text(encoding="utf-8")
+
+
+def test_dispatch_bookkeeping_does_not_bump_state_version(harness, make_repo):
+    """T3: unit_name/boot_id, assigned as part of dispatch, is bookkeeping. A caller holding the
+    version start_task handed it must still be able to use it after the task is dispatched; only
+    a genuine state transition may move state_version.
+    """
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    started = harness.orchestrator.start_task(implement_request(repo))
+    task_id = started["task_id"]
+    assert started["state"] == TaskState.QUEUED.value
+    version = started["state_version"]
+
+    dispatched = harness.orchestrator.store.get_task(task_id)
+    assert dispatched.unit_name is not None  # start_task's own dispatch already ran
+    assert dispatched.state is TaskState.QUEUED
+    assert dispatched.state_version == version  # bookkeeping alone must not bump it
+
+    status = harness.orchestrator.task_status(task_id)
+    assert status["state_version"] == version  # _observe()'s reconcile agrees
+
+    # The version a client got from start_task -- and task_status still agrees on -- is still
+    # the one cancel_task needs, unaffected by the dispatch that ran in between.
+    result = harness.orchestrator.cancel_task(task_id, version)
+    assert result["state"] == TaskState.CANCELLING.value
+    assert result["state_version"] == version + 1  # the genuine transition bumps it once
+
+
+def test_continue_task_resets_a_dead_unit_left_by_a_self_settled_interrupt(harness, make_repo):
+    """T4: a worker that settles itself into INTERRUPTED (as the real runner does when it exits
+    non-zero without being caught by reconcile's own dead-unit detection) leaves its own unit
+    loaded and failed. reconcile never revisits it: INTERRUPTED is not one of the ACTIVE_STATES
+    the sweep looks at, so nothing else resets that unit. continue_task's dispatch must reset it
+    itself, or the next systemd-run for the same task id -- unit names are derived from the task
+    id alone -- refuses with "Unit already exists".
+    """
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.defer()
+    task_id = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    unit = harness.backend.started[-1][0]
+
+    harness.orchestrator.store.update_task(task_id, None, session_id="sess-before-interrupt")
+    service.transition(
+        harness.orchestrator.store,
+        task_id,
+        TaskState.INTERRUPTED,
+        reason="worker settled itself before exiting non-zero",
+    )
+    harness.orchestrator.store.release_lease(AUTHOR, task_id)
+    harness.backend.set(unit, EXITED)
+
+    # Confirm the gap: once the task has left the active states, reconcile never looks at its
+    # unit again, so nothing would otherwise have reset it.
+    harness.orchestrator.reconcile()
+    assert unit not in harness.backend.reset
+
+    record = harness.orchestrator.store.get_task(task_id)
+    result = harness.orchestrator.continue_task(task_id, record.state_version)
+
+    assert result["state"] == TaskState.RESUMING.value
+    assert unit in harness.backend.reset
+    assert harness.backend.started[-1][0] == unit
+    settled = harness.orchestrator.store.get_task(task_id)
+    assert settled.state == TaskState.RESUMING
+    assert settled.error is None
 
 
 def test_capacity_reports_execution_namespace_and_conservative_default(harness):

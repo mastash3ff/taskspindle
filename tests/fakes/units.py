@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
-from taskspindle.units import UnitState
+from taskspindle.units import UnitError, UnitState
 
 #: The states a unit is ever found in, named the way the rules talk about them.
 ACTIVE = UnitState("loaded", "active", "running", "success", None, 4242)
@@ -54,9 +54,14 @@ class FakeUnitBackend:
         env: Mapping[str, str],
         properties: Mapping[str, str],
     ) -> None:
+        # Mirrors real systemd: a unit left loaded (failed or otherwise dead, without
+        # ``--collect``) refuses a second ``systemd-run`` under the same name until it is reset.
+        current = self.states.get(unit)
+        if current is not None and current.kind not in ("active", "not_found"):
+            raise UnitError("UNIT_START_FAILED", f"Unit {unit} already exists.")
         self.started.append((unit, tuple(argv)))
         self.envs[unit] = dict(env)
-        self.states.setdefault(unit, ACTIVE)
+        self.states[unit] = ACTIVE
         if self.on_start is not None:
             self.on_start(unit, tuple(argv))
 

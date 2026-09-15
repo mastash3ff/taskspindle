@@ -1056,9 +1056,19 @@ class Store:
         self,
         task_id: str,
         expected_state_version: int | None = None,
+        *,
+        bump_version: bool = True,
         **fields: Any,
     ) -> TaskRecord:
-        """Update columns, bump ``state_version`` and set ``updated_at`` in one transaction."""
+        """Update columns and set ``updated_at`` in one transaction.
+
+        ``state_version`` only moves for callers who pass ``bump_version=True`` (the default):
+        a genuine state transition, or another change a caller holding a ``state_version`` needs
+        to see reflected. Pure bookkeeping -- workspace fields written once at prepare time, the
+        unit/boot identity recorded at dispatch, ``cleanup_state`` -- passes ``bump_version=False``
+        so a client's already-issued version keeps matching the task it was given for.
+        ``expected_state_version`` is still honoured either way.
+        """
         unknown = set(fields) - _UPDATABLE_TASK_COLUMNS
         if unknown:
             raise StoreError(f"unknown task columns: {', '.join(sorted(unknown))}")
@@ -1073,7 +1083,9 @@ class Store:
                 raise StaleStateVersionError(task_id, expected_state_version, current)
             assignments = [f"{column} = ?" for column in fields]
             params = [_encode(column, value) for column, value in fields.items()]
-            assignments.extend(["state_version = state_version + 1", "updated_at = ?"])
+            if bump_version:
+                assignments.append("state_version = state_version + 1")
+            assignments.append("updated_at = ?")
             params.extend([now(), task_id])
             conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?", params)
             updated = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()

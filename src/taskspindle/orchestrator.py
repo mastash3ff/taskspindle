@@ -16,6 +16,7 @@ import os
 import secrets
 import shutil
 import sys
+import traceback
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -274,7 +275,8 @@ class Orchestrator:
 
         The declared secrets of every ``api_key`` profile are forwarded by name, because the
         worker rebuilds the agent's own environment from its own and cannot invent a credential
-        the unit was never given. Values are never logged.
+        the unit was never given. Values are never logged; :meth:`units.SystemdUserBackend.start`
+        keeps them off argv and unit properties too, in a 0600 ``EnvironmentFile``.
         """
         return units.unit_env(
             self.parent_env,
@@ -318,13 +320,50 @@ class Orchestrator:
         """Reconcile, do the work, then dispatch whatever the work made runnable.
 
         The dispatch runs even when the body raised: a tool that refused half way through can
-        still have freed a lease, and the next task in line should not wait for a later call.
+        still have freed a lease, and the next task in line should not wait for a later call. But
+        that recovery dispatch must never be what the caller learns about: an exception it raises
+        is logged and swallowed, and the body's own exception -- the one the caller actually asked
+        about -- is what propagates.
         """
         self.reconcile()
         try:
             yield
-        finally:
+        except BaseException:
+            try:
+                self.dispatch_queued()
+            except Exception as dispatch_exc:
+                self._log_dispatch_failure(dispatch_exc)
+            raise
+        else:
             self.dispatch_queued()
+
+    @contextmanager
+    def _observe(self) -> Any:
+        """Reconcile before reading, but never dispatch.
+
+        Reconciling is what keeps a restarted server honest even for a caller that only ever
+        reads, but pairing it with ``dispatch_queued`` here would break the promise
+        ``READ_ONLY_TOOLS`` makes about these tools: a status check must never be what starts an
+        agent's worker unit.
+        """
+        self.reconcile()
+        yield
+
+    def _log_dispatch_failure(self, exc: BaseException) -> None:
+        """Write a recovery-dispatch exception to the server log, the way the server itself does.
+
+        This runs only when ``dispatch_queued`` raised while masking would have hidden the tool's
+        own error, so it is best effort by design: the operator can read ``server.log``, but a
+        failure to write to it must not raise in place of the exception ``_cycle`` is re-raising.
+        """
+        log_path = self.paths.state_dir / "server.log"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"--- _cycle dispatch_queued: {type(exc).__name__}\n")
+                handle.write("".join(traceback.format_exception(exc)))
+        except OSError:  # pragma: no cover - the log is best effort by design
+            pass
 
     def reconcile(self) -> list[recovery.ReconcileAction]:
         """Settle every task that claims to be active but may no longer be."""
@@ -576,7 +615,7 @@ class Orchestrator:
 
     def list_repository_policies(self) -> dict[str, Any]:
         """Every repository TaskSpindle knows about and the grants it holds."""
-        with self._cycle():
+        with self._observe():
             repositories = [
                 {
                     "repository_id": row["id"],
@@ -927,7 +966,7 @@ class Orchestrator:
             self._fail(record.id, exc.code, str(exc))
             raise TaskSpindleError(INVALID_REQUEST, str(exc), details={"code": exc.code}) from exc
 
-        task = self.store.update_task(record.id, None, **fields)
+        task = self.store.update_task(record.id, None, bump_version=False, **fields)
         self.store.insert_turn(
             task.id,
             task.candidate_revision + 1,
@@ -1070,6 +1109,24 @@ class Orchestrator:
                 started.append(task.id)
         return started
 
+    def _reset_stale_unit(self, unit: str) -> None:
+        """Forget a previous run's dead unit before its name is reused.
+
+        A worker that settles itself into INTERRUPTED (rather than being found dead by
+        :func:`taskspindle.recovery.reconcile`) exits non-zero -- INTERRUPTED is not a terminal
+        state -- and leaves its unit *loaded*: units run without ``--collect`` so a post-mortem
+        can still be read, and ``reconcile`` only resets a unit for a task it still finds in one
+        of the active states, which INTERRUPTED is not. Unit names are derived from the task id
+        alone, so without this, ``systemd-run --unit=<name>`` for the same task's next turn
+        refuses with "Unit already exists".
+        """
+        try:
+            state = self.units.show(unit)
+        except UnitError:
+            return
+        if state.kind not in ("active", "not_found"):
+            self.units.reset_failed(unit)
+
     def _start_worker(self, task: TaskRecord) -> bool:
         """Claim capacity and publish task identity before starting its unit outside the lock."""
         unit = units.worker_unit_name(task.id)
@@ -1142,10 +1199,13 @@ class Orchestrator:
                     return False
                 hybrid_recovery.admit(self.store, profile, task.id, now=self.clock(), model=selected_model,
                                       parent_env=self.parent_env, defer_model=selected_model is None)
-                self.store.update_task(task.id, None, unit_name=unit, boot_id=self.boot)
+                self.store.update_task(
+                    task.id, None, bump_version=False, unit_name=unit, boot_id=self.boot
+                )
         except TaskSpindleError as exc:
             self._fail(task.id, exc.code, exc.message, exc.details, reason="dispatch failed")
             return False
+        self._reset_stale_unit(unit)
         try:
             self.units.start(
                 unit,
@@ -1177,7 +1237,7 @@ class Orchestrator:
         limit: int = 50,
     ) -> dict[str, Any]:
         """The public view of every matching task, newest first."""
-        with self._cycle():
+        with self._observe():
             records = self.store.list_tasks(
                 repository_id=repository_id,
                 provider=provider,
@@ -1190,7 +1250,7 @@ class Orchestrator:
 
     def task_status(self, task_id: str) -> dict[str, Any]:
         """One task's public view, plus what to do about it when nothing else can."""
-        with self._cycle():
+        with self._observe():
             record = require_task(self.store, task_id)
             view = task_view(record).model_dump(mode="json")
             turns = self.store.list_turns(task_id)
@@ -1226,7 +1286,7 @@ class Orchestrator:
 
     def task_result(self, task_id: str) -> dict[str, Any]:
         """What a finished turn produced: its answer, its checks and its attribution."""
-        with self._cycle():
+        with self._observe():
             result = task_result(self.store, task_id).model_dump(mode="json")
             turns = self.store.list_turns(task_id)
             result["native_overage"] = (
@@ -1256,7 +1316,7 @@ class Orchestrator:
             since_iso = usage.parse_since(since, now)
         except ValueError as exc:
             raise TaskSpindleError(INVALID_REQUEST, str(exc), details={"since": since}) from exc
-        with self._cycle():
+        with self._observe():
             result = usage.report(
                 self.store,
                 since=since_iso,
@@ -1764,7 +1824,9 @@ class Orchestrator:
                     f"task {task_id} is {record.state.value} and is still working",
                     details={"task_id": task_id, "from": record.state.value},
                 )
-            self.store.update_task(task_id, None, cleanup_state=CleanupState.PENDING)
+            self.store.update_task(
+                task_id, None, bump_version=False, cleanup_state=CleanupState.PENDING
+            )
             result = self._cleanup(record, force=force)
             self.store.append_event(task_id, EventKind.CLEANUP, result)
         return result
@@ -1823,6 +1885,14 @@ class Orchestrator:
                 shutil.rmtree(target, ignore_errors=True)
                 (removed if not target.exists() else retained).append(str(target))
 
+        # The worker's environment file may hold a metered profile's secret; the unit that
+        # read it has exited by now, so nothing needs it any more.
+        env_file = self.paths.state_dir / "tasks" / record.id / units.ENV_FILE_NAME
+        if env_file.exists():
+            with contextlib.suppress(OSError):
+                env_file.unlink()
+            (removed if not env_file.exists() else retained).append(str(env_file))
+
         if record.unit_name:
             with contextlib.suppress(UnitError):
                 self.units.reset_failed(record.unit_name)
@@ -1835,7 +1905,9 @@ class Orchestrator:
                 code="RESOURCES_RETAINED",
                 message="some of the task's resources could not be given back",
             )
-        self.store.update_task(record.id, None, cleanup_state=CleanupState.COMPLETE)
+        self.store.update_task(
+            record.id, None, bump_version=False, cleanup_state=CleanupState.COMPLETE
+        )
         return {
             "task_id": record.id,
             "cleanup_state": CleanupState.COMPLETE.value,
@@ -1860,7 +1932,9 @@ class Orchestrator:
         message: str,
     ) -> dict[str, Any]:
         """A cleanup that left something behind is FAILED, and says what it left."""
-        self.store.update_task(record.id, None, cleanup_state=CleanupState.FAILED)
+        self.store.update_task(
+            record.id, None, bump_version=False, cleanup_state=CleanupState.FAILED
+        )
         return {
             "task_id": record.id,
             "cleanup_state": CleanupState.FAILED.value,

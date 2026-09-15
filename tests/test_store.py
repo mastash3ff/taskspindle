@@ -103,6 +103,32 @@ def test_task_roundtrip_and_optimistic_concurrency(tmp_path: Path) -> None:
     store.close()
 
 
+def test_update_task_bump_version_false_leaves_version_unchanged(tmp_path: Path) -> None:
+    """Bookkeeping writes must not move ``state_version`` from under a caller holding it."""
+    store = make_store(tmp_path)
+    record = make_task(store)
+    before = record.state_version
+
+    updated = store.update_task(record.id, None, bump_version=False, diff_size=12)
+    assert updated.state_version == before
+    assert updated.diff_size == 12
+    assert updated.updated_at >= record.updated_at
+
+    # expected_state_version is still honoured when the version itself never moves.
+    with pytest.raises(StaleStateVersionError):
+        store.update_task(record.id, before + 1, bump_version=False, diff_size=13)
+    still = store.get_task(record.id)
+    assert still is not None
+    assert still.state_version == before
+    assert still.diff_size == 12  # the rejected write never applied
+
+    # A matching expected_state_version still succeeds without bumping.
+    matched = store.update_task(record.id, before, bump_version=False, diff_size=14)
+    assert matched.state_version == before
+    assert matched.diff_size == 14
+    store.close()
+
+
 def test_acquire_lease_is_single_flight(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     first = make_task(store, "ts_000000000001")
