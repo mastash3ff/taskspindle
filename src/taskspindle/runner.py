@@ -592,14 +592,18 @@ async def _run_turn(
                 run.agent_info = {"name": "antigravity-cli", "version": ADAPTER_VERSION}
                 evidence = {"auth": "oauth", "auth_method_id": "cached_native_cli",
                             "source": "authenticated_model_catalog"}
-                run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
+                run.task = run.store.update_task(
+                    run.task_id, None, bump_version=False, oauth_evidence=evidence
+                )
                 result = await _prompt(run, agent, cancel_event, native=True)
             else:
                 run.agent_info = dict(agent.init.agent_info) if agent.init else {}
                 if evidence is None:
                     _check_initial_auth_context(run, profile)
                     evidence = _post_init_evidence(profile, agent, env=run.child_env)
-                run.task = run.store.update_task(run.task_id, None, oauth_evidence=evidence)
+                run.task = run.store.update_task(
+                    run.task_id, None, bump_version=False, oauth_evidence=evidence
+                )
                 await _open_session(run, agent)
                 result = await _prompt(run, agent, cancel_event)
     except AcpError as exc:
@@ -699,7 +703,7 @@ def _native_agy_worker(run: _Run, profile: Profile, workspace: Path, stderr_path
         if run.task.session_id and session_id != run.task.session_id:
             raise AcpError("RESUME_UNAVAILABLE", "Native AGY returned a different conversation")
         run.session_id = session_id
-        run.task = run.store.update_task(run.task_id, None, session_id=session_id)
+        run.task = run.store.update_task(run.task_id, None, bump_version=False, session_id=session_id)
 
     try:
         command = prepare_launch(
@@ -741,7 +745,8 @@ def _configure_native_agy(run: _Run, profile: Profile, catalog: list[tuple[str, 
         raise _Failure(exc.code, str(exc)) from exc
     run.session_model = selection.model_id
     run.task = run.store.update_task(
-        run.task_id, None, resolved_model=selection.model_id, resolved_effort=selection.effort,
+        run.task_id, None, bump_version=False,
+        resolved_model=selection.model_id, resolved_effort=selection.effort,
     )
 
 
@@ -1008,7 +1013,7 @@ async def _open_session(run: _Run, agent: AcpWorker) -> None:
     if run.kind is TurnKind.INITIAL:
         session_id = await agent.new_session(**options)
         run.session_id = session_id
-        run.task = run.store.update_task(run.task_id, None, session_id=session_id)
+        run.task = run.store.update_task(run.task_id, None, bump_version=False, session_id=session_id)
     else:
         if not run.task.session_id:
             raise _Interrupted("RESUME_UNAVAILABLE", "the task has no session to resume")
@@ -1083,7 +1088,8 @@ async def _configure_agy_session(run: _Run, agent: AcpWorker) -> None:
     await agent.set_config_option(session_id, "model", selection.model_id)
     run.session_model = selection.model_id
     run.task = run.store.update_task(
-        run.task_id, None, resolved_model=selection.model_id, resolved_effort=selection.effort,
+        run.task_id, None, bump_version=False,
+        resolved_model=selection.model_id, resolved_effort=selection.effort,
     )
 
 
