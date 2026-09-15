@@ -1,4 +1,4 @@
-"""The MCP server: nineteen tools, one envelope, no surprises.
+"""The MCP server: eighteen tools, one envelope, no surprises.
 
 Every tool returns the same shape whether it succeeded or not, so a caller never has to tell an
 exception from a result. Errors carry a stable code; an error TaskSpindle did not anticipate is
@@ -59,7 +59,6 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset(
 #: Every tool this server exposes, in the order it registers them.
 TOOL_NAMES: tuple[str, ...] = (
     "capabilities",
-    "provider_recovery",
     "doctor",
     "authorize_repository",
     "revoke_repository",
@@ -181,15 +180,12 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
             "Delegate bounded work to a coding agent in its own detached git worktree, then "
             "inspect, cross-review and explicitly accept what it produced. Start with "
             "capabilities; authorize a repository before starting a task in it; retrieve the "
-            "whole diff and record an independent review before accept_task will run. When "
-            "cached refusal evidence blocks work, inspect availability.automatic_recovery. "
-            "Hybrid policy admits necessary work after its bounded cooldowns and holds after "
-            "three failed trials until relevant new positive evidence permits one trial. "
-            "Do not launch synthetic probes. Under manual policy, arm the exact evidence_revision "
-            "with provider_recovery only after explicit user authorization and pass that permit "
-            "once to start_task. Manual permits cannot bypass hybrid policy. Read dispatch_policy "
-            "(or the dispatch_policy block of capabilities) before choosing a provider; it is "
-            "advisory unless a budget is enforced."
+            "whole diff and record an independent review before accept_task will run. When a "
+            "provider's availability is not ok, wait for its eligible_at (capabilities.providers[]."
+            "availability) rather than retrying immediately; start_task's ignore_provider_status is "
+            "an explicit coordinator override, not a routine choice. Read dispatch_policy (or the "
+            "dispatch_policy block of capabilities) before choosing a provider; it is advisory "
+            "unless a budget is enforced."
         ),
     )
     log_path = orchestrator.paths.state_dir / "server.log"
@@ -216,61 +212,6 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
             return call("capabilities", orchestrator.capabilities)
         return await _guard_async("capabilities", log_path,
                                   lambda: orchestrator.capabilities_checked(check_providers))
-
-    @tool("provider_recovery")
-    def provider_recovery(
-        action: str,
-        provider: str | None = None,
-        model: str | None = None,
-        evidence_revision: str | None = None,
-        permit_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Under manual policy, arm one controlled retry against an explicit cached evidence
-        revision, or revoke an armed permit. Hybrid profiles use availability.automatic_recovery
-        and reject manual overrides. This tool never checks a provider or runs inference."""
-        def body() -> dict[str, Any]:
-            if action == "arm":
-                if (
-                    not provider
-                    or not provider.strip()
-                    or not evidence_revision
-                    or not evidence_revision.strip()
-                ):
-                    raise TaskSpindleError(
-                        INVALID_REQUEST,
-                        "provider_recovery arm requires provider and evidence_revision",
-                    )
-                if permit_id is not None:
-                    raise TaskSpindleError(
-                        INVALID_REQUEST, "provider_recovery arm does not accept permit_id"
-                    )
-                if model is not None and not model.strip():
-                    raise TaskSpindleError(
-                        INVALID_REQUEST, "provider_recovery model must not be empty"
-                    )
-            elif action == "revoke":
-                if not permit_id or not permit_id.strip():
-                    raise TaskSpindleError(
-                        INVALID_REQUEST, "provider_recovery revoke requires permit_id"
-                    )
-                if provider is not None or model is not None or evidence_revision is not None:
-                    raise TaskSpindleError(
-                        INVALID_REQUEST,
-                        "provider_recovery revoke accepts only action and permit_id",
-                    )
-            else:
-                raise TaskSpindleError(
-                    INVALID_REQUEST, "provider_recovery action must be arm or revoke"
-                )
-            return orchestrator.provider_recovery(
-                action,
-                provider=provider,
-                model=model,
-                evidence_revision=evidence_revision,
-                permit_id=permit_id,
-            )
-
-        return call("provider_recovery", body)
 
     @tool("doctor")
     async def doctor(live_probes: bool = True) -> dict[str, Any]:
@@ -492,8 +433,8 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
         """Read the operator's dispatch policy: how work should be spread across providers, the
         model/effort/brief for each role, and observed usage against targets and budgets.
         action is get (the document) or status (the document plus computed status and the
-        file-managed [concurrency], [native_overage] and [provider_recovery] tables). Advisory
-        unless an enforced budget refuses start_task with POLICY_BUDGET_EXHAUSTED."""
+        file-managed [concurrency] table). Advisory unless an enforced budget refuses
+        start_task with POLICY_BUDGET_EXHAUSTED."""
         def body() -> dict[str, Any]:
             if action not in {"get", "status"}:
                 raise TaskSpindleError(

@@ -22,151 +22,35 @@ globalThis.document = {
   createTextNode: (text) => new FakeNode("#text", text),
 };
 
-const { recoveryFeedback, __test__ } = await import("../../src/taskspindle/web/static/views/workers.js");
+const { __test__ } = await import("../../src/taskspindle/web/static/views/workers.js");
 const textOf = (node) => node.textContent + node.children.map(textOf).join("");
-const nodes = (node, predicate) => {
-  const result = predicate(node) ? [node] : [];
-  return result.concat(...node.children.map((child) => nodes(child, predicate)));
-};
 
-test("recovery feedback shows arm, pending task, and settled outcome without action requests", async () => {
-  const command = "taskspindle providers --retry-next --provider grok --model 'grok safe'";
-  const copied = [];
-  Object.defineProperty(globalThis, "navigator", {
-    configurable: true,
-    value: { clipboard: { writeText: async (value) => copied.push(value) } },
-  });
-  const armed = recoveryFeedback({
-    state: "armed", permit_id: "recovery-1", provider: "grok", model: "grok safe",
-    expires_at: "2030-01-03T00:00:00Z", evidence_revision: "evidence-1", cli_command: command,
-  });
-  assert.match(textOf(armed), /Retry armed/);
-  assert.match(textOf(armed), /Providergrok/);
-  assert.match(textOf(armed), /Model scopegrok safe/);
-  assert.match(textOf(armed), /Permitrecovery-1/);
-  assert.match(textOf(armed), /Deadline/);
-  assert.match(textOf(armed), /evidence-1/);
-  const copy = nodes(armed, (node) => node.tag === "button")[0];
-  await copy.listeners.click();
-  assert.deepEqual(copied, [command]);
-  assert.match(textOf(armed), /Command copied/);
-
-  const claimed = recoveryFeedback({
-    state: "claimed", permit_id: "recovery-1", provider: "grok", model: null,
-    task_id: "ts_attempt", expires_at: "2030-01-03T00:00:00Z",
-  });
-  assert.match(textOf(claimed), /Recovery attempt pending/);
-  assert.match(textOf(claimed), /Model scopeProvider default/);
-  const taskLink = nodes(claimed, (node) => node.tag === "a")[0];
-  assert.equal(taskLink.attributes.href, "#/tasks/ts_attempt");
-
-  const settled = recoveryFeedback({
-    state: "failed", task_id: "ts_attempt", outcome: "no_access", outcome_code: "PROVIDER_AUTH_EXPIRED",
-  });
-  assert.match(textOf(settled), /Recovery failed/);
-  assert.match(textOf(settled), /no_access/);
-  assert.match(textOf(settled), /PROVIDER_AUTH_EXPIRED/);
+test("availability card shows the ok state with no reset or eligible time", () => {
+  const card = __test__.availabilityCard({ id: "claude" }, { state: "ok", reset_at: null, eligible_at: null, reason: null });
+  assert.match(textOf(card), /Worker access/);
+  assert.match(textOf(card), /No current refusal recorded/);
+  assert.doesNotMatch(textOf(card), /Reset/);
+  assert.doesNotMatch(textOf(card), /Eligible again/);
 });
 
-test("recovery feedback exposes the generated CLI only and has no mutation control", () => {
-  const command = "taskspindle providers --retry-next --provider claude";
-  const available = recoveryFeedback({ state: "none", provider: "claude", can_arm: true, cli_command: command });
-  assert.match(textOf(available), /Controlled retry available/);
-  assert.match(textOf(available), /A recorded refusal/);
-  assert.match(textOf(available), new RegExp(command));
-  assert.deepEqual(nodes(available, (node) => node.tag === "button").map((node) => node.textContent), ["Copy command"]);
-  assert.equal(recoveryFeedback({ state: "none", can_arm: false, cli_command: null }), null);
+test("availability card shows a refusal's state, reason, reset time, and eligible time", () => {
+  const card = __test__.availabilityCard({ id: "grok" }, {
+    state: "throttled", reset_at: "2030-01-03T00:00:00Z", eligible_at: "2030-01-03T00:00:00Z",
+    reason: "The provider reported a usage limit.",
+  });
+  assert.match(textOf(card), /throttled/);
+  assert.match(textOf(card), /The provider reported a usage limit/);
+  assert.match(textOf(card), /Reset/);
+  assert.match(textOf(card), /Eligible again/);
 });
 
-test("shared-scope permits and newer refusals retain explicit warnings", () => {
-  const mismatched = recoveryFeedback({
-    state: "armed", provider: "claude", model: "sonnet", permit_id: "recovery-shared",
-    evidence_revision: "evidence-original", next_action: "inspect_permit",
+test("availability card falls back to an eligible-at fifteen minutes after observation", () => {
+  const card = __test__.availabilityCard({ id: "claude" }, {
+    state: "auth_expired", reset_at: null, eligible_at: "2030-01-01T00:15:00Z",
+    reason: "Provider authentication is required.",
   });
-  assert.match(textOf(mismatched), /Providerclaude/);
-  assert.match(textOf(mismatched), /Model scopesonnet/);
-  assert.match(textOf(mismatched), /Permitrecovery-shared/);
-  assert.match(textOf(mismatched), /cannot authorize this projection/);
-
-  const succeeded = recoveryFeedback({
-    state: "succeeded", provider: "claude", model: null, permit_id: "recovery-old",
-    task_id: "ts_old", outcome: "succeeded", next_action: "arm",
-  });
-  assert.match(textOf(succeeded), /Recovery succeeded/);
-  assert.match(textOf(succeeded), /Current access is separate/);
-  assert.match(textOf(succeeded), /newer availability evidence/);
-});
-
-test("quota restrictions show each scope and reset while auth metadata remains non-identifying", () => {
-  const details = __test__.quotaDetails({
-    quota_restrictions: [
-      { scope: "account", model_family: "all", window: "five_hour", reset: "2030-01-03T00:00:00Z", source: "rate_limit_event", observed: "2030-01-02T23:00:00Z", fingerprint: "quota-a" },
-      { scope: "model_family", model_family: "grok-5", window: "weekly", reset: "2030-01-09T00:00:00Z", source: "native_auth_check", observed: "2030-01-02T23:01:00Z", fingerprint: "quota-b" },
-    ],
-    auth_context: { changed: true, fingerprint: "context-new" },
-    quota_retry: { state: "pending", task_id: "ts_post_reset" },
-  });
-  assert.match(textOf(details), /Active quota restrictions/);
-  assert.match(textOf(details), /five_hour/);
-  assert.match(textOf(details), /weekly/);
-  assert.match(textOf(details), /Authentication context changed/);
-  assert.match(textOf(details), /does not identify an account/);
-  assert.match(textOf(details), /Quota retry pending/);
-  const task = nodes(details, (node) => node.tag === "a")[0];
-  assert.equal(task.attributes.href, "#/tasks/ts_post_reset");
-});
-
-test("automatic recovery shows policy, state, attempts, timing, hold reason, and active task", () => {
-  const details = __test__.availabilityCard({ id: "claude" }, {
-    state: "throttled", automatic_recovery: {
-      policy: "hybrid", state: "cooldown", attempts_used: 1, attempts_remaining: 2,
-      next_attempt_at: "2030-01-03T00:00:00Z", hold_reason: "Provider access refused.",
-      active_task_id: "ts_recovery", episode_id: "episode-1", evidence_revision: "evidence-2",
-    },
-  });
-
-  assert.match(textOf(details), /Automatic recovery/);
-  assert.match(textOf(details), /hybrid/);
-  assert.match(textOf(details), /cooldown/);
-  assert.match(textOf(details), /Attempts remaining2/);
-  assert.match(textOf(details), /Next attempt/);
-  assert.match(textOf(details), /Provider access refused/);
-  assert.match(textOf(details), /episode-1/);
-  assert.match(textOf(details), /evidence-2/);
-  const task = nodes(details, (node) => node.tag === "a")[0];
-  assert.equal(task.attributes.href, "#/tasks/ts_recovery");
-});
-
-test("automatic recovery is absent for older provider responses", () => {
-  const details = __test__.availabilityCard({ id: "claude" }, { state: "unknown" });
-  assert.doesNotMatch(textOf(details), /Automatic recovery/);
-});
-
-test("hybrid recovery replaces manual retry controls with automatic state guidance", () => {
-  const manual = {
-    state: "none", provider: "claude", can_arm: true,
-    cli_command: "taskspindle providers --retry-next --provider claude",
-  };
-  const held = __test__.availabilityCard({ id: "claude" }, {
-    state: "auth_expired", next_action: "sign_in", recovery: manual,
-    automatic_recovery: { policy: "hybrid", state: "held", attempts_remaining: 0, hold_reason: "attempts_exhausted" },
-  });
-  assert.match(textOf(held), /Recovery is held until new relevant positive evidence is recorded/);
-  assert.doesNotMatch(textOf(held), /Controlled retry available|Copy command|Sign in/);
-  assert.equal(nodes(held, (node) => node.tag === "button").length, 0);
-
-  const trialReady = __test__.availabilityCard({ id: "claude" }, {
-    state: "auth_expired", next_action: "retry", recovery: manual,
-    automatic_recovery: { policy: "hybrid", state: "trial_ready", attempts_remaining: 1 },
-  });
-  assert.match(textOf(trialReady), /One automatic recovery trial is available when work is pending/);
-  assert.doesNotMatch(textOf(trialReady), /New positive evidence/);
-  const resetHeld = __test__.availabilityCard({ id: "claude" }, {
-    state: "throttled",
-    automatic_recovery: { policy: "hybrid", state: "held", attempts_remaining: 3, hold_reason: "provider_reset_pending" },
-  });
-  assert.match(textOf(resetHeld), /Recovery is blocked by the recorded hold reason/);
-  assert.doesNotMatch(textOf(resetHeld), /until new relevant positive evidence/);
-  assert.doesNotMatch(textOf(trialReady), /Controlled retry available|Copy command|Retry a task/);
-  assert.equal(nodes(trialReady, (node) => node.tag === "button").length, 0);
+  assert.match(textOf(card), /auth expired/);
+  assert.match(textOf(card), /Provider authentication is required/);
+  assert.match(textOf(card), /Eligible again/);
+  assert.doesNotMatch(textOf(card), /^Reset/);
 });

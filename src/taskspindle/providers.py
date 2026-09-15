@@ -157,9 +157,6 @@ class Profile:
     #: Host of ``ANTHROPIC_BASE_URL`` / ``OPENAI_BASE_URL`` in :attr:`env`, for attribution only.
     gateway_host: str | None = None
 
-    native_overage: str = "observe_only"
-    provider_recovery: str = "manual"
-
     @property
     def family(self) -> str:
         """The built-in this profile behaves as: its own id, or the id it is based on."""
@@ -447,12 +444,10 @@ def load_profiles(
     from .auth_context import validate_contexts
 
     validate_contexts(profiles, parent_env if parent_env is not None else os.environ)
-    from .config import native_overage_policies, provider_recovery_policies
+    from .config import warn_retired_settings
 
-    policies = native_overage_policies(config, profiles)
-    recovery = provider_recovery_policies(config, profiles)
-    return {name: replace(profile, native_overage=policies[name], provider_recovery=recovery[name])
-            for name, profile in profiles.items()}
+    warn_retired_settings(config)
+    return profiles
 
 
 def profile_for_task(

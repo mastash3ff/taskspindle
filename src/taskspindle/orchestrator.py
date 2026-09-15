@@ -12,7 +12,6 @@ import base64
 import contextlib
 import hashlib
 import json
-import os
 import secrets
 import shutil
 import sys
@@ -27,13 +26,9 @@ import taskspindle
 
 from . import (
     auth_context,
-    hybrid_recovery,
     integration,
-    native_overage,
     policy,
-    provider_recovery,
     providers,
-    quota,
     recovery,
     repos,
     units,
@@ -84,8 +79,8 @@ from .service import (
     apply_acceptance,
     check_acceptance,
     create_task,
-    model_availability,
     provider_availability,
+    provider_eligible,
     record_diff_receipt,
     require_diff_retrieved,
     require_grant,
@@ -229,46 +224,7 @@ class Orchestrator:
         self.parent_env = dict(parent_env)
         auth_context.validate_contexts(self.profiles, self.parent_env)
         self.clock = clock
-        self._policy_file_seen = paths.config_file.exists()
         _mkdir(paths.state_dir)
-
-    def _policy_profile(self, profile: Profile) -> Profile:
-        if self.paths.config_file.exists() or self._policy_file_seen:
-            self._policy_file_seen = True
-            return native_overage.current_profile(profile, self.profiles, self.paths.config_file)
-        return profile
-
-    def _quota_continuation_model(self, task: TaskRecord) -> str:
-        turns = self.store.list_turns(task.id)
-        last = turns[-1] if turns else {}
-        attribution = last.get("attribution") or {}
-        captured = last.get("native_overage") or {}
-        model = (task.resolved_model if task.provider_family == "agy" else None) or (
-            attribution.get("reported_model")
-            or task.reported_model
-            or captured.get("session_model")
-            or attribution.get("session_model")
-        )
-        if not isinstance(model, str) or not model:
-            raise TaskSpindleError(
-                "RESUME_MODEL_UNKNOWN", "The failed turn has no observed model identity to preserve."
-            )
-        return model
-
-    def _turn_policy(self, task: TaskRecord) -> dict[str, Any]:
-        profile = self._policy_profile(self.profiles[task.provider])
-        continuation_model = self._quota_continuation_model(task) if task.state is TaskState.FAILED else None
-        result = native_overage.snapshot(
-            self.store,
-            profile,
-            self.clock(),
-            model=continuation_model or task.resolved_model or task.requested_model or profile.model,
-            parent_env=self.parent_env,
-            task_id=task.id,
-        )
-        if continuation_model:
-            result["continuation_model"] = continuation_model
-        return result
 
     def _unit_env(self) -> dict[str, str]:
         """The environment a worker or accept unit is started with.
@@ -367,32 +323,13 @@ class Orchestrator:
 
     def reconcile(self) -> list[recovery.ReconcileAction]:
         """Settle every task that claims to be active but may no longer be."""
-        actions = recovery.reconcile(
+        return recovery.reconcile(
             self.store,
             self.units,
             boot=self.boot,
             now=self.clock(),
             accept_recover=self._recover_accept,
         )
-        for attempt in self.store.list_native_overage_attempts():
-            if attempt["state"] not in {"claimed", "prompting"}:
-                continue
-            task = self.store.get_task(attempt["task_id"])
-            if (
-                task
-                and task.state in {TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}
-                and self._worker_definitely_terminated(task)
-            ):
-                native_overage.finish(
-                    self.store,
-                    self.profiles.get(task.provider),
-                    attempt["turn_id"],
-                    False,
-                    now=self.clock(),
-                    parent_env=self.parent_env,
-                    code="WORKER_TERMINATED_WITHOUT_NATIVE_SUCCESS",
-                )
-        return actions
 
     def _recover_accept(self, task: TaskRecord) -> recovery.AcceptOutcome:
         """What an interrupted accept actually did to the root repository.
@@ -470,21 +407,12 @@ class Orchestrator:
                     "adapter": providers.adapter_metadata(profile),
                     "native_check": checks.get(profile.id)
                     or cached_native_check(self.store, profile, self.parent_env, now=now),
-                    "native_overage": native_overage.project(
-                        self.store, profile, now, parent_env=self.parent_env
-                    ),
                     "gateway_host": profile.gateway_host,
                     "availability": provider_availability(
                         self.store,
                         profile,
                         now=now,
                         model=profile.model,
-                        parent_env=self.parent_env,
-                    ),
-                    "model_availability": model_availability(
-                        self.store,
-                        profile,
-                        now=now,
                         parent_env=self.parent_env,
                     ),
                     "capacity": {
@@ -495,8 +423,7 @@ class Orchestrator:
                     "windows": self.store.latest_provider_windows(limits_key(profile)),
                     "policy": policy_status["providers"].get(profile.id),
                 }
-                for raw_profile in sorted(self.profiles.values(), key=lambda item: item.id)
-                for profile in [self._policy_profile(raw_profile)]
+                for profile in sorted(self.profiles.values(), key=lambda item: item.id)
             ],
             "modes": [mode.value for mode in Mode],
             "versions": {
@@ -719,23 +646,21 @@ class Orchestrator:
         )
 
     def start_task(self, request: StartTaskRequest) -> dict[str, Any]:
-        """Create, prepare and queue one task."""
-        if request.ignore_provider_status:
-            raise TaskSpindleError(
-                "LEGACY_OVERRIDE_RETIRED",
-                "Remove ignore_provider_status. Use a recovery permit for a recoverable refusal; "
-                "wait for active quota restrictions to lift.",
-            )
+        """Create, prepare and queue one task.
+
+        ``ignore_provider_status`` is an explicit coordinator override: it admits the task even
+        while the provider's last turn is still within its refusal window. There is no other
+        bypass -- a provider that is eligible again after its ``reset_at`` (or, absent one, fifteen
+        minutes after the refusal was observed) is simply eligible, no override needed.
+        """
         with self._cycle():
-            profile = self._policy_profile(self._profile_for(request))
+            profile = self._profile_for(request)
             self._require_policy_admission(profile)
             model = request.model or profile.model
-            if request.recovery_permit_id is None:
-                require_provider_available(
-                    self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
-                    model=model, parent_env=self.parent_env,
-                    defer_model=model is None,
-                )
+            require_provider_available(
+                self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
+                model=model, parent_env=self.parent_env,
+            )
             placement = self._placement(request)
             with self.store.transaction():
                 if placement.repository_id:
@@ -748,29 +673,10 @@ class Orchestrator:
                             or subject.candidate_sha != request.review_target.candidate_sha):
                         raise TaskSpindleError(CANDIDATE_MISMATCH, "The review candidate changed.")
                     self._require_independent(subject, request.provider)
-                if request.recovery_permit_id is not None:
-                    provider_recovery.validate(
-                        self.store, profile, request.recovery_permit_id, now=self.clock(),
-                        model=model, parent_env=self.parent_env,
-                    )
-                else:
-                    require_provider_available(
-                        self.store, profile, now=self.clock(), model=model,
-                        parent_env=self.parent_env, defer_model=model is None,
-                    )
-                quota_evidence = quota.evaluate(
-                    self.store, profile, now=self.clock(), model=model,
-                    parent_env=self.parent_env, defer_model=model is None,
+                require_provider_available(
+                    self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
+                    model=model, parent_env=self.parent_env,
                 )
-                trial_fingerprints = (quota_evidence["retry_fingerprints"]
-                                      if profile.provider_recovery == "manual" else [])
-                if trial_fingerprints:
-                    holder = self.store.get_active_quota_retry_claim(limits_key(profile))
-                    if holder is not None:
-                        raise TaskSpindleError(
-                            "QUOTA_RETRY_PENDING", "Another task is testing this account's quota recovery.",
-                            retryable=True, details={"task_id": holder["task_id"]},
-                        )
                 self._require_policy_admission(profile)
                 record = create_task(
                     self.store,
@@ -782,66 +688,10 @@ class Orchestrator:
                 self.store.set_task_auth_context(
                     record.id, auth_context.fingerprint(profile, self.parent_env),
                 )
-                if request.recovery_permit_id is None:
-                    hybrid_recovery.admit(self.store, profile, record.id, now=self.clock(), model=model,
-                                          parent_env=self.parent_env, defer_model=model is None)
-                if trial_fingerprints:
-                    claimed = self.store.claim_quota_retry(
-                        status_key=limits_key(profile), task_id=record.id,
-                        restriction_fingerprints=trial_fingerprints,
-                    )
-                    if claimed is None:  # guarded by the same immediate transaction
-                        raise TaskSpindleError(
-                            "QUOTA_RETRY_PENDING", "Another task is testing this account's quota recovery.",
-                            retryable=True,
-                        )
-                    self.store.append_event(record.id, EventKind.WARNING, {
-                        "code": "QUOTA_RETRY_ATTEMPT", "provider": profile.id,
-                        "status_key": limits_key(profile), "model": model,
-                    })
-                if request.recovery_permit_id is not None:
-                    provider_recovery.claim(
-                        self.store, profile, request.recovery_permit_id, record.id,
-                        now=self.clock(), model=model, parent_env=self.parent_env,
-                    )
-                    self.store.append_event(record.id, EventKind.WARNING, {
-                        "code": "PROVIDER_RECOVERY_ATTEMPT",
-                        "permit_id": request.recovery_permit_id,
-                        "provider": profile.id, "model": model,
-                    })
-            try:
-                self._prepare(record, request, placement)
-            except Exception:
-                # Filesystem/setup errors outside _prepare's classified exceptions still burn
-                # an already claimed permit. Never quietly leave a second attempt authorized.
-                if (request.recovery_permit_id is not None or trial_fingerprints
-                        or profile.provider_recovery == "hybrid"):
-                    self._fail(record.id, "PREPARATION_FAILED", "Task preparation failed.")
-                raise
+            self._prepare(record, request, placement)
             self.dispatch_queued()
             final = require_task(self.store, record.id)
         return _acknowledge(final)
-
-    def provider_recovery(
-        self, action: str, *, provider: str | None = None, model: str | None = None,
-        evidence_revision: str | None = None, permit_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Authorize or revoke a retry without reconciliation, dispatch, or live checks."""
-        if action == "revoke":
-            if not permit_id or provider is not None or model is not None or evidence_revision is not None:
-                raise TaskSpindleError(INVALID_REQUEST, "revoke requires only permit_id")
-            return provider_recovery.revoke(self.store, permit_id, now=self.clock())
-        if action != "arm" or not provider or not evidence_revision or permit_id is not None:
-            raise TaskSpindleError(INVALID_REQUEST, "arm requires provider and evidence_revision")
-        profile = self.profiles.get(provider)
-        if profile is None:
-            raise TaskSpindleError(INVALID_REQUEST, "provider is not configured")
-        if model is not None and not model.strip():
-            raise TaskSpindleError(INVALID_REQUEST, "model must not be empty")
-        return provider_recovery.arm(
-            self.store, profile, evidence_revision=evidence_revision, now=self.clock(),
-            model=model or profile.model, parent_env=self.parent_env,
-        )
 
     def _profile_for(self, request: StartTaskRequest) -> Profile:
         try:
@@ -971,7 +821,6 @@ class Orchestrator:
             task.id,
             task.candidate_revision + 1,
             TurnKind.INITIAL.value,
-            native_overage=self._turn_policy(task),
             prompt=compose_prompt(task, TurnKind.INITIAL, review_diff=self._review_diff(task, placement)),
         )
         transition(self.store, task.id, TaskState.QUEUED, reason="prepared")
@@ -1139,23 +988,11 @@ class Orchestrator:
                 profile = self.profiles.get(task.provider)
                 require_task_profile(task, profile)
                 assert profile is not None
-                profile = self._policy_profile(profile)
                 turns = self.store.list_turns(task.id)
                 if not turns:
                     return False
-                turn = turns[-1]
-                selected_model = (turn.get("native_overage") or {}).get("continuation_model") or (
-                    task.resolved_model or task.requested_model or profile.model
-                )
-                native_overage.admit(
-                    self.store,
-                    profile,
-                    turn,
-                    self.clock(),
-                    model=selected_model,
-                    parent_env=self.parent_env,
-                )
-                initial = len(self.store.list_turns(task.id)) == 1
+                selected_model = task.resolved_model or task.requested_model or profile.model
+                initial = len(turns) == 1
                 if initial:
                     bound_context = self.store.get_task_auth_context(task.id)
                     if (bound_context is not None
@@ -1163,42 +1000,18 @@ class Orchestrator:
                         raise TaskSpindleError(
                             "AUTH_CONTEXT_CHANGED", "Authentication context changed before task admission.",
                         )
-                permit = self.store.get_task_recovery_permit(task.id)
-                recovery_override = False
-                if permit is not None and initial:
-                    provider_recovery.validate(
-                        self.store,
-                        profile,
-                        permit["permit_id"],
-                        task_id=task.id,
-                        now=self.clock(),
-                        model=selected_model,
+                if not task.ignore_provider_status:
+                    availability = provider_availability(
+                        self.store, profile, now=self.clock(), model=selected_model,
                         parent_env=self.parent_env,
                     )
-                    recovery_override = True
-                availability = provider_availability(
-                    self.store,
-                    profile,
-                    now=self.clock(),
-                    model=selected_model,
-                    parent_env=self.parent_env,
-                    defer_model=selected_model is None,
-                    task_id=task.id,
-                )
-                if (availability["state"] not in ("ok", "unknown")
-                        and not recovery_override):
-                    if initial and self.store.get_task_quota_retry_claim(task.id) is not None:
-                        raise TaskSpindleError(
-                            "PROVIDER_UNAVAILABLE", "Quota restrictions changed before the retry started.",
-                        )
-                    return False
+                    if not provider_eligible(availability, self.clock()):
+                        return False
                 if not self.store.acquire_lease(
                     task.provider, task.id, unit, None, self.boot,
                     limit=self.concurrency.get(task.provider, 1),
                 ):
                     return False
-                hybrid_recovery.admit(self.store, profile, task.id, now=self.clock(), model=selected_model,
-                                      parent_env=self.parent_env, defer_model=selected_model is None)
                 self.store.update_task(
                     task.id, None, bump_version=False, unit_name=unit, boot_id=self.boot
                 )
@@ -1253,26 +1066,6 @@ class Orchestrator:
         with self._observe():
             record = require_task(self.store, task_id)
             view = task_view(record).model_dump(mode="json")
-            turns = self.store.list_turns(task_id)
-            selected_profile = self.profiles.get(record.provider)
-            if selected_profile is not None:
-                view["automatic_recovery"] = hybrid_recovery.status(
-                    self.store, self._policy_profile(selected_profile), now=self.clock(),
-                    model=record.resolved_model or record.requested_model,
-                    parent_env=self.parent_env, task_id=record.id,
-                )
-            view["native_overage"] = (
-                (native_overage.unknown() | (turns[-1].get("native_overage") or {}))
-                if turns
-                else native_overage.unknown()
-            )
-            if record.state is TaskState.FAILED:
-                try:
-                    self._require_quota_continuation(record)
-                    continuation = {"eligible": True, "reason": "included_quota_continuation_available"}
-                except TaskSpindleError as exc:
-                    continuation = {"eligible": False, "reason": exc.code}
-                view["native_overage"]["continuation"] = continuation
             if record.state is TaskState.RECOVERY_AMBIGUOUS:
                 view["evidence"] = self._last_recovery(task_id)
                 view["manual_action"] = MANUAL_ACTION
@@ -1316,12 +1109,6 @@ class Orchestrator:
         """What a finished turn produced: its answer, its checks and its attribution."""
         with self._observe():
             result = task_result(self.store, task_id).model_dump(mode="json")
-            turns = self.store.list_turns(task_id)
-            result["native_overage"] = (
-                (native_overage.unknown() | (turns[-1].get("native_overage") or {}))
-                if turns
-                else native_overage.unknown()
-            )
         return result
 
     def usage_report(
@@ -1442,20 +1229,20 @@ class Orchestrator:
         expected_state_version: int,
         prompt: str = "",
     ) -> dict[str, Any]:
-        """Send one more turn to a task that can take one."""
+        """Send one more turn to a task that can take one.
+
+        A ``FAILED`` task cannot be continued: a provider refusal is recorded on
+        ``provider_status`` and cleared by ``start_task``'s own admission once the provider is
+        eligible again, not by resuming the failed task's own session.
+        """
         with self._cycle():
             record = require_task(self.store, task_id)
             _require_version(record, expected_state_version)
             if record.state is TaskState.RECOVERY_AMBIGUOUS:
                 record = self._settle_ambiguous(record, expected_state_version)
-            failed_quota = record.state is TaskState.FAILED
-            if failed_quota:
-                self._require_quota_continuation(record)
             kind, target = _CONTINUATIONS.get(
                 (record.state, record.mode), (None, None)
             )
-            if failed_quota:
-                kind, target = TurnKind.RESUME, TaskState.RESUMING
             if kind is None or target is None:
                 raise TaskSpindleError(
                     ILLEGAL_TRANSITION,
@@ -1479,33 +1266,12 @@ class Orchestrator:
                 else len(self.store.list_turns(task_id)) + 1
             )
             with self.store.transaction():
-                profile = self._policy_profile(self.profiles[record.provider])
-                if (failed_quota or profile.native_overage == "provider_managed"
-                        or profile.provider_recovery == "hybrid"):
-                    require_provider_available(
-                        self.store,
-                        profile,
-                        now=self.clock(),
-                        model=(
-                            self._quota_continuation_model(record)
-                            if failed_quota
-                            else record.resolved_model or record.requested_model or profile.model
-                        ),
-                        parent_env=self.parent_env,
-                    )
-                hybrid_recovery.admit(
-                    self.store, profile, record.id, now=self.clock(),
-                    model=(self._quota_continuation_model(record) if failed_quota
-                           else record.resolved_model or record.requested_model or profile.model),
-                    parent_env=self.parent_env,
-                )
                 self.store.insert_turn(
                     task_id,
                     revision,
                     kind.value,
                     prompt=text,
                     session_id=record.session_id,
-                    native_overage=self._turn_policy(record),
                 )
                 # The unit the *previous* turn ran in is gone; clearing it is what tells recovery
                 # that this task is waiting for a lease rather than for a worker that vanished.
@@ -1514,105 +1280,12 @@ class Orchestrator:
                     task_id,
                     target,
                     reason=f"{kind.value} turn requested",
-                    native_quota_continuation=failed_quota and profile.provider_recovery == "manual",
-                    provider_recovery_continuation=failed_quota and profile.provider_recovery == "hybrid",
                     expected_state_version=record.state_version,
                     **_AWAITING_DISPATCH,
                 )
             self._start_worker(updated)
             final = require_task(self.store, task_id)
         return _acknowledge(final)
-
-    def _require_quota_continuation(self, record: TaskRecord) -> None:
-        require_task_profile(record, self.profiles.get(record.provider))
-        profile = self._policy_profile(self.profiles[record.provider])
-        bound = self.store.get_task_auth_context(record.id)
-        if not bound or bound != auth_context.fingerprint(profile, self.parent_env):
-            raise TaskSpindleError(
-                "AUTH_CONTEXT_CHANGED", "Quota continuation requires the original authentication context."
-            )
-        error = record.error or {}
-        if profile.provider_recovery == "hybrid":
-            if error.get("code") not in {
-                "PROVIDER_THROTTLED", "PROVIDER_UNAVAILABLE", "PROVIDER_AUTH_EXPIRED",
-                "PROVIDER_ACCESS_DENIED", "PROVIDER_MODEL_UNAVAILABLE", "RECOVERY_NOT_READY",
-                "RECOVERY_EVIDENCE_CHANGED",
-            }:
-                raise TaskSpindleError(
-                    ILLEGAL_TRANSITION, "Only a provider-access failure can recover this way."
-                )
-            require_provider_available(
-                self.store, profile, now=self.clock(), model=self._quota_continuation_model(record),
-                parent_env=self.parent_env,
-            )
-            self._require_retained_session(record)
-            return
-        if error.get("code") not in {"PROVIDER_THROTTLED", "PROVIDER_UNAVAILABLE"}:
-            raise TaskSpindleError(
-                ILLEGAL_TRANSITION, "Only an included-quota failure can continue under native overage."
-            )
-        details = error.get("details") or {}
-        original_included = isinstance(details, dict) and (
-            details.get("window") in native_overage.INCLUDED_WINDOWS
-            or (
-                details.get("source") == "native_check"
-                and details.get("code") == "NATIVE_QUOTA_EXHAUSTED"
-                and details.get("window") in {"weekly", "monthly"}
-            )
-        )
-        if not original_included:
-            raise TaskSpindleError(
-                ILLEGAL_TRANSITION, "The original failed turn did not identify an included quota window."
-            )
-        view = native_overage.project(
-            self.store,
-            profile,
-            self.clock(),
-            model=self._quota_continuation_model(record),
-            parent_env=self.parent_env,
-            task_id=record.id,
-        )
-        if view["eligibility"] != "overage":
-            raise TaskSpindleError("NATIVE_OVERAGE_BLOCKED", view["admission_reason"])
-        self._require_retained_session(record)
-
-    def _require_retained_session(self, record: TaskRecord) -> None:
-        if not record.session_id:
-            raise TaskSpindleError(RESUME_UNAVAILABLE, "The failed task has no original session to resume.")
-        workspace = record.worktree_path or record.scratch_repo
-        if not workspace or not Path(workspace).is_dir():
-            raise TaskSpindleError("WORKSPACE_UNAVAILABLE", "The original task workspace is unavailable.")
-        try:
-            repos.current_head(Path(workspace))
-        except GitError as exc:
-            raise TaskSpindleError(
-                "WORKSPACE_UNAVAILABLE", "The original task workspace is not usable."
-            ) from exc
-        if not self._worker_definitely_terminated(record):
-            raise TaskSpindleError(
-                "WORKER_LIVENESS_UNRESOLVED", "The previous worker has not definitely terminated."
-            )
-
-    def _worker_definitely_terminated(self, record: TaskRecord) -> bool:
-        if self.store.get_lease(record.provider, record.id) is not None:
-            return False
-        if record.boot_id and record.boot_id != self.boot:
-            return True
-        try:
-            state = self.units.show(record.unit_name or units.worker_unit_name(record.id))
-        except UnitError:
-            return False
-        if state.kind not in {"success", "exit", "signal", "oom", "not_found"} or state.main_pid:
-            return False
-        if state.kind == "not_found" and record.worker_pid:
-            try:
-                os.kill(record.worker_pid, 0)
-            except ProcessLookupError:
-                return True
-            except (PermissionError, OSError):
-                return False
-            return False
-        return True
 
     def _settle_ambiguous(self, record: TaskRecord, expected_state_version: int) -> TaskRecord:
         """Give recovery one more look before refusing to guess.

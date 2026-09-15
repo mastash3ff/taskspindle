@@ -1,6 +1,5 @@
 import { getJSON } from "../api.js";
 import { badge, emptyState, h, metric, s, sectionHeading, table } from "../dom.js";
-import { nativeOverageSummary } from "../native-overage.js";
 import { updateRouteQuery } from "../router.js";
 
 const GROUPS = ["provider", "day", "provider_day", "model", "role", "mode", "repository_id"];
@@ -88,7 +87,6 @@ export async function renderUsage(route, { signal } = {}) {
     h("div", { class: "page-heading" }, h("div", {}, h("span", { class: "eyebrow", text: "Observed consumption" }), h("h1", { text: "Usage" }), h("p", { text: "Explore recorded token volume, outcomes, timing, and provider window telemetry." })), stale ? badge("stale", "Cached data") : null),
     controls(route),
     h("section", { class: "metric-grid" }, metric("Turns", compact(totals.turns), "Recorded"), metric("Input", compact(totals.input), "Recorded aggregate"), metric("Output", compact(totals.output), "Recorded aggregate"), metric("Estimated cost", totals.priced ? `$${totals.cost.toFixed(2)}` : "Unavailable", totals.priced ? `${totals.priced}/${totals.turns} turns priced` : "No priced turns")),
-    nativeOverageSummary(data.native_overage),
     h("div", { class: "usage-grid chart-grid" },
       h("section", { class: "panel" }, sectionHeading("Provider distribution", "Observed tokens"), usageChart(providerUsage, ["provider"], "Token distribution by provider")),
       h("section", { class: "panel" }, sectionHeading("Outcome distribution", "Recorded task states"), outcomeChart(data.outcomes)),

@@ -89,23 +89,14 @@ billing collection.
   permission events, and the parsed transcript file when one was written), every check across
   every revision, the review verdict and findings when one exists, the candidate diff, the
   recorded warnings, and the tail of the worker log.
-- **Workers** — each profile's current availability (`ok` / `unknown` / `throttled` /
-  `auth_expired`), when it resets, the suggested first-class alternative, the latest observed
-  usage windows, its cached native-check projection, controlled-recovery status, and cached doctor
-  status. A recoverable refusal includes a copyable CLI command for the operator to arm one retry.
-  Armed and claimed attempts show their admission deadline and related task; completed attempts show
-  the named provider, model scope, permit, recorded outcome, and outcome code. A shared-account alias
-  shows that named scope and cannot imply the permit authorizes the alias. These are read-only
-  projections: Workers has no control that
-  arms, revokes, or starts a recovery attempt. A "run live probes"
-  button explicitly calls `/api/doctor?live=1`; an untouched dashboard reports doctor status as
-  not run rather than treating the absence of a diagnostic as success. The old `#/providers`
-  location remains an alias for `#/workers`. Native extra usage shows the current exact-profile
-  policy, account/worker control scope, eligibility and safe billing observations, with unknowns
-  preserved. Policy changes are read on refresh. Grok balances/caps and automatic-top-up settings
-  are read-only account diagnostics; they are not task charges or spending controls.
-  Automatic recovery shows the configured policy, current state, remaining attempts, next attempt,
-  hold reason, and any active task. Older runtime responses without that projection remain valid.
+- **Workers** — each profile's current availability (`ok` / `throttled` / `auth_expired` /
+  `access_denied` / `model_unavailable`), its `reset_at` and `eligible_at`, a fixed safe `reason`
+  (naming the model for a model-scoped refusal), the latest observed usage windows, its cached
+  native-check projection, and cached doctor status. These are read-only projections: Workers has
+  no control that changes provider status or starts work. A "run live probes" button explicitly
+  calls `/api/doctor?live=1`; an untouched dashboard reports doctor status as not run rather than
+  treating the absence of a diagnostic as success. The old `#/providers` location remains an alias
+  for `#/workers`.
 - **Policy** — at the top, an independent Codex AI mode card (Ensemble or Native, host Both /
   Windows / WSL, Apply) with per-host `configured`, `needs repair`, `unavailable`, `update failed`,
   or mixed state. Ensemble is TaskSpindle-first with native fallback; Native turns external
@@ -114,16 +105,13 @@ billing collection.
   conversation. Routine integrity checks stay collapsed; failures stay visible. Below that, the
   dispatch policy document and its
   observed status: per-provider shares, budgets and enable state; per-role briefs, provider
-  preference, model/effort selections and timeouts; and the read-only `[concurrency]`,
-  `[native_overage]` and `[provider_recovery]` tables from `config.toml` for context. The dispatch
-  editor holds a draft while you edit — polling pauses — validates locally, and saves the whole
-  document against the revision it was loaded from; every save is kept in history. See
-  [dispatch-policy.md](dispatch-policy.md#editing).
+  preference, model/effort selections and timeouts; and the read-only `[concurrency]` table from
+  `config.toml` for context. The dispatch editor holds a draft while you edit — polling pauses —
+  validates locally, and saves the whole document against the revision it was loaded from; every
+  save is kept in history. See [dispatch-policy.md](dispatch-policy.md#editing).
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
   choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
-  counts, window telemetry notes, and the cost-estimate disclaimer. Billing classifications count
-  all turns separately, including historical/tokenless unknown turns; native-overage observations
-  never turn token estimates or account balances into reported task charges.
+  counts, window telemetry notes, and the cost-estimate disclaimer.
 The navigation order is **Overview**, **Tasks**, **Workers**, **Policy**, and **Usage**.
 `Ctrl+K` or `Cmd+K` opens navigation destinations and a GET-only finder over as many as 200
 recent tasks. Typing filters task ID, summary, repository, and state; arrow keys select a result,
@@ -157,7 +145,7 @@ route are `405`. Errors are JSON, never a traceback.
 | `/api/tasks?q&state&provider&mode&limit` | `{tasks: [...]}`, newest first, `limit` default 100, max 1000 |
 | `/api/tasks/{id}` | task, events, turns (with usage and transcript), checks, review, repository, worker log tail; `404` `TASK_NOT_FOUND` |
 | `/api/tasks/{id}/diff?revision=N` | the candidate diff as `text/plain`, defaulting to the candidate revision; `404` if none |
-| `/api/providers` | per-profile availability, windows, cached `native_check`, sanitized provider status, cached doctor report; no probes |
+| `/api/providers` | per-profile availability (`state`, `reset_at`, `eligible_at`, `reason`), windows, cached `native_check`, sanitized provider status, cached doctor report; no probes |
 | `/api/doctor?live=1` | run the doctor report with explicit live probes |
 | `/api/usage?since&provider&group_by` | the same shape as `taskspindle usage --json`; `400` on a bad `since` or `group_by` |
 | `/api/policy` | GET: `{policy, revision, fingerprint, updated_at, updated_by, source, document_error, status, defaults, profiles, file_managed, writable, csrf_token}` |
@@ -190,26 +178,11 @@ apply errors keep that fresh per-host state and never claim that every host succ
 plain HTML, CSS, and JavaScript — no build step or CDN, and no request leaves the browser's own
 origin.
 
-Each `/api/providers` availability projection includes its `evidence_revision` and `recovery`.
-Exact entries in `model_availability` carry the same fields for that model. Recovery state is one of
-`none`, `armed`, `claimed`, `succeeded`, `failed`, `revoked`, or `expired`. The command shown for an
-armable refusal is generated by TaskSpindle from validated provider and model identifiers; copying it
-uses the local browser clipboard and does not execute it. Recovery tasks also retain a readable
-`PROVIDER_RECOVERY_ATTEMPT` warning and `PROVIDER_RECOVERY_OUTCOME` in the task event timeline. A
-successful attempt remains distinct from current availability, so newer refusal evidence remains
-visible and blocking. The dashboard never sends a recovery mutation request.
-
-Availability also carries `quota_restrictions`, one normalized row for every applicable quota
-window: `scope`, `model_family`, `window`, `reset`, `source`, `observed`, and an opaque
-`fingerprint`. Overlapping account and model-family restrictions remain separately visible.
-`auth_context` supplies an opaque fingerprint, whether it changed, and its observation; a changed
-context is metadata about the evidence, never an account identity. `quota_retry` reports the
-single shared post-reset retry state, its task ID, and restriction fingerprints. When it is
-pending, claimed, or prompting, Workers links to that task without creating, retrying, or mutating anything.
-
-`automatic_recovery` is an optional availability projection for compatibility with older runtime
-responses. When present, it carries `policy`, `state`, `attempts_used`, `attempts_remaining`,
-`next_attempt_at`, `hold_reason`, `active_task_id`, `episode_id`, and `evidence_revision`.
+Each `/api/providers` availability projection is deliberately small: `state` (`ok`, `throttled`,
+`auth_expired`, `access_denied`, or `model_unavailable`), `reset_at`, `eligible_at`, and `reason` —
+the same shape `capabilities.providers[].availability` returns over MCP. A model-scoped refusal
+names the model in `reason`; there is no separate per-model projection. Nothing here starts a
+process or mutates provider state; Workers is entirely read-only.
 
 Repository usage groups display the registered repository path when available. The JSON keeps
 `repository_id` as its stable grouping key and adds `repository_path`; missing paths fall back

@@ -444,21 +444,13 @@ def save(
 
 def file_managed(config_file: Any, profiles: Mapping[str, Any]) -> dict[str, Any]:
     """The ``config.toml`` tables the dashboard displays read-only, re-read on every call."""
-    from .config import (
-        ConfigError,
-        concurrency_limits,
-        load_config,
-        native_overage_policies,
-        provider_recovery_policies,
-    )
+    from .config import ConfigError, concurrency_limits, load_config
 
     try:
         settings = load_config(config_file)
         return {
             "config_file": str(config_file),
             "concurrency": concurrency_limits(settings, profiles),
-            "native_overage": native_overage_policies(settings, profiles),
-            "provider_recovery": provider_recovery_policies(settings, profiles),
         }
     except ConfigError as exc:
         return {"config_file": str(config_file), "error": str(exc)}

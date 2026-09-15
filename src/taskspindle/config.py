@@ -7,6 +7,7 @@ config, state, data and pinned runtimes, and reads the single TOML file the user
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -15,7 +16,13 @@ from typing import Any
 
 import taskspindle
 
-__all__ = ["ConfigError", "Paths", "concurrency_limits", "load_config", "paths"]
+__all__ = [
+    "ConfigError", "Paths", "concurrency_limits", "load_config", "paths", "warn_retired_settings",
+]
+
+#: Config tables that once configured deleted machinery. They are accepted and ignored, with one
+#: warning, so a config file written for an older release still loads.
+_RETIRED_SETTINGS: tuple[str, ...] = ("provider_recovery", "native_overage")
 
 
 class ConfigError(Exception):
@@ -91,33 +98,16 @@ def concurrency_limits(settings: Mapping[str, Any], providers: Iterable[str]) ->
     return {provider: configured.get(provider, 1) for provider in sorted(names)}
 
 
-def native_overage_policies(settings: Mapping[str, Any], profiles: Mapping[str, Any]) -> dict[str, str]:
-    """Exact-profile standing authorization; account billing remains provider controlled."""
-    configured = settings.get("native_overage", {})
-    if not isinstance(configured, dict):
-        raise ConfigError("native_overage must be a table of exact profile policies")
-    unknown = set(configured) - set(profiles)
-    if unknown:
-        raise ConfigError(f"native_overage contains unknown provider(s): {', '.join(sorted(unknown))}")
-    for name, policy in configured.items():
-        if not isinstance(policy, str) or policy not in {"observe_only", "provider_managed"}:
-            raise ConfigError(f"native_overage.{name} must be observe_only or provider_managed")
-        if profiles[name].auth != "oauth":
-            raise ConfigError(f"native_overage.{name} requires a native OAuth profile")
-    return {name: configured.get(name, "observe_only") for name in sorted(profiles)}
+def warn_retired_settings(settings: Mapping[str, Any]) -> None:
+    """Accept and ignore ``[provider_recovery]``/``[native_overage]``, with one warning line.
 
-
-def provider_recovery_policies(settings: Mapping[str, Any], profiles: Mapping[str, Any]) -> dict[str, str]:
-    """Recovery authority belongs to each exact configured OAuth profile."""
-    configured = settings.get("provider_recovery", {})
-    if not isinstance(configured, dict):
-        raise ConfigError("provider_recovery must be a table of exact profile policies")
-    unknown = set(configured) - set(profiles)
-    if unknown:
-        raise ConfigError(f"provider_recovery contains unknown provider(s): {', '.join(sorted(unknown))}")
-    for name, policy in configured.items():
-        if not isinstance(policy, str) or policy not in {"manual", "hybrid"}:
-            raise ConfigError(f"provider_recovery.{name} must be manual or hybrid")
-        if profiles[name].auth != "oauth":
-            raise ConfigError(f"provider_recovery.{name} requires a native OAuth profile")
-    return {name: configured.get(name, "manual") for name in sorted(profiles)}
+    Both tables configured machinery this release deletes. A config file written for an older
+    release must still load; it just no longer does anything with these two tables.
+    """
+    present = [name for name in _RETIRED_SETTINGS if name in settings]
+    if present:
+        print(
+            f"taskspindle: [{'], ['.join(present)}] settings are retired and ignored; "
+            "provider refusals are now a single provider_status rule (see docs/configuration.md)",
+            file=sys.stderr,
+        )

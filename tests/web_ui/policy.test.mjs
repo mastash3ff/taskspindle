@@ -180,7 +180,7 @@ function fixture(overrides = {}) {
       share_window: "day", window_start: {}, observed_at: "2030-01-01T00:00:00Z", under_target_order: ["claude"],
       providers: { claude: { enabled: true, state: "active", enforced_exhaustion: false, target_share: 50, target_share_normalized: 0.5, share_state: "on_target", observed: { day: { turns: 4, telemetry_turns: 4, tokens: 400, share_turns: 0.5, share_tokens: 0.5 }, week: { turns: 4, telemetry_turns: 4, tokens: 400, share_turns: 0.5, share_tokens: 0.5 } }, budgets: { day: { turns: { limit: null, used: 0, remaining: null, exhausted: false }, tokens: { limit: null, used: 0, remaining: null, exhausted: false }, enforce: false, exhausted: false, window_start: "2030-01-01T00:00:00Z" }, week: { turns: { limit: null, used: 0, remaining: null, exhausted: false }, tokens: { limit: null, used: 0, remaining: null, exhausted: false }, enforce: false, exhausted: false, window_start: "2030-01-01T00:00:00Z" } }, allowed_modes: null, note: "", advertised_models: ["haiku", "sonnet"], advertised_efforts: ["low", "medium"], models_without_effort: ["haiku"] } },
     },
-    defaults: {}, file_managed: { config_file: "/x/config.toml", concurrency: {}, native_overage: {}, provider_recovery: {} },
+    defaults: {}, file_managed: { config_file: "/x/config.toml", concurrency: {} },
     profiles: [{ id: "claude", family: "claude", first_class: true, auth: "oauth", modes: ["consult", "review", "implement"] }],
     writable: true, csrf_token: "tok",
     ...overrides,

@@ -439,40 +439,6 @@ def _stats(values: list[int]) -> dict[str, Any]:
     }
 
 
-def native_overage_report(
-    rows: list[dict[str, Any]], *, group_by: str,
-    repositories: Mapping[str, str | None] | None = None,
-) -> dict[str, Any]:
-    """Count all turns, including historical/tokenless turns, without pricing account balances."""
-    groups: dict[tuple[tuple[str, Any], ...], dict[str, Any]] = {}
-    unknown = 0
-    modes = {str(row["task_id"]): row.get("mode") for row in rows}
-    for row in rows:
-        native = row.get("native_overage")
-        native = native if isinstance(native, dict) else {}
-        classification = native.get("billing_classification")
-        if classification not in {"included", "native_overage", "mixed"}:
-            classification = "unknown"
-            unknown += 1
-        policy = native.get("policy")
-        if policy not in {"observe_only", "provider_managed"}:
-            policy = "unknown"
-        key = _group_key(row, modes, group_by) | {"policy": policy, "billing_classification": classification}
-        bucket = groups.setdefault(tuple(sorted(key.items())), {**key, "turns": 0})
-        bucket["turns"] += 1
-        if group_by == "repository_id":
-            bucket["repository_path"] = (repositories or {}).get(row.get("repository_id"))
-    return {
-        "total_turns": len(rows), "observed_turns": len(rows) - unknown, "unknown_turns": unknown,
-        "groups": list(groups.values()),
-        "note": (
-            "Billing classification uses provider observations; authorization alone is not a charge. "
-            "Historical or missing telemetry remains unknown. Account balances and spending caps "
-            "are shared observations, not task charges. Token estimates are reported separately."
-        ),
-    }
-
-
 def report(
     store: UsageReader,
     *,
@@ -548,10 +514,6 @@ def report(
         for row in store.violation_counts(since=since)
         if provider is None or row["provider"] == provider
     ]
-    overage_rows = store.list_native_overage_turns(since=since, provider=provider)
-    overage_repositories = {
-        row["id"]: row.get("display_path") for row in store.list_repositories()
-    } if group_by == "repository_id" else {}
     return {
         "since": since,
         "provider": provider,
@@ -561,9 +523,6 @@ def report(
             "cost_estimate_usd is what the tokens would cost at the published API rates "
             f"(price table {PRICE_TABLE_VERSION}); it is not a reported charge. OAuth sessions can "
             "consume provider-managed extra usage. Grok's cost ticks remain raw and unconverted."
-        ),
-        "native_overage": native_overage_report(
-            overage_rows, group_by=group_by, repositories=overage_repositories,
         ),
         "usage": list(groups.values()),
         "outcomes": outcomes,

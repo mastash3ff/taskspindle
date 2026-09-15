@@ -5,7 +5,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 
@@ -295,13 +295,14 @@ def test_safe_projection_of_corrupt_rows(profile, tmp_path):
         assert "SECRET" not in json.dumps(view)
 
 
-def test_fresh_quota_gates_without_clearing_task_refusal(profile, tmp_path, monkeypatch):
+def test_native_check_never_affects_task_admission_availability(profile, tmp_path, monkeypatch):
+    """The native check is an on-demand probe (``doctor``/``capabilities(check_providers=...)``);
+    it never gates ``start_task`` admission, which reads only ``provider_status``."""
     monkeypatch.setenv("HOME", str(tmp_path))
     with Store.open(tmp_path / "db") as store:
         seed(store, profile, os.environ, observation(100))
         current = datetime(2026, 9, 7, 10, 1, tzinfo=UTC)
-        assert provider_availability(store, profile, now=current)["code"] == "NATIVE_QUOTA_EXHAUSTED"
-        assert provider_availability(store, profile, now=current + timedelta(minutes=5))["state"] == "unknown"
+        assert provider_availability(store, profile, now=current)["state"] == "ok"
         store.set_provider_status("grok", "auth_expired", source="acp_error", code="AUTH_EXPIRED")
         before = store.get_provider_status("grok")
         assert provider_availability(store, profile, now=current)["state"] == "auth_expired"
@@ -414,7 +415,7 @@ def test_actual_multiprocess_claim_coalescing(tmp_path):
     queue.close()
 
 
-def test_oauth_model_alias_shares_quota_fingerprint_cache_and_gate(profile, tmp_path):
+def test_oauth_model_alias_shares_the_native_check_fingerprint_cache(profile, tmp_path):
     env = {"HOME": str(tmp_path), "PATH": "/usr/bin"}
     alias = replace(
         profile,
@@ -430,49 +431,8 @@ def test_oauth_model_alias_shares_quota_fingerprint_cache_and_gate(profile, tmp_
         seed(store, profile, env, observation(100))
         current = datetime(2026, 9, 7, 10, 1, tzinfo=UTC)
         assert access_checks.cached_native_check(store, alias, env, now=current)["used_percent"] == 100
-        assert (
-            provider_availability(store, alias, now=current, parent_env=env)["code"]
-            == "NATIVE_QUOTA_EXHAUSTED"
-        )
-
-
-def test_start_and_dispatch_use_orchestrator_environment(profile, tmp_path, monkeypatch):
-    from taskspindle.config import Paths
-    from taskspindle.models import TaskState
-    from taskspindle.orchestrator import Orchestrator
-    from taskspindle.service import TaskSpindleError
-    from tests.fakes.units import FakeUnitBackend
-    from tests.test_orchestrator import implement_request
-    from tests.test_store import make_task
-
-    env = {"HOME": str(tmp_path / "selected-home"), "PATH": "/usr/bin"}
-    monkeypatch.setenv("HOME", str(tmp_path / "wrong-ambient-home"))
-    with Store.open(tmp_path / "db") as store:
-        seed(store, profile, env, observation(100))
-        paths = Paths(
-            config_file=tmp_path / "config",
-            state_dir=tmp_path / "state",
-            data_dir=tmp_path / "data",
-            runtime_dir=tmp_path / "runtime",
-        )
-        orchestrator = Orchestrator(
-            store=store,
-            paths=paths,
-            profiles={"grok": profile},
-            units=FakeUnitBackend(),
-            boot="test",
-            parent_env=env,
-            clock=lambda: datetime(2026, 9, 7, 10, 1, tzinfo=UTC),
-        )
-        with pytest.raises(TaskSpindleError) as caught:
-            orchestrator.start_task(implement_request(tmp_path, provider="grok"))
-        assert caught.value.code == "PROVIDER_UNAVAILABLE"
-        assert store.list_tasks() == []
-        task = make_task(store, provider="grok")
-        queued = store.update_task(task.id, None, state=TaskState.QUEUED)
-        assert not orchestrator._start_worker(queued)
-        assert store.list_leases() == []
-        assert store.get_task(task.id).state == TaskState.QUEUED
+        # The alias shares the account's provider_status row, not the native check.
+        assert provider_availability(store, alias, now=current, parent_env=env)["state"] == "ok"
 
 
 @pytest.mark.parametrize("raw", ["{broken", "[]", '"SECRET"', "42"])
@@ -482,7 +442,7 @@ def test_malformed_native_cache_is_unknown_safe(profile, tmp_path, raw):
         store._conn.execute("UPDATE native_checks SET result_json=?", (raw,))
         assert store.get_native_check("grok") is None
         assert access_checks.cached_native_check(store, profile, {})["state"] == "not_checked"
-        assert provider_availability(store, profile, now=datetime.now(UTC))["state"] == "unknown"
+        assert provider_availability(store, profile, now=datetime.now(UTC))["state"] == "ok"
 
 
 @pytest.mark.parametrize("raw", [{}, [], ["weekly"]])

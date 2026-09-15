@@ -302,74 +302,70 @@ def test_explicit_model_failure_is_scoped_to_a_safe_model_identifier() -> None:
     assert unknown.affected_model is None
 
 
-def test_availability_exposes_stale_account_evidence_without_claiming_success(tmp_path) -> None:
+def test_availability_reports_a_passed_reset_as_already_eligible(tmp_path) -> None:
     now = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
     profile = Profile(id="claude-fast", auth="oauth", command=("x",), base="claude")
+    reset_at = (now - timedelta(minutes=1)).isoformat()
     with Store.open(tmp_path / "state.sqlite3") as store:
         store.set_provider_status(
             "claude",
             "throttled",
             code=limits.PROVIDER_THROTTLED,
             reason="The provider reported a usage limit.",
-            reset_at=(now - timedelta(minutes=1)).isoformat(),
+            reset_at=reset_at,
             source="acp_error",
         )
         availability = service.provider_availability(store, profile, now=now)
 
-    assert availability["native_overage"]["eligibility"] == "unknown"
-    assert availability["native_overage"]["policy"] == "observe_only"
     assert availability == {
-        "automatic_recovery": availability["automatic_recovery"],
-        "native_overage": availability["native_overage"],
-        "evidence_revision": availability["evidence_revision"],
-        "recovery": availability["recovery"],
-        "state": "unknown",
-        "status_key": "claude",
-        "code": limits.PROVIDER_THROTTLED,
-        "window": None,
-        "reset_at": (now - timedelta(minutes=1)).isoformat(),
+        "state": "throttled",
+        "reset_at": reset_at,
+        "eligible_at": reset_at,
         "reason": "The provider reported a usage limit.",
-        "observed_at": availability["observed_at"],
-        "suggested_alternative": None,
-        "last_success_at": None,
-        "source": "acp_error",
-        "scope": "account",
-        "affected_model": None,
-        "stale": True,
-            "next_action": "retry",
-            "retry_eligible": True,
-            "quota_restrictions": [],
-            "auth_context": availability["auth_context"],
-            "quota_retry": {"state": "none", "task_id": None, "fingerprints": []},
-        }
+    }
+    assert service.provider_eligible(availability, now) is True
 
 
-def test_model_unavailable_only_blocks_the_matching_model(tmp_path) -> None:
+def test_a_refusal_without_a_reported_reset_is_eligible_after_fifteen_minutes(tmp_path) -> None:
+    observed = datetime(2030, 1, 1, 11, 50, 0, tzinfo=UTC)
+    eligible_at = observed + timedelta(minutes=15)
+    profile = Profile(id="claude-fast", auth="oauth", command=("x",), base="claude")
+    with Store.open(tmp_path / "state.sqlite3") as store:
+        store.set_provider_status(
+            "claude", "auth_expired", code=limits.PROVIDER_AUTH_EXPIRED, source="acp_error",
+            observed_at=observed.isoformat().replace("+00:00", "Z"),
+        )
+        just_before = service.provider_availability(store, profile, now=eligible_at - timedelta(seconds=1))
+        just_after = service.provider_availability(store, profile, now=eligible_at + timedelta(seconds=1))
+
+    assert just_before["reset_at"] is None
+    assert just_before["eligible_at"] == "2030-01-01T12:05:00Z"
+    assert service.provider_eligible(just_before, eligible_at - timedelta(seconds=1)) is False
+    assert service.provider_eligible(just_after, eligible_at + timedelta(seconds=1)) is True
+
+
+def test_a_model_scoped_refusal_collapses_into_the_provider_wide_status(tmp_path) -> None:
+    """There is no separate per-model row any more: the model is named in ``reason``."""
     now = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
     profile = Profile(id="claude-fast", auth="oauth", command=("x",), base="claude")
     with Store.open(tmp_path / "state.sqlite3") as store:
-        store.set_provider_model_status(
+        store.set_provider_status(
             "claude",
-            "claude-opus-5",
             "model_unavailable",
             code=limits.PROVIDER_MODEL_UNAVAILABLE,
             reason="The requested model is unavailable.",
             source="acp_error",
+            affected_model="claude-opus-5",
         )
         blocked = service.provider_availability(
             store, profile, now=now, model="claude-opus-5",
         )
-        other = service.provider_availability(
+        other_model = service.provider_availability(
             store, profile, now=now, model="claude-fable-5",
         )
 
-    assert blocked["state"] == "model_unavailable"
-    assert blocked["scope"] == "model"
-    assert blocked["affected_model"] == "claude-opus-5"
-    assert blocked["next_action"] == "choose_model"
-    assert blocked["retry_eligible"] is False
-    assert other["state"] == "unknown"
-    assert other["scope"] is None
+    assert blocked["state"] == other_model["state"] == "model_unavailable"
+    assert "claude-opus-5" in blocked["reason"]
 
 
 def test_account_override_can_follow_default_model_resolution_but_not_new_model_evidence() -> None:
@@ -407,7 +403,7 @@ def test_account_override_can_follow_default_model_resolution_but_not_new_model_
     )
 
 
-def test_schema_four_turn_ok_observation_is_projected_as_last_success(tmp_path, monkeypatch) -> None:
+def test_reading_a_pre_last_success_column_database_still_works(tmp_path, monkeypatch) -> None:
     from taskspindle.web.db import ReadOnlyStore
 
     path = tmp_path / "schema4.sqlite3"
@@ -424,5 +420,4 @@ def test_schema_four_turn_ok_observation_is_projected_as_last_success(tmp_path, 
             store, profile, now=datetime(2030, 1, 1, 12, 0, tzinfo=UTC),
         )
 
-    assert projected["state"] == "ok"
-    assert projected["last_success_at"] == stamp
+    assert projected == {"state": "ok", "reset_at": None, "eligible_at": None, "reason": None}

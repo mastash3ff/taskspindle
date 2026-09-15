@@ -66,7 +66,6 @@ POLICY_BUDGET_EXHAUSTED = "POLICY_BUDGET_EXHAUSTED"
 PROVIDER_UNAVAILABLE = limits.PROVIDER_UNAVAILABLE
 PROVIDER_THROTTLED = limits.PROVIDER_THROTTLED
 PROVIDER_AUTH_EXPIRED = limits.PROVIDER_AUTH_EXPIRED
-LEGACY_OVERRIDE_RETIRED = "LEGACY_OVERRIDE_RETIRED"
 
 
 class TaskSpindleError(Exception):
@@ -190,8 +189,6 @@ def transition(
     *,
     reason: str,
     expected_state_version: int | None = None,
-    native_quota_continuation: bool = False,
-    provider_recovery_continuation: bool = False,
     **fields: Any,
 ) -> TaskRecord:
     """Move a task to ``to_state``, applying ``fields`` and the audit event atomically."""
@@ -208,9 +205,6 @@ def transition(
                 },
             )
         allowed = LEGAL_TRANSITIONS.get(record.state, frozenset())
-        if ((native_quota_continuation or provider_recovery_continuation)
-                and record.state is TaskState.FAILED and to_state is TaskState.RESUMING):
-            allowed = frozenset({TaskState.RESUMING})
         if to_state not in allowed:
             raise TaskSpindleError(
                 ILLEGAL_TRANSITION,
@@ -248,23 +242,6 @@ def transition(
             EventKind.STATE_CHANGED,
             {"from": record.state.value, "to": to_state.value, "reason": reason},
         )
-        if to_state in {TaskState.FAILED, TaskState.CANCELLED, TaskState.INTERRUPTED}:
-            from . import hybrid_recovery
-            from .provider_recovery import finish
-
-            error = fields.get("error") or {}
-            hybrid_recovery.finish(store, task_id, "failed", now=datetime.now(UTC),
-                                   code=error.get("code") or to_state.value)
-            finish(
-                store,
-                task_id,
-                "failed",
-                now=datetime.now(UTC),
-                code=error.get("code") or to_state.value,
-            )
-            quota_finish = getattr(store, "finish_quota_retry", None)
-            if quota_finish:
-                quota_finish(task_id, "failed", code=error.get("code") or to_state.value)
     return updated
 
 
@@ -278,45 +255,26 @@ def require_task(store: Store, task_id: str) -> TaskRecord:
 # -- task creation ------------------------------------------------------------------
 
 
-_AVAILABILITY_ACTIONS: dict[str, tuple[str, bool]] = {
-    "ok": ("start", True),
-    "unknown": ("retry", True),
-    "throttled": ("wait", False),
-    "auth_expired": ("sign_in", False),
-    "access_denied": ("review_access", False),
-    "model_unavailable": ("choose_model", False),
+#: How long a refusal without a provider-reported reset time blocks admission.
+_ELIGIBLE_AFTER = timedelta(minutes=15)
+
+#: The per-state code carried in a refusal's details, for a caller or test that still keys off it.
+_STATE_CODES: dict[str, str] = {
+    "throttled": limits.PROVIDER_THROTTLED,
+    "auth_expired": limits.PROVIDER_AUTH_EXPIRED,
+    "access_denied": limits.PROVIDER_ACCESS_DENIED,
+    "model_unavailable": limits.PROVIDER_MODEL_UNAVAILABLE,
 }
 
-_AVAILABILITY_FRESH_FOR = timedelta(hours=24)
 
-
-def _observation_stale(row: dict[str, Any] | None, current: datetime) -> bool:
-    if row is None:
-        return False
-    raw = row.get("observed_at")
-    if not isinstance(raw, str) or not raw:
-        return True
-    try:
-        observed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except ValueError:
-        return True
-    if observed.tzinfo is None or observed.utcoffset() is None:
-        return True
-    age = current.astimezone(UTC) - observed.astimezone(UTC)
-    return age < timedelta(0) or age >= _AVAILABILITY_FRESH_FOR
-
-
-def _last_success_at(row: dict[str, Any] | None) -> str | None:
-    """Read v5 success metadata, with the exact equivalent from a schema-4 success row."""
-    if row is None:
+def _parse_iso(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
         return None
-    value = row.get("last_success_at")
-    if isinstance(value, str) and value:
-        return value
-    if row.get("state") == "ok" and row.get("source") == "turn_ok":
-        observed = row.get("observed_at")
-        return observed if isinstance(observed, str) and observed else None
-    return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def provider_availability(
@@ -326,228 +284,45 @@ def provider_availability(
     now: datetime,
     model: str | None = None,
     parent_env: Mapping[str, str] | None = None,
-    defer_model: bool = False,
-    task_id: str | None = None,
 ) -> dict[str, Any]:
-    from . import hybrid_recovery, native_overage, quota
+    """The one rule: what the last turn on this provider reported, and when it is eligible again.
 
-    view = _provider_availability(
-        store, profile, now=now, model=model, parent_env=parent_env, defer_model=defer_model
-    )
-    evidence = quota.evaluate(store, profile, now, model, parent_env, defer_model)
-    native = native_overage.project(store, profile, now, model, parent_env, task_id, evidence)
-    view["native_overage"] = native
-    if native["admission_reason"] == "hard_provider_block" and view["state"] in {"ok", "unknown"}:
-        view.update(state="throttled", next_action="wait", retry_eligible=False,
-                    reason="A provider hard limit remains active.")
-    if native["eligibility"] == "overage" and view["state"] in {"throttled", "ok", "unknown"}:
-        view.update(
-            state="unknown",
-            next_action="start",
-            retry_eligible=True,
-            reason="Standing policy permits a provider-enforced native overage attempt.",
-        )
-    automatic = hybrid_recovery.status(store, profile, now=now, model=model, parent_env=parent_env,
-                                       task_id=task_id, defer_model=defer_model)
-    view["automatic_recovery"] = automatic
-    native_check = hybrid_recovery.cached_native_check(store, profile, parent_env, now=now)
-    native_block = hybrid_recovery._native_block(native_check, model if model is not None else profile.model)
-    if native_block in {"native_auth_required", "native_model_absent"}:
-        view.update(state="auth_expired" if native_block == "native_auth_required" else "access_denied",
-                    next_action="wait", retry_eligible=False, reason=native_block)
-    if automatic["state"] == "trial_running" and automatic["active_task_id"] != task_id:
-        view.update(state="access_denied", next_action="wait", retry_eligible=False,
-                    reason="Another task holds this account's recovery trial.")
-    if automatic["policy"] == "hybrid":
-        if automatic["state"] == "trial_ready" or (
-            automatic["state"] == "trial_running" and automatic["active_task_id"] == task_id
-            and not automatic["hold_reason"]
-        ):
-            view.update(state="unknown", next_action="start", retry_eligible=True)
-        elif automatic["state"] in {"held", "cooldown", "trial_running"}:
-            view.update(state="access_denied", next_action="wait", retry_eligible=False,
-                        reason=automatic["hold_reason"] or "Automatic recovery is pending.")
-    return view
-
-
-def _provider_availability(
-    store: ProviderStatusReader,
-    profile: Profile,
-    *,
-    now: datetime,
-    model: str | None = None,
-    parent_env: Mapping[str, str] | None = None,
-    defer_model: bool = False,
-) -> dict[str, Any]:
-    """What TaskSpindle currently believes about a provider's willingness to take a turn."""
-    from .provider_recovery import status as recovery_status
-
-    model = model if model is not None else profile.model
-    recovery = recovery_status(store, profile, now=now, model=model, parent_env=parent_env)
-    from .quota import evaluate as evaluate_quota
-
-    quota = evaluate_quota(store, profile, now, model=model, parent_env=parent_env, defer_model=defer_model)
+    A provider whose last recorded turn was refused stays refused until the provider's own
+    ``reset_at``, or -- when it gave none -- fifteen minutes after the refusal was observed.
+    After that it is simply eligible again: one ordinary attempt, and if that attempt is refused
+    too the clock restarts from the new observation. ``model`` and ``parent_env`` are accepted for
+    call-site symmetry with the rest of the availability surface; the rule itself is per provider.
+    """
+    del model, parent_env
     key = limits.status_key(profile)
-    account_row = store.get_provider_status(key)
-    account_state = limits.effective_state(account_row, now)
-    # Schema-8 records quota separately by scope.  The legacy account throttle is
-    # retained for old readers, but must not make an Opus-only weekly row reject
-    # a selected Sonnet model.  Auth/access refusals keep their normal priority.
-    quota_reader = getattr(store, "list_quota_restrictions", None)
-    if account_state == "throttled" and quota_reader and quota_reader(key, unresolved_only=True):
-        account_state = "unknown"
-    if quota["auth_context"].get("changed") and account_state == "ok":
-        account_state = "unknown"
-    model_row = store.get_provider_model_status(key, model) if model else None
-    selected = account_row
-    state = account_state
-    scope = "account" if account_row is not None else None
-    affected_model = None
-    if account_state in ("ok", "unknown") and model_row is not None:
-        model_state = limits.effective_state(model_row, now)
-        if model_state == "model_unavailable":
-            selected = model_row
-            state = model_state
-            scope = "model"
-            affected_model = model
-    stale = _observation_stale(selected, now) or bool(
-        selected is not None and selected.get("state") == "throttled" and state == "unknown"
-    )
-    # Native quota may add a temporary throttle, never remove task/model refusal evidence.
-    from .access_checks import cached_native_check
-
-    native = cached_native_check(store, profile, parent_env, now=now)
-    if quota["quota_restrictions"] and state in ("ok", "unknown") and native["eligible_hint"] is not False:
-        first = quota["quota_restrictions"][0]
-        return {
-            "evidence_revision": recovery["evidence_revision"],
-            "recovery": recovery,
-            "state": "throttled",
-            "status_key": key,
-            "code": "QUOTA_RESTRICTED",
-            "window": first.get("window"),
-            "reset_at": first.get("reset_at") or first.get("resets_at"),
-            "reason": "The provider reported a usage limit.",
-            "observed_at": first.get("observed_at"),
-            "suggested_alternative": limits.suggested_alternative(profile.id),
-            "last_success_at": _last_success_at(account_row),
-            "source": first.get("source"),
-            "scope": first.get("scope", "account"),
-            "affected_model": first.get("model"),
-            "stale": False,
-            "next_action": "wait",
-            "retry_eligible": False,
-            "quota_restrictions": quota["quota_restrictions"],
-            "auth_context": quota["auth_context"],
-            "quota_retry": quota["quota_retry"],
-        }
-    if state in ("ok", "unknown") and native["eligible_hint"] is False:
-        return {
-            "evidence_revision": recovery["evidence_revision"],
-            "recovery": recovery,
-            "state": "throttled",
-            "status_key": key,
-            "code": "NATIVE_QUOTA_EXHAUSTED",
-            "window": native["window"],
-            "reset_at": native["reset_at"],
-            "reason": "Grok reported its current quota fully used.",
-            "observed_at": native["checked_at"],
-            "suggested_alternative": limits.suggested_alternative(profile.id),
-            "last_success_at": _last_success_at(account_row),
-            "source": "native_check",
-            "scope": "account",
-            "affected_model": None,
-            "stale": False,
-            "next_action": "wait",
-            "retry_eligible": False,
-            "quota_restrictions": quota["quota_restrictions"],
-            "auth_context": quota["auth_context"],
-            "quota_retry": quota["quota_retry"],
-        }
-    next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
-    stored_state = selected.get("state") if selected else None
-    return {
-        "evidence_revision": recovery["evidence_revision"],
-        "recovery": recovery,
-        "state": state,
-        "status_key": key,
-        "code": selected.get("code") if selected and state != "ok" else None,
-        "window": selected.get("window") if selected and state != "ok" else None,
-        "reset_at": selected.get("reset_at") if selected and state != "ok" else None,
-        "reason": limits.safe_provider_reason(stored_state) if state != "ok" else None,
-        "observed_at": selected.get("observed_at") if selected else None,
-        "suggested_alternative": (
-            limits.suggested_alternative(profile.id)
-            if scope == "account" and state not in ("ok", "unknown")
+    row = store.get_provider_status(key)
+    state = str(row.get("state")) if row and row.get("state") else "ok"
+    if state == "ok":
+        return {"state": "ok", "reset_at": None, "eligible_at": None, "reason": None}
+    reset_at = row.get("reset_at") if row else None
+    observed_at = row.get("observed_at") if row else None
+    eligible_at = reset_at
+    if eligible_at is None:
+        observed = _parse_iso(observed_at)
+        eligible_at = (
+            (observed + _ELIGIBLE_AFTER).isoformat(timespec="seconds").replace("+00:00", "Z")
+            if observed is not None
             else None
-        ),
-        "last_success_at": _last_success_at(selected),
-        "source": limits.safe_provider_source(selected.get("source")) if selected else None,
-        "scope": scope,
-        "affected_model": affected_model,
-        "stale": stale,
-        "next_action": next_action,
-        "retry_eligible": retry_eligible,
-        "quota_restrictions": quota["quota_restrictions"],
-        "auth_context": quota["auth_context"],
-        "quota_retry": quota["quota_retry"],
+        )
+    return {
+        "state": state,
+        "reset_at": reset_at,
+        "eligible_at": eligible_at,
+        "reason": limits.safe_provider_reason(state, row.get("affected_model") if row else None),
     }
 
 
-def model_availability(
-    store: ProviderStatusReader,
-    profile: Profile,
-    *,
-    now: datetime,
-    parent_env: Mapping[str, str] | None = None,
-) -> list[dict[str, Any]]:
-    """Safe model-scoped observations a caller can use before choosing an override."""
-    key = limits.status_key(profile)
-    from .provider_recovery import status as recovery_status
-
-    result: list[dict[str, Any]] = []
-    rows = list(store.list_provider_model_status(key))
-    permit_reader = getattr(store, "latest_recovery_permit", None)
-    permit = permit_reader(key) if permit_reader else None
-    if (
-        permit
-        and permit["provider"] == profile.id
-        and permit["model"]
-        and not any(row["model"] == permit["model"] for row in rows)
-    ):
-        # Keep explicitly named retries discoverable before that model has reported any
-        # evidence. This remains an unknown observation, never entitlement proof.
-        rows.append({"model": permit["model"], "state": "unknown"})
-    for row in sorted(rows, key=lambda row: row["model"]):
-        state = limits.effective_state(row, now)
-        next_action, retry_eligible = _AVAILABILITY_ACTIONS.get(state, ("retry", True))
-        model = str(row["model"])
-        recovery = recovery_status(store, profile, now=now, model=model, parent_env=parent_env)
-        result.append(
-            {
-                "automatic_recovery": provider_availability(
-                    store, profile, now=now, model=model, parent_env=parent_env
-                )["automatic_recovery"],
-                "evidence_revision": recovery["evidence_revision"],
-                "recovery": recovery,
-                "state": state,
-                "status_key": key,
-                "code": row.get("code") if state != "ok" else None,
-                "window": None,
-                "reset_at": None,
-                "reason": limits.safe_provider_reason(row.get("state")) if state != "ok" else None,
-                "observed_at": row.get("observed_at"),
-                "suggested_alternative": None,
-                "last_success_at": _last_success_at(row),
-                "source": limits.safe_provider_source(row.get("source")),
-                "scope": "model",
-                "affected_model": model,
-                "stale": _observation_stale(row, now) if "observed_at" in row else False,
-                "next_action": next_action,
-                "retry_eligible": retry_eligible,
-            }
-        )
-    return result
+def provider_eligible(availability: Mapping[str, Any], now: datetime) -> bool:
+    """Whether ``availability`` (as returned by :func:`provider_availability`) admits a turn now."""
+    if availability["state"] == "ok":
+        return True
+    eligible_at = _parse_iso(availability["eligible_at"])
+    return eligible_at is not None and eligible_at <= now
 
 
 def require_provider_available(
@@ -558,33 +333,26 @@ def require_provider_available(
     ignore: bool = False,
     model: str | None = None,
     parent_env: Mapping[str, str] | None = None,
-    defer_model: bool = False,
 ) -> None:
     """Refuse to start on a provider the last turn found throttled or logged out.
 
-    This is the whole of the fallback policy: the refusal names the reset time and the other
-    first-class provider, and the caller decides. ``ignore`` starts the task anyway.
+    This is the whole of the fallback policy: the refusal names the reset (or eligible) time and
+    the other first-class provider, and the caller decides. ``ignore`` is an explicit coordinator
+    override that admits the task anyway; there is no other bypass.
     """
-    availability = provider_availability(
-        store, profile, now=now, model=model, parent_env=parent_env, defer_model=defer_model
-    )
     if ignore:
-        raise TaskSpindleError(
-            LEGACY_OVERRIDE_RETIRED,
-            "ignore_provider_status is retired; use a captured recovery permit or quota retry.",
-            details={"provider": profile.id},
-        )
-    if availability["state"] in ("ok", "unknown"):
+        return
+    availability = provider_availability(store, profile, now=now, model=model, parent_env=parent_env)
+    if provider_eligible(availability, now):
         return
     raise TaskSpindleError(
         PROVIDER_UNAVAILABLE,
-        f"provider {profile.id!r} is {availability['state']} "
-        f"({availability['reason'] or availability['code']})",
+        f"provider {profile.id!r} is {availability['state']} ({availability['reason']})",
         retryable=True,
         details={
             "provider": profile.id,
+            "code": _STATE_CODES.get(availability["state"], PROVIDER_UNAVAILABLE),
             **availability,
-            "override": "recovery permits and quota retries require captured current evidence",
         },
     )
 
@@ -626,6 +394,7 @@ def create_task(
         role=request.role,
         timeout_s=request.timeout_s,
         allow_metered=request.allow_metered,
+        ignore_provider_status=request.ignore_provider_status,
         acceptance_criteria=request.acceptance_criteria,
         path_prefixes=request.path_prefixes,
         verification_commands=request.verification_commands,

@@ -73,29 +73,6 @@ class ReadOnlyStore:
 
     # -- repositories -------------------------------------------------------------------
 
-    def list_recovery_episodes(self, status_key: str) -> list[dict[str, Any]]:
-        if self._conn is None or (self.schema_version() or 0) < 10:
-            return []
-        return [dict(row) for row in self._conn.execute(
-            "SELECT * FROM recovery_episodes WHERE status_key=? AND resolved_at IS NULL", (status_key,)
-        )]
-
-    def active_recovery_claim(self, status_key: str) -> dict[str, Any] | None:
-        if self._conn is None or (self.schema_version() or 0) < 10:
-            return None
-        row = self._conn.execute(
-            "SELECT * FROM recovery_claims WHERE status_key=? AND state IN ('claimed','prompting')",
-            (status_key,),
-        ).fetchone()
-        return dict(row) if row else None
-
-    def list_recovery_evidence(self, status_key: str) -> list[dict[str, Any]]:
-        if self._conn is None or (self.schema_version() or 0) < 10:
-            return []
-        return [dict(row) for row in self._conn.execute(
-            "SELECT * FROM recovery_evidence WHERE status_key=? ORDER BY revision", (status_key,)
-        )]
-
     def list_repositories(self) -> list[dict[str, Any]]:
         if self._conn is None:
             return []
@@ -257,55 +234,8 @@ class ReadOnlyStore:
         for row in rows:
             turn = dict(row)
             turn["attribution"] = _loads(turn["attribution"])
-            turn["native_overage"] = _loads(turn.get("native_overage"))
             turns.append(turn)
         return turns
-
-    def list_native_overage_turns(
-        self, *, since: str | None = None, provider: str | None = None,
-    ) -> list[dict[str, Any]]:
-        from ..native_overage import unknown
-
-        if self._conn is None:
-            return []
-        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(turns)")}
-        projection = "r.native_overage" if "native_overage" in columns else "NULL AS native_overage"
-        conditions, params = [], []
-        for clause, value in (("r.started_at >= ?", since), ("t.provider = ?", provider)):
-            if value is not None:
-                conditions.append(clause)
-                params.append(value)
-        where = " WHERE " + " AND ".join(conditions) if conditions else ""
-        rows = self._conn.execute(
-            "SELECT r.id AS turn_id, r.task_id, r.revision, t.provider, t.mode, "
-            "COALESCE(t.resolved_model, t.requested_model) AS model, t.repository_id, "
-            "r.started_at AS captured_at, " + projection + " FROM turns r "
-            "JOIN tasks t ON t.id = r.task_id" + where + " ORDER BY r.id", params,
-        )
-        return [dict(row) | {"native_overage": unknown() | (_loads(row["native_overage"]) or {})}
-                for row in rows]
-
-    def get_native_overage_attempt(self, key: str) -> dict[str, Any] | None:
-        if not self._table_exists("native_overage_attempts"):
-            return None
-        row = self._conn.execute(
-            "SELECT * FROM native_overage_attempts WHERE claim_key = ?", (key,),
-        ).fetchone()
-        return dict(row) if row else None
-
-    def list_native_overage_attempts(self) -> list[dict[str, Any]]:
-        if not self._table_exists("native_overage_attempts"):
-            return []
-        return [dict(row) for row in self._conn.execute("SELECT * FROM native_overage_attempts")]
-
-    def latest_native_overage_observation(self, status_key: str) -> dict[str, Any] | None:
-        if not self._table_exists("native_overage_observations"):
-            return None
-        row = self._conn.execute(
-            "SELECT * FROM native_overage_observations WHERE status_key = ? "
-            "ORDER BY id DESC LIMIT 1", (status_key,),
-        ).fetchone()
-        return dict(row) | {"observed": _loads(row["observed"])} if row else None
 
     # -- checks ---------------------------------------------------------------------
 
@@ -377,31 +307,6 @@ class ReadOnlyStore:
 
     # -- provider status --------------------------------------------------------------
 
-    def _recovery_lookup(self, clause: str, value: str) -> dict[str, Any] | None:
-        if self._conn is None:
-            return None
-        try:
-            row = self._conn.execute(
-                "SELECT * FROM provider_recovery_permits WHERE " + clause, (value,)
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                return None
-            raise
-        return dict(row) if row else None
-
-    def get_recovery_permit(self, permit_id: str) -> dict[str, Any] | None:
-        return self._recovery_lookup("permit_id = ?", permit_id)
-
-    def get_task_recovery_permit(self, task_id: str) -> dict[str, Any] | None:
-        return self._recovery_lookup("task_id = ?", task_id)
-
-    def latest_recovery_permit(self, status_key: str) -> dict[str, Any] | None:
-        return self._recovery_lookup(
-            "status_key = ? ORDER BY (state IN ('armed', 'claimed')) DESC, "
-            "created_at DESC, rowid DESC LIMIT 1", status_key,
-        )
-
     def get_provider_status(self, provider: str) -> dict[str, Any] | None:
         if self._conn is None:
             return None
@@ -410,42 +315,11 @@ class ReadOnlyStore:
         ).fetchone()
         return dict(row) if row else None
 
-    def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None:
-        """Read v5 model evidence; a schema-4 database has none."""
-        if self._conn is None:
-            return None
-        try:
-            row = self._conn.execute(
-                "SELECT * FROM provider_model_status WHERE provider = ? AND model = ?",
-                (provider, model),
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                return None
-            raise
-        return dict(row) if row else None
-
-    def list_provider_model_status(self, provider: str) -> list[dict[str, Any]]:
-        """List v5 model evidence; a schema-4 database has none."""
-        if self._conn is None:
-            return []
-        try:
-            rows = self._conn.execute(
-                "SELECT * FROM provider_model_status WHERE provider = ? ORDER BY model", (provider,)
-            ).fetchall()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc):
-                return []
-            raise
-        return [dict(row) for row in rows]
-
     def list_provider_status(self) -> list[dict[str, Any]]:
         if self._conn is None:
             return []
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
         return [dict(row) for row in rows]
-
-    # -- quota evidence / retry history ----------------------------------------------
 
     def _table_exists(self, name: str) -> bool:
         if self._conn is None:
@@ -461,66 +335,6 @@ class ReadOnlyStore:
             "SELECT auth_context FROM task_provider_context WHERE task_id = ?", (task_id,)
         ).fetchone()
         return str(row[0]) if row else None
-
-    def get_provider_auth_context(self, status_key: str) -> str | None:
-        if not self._table_exists("provider_auth_context"):
-            return None
-        row = self._conn.execute(
-            "SELECT auth_context FROM provider_auth_context WHERE status_key = ?", (status_key,)
-        ).fetchone()
-        return str(row[0]) if row else None
-
-    def list_quota_restrictions(
-        self, status_key: str | None = None, *, unresolved_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        if not self._table_exists("provider_quota_restrictions"):
-            return []
-        clauses: list[str] = []
-        params: list[Any] = []
-        if status_key is not None:
-            clauses.append("status_key = ?")
-            params.append(status_key)
-        if unresolved_only:
-            clauses.append("resolved_at IS NULL")
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            "SELECT * FROM provider_quota_restrictions" + where + " ORDER BY observed_at, id", params
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def get_active_quota_retry_claim(self, status_key: str) -> dict[str, Any] | None:
-        if not self._table_exists("provider_quota_retry_attempts"):
-            return None
-        row = self._conn.execute(
-            "SELECT * FROM provider_quota_retry_attempts WHERE status_key = ? "
-            "AND state IN ('claimed', 'prompting') ORDER BY id DESC LIMIT 1", (status_key,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def get_task_quota_retry_claim(self, task_id: str) -> dict[str, Any] | None:
-        if not self._table_exists("provider_quota_retry_attempts"):
-            return None
-        row = self._conn.execute(
-            "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def successful_quota_retry_fingerprints(self, status_key: str) -> set[str]:
-        if not self._table_exists("provider_quota_retry_attempts"):
-            return set()
-        rows = self._conn.execute(
-            "SELECT restriction_fingerprints FROM provider_quota_retry_attempts "
-            "WHERE status_key = ? AND state = 'succeeded' ORDER BY id", (status_key,)
-        ).fetchall()
-        result: set[str] = set()
-        for row in rows:
-            try:
-                values = json.loads(row[0])
-            except (TypeError, ValueError):
-                continue
-            if isinstance(values, list):
-                result.update(value for value in values if isinstance(value, str))
-        return result
 
     def get_native_check(self, provider: str) -> dict[str, Any] | None:
         """Read a schema-6 native-check cache row; older databases have no cache."""

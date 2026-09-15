@@ -322,17 +322,7 @@ def test_provider_status_is_read_only_and_uses_shared_projection(tmp_path: Path)
 
     assert response.status_code == 200
     availability = response.json()["providers"][0]["availability"]
-    assert {
-        "state",
-        "last_success_at",
-        "source",
-        "scope",
-        "affected_model",
-        "stale",
-        "next_action",
-        "retry_eligible",
-    } <= availability.keys()
-    assert response.json()["providers"][0]["model_availability"] == []
+    assert availability.keys() == {"state", "reset_at", "eligible_at", "reason"}
     assert before == after == []
 
 
@@ -364,26 +354,15 @@ def test_provider_api_sanitizes_legacy_status_reason_and_source_in_entire_respon
     assert status["source"] == "legacy"
 
 
-def test_provider_api_requests_model_scoped_shared_availability(
+def test_provider_api_requests_the_shared_availability_projection(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[tuple[str, str | None]] = []
     projection = {
         "state": "model_unavailable",
-        "status_key": "agy",
-        "code": "MODEL_UNAVAILABLE",
-        "window": None,
         "reset_at": None,
-        "reason": "The selected model is unavailable.",
-        "observed_at": "2030-01-02T12:00:00Z",
-        "suggested_alternative": None,
-        "last_success_at": "2030-01-02T11:00:00Z",
-        "source": "worker_error",
-        "scope": "model",
-        "affected_model": "gemini-test",
-        "stale": False,
-        "next_action": "choose_model",
-        "retry_eligible": False,
+        "eligible_at": "2030-01-02T12:15:00Z",
+        "reason": "The requested model is unavailable.",
     }
 
     def fake_availability(
@@ -394,17 +373,6 @@ def test_provider_api_requests_model_scoped_shared_availability(
         return projection
 
     monkeypatch.setattr("taskspindle.web.app.provider_availability", fake_availability)
-    model_projection = [
-        {
-            **projection,
-            "affected_model": "gemini-other",
-            "observed_at": "2030-01-02T10:00:00Z",
-        }
-    ]
-    monkeypatch.setattr(
-        "taskspindle.web.app.model_availability",
-        lambda store, profile, *, now: model_projection,
-    )
     profile = Profile(
         id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
     )
@@ -414,30 +382,7 @@ def test_provider_api_requests_model_scoped_shared_availability(
 
     assert response.status_code == 200
     assert response.json()["providers"][0]["availability"] == projection
-    assert response.json()["providers"][0]["model_availability"] == model_projection
     assert seen == [("agy", "gemini-test")]
-
-
-def test_provider_api_reads_a_pre_model_status_database_without_migrating_it(
-    tmp_path: Path,
-) -> None:
-    paths = _paths(tmp_path)
-    db_path = paths.state_dir / "taskspindle.sqlite3"
-    with Store.open(db_path):
-        pass
-    with sqlite3.connect(db_path) as connection:
-        connection.execute("DROP TABLE provider_model_status")
-    before = db_path.read_bytes()
-    profile = Profile(
-        id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
-    )
-    client = TestClient(build_app(paths, {"agy": profile}), base_url="http://127.0.0.1")
-
-    response = client.get("/api/providers")
-
-    assert response.status_code == 200
-    assert response.json()["providers"][0]["availability"]["state"] == "unknown"
-    assert db_path.read_bytes() == before
 
 
 def test_providers_shape_and_throttled_availability(tmp_path: Path) -> None:

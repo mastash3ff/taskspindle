@@ -1,6 +1,6 @@
 # Tool reference
 
-Nineteen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
+Eighteen tools, one envelope. Everything a Codex session can ask TaskSpindle to do is here, and
 nothing else is: there is no side channel, no implicit action and no tool that decides on a
 candidate's behalf.
 
@@ -58,12 +58,9 @@ returning.
                            "advertised_models": ["grok-4.6"],
                            "advertised_efforts": ["low", "medium", "high"],
                            "models_without_effort": []},
-                "availability": {"state": "throttled", "status_key": "grok",
-                                 "code": "PROVIDER_THROTTLED", "window": "five_hour",
-                                 "reset_at": "2026-09-04T21:00:00Z",
-                                 "reason": "The provider reported a usage limit.",
-                                 "observed_at": "2026-09-04T18:41:07Z",
-                                 "suggested_alternative": "claude"},
+                "availability": {"state": "throttled", "reset_at": "2026-09-04T21:00:00Z",
+                                 "eligible_at": "2026-09-04T21:00:00Z",
+                                 "reason": "The provider reported a usage limit."},
                 "windows": [{"window": "five_hour", "status": "rejected", "used_percent": 100.0,
                              "resets_at": "2026-09-04T21:00:00Z", "source": "throttle_error"}],
                 "native_check": {"state": "quota", "source": "grok_billing",
@@ -98,40 +95,24 @@ window, `allowed_modes`, `note`, `advertised_models`, `advertised_efforts` and
 provider or changes admission by itself; see [dispatch-policy.md](dispatch-policy.md) for the full
 shape and [`dispatch_policy`](#dispatch_policy--read-only) below for the dedicated tool.
 
-`availability` is the one part of this answer that changes. `state` is `unknown` until a turn has
-run on the provider, `ok` after one that did, and `throttled` or `auth_expired` after one the
-provider refused for a usage, rate, credit or login reason; a throttle whose `reset_at` has passed
-reads as `unknown` again. `suggested_alternative` names the other first-class provider when there is
-one. Nothing is chosen for you: see [`start_task`](#start_task) for what a throttled provider does
-to a request, and [architecture.md](architecture.md#provider-availability) for why that is all it
-does. `windows` is the newest observation of each usage window, as far as the agent reports them.
+`availability` is the one part of this answer that changes, and it is deliberately small: `state`
+(`ok`, `throttled`, `auth_expired`, `access_denied`, or `model_unavailable`), `reset_at` (the
+provider's own reset time, when it gave one), `eligible_at` (when the provider is eligible again —
+`reset_at` if there is one, otherwise fifteen minutes after the refusal was observed), and `reason`
+(a fixed, safe sentence for the state; a model-scoped refusal names the model here). A provider with
+no recorded refusal is simply `"state": "ok"`. Nothing else is in this object, and nothing is chosen
+for you: see [`start_task`](#start_task) for what a refused provider does to a request, and
+[architecture.md](architecture.md#provider-availability) for the one rule behind it. `windows` is
+the newest observation of each usage window, as far as the agent reports them — informational only;
+nothing gates admission on it.
 
 Every provider includes a normalized `native_check`. Stable fields include `state`, `source`,
 `version`, `checked_at`, `last_attempt_at`, `last_success_at`, `used_percent`, `window`,
 `period_start`, `reset_at`, `freshness`, `eligible_hint`, `checking`, `error_code`, `detail`, and a
-bounded `last_success`. Null fields remain explicit. The native result is account-unbound and
-separate from task refusal evidence. Only a fresh, current Grok quota result
-can set `eligible_hint`; explicit exhaustion adds a temporary new-task gate, while a passed reset,
-stale result, unsupported method, or failed check leaves quota unknown. It never clears an
-existing account/model refusal.
-
-Availability also carries `automatic_recovery`: `policy`, `state`, `attempts_used`,
-`attempts_remaining`, `next_attempt_at`, `hold_reason`, `active_task_id`, `episode_id`,
-and `evidence_revision`. Hybrid states are `eligible`, `cooldown`, `trial_ready`,
-`trial_running`, and `held`. Starts and continuations atomically claim an available
-trial; capability reads never reserve one. Honor this projection on hybrid profiles
-without arming a manual permit. See [recovery configuration](configuration.md#provider_recovery)
-for cooldowns and the evidence required to release a hold.
-
-For manual policy, availability also carries `evidence_revision` and `recovery`. The revision identifies the exact
-cached account and selected-model evidence plus effective quota restrictions. `recovery` reports
-the latest controlled attempt for that provider account: `state`, `permit_id`, provider and model
-scope, creation and expiry, bound task and outcome, whether a new attempt can be armed, the next
-action, and a shell-quoted `cli_command` when arming is allowed. For an explicitly requested model
-with no model observation, use `recovery.account_evidence_revision`; new model evidence makes that
-revision invalid for arming. A named permit also appears in `model_availability` with unknown model
-status until the model supplies evidence. Reading these fields never runs a
-check or starts inference.
+bounded `last_success`. Null fields remain explicit. This is an on-demand, account-unbound probe of
+what the CLI itself reports; it is entirely separate from `availability` and never gates admission —
+it exists so a caller can ask "is this CLI logged in, and what does its catalog look like" before
+starting work, the same way `doctor` does.
 
 The Grok check uses only the installed OAuth CLI's ACP billing extension. It starts no model turn,
 login, browser, or direct HTTP request; reads no token contents; and does not upgrade the CLI. A
@@ -139,32 +120,6 @@ persistent cache shared by OAuth aliases of the same provider account coalesces 
 minutes. Executable, authentication-mode, and relevant configuration/auth-file metadata changes
 invalidate it; model and effort selection do not split the account quota. Unsupported native
 methods are reported as `unsupported` without another transport.
-
-### `provider_recovery`
-
-| Parameter | Type | Default | Meaning |
-| --- | --- | --- | --- |
-| `action` | `arm`\|`revoke` | — | create one permit or revoke an unused permit |
-| `provider` | string\|null | `null` | configured profile ID; required for `arm` |
-| `model` | string\|null | `null` | exact model scope for `arm` |
-| `evidence_revision` | string\|null | `null` | revision read from current availability; required for `arm` |
-| `permit_id` | string\|null | `null` | permit to revoke; required for `revoke` |
-
-`arm` creates one single-use permit bound to the named provider, model scope, and exact cached
-refusal evidence. It rejects changed evidence, a future reset, fresh native quota exhaustion,
-malformed evidence, and another active attempt for the same provider account. It does not check a
-provider, open a browser, log in, dispatch work, or run inference. Pass the returned `permit_id` as
-`recovery_permit_id` on exactly one `start_task` request. Arm only after the user explicitly
-authorizes that retry; cached evidence and an available permit never authorize autonomous retry.
-
-`revoke` accepts only `action` and `permit_id`. It can revoke an armed permit; a permit already
-claimed by a task cannot become reusable. Both actions return the safe recovery projection inside
-the standard envelope. This tool changes authorization state and is not annotated read-only.
-
-For the equivalent operator flow, `taskspindle providers --retry-next --provider ID [--model
-MODEL]` reads the current cached revision and arms it atomically. `taskspindle providers
---revoke-retry PERMIT_ID` revokes an unused permit. These flags cannot be combined with `--check`;
-neither command performs provider checks, browser work, login, or inference.
 
 ### `doctor` — read-only
 
@@ -184,8 +139,8 @@ checks. Same checks as the `taskspindle doctor` command.
 `get` returns `{"policy", "revision", "fingerprint", "updated_at", "updated_by", "source",
 "document_error"}` — the same document `capabilities()` reads. `status` adds `status` (observed
 usage against the policy, per [dispatch-policy.md](dispatch-policy.md#status)) and
-`file_managed: {"config_file", "concurrency", "native_overage", "provider_recovery"}`, the
-`config.toml` tables the dashboard shows read-only alongside the policy.
+`file_managed: {"config_file", "concurrency"}`, the `config.toml` tables the dashboard shows
+read-only alongside the policy.
 
 There is no `set` through MCP: the caller being steered does not rewrite its own steering. The
 policy is edited only through the dashboard's Policy page or `taskspindle policy`; see
@@ -244,8 +199,7 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `effort` | string\|null | `null` | as above |
 | `timeout_s` | int | `1800` | 60–14400 |
 | `allow_metered` | bool | `false` | required for an `api_key` profile |
-| `ignore_provider_status` | bool | `false` | recognized legacy input; `true` is rejected with `LEGACY_OVERRIDE_RETIRED` before task creation |
-| `recovery_permit_id` | string\|null | `null` | consume one controlled-retry permit bound to this provider/model and current evidence |
+| `ignore_provider_status` | bool | `false` | an explicit coordinator override: admit the task even while the provider's last turn is still within its refusal window |
 | `acceptance_criteria` | string\|null | `null` | **implement only, required** |
 | `path_prefixes` | string[]\|null | `null` | **implement only, required**; repository-relative, no `..`, no leading `/` |
 | `verification_commands` | string[]\|null | `null` | **implement only, required**; may be `[]` |
@@ -286,20 +240,17 @@ uncommitted changes inside the task's own path prefixes — `details.code = DIRT
 
 **`PROVIDER_UNAVAILABLE`** is the whole of TaskSpindle's answer to a subscription limit. When the
 last turn on a provider was refused for a usage, rate, credit or login reason, the next
-`start_task` on that provider is refused too, with `details` carrying the `state`, the `window`,
-the `reset_at` the provider gave (when it gave one), a sanitized `reason`, and
-`suggested_alternative`, the other first-class provider. The error is `retryable`. Nothing is
-re-queued on another provider. A reported future reset means wait; a missing reset may receive one
-explicitly authorized `recovery_permit_id` attempt. `ignore_provider_status` is retired and returns
-`LEGACY_OVERRIDE_RETIRED`; it cannot start a task. A turn that runs clears only the evidence it
-actually established.
+`start_task` on that provider is refused too, until the provider's own `reset_at` — or, when it gave
+none, fifteen minutes after the refusal was observed. `details` carries the same shape
+`capabilities.providers[].availability` does (`state`, `reset_at`, `eligible_at`, `reason`), plus
+the per-state `code` (`PROVIDER_THROTTLED`, `PROVIDER_AUTH_EXPIRED`, `PROVIDER_ACCESS_DENIED`, or
+`PROVIDER_MODEL_UNAVAILABLE`). The error is `retryable`; once `eligible_at` passes, the provider is
+simply eligible again — one ordinary attempt, and if that one is refused too the clock restarts from
+the new observation. Nothing is re-queued on another provider.
 
-`recovery_permit_id` is the controlled replacement for an unrestricted retry. It is mutually
-exclusive with the legacy `ignore_provider_status` flag. Task creation validates the permit and
-permanently claims it in the same transaction as the task and its `PROVIDER_RECOVERY_ATTEMPT`
-warning. Expiry applies until the initial prompt is admitted; it never interrupts a running turn.
-The permit settles permanently as succeeded when provider access was established, or failed when
-no turn was accepted or an unrelated failure occurred.
+`ignore_provider_status` is the only bypass: an explicit coordinator override that admits the task
+regardless of the provider's current status. There is no other override, and no permit to arm or
+claim — a provider that is eligible again needs no override at all.
 
 ### `list_tasks` — read-only
 
@@ -391,22 +342,18 @@ have not seen. A new candidate revision has a new digest, and its coverage start
 | `expected_state_version` | int | — |
 | `prompt` | string | `""` |
 
-One more turn. What it means depends on where the task is. Ordinary observe-only
-continuations retain their existing refusal handling. Native extra-usage continuations
-recheck current policy and eligibility; the provider and original model remain fixed.
+One more turn. What it means depends on where the task is.
 
 | State | Mode | Turn |
 | --- | --- | --- |
 | `RESULT_READY` | implement | a **repair** on the candidate, producing a new revision |
 | `COMPLETED` | consult | a **follow-up** question in the same session |
 | `INTERRUPTED` | any | a **resume** of the interrupted turn |
-| `FAILED` | any | a narrow **resume** only when `native_overage.continuation.eligible` is true |
 
-The failed-task path requires original included-quota failure evidence, a retained
-usable workspace, original model/authentication/session, and a definitely stopped worker.
-Inspect `task_status.native_overage.continuation` for current eligibility and its reason.
-It preserves partial work and adds a continuation turn; it never replays the original request.
-See [native extra usage](native-overage.md).
+A `FAILED` task cannot be continued: `ILLEGAL_TRANSITION`. A provider refusal is recorded on
+`provider_status` and cleared by `start_task`'s own admission once the provider is eligible again
+(or immediately with `ignore_provider_status`) — start a new task rather than resuming the failed
+one's own session.
 
 Anything else is `ILLEGAL_TRANSITION`. A resume of a task with no stored session is
 `RESUME_UNAVAILABLE`. A task in `RECOVERY_AMBIGUOUS` is reconciled once more first, and if it is
@@ -585,11 +532,6 @@ Where the numbers come from, and what they are not:
   static price table whose date is `price_table_version`, so seat usage can be compared and
   budgeted. Grok's own cost figure is not converted, because its unit is not documented; a model
   the table does not know has no estimate.
-- **`native_overage`** counts all turns by recorded policy and observed billing classification,
-  including tokenless and historical unknown turns, with the requested grouping/filter. Account
-  balances and caps are observations shared by the account, not task charges. Task status/result
-  exposes the latest turn snapshot; failed task status separately exposes current continuation
-  eligibility. See [native extra usage](native-overage.md).
 - **Outcomes, timings and violations** are computed from the task, turn, check and event tables
   on every call; nothing is aggregated ahead of time.
 - **Windows** are observed, never polled. For Claude, the adapter forwards the SDK's rate-limit
@@ -676,17 +618,8 @@ invalidates the review: get a new one.
 | `MODE_UNAVAILABLE` | on a FAILED task: the agent refused the session mode its task needs, so the turn did not run |
 | `PROVIDER_THROTTLED` | on a FAILED task: the provider refused the turn for a usage, rate or credit limit |
 | `PROVIDER_AUTH_EXPIRED` | on a FAILED task: the provider refused the turn because the seat is logged out or not allowed |
-| `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and the reset has not passed |
-| `QUOTA_RETRY_PENDING` | the shared provider seat already has its single ordinary post-reset attempt bound to another task |
-| `LEGACY_OVERRIDE_RETIRED` | `ignore_provider_status` was supplied; cached provider status cannot be bypassed |
-| `RECOVERY_EVIDENCE_CHANGED` | cached provider evidence changed after the permit was proposed or armed |
-| `RECOVERY_NOT_ELIGIBLE` | current refusal/reset/native evidence does not allow a controlled attempt |
-| `RECOVERY_ACTIVE_ATTEMPT` | the provider account already has an armed or claimed attempt |
-| `RECOVERY_NOT_FOUND` | no such recovery permit |
-| `RECOVERY_ALREADY_CLAIMED` | a task claimed the permit, so it cannot be revoked |
-| `RECOVERY_SCOPE_MISMATCH` | the named provider or model does not match the permit |
-| `RECOVERY_NOT_AVAILABLE` | the permit has already been used or settled |
-| `RECOVERY_EXPIRED` | the permit expired before initial prompt admission |
-| `RECOVERY_INVALID_SCOPE` | the provider or model identifier is not safe and valid |
+| `PROVIDER_ACCESS_DENIED` | on a FAILED task: the provider denied account access without claiming the login itself is invalid |
+| `PROVIDER_MODEL_UNAVAILABLE` | on a FAILED task: the requested model, rather than the account, is unavailable |
+| `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and it is not eligible again yet; pass `ignore_provider_status` for an explicit coordinator override |
 | `POLICY_BUDGET_EXHAUSTED` | `start_task` refused (retryable): the named provider has an exhausted, enforced dispatch-policy budget; `details` carries `provider`, `window`, `kind`, `limit`, `used`, `window_start`, `policy_revision` |
 | `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |

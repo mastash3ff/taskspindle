@@ -36,11 +36,11 @@ from starlette.staticfiles import StaticFiles
 
 import taskspindle
 
-from .. import access_checks, limits, native_overage, policy, usage
+from .. import access_checks, limits, policy, usage
 from ..config import Paths
 from ..doctor import run_doctor_async
 from ..providers import Profile
-from ..service import model_availability, provider_availability, task_view
+from ..service import provider_availability, task_view
 from ..store import PolicyRevisionConflict
 from . import ai_policy
 from .ai_policy import AdapterFactory
@@ -392,8 +392,7 @@ def build_app(
         with _store() as store:
             providers_out = []
             observed_now = clock()
-            for original in sorted(profiles.values(), key=lambda item: item.id):
-                profile = native_overage.current_profile(original, profiles, paths.config_file)
+            for profile in sorted(profiles.values(), key=lambda item: item.id):
                 providers_out.append(
                     {
                         "id": profile.id,
@@ -406,9 +405,6 @@ def build_app(
                         "command_name": os.path.basename(profile.command[0]) if profile.command else None,
                         "availability": provider_availability(
                             store, profile, now=observed_now, model=profile.model
-                        ),
-                        "model_availability": model_availability(
-                            store, profile, now=observed_now
                         ),
                         "native_check": access_checks.cached_native_check(
                             store, profile, now=observed_now

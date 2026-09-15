@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from taskspindle import provider_recovery, repos, runner, service, units, worktrees
+from taskspindle import repos, runner, service, units, worktrees
 from taskspindle.config import Paths
 from taskspindle.models import (
     AuthMode,
@@ -122,6 +122,7 @@ def seed_task(
     provider_family: str = PROVIDER,
     lease_limit: int = 1,
     model: str | None = None,
+    ignore_provider_status: bool = False,
 ) -> TaskRecord:
     """Set a task up exactly the way the server will before it starts a worker unit.
 
@@ -133,6 +134,7 @@ def seed_task(
         "mode": mode,
         "prompt": prompt,
         "timeout_s": 60,
+        "ignore_provider_status": ignore_provider_status,
     }
     if model is not None:
         fields["model"] = model
@@ -195,21 +197,6 @@ def seed_task(
     if identity is not None:
         record_root_snapshot(store, paths, task.id, identity.toplevel, revision=1)
     return task
-
-
-def attach_recovery_permit(
-    store: Store, task: TaskRecord, profile: Profile, *, model: str | None = None,
-) -> None:
-    """Bind a seeded task to the same single-use permit an authorized start would claim."""
-    stamp = datetime.now(UTC)
-    evidence = provider_recovery.status(store, profile, now=stamp, model=model, parent_env=os.environ)
-    permit = provider_recovery.arm(
-        store, profile, evidence_revision=evidence["evidence_revision"], now=stamp,
-        model=model, parent_env=os.environ,
-    )
-    provider_recovery.claim(
-        store, profile, permit["permit_id"], task.id, now=stamp, model=model, parent_env=os.environ,
-    )
 
 
 def record_root_snapshot(
@@ -743,9 +730,8 @@ async def test_cancelled_turn_is_not_evidence_that_a_previous_throttle_cleared(
 ) -> None:
     store.set_provider_status(PROVIDER, "throttled", source="earlier_failure")
     observed = store.get_provider_status(PROVIDER)
-    task = seed_task(store, paths, mode=Mode.CONSULT)
+    task = seed_task(store, paths, mode=Mode.CONSULT, ignore_provider_status=True)
     script_path = script({"block_seconds": 30})
-    attach_recovery_permit(store, task, profile_for(script_path))
     state = await cancel_mid_turn(store, paths, task, script_path)
     assert state is TaskState.CANCELLED
     assert store.get_provider_status(PROVIDER) == observed
@@ -827,14 +813,11 @@ async def test_transport_close_during_startup_honors_only_requested_cancellation
 # -- provider limits and usage ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("scope", ["account", "model"])
 async def test_new_refusal_before_first_prompt_blocks_the_turn(
-    store: Store, paths: Paths, script, scope: str,
+    store: Store, paths: Paths, script,
 ) -> None:
-    task = seed_task(
-        store, paths, mode=Mode.CONSULT, model="model-a" if scope == "model" else None,
-    )
-    marker = paths.state_dir / f"{scope}-session-started.pid"
+    task = seed_task(store, paths, mode=Mode.CONSULT, model="model-a")
+    marker = paths.state_dir / "account-session-started.pid"
     script_path = script({
         "new_delay": 0.5,
         "started_new_to": str(marker),
@@ -853,12 +836,7 @@ async def test_new_refusal_before_first_prompt_blocks_the_turn(
             while not marker.exists():
                 assert not worker.done()
                 await asyncio.sleep(0.01)
-        if scope == "account":
-            store.set_provider_status(PROVIDER, "auth_expired", source="acp_error")
-        else:
-            store.set_provider_model_status(
-                PROVIDER, "model-a", "model_unavailable", source="acp_error",
-            )
+        store.set_provider_status(PROVIDER, "auth_expired", source="acp_error")
         assert await worker is TaskState.FAILED
     finally:
         if not worker.done():
@@ -868,45 +846,6 @@ async def test_new_refusal_before_first_prompt_blocks_the_turn(
     final = store.get_task(task.id)
     assert final.error["code"] == service.PROVIDER_UNAVAILABLE
     assert final.response is None
-
-
-@pytest.mark.parametrize("new_model_refusal", [False, True])
-async def test_recovery_permit_follows_default_model_resolution_only_without_model_refusal(
-    store: Store, paths: Paths, script, new_model_refusal: bool,
-) -> None:
-    store.set_provider_status(PROVIDER, "auth_expired", source="acp_error")
-    task = seed_task(store, paths, mode=Mode.CONSULT)
-    marker = paths.state_dir / "default-model-session-started.pid"
-    script_path = script({
-        "new_delay": 0.5,
-        "started_new_to": str(marker),
-        "response": "allowed explicit retry",
-        "config_options": [{
-            "id": "model", "name": "Model", "type": "select", "currentValue": "model-a",
-            "options": [{"value": "model-a", "name": "Model A"}],
-        }],
-    })
-    profile = replace(profile_for(script_path), model="model-a")
-    attach_recovery_permit(store, task, profile, model=None)
-    worker = asyncio.create_task(run_task(
-        store, paths, task, script_path,
-        profile=profile,
-    ))
-    try:
-        async with asyncio.timeout(10):
-            while not marker.exists():
-                assert not worker.done()
-                await asyncio.sleep(0.01)
-        if new_model_refusal:
-            store.set_provider_model_status(
-                PROVIDER, "model-a", "model_unavailable", source="acp_error",
-            )
-        expected = TaskState.FAILED if new_model_refusal else TaskState.COMPLETED
-        assert await worker is expected
-    finally:
-        if not worker.done():
-            runner.request_cancel(task.id)
-            await worker
 
 
 async def test_a_usage_limit_refusal_marks_the_provider_throttled(
@@ -926,10 +865,10 @@ async def test_a_usage_limit_refusal_marks_the_provider_throttled(
         store, profile_for(script({})), now=datetime.now(UTC), parent_env=os.environ,
     )
     assert availability["state"] == "throttled"
-    assert [(row["window"], row["reset"], row["source"]) for row in availability["quota_restrictions"]] == [
-        ("unknown", "2030-01-01T00:00:00Z", "legacy"),
-    ]
-    assert store.get_provider_status(PROVIDER) is None
+    assert availability["reset_at"] == "2030-01-01T00:00:00Z"
+    status = store.get_provider_status(PROVIDER)
+    assert status["state"] == "throttled"
+    assert status["reset_at"] == "2030-01-01T00:00:00Z"
     assert EventKind.PROVIDER_LIMIT.value in event_kinds(store, task.id)
     windows = store.latest_provider_windows(PROVIDER)
     assert [(row["window"], row["status"], row["used_percent"]) for row in windows] == [
@@ -1006,7 +945,7 @@ async def test_a_turn_that_runs_clears_the_throttle_and_records_its_usage(
     store: Store, paths: Paths, script
 ) -> None:
     store.set_provider_status(PROVIDER, "throttled", code="PROVIDER_THROTTLED", source="acp_error")
-    task = seed_task(store, paths, mode=Mode.CONSULT)
+    task = seed_task(store, paths, mode=Mode.CONSULT, ignore_provider_status=True)
     script_path = script(
         {
             "response": "fine now",
@@ -1014,7 +953,6 @@ async def test_a_turn_that_runs_clears_the_throttle_and_records_its_usage(
             "rate_limit": {"status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.8},
         }
     )
-    attach_recovery_permit(store, task, profile_for(script_path))
 
     state = await run_task(store, paths, task, script_path)
 
@@ -1071,9 +1009,12 @@ async def test_older_success_preserves_new_sibling_failure(
             await worker
 
 
-async def test_rejected_window_is_not_misattributed_to_a_later_allowed_window(
+async def test_an_embedded_rejected_window_on_a_completed_turn_is_informational_only(
     store: Store, paths: Paths, script,
 ) -> None:
+    """Only a refused turn (an ``AcpError``) writes ``provider_status``; a completed turn's own
+    rate-limit telemetry -- rejected or not -- is recorded on ``provider_windows`` and nowhere
+    else, and it clears the provider's status the same as any other successful turn."""
     task = seed_task(store, paths, mode=Mode.CONSULT)
     rejected = {"status": "rejected", "rateLimitType": "five_hour", "resetsAt": 1893456000}
     state = await run_task(store, paths, task, script({
@@ -1085,10 +1026,10 @@ async def test_rejected_window_is_not_misattributed_to_a_later_allowed_window(
     availability = service.provider_availability(
         store, profile_for(script({})), now=datetime.now(UTC), parent_env=os.environ,
     )
-    assert availability["state"] == "throttled"
-    assert [(row["window"], row["reset"], row["source"]) for row in availability["quota_restrictions"]] == [
-        ("five_hour", "2030-01-01T00:00:00Z", "rate_limit_event"),
-    ]
+    assert availability["state"] == "ok"
+    windows = {row["window"]: row["status"] for row in store.latest_provider_windows(PROVIDER)}
+    assert windows["five_hour"] == "rejected"
+    assert windows["seven_day"] == "allowed"
 
 
 async def test_a_grok_style_turn_completed_update_is_recorded_with_its_model(

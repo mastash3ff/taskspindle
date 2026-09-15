@@ -4,7 +4,7 @@
 
 ```
   Codex session                                  browser (localhost)
-        │  MCP over stdio (19 tools, one envelope)        │  taskspindle web:
+        │  MCP over stdio (18 tools, one envelope)        │  taskspindle web:
         ▼                                                 ▼  task tables read-only, policy tables writable
   taskspindle mcp ──────────────────────────────────────────────┐
   server.py: envelope, annotations, traceback → server.log      │
@@ -17,7 +17,6 @@
   reviews · grants · leases            │                                    │
   artifacts · journals                 │                                    │
   provider_status · provider_windows   │                                    │
-  provider_recovery_permits            │                                    │
   turn_usage                           │                                    │
         ▲                              ▼                                    ▼
         │            taskspindle-worker-<task>.service     taskspindle-accept-<task>.service
@@ -35,7 +34,6 @@
   recovery.py    what to believe when a worker vanished
   review.py      the reviewer's JSON, and what blocks an acceptance
   limits.py      what a refused turn means for its provider; never what to do about it
-  provider_recovery.py  single-use authorization bound to cached refusal evidence
   usage.py       token counts per turn, the price table, the rolled-up report
   policy.py      dispatch policy: document, defaults, validation, status against observed usage
   web/           operator console: read-only task, worker, overview and usage projections, plus
@@ -216,74 +214,58 @@ provider output. Persisted access reasons and diagnostic fields are sanitized.
 **Recording.** The runner writes a classified refusal in three places: the task's `error` (code
 `PROVIDER_THROTTLED`, `PROVIDER_AUTH_EXPIRED`, `PROVIDER_ACCESS_DENIED`, or
 `PROVIDER_MODEL_UNAVAILABLE`, with the relevant scope and reset time in `details`), a
-`PROVIDER_LIMIT` event on the task, and the provider's row in `provider_status`, keyed by the
-seat — an OAuth profile derived from `claude` shares `claude`'s seat and therefore its throttle;
-an `api_key` profile is keyed by its own id. A throttle also writes a `provider_windows` row at
-100% for the window it named. A turn that runs writes the windows the agent reported along the way
-(the Claude adapter forwards the SDK's rate-limit events). Model-scoped evidence is stored
-separately so it cannot disable other models. Successful use advances `last_success_at`, but
-clears a refusal only when it matches the observation taken before the turn; a sibling's newer
-failure survives. Schema 5 adds this evidence without changing task ownership or provider binding.
+`PROVIDER_LIMIT` event on the task, and the provider's one row in `provider_status`, keyed by the
+seat — an OAuth profile derived from `claude` shares `claude`'s seat and therefore its throttle; an
+`api_key` profile is keyed by its own id. There is exactly one row per provider: a model-scoped
+refusal (`PROVIDER_MODEL_UNAVAILABLE`) writes to that same row, naming the affected model in
+`reason` rather than in a row of its own — there is no per-model table. A throttle also writes a
+`provider_windows` row at 100% for the window it named; a turn that runs writes every window the
+agent reported along the way (the Claude adapter forwards the SDK's rate-limit events), but that is
+informational telemetry only and never itself gates admission. A turn that completes successfully
+clears the row, but only when it still matches the observation taken before the turn started; a
+sibling's newer failure survives.
 
-**Selection before task creation.** MCP `capabilities`, `GET /api/providers`, and
-`taskspindle providers --json` share the availability projection: scope, source, observation time,
-last successful use, staleness, reset time, retry eligibility, and a suggested next action.
-`model_availability` lists known model observations even when a profile has no fixed default.
-A passed reset means `unknown` and eligible for an ordinary attempt, not proven healthy.
-Unresolved refusals remain blocking even when their observations become stale. Each availability
-projection includes an `evidence_revision` and a recovery projection derived entirely from cached
-state.
+**The one rule.** A provider whose `provider_status` is not `ok` is refused
+(`PROVIDER_UNAVAILABLE`) until it is eligible again: the provider's own `reset_at` when it gave
+one, or fifteen minutes after the refusal was observed when it did not. After that time it is
+simply eligible again — one ordinary attempt, and if that attempt is refused too the clock restarts
+from the new observation. `start_task`'s `ignore_provider_status` is the one explicit override: a
+coordinator that sets it is admitted regardless of the provider's current status. There is no
+permit to arm, no claim to hold, and no separate quota-window ledger; `capabilities`,
+`GET /api/providers`, and `taskspindle providers --json` all share the same four-field projection —
+`state`, `reset_at`, `eligible_at`, `reason` — because that is the whole of what a caller needs to
+decide.
 
-Quota is a separate durable projection. `quota_restrictions` retains every applicable account or
-model-family window with its scope, normalized model family, reset, source, observation, and
-opaque fingerprint. A changed `auth_context` invalidates authorization tied to the earlier context;
-it never clears quota restrictions or identifies an account. After all applicable restrictions have
-passed their reset, aliases of the same OAuth seat share one ordinary, acceptance-bearing retry
-claim. A pending claim is attached to its task and prevents duplicate replacement tasks. An
-unaffected model remains eligible under the normal capacity and grant rules.
-
-The Codex coordinator selects a compatible OAuth worker before calling `start_task`,
-preserving explicit provider/model requirements, repository grants, capacity, and review
-independence. Unknown access permits ordinary needed work; it never justifies synthetic probes.
+The Codex coordinator selects a compatible OAuth worker before calling `start_task`, preserving
+explicit provider/model requirements, repository grants, capacity, and review independence.
 TaskSpindle receives an explicit provider and does not migrate, retry, or change that task's
-provider. When none is eligible the coordinator reports the constraint and next action.
-A controlled retry first arms one permit against that exact evidence revision, then names the
-permit on one `start_task`. Arming and task creation both reject changed evidence, future resets,
-fresh native quota exhaustion, scope changes, and another active attempt for the shared provider
-account. Task creation claims the permit transactionally, so it cannot authorize two tasks. The
-permit is settled permanently from the accepted provider turn; expiry only governs admission and
-never interrupts running work. A non-quota refusal or an explicitly authorized throttle with no
-reported reset may use this one exact permit. A quota restriction with a reported future reset and
-fresh native exhaustion never bypass it. The legacy `ignore_provider_status` field remains
-recognizable for compatibility but is rejected as `LEGACY_OVERRIDE_RETIRED`. Native cached-login
-checks alone do not clear a refusal.
-Metered workers still require separate explicit opt-in and are never selected automatically by
-the work pool.
+provider. When none is eligible the coordinator reports the constraint and either waits for
+`eligible_at` or, as an explicit decision, sets `ignore_provider_status`. Metered workers still
+require separate explicit opt-in and are never selected automatically by the work pool.
 
-`capabilities(check_providers=["grok"])` and `taskspindle providers --check --provider grok`
-optionally refresh Grok's native quota observation. The checker starts a session-free native ACP
-process, calls the vendor billing extension, and retains only normalized percentage, weekly/monthly
-window, reset, timestamps, version, freshness, and safe status fields. The persistent cache is
-shared by OAuth model aliases of the same provider account. It coalesces concurrent checks for
-five minutes and invalidates on executable, auth mode, or relevant config/auth-file metadata
-changes; model and effort selection do not create separate account quota caches. It never starts inference, login, a browser, or direct HTTP;
-it reads no credential contents and never upgrades the CLI. Unsupported versions keep quota
-unknown rather than trying another transport.
+`capabilities(check_providers=["grok"])`, `taskspindle providers --check --provider grok`, and
+`doctor` share a second, independent projection: the on-demand native check. It answers "is this
+CLI logged in, and what does its catalog look like" — it never gates `start_task` admission, and
+admission never triggers it. The checker starts a session-free native ACP process, calls the vendor
+billing extension, and retains only normalized percentage, weekly/monthly window, reset,
+timestamps, version, freshness, and safe status fields. The persistent cache is shared by OAuth
+model aliases of the same provider account. It coalesces concurrent checks for five minutes and
+invalidates on executable, auth mode, or relevant config/auth-file metadata changes; model and
+effort selection do not create separate account quota caches. It never starts inference, login, a
+browser, or direct HTTP; it reads no credential contents and never upgrades the CLI. Unsupported
+versions keep quota unknown rather than trying another transport. Because the optional MCP
+parameter writes this diagnostic cache, `capabilities` is not advertised with a read-only
+annotation; its default call is cached-only. Dashboard Overview and Workers GETs read cached
+task/native/doctor data, start no diagnostics, and tolerate older task schemas without migrating
+them. The CLI's default `providers` status path also uses the read-only store.
 
-A fresh explicit 100-percent native observation can add a temporary new-task gate. A passed reset,
-stale observation, or unknown quota permits an ordinary attempt unless task evidence still refuses
-it. Native evidence never clears account/model refusals or establishes browser identity, CLI
-account binding, billing dates, or future model-turn success. Because the optional MCP parameter
-writes this diagnostic cache, `capabilities` is not advertised with a read-only annotation; its
-default call is cached-only. Dashboard Overview and Workers GETs read cached task/native/doctor
-data, start no diagnostics, and tolerate older task schemas without migrating them. The CLI's
-default `providers` status path also uses the read-only store. Schema 6 adds the native diagnostic
-cache; schema 7 adds recovery permits; schema 8 adds durable quota windows, authentication-context
-binding, and shared post-reset retry claims without changing task ownership or provider binding.
-Schema 9 adds nullable per-turn native-overage metadata, bounded admission claims, and safe
-native observations. Historical billing remains unknown. [Native extra usage](native-overage.md)
-adds exact-profile standing policy and a same-session quota continuation; account settings
-remain the spending authority. Native-overage service success preserves included-quota evidence.
+Schema 12 collapses the machinery this rule replaces: it drops `provider_model_status`,
+`provider_recovery_permits`, `provider_auth_context`, `provider_quota_restrictions`,
+`provider_quota_retry_attempts`, `native_overage_attempts`, `native_overage_observations`,
+`recovery_episodes`, `recovery_claims`, `recovery_native_semantics`, and `recovery_evidence` —
+eleven tables whose entire job was recording an intermediate state on the road to exactly the one
+rule above. `provider_status`, `provider_windows`, and the schema-6 native-check cache are
+unaffected; nothing in this collapse touches task ownership or provider binding.
 
 ## What isolation is, and is not
 

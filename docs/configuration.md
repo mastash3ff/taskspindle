@@ -27,62 +27,22 @@ Their ids are reserved. You cannot redefine them in `config.toml`.
 personal login. Setup, authentication and the enforced worker policy are described in
 [antigravity.md](antigravity.md). An `agy`-derived profile cannot switch to API-key authentication.
 
-## `[provider_recovery]`
+## `[provider_recovery]` and `[native_overage]` (retired)
 
-Each exact profile defaults to `"manual"`. Enable `"hybrid"` to authorize bounded
-recovery using necessary tasks, without manual retry permits:
-
-```toml
-[provider_recovery]
-claude = "hybrid"
-grok = "hybrid"
-agy = "hybrid"
-```
-
-After an initial access refusal, retry cooldowns are 5, 15, and 60 minutes from
-the preceding refusal. Three failed retries hold the affected account/model
-indefinitely. New relevant positive native evidence permits one trial; another
-refusal returns to held. Only successful model access resolves the refusal.
-
-Native checks are cached for five minutes and never start inference or browser
-login. Fresh native denials and future quota resets still block admission.
-Unchanged login/catalog results, refresh timestamps, credential metadata alone,
-and elapsed reset times do not release an indefinite hold. Some providers do
-not expose enough native evidence to release every kind of hold automatically.
-
-Aliases need their own policy entry but share account trial capacity. Counters
-and claims survive restarts. `availability.automatic_recovery` is authoritative
-for hybrid admission; manual permits cannot override it. No synthetic probe,
-background model task, provider switch, or paid fallback is created by this policy.
-The caller may route necessary work to another eligible provider while preserving
-explicit provider/model constraints. Native extra usage remains a separate policy.
-
-## `[native_overage]`
-
-Every exact profile defaults to `"observe_only"`. Setting an OAuth profile to
-`"provider_managed"` is standing authorization for native extra usage after included
-allowance exhaustion. Provider account settings remain the spending authority.
-Aliases require their own entry; API-key profiles cannot use this policy.
-
-```toml
-[native_overage]
-claude = "observe_only"
-grok = "observe_only"
-agy = "observe_only"
-```
-
-`observe_only` retains ordinary quota gates and disables AGY credits. It cannot
-prevent Claude/Grok from consuming extra usage already enabled on the provider
-account. `allow_metered` remains the separate API-key authorization gate.
-See [native extra usage](native-overage.md) for continuation, telemetry, and rollout.
+Both tables configured machinery this release deletes: manual and hybrid recovery permits, and
+standing native-extra-usage policy. A provider refusal is now a single rule — see
+[architecture.md](architecture.md#provider-availability) — with no permit to arm, no cooldown
+ledger, and no per-profile spending policy. If either table is still present in `config.toml`, it
+is accepted and ignored, with one warning line on startup; delete it whenever convenient. There is
+no replacement key: a refusal is reported and waited out (or bypassed with `ignore_provider_status`
+on `start_task`), not configured.
 
 ## Dispatch policy
 
 Target shares, budgets, per-role model and effort, and the rest of the dispatch policy live in the
 state database, not here. Edit them through the dashboard's Policy page or `taskspindle policy` —
-never in `config.toml`. The Policy page shows `[concurrency]`, `[native_overage]` and
-`[provider_recovery]` from this file read-only, for context alongside the policy they sit next to.
-See [dispatch-policy.md](dispatch-policy.md).
+never in `config.toml`. The Policy page shows `[concurrency]` from this file read-only, for context
+alongside the policy they sit next to. See [dispatch-policy.md](dispatch-policy.md).
 
 ## `[providers.<id>]`
 

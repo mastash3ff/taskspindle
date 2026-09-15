@@ -93,8 +93,7 @@ def test_policy_get_shape_before_anything_is_saved(tmp_path: Path) -> None:
     file_managed = body["file_managed"]
     assert file_managed["config_file"] == str(paths.config_file)
     assert file_managed["concurrency"] == {"claude": 1, "grok": 1}
-    assert file_managed["native_overage"] == {"claude": "observe_only", "grok": "observe_only"}
-    assert file_managed["provider_recovery"] == {"claude": "manual", "grok": "manual"}
+    assert file_managed.keys() == {"config_file", "concurrency"}
 
 
 def test_get_from_non_loopback_peer_is_refused_without_a_csrf_token(tmp_path: Path) -> None:

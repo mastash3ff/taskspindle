@@ -79,22 +79,10 @@ def build_parser() -> argparse.ArgumentParser:
         "providers", help="show cached worker availability without starting work",
     )
     provider_status.add_argument("--provider", help="only this configured provider ID")
-    provider_status.add_argument(
-        "--model", help="model for the one controlled retry (requires --retry-next)"
-    )
     provider_status.add_argument("--json", action="store_true", help="print the report as JSON")
-    provider_action = provider_status.add_mutually_exclusive_group()
-    provider_action.add_argument(
+    provider_status.add_argument(
         "--check", action="store_true",
         help="also check supported native cached logins/catalogs without browser login or inference",
-    )
-    provider_action.add_argument(
-        "--retry-next", action="store_true",
-        help="arm one controlled retry using the current cached evidence revision",
-    )
-    provider_action.add_argument(
-        "--revoke-retry", metavar="PERMIT_ID",
-        help="revoke an armed controlled-retry permit",
     )
 
     sub.add_parser("mcp", help="run the stdio MCP server (what Codex launches)")
@@ -193,21 +181,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return _doctor(live_probes=not args.no_live, as_json=args.json)
     if args.command == "providers":
-        if args.retry_next and not args.provider:
-            parser.error("providers --retry-next requires --provider")
-        if args.retry_next and args.model is not None and not args.model.strip():
-            parser.error("providers --model must not be empty")
-        if args.model and not args.retry_next:
-            parser.error("providers --model requires --retry-next")
-        if args.revoke_retry and args.provider:
-            parser.error("providers --revoke-retry does not accept --provider")
-        if args.retry_next or args.revoke_retry:
-            return _provider_recovery(
-                provider=args.provider,
-                model=args.model,
-                permit_id=args.revoke_retry,
-                as_json=args.json,
-            )
         return _providers_status(check=args.check, as_json=args.json, provider=args.provider)
     if args.command == "mcp":
         return _mcp()
@@ -347,7 +320,7 @@ def _providers_status(*, check: bool, as_json: bool, provider: str | None = None
     from datetime import UTC, datetime
 
     from .providers import ProfileError
-    from .service import model_availability, provider_availability
+    from .service import provider_availability
     from .web.db import ReadOnlyStore
 
     paths = resolve_paths()
@@ -373,7 +346,6 @@ def _providers_status(*, check: bool, as_json: bool, provider: str | None = None
                     "availability": provider_availability(
                         store, profile, now=checked_at, model=profile.model,
                     ),
-                    "model_availability": model_availability(store, profile, now=checked_at),
                 }
                 rows.append(row)
     except (ConfigError, ProfileError, OSError, sqlite3.Error):
@@ -389,144 +361,16 @@ def _providers_status(*, check: bool, as_json: bool, provider: str | None = None
     else:
         for row in rows:
             availability = row["availability"]
-            print(f"{row['id']}: {availability['state']} — {availability.get('next_action', 'verify')}")
-            print(f"  Last successful use: {availability.get('last_success_at') or 'not observed'}")
+            print(f"{row['id']}: {availability['state']}")
             if availability.get("reset_at"):
-                print(f"  Reported quota reset: {availability['reset_at']}")
-            _print_quota_context(availability, indent="  ")
-            _print_provider_recovery(availability, indent="  ")
-            for model in row["model_availability"]:
-                if model["affected_model"] != availability.get("affected_model"):
-                    print(f"  Model {model['affected_model']}: {model['state']} — {model['next_action']}")
-                    _print_quota_context(model, indent="    ")
-                    _print_provider_recovery(model, indent="    ")
+                print(f"  Reported reset: {availability['reset_at']}")
+            if availability.get("eligible_at"):
+                print(f"  Eligible again: {availability['eligible_at']}")
+            if availability.get("reason"):
+                print(f"  Reason: {availability['reason']}")
             if check:
                 native = row["native_check"]
                 print(f"  Native check: {native['state']} — {native['detail']}")
-    return 0
-
-
-def _print_quota_context(availability: dict[str, Any], *, indent: str) -> None:
-    """Print quota/auth/retry evidence without implying a provider identity."""
-    for restriction in availability.get("quota_restrictions") or []:
-        model_family = restriction.get("model_family") or restriction.get("model") or "-"
-        reset = restriction.get("reset") or restriction.get("reset_at") or "-"
-        observed = restriction.get("observed") or restriction.get("observed_at") or "-"
-        print(
-            f"{indent}Quota restriction: scope={restriction.get('scope') or '-'} "
-            f"model_family={model_family} window={restriction.get('window') or '-'} "
-            f"reset={reset} source={restriction.get('source') or '-'} observed={observed}"
-        )
-    context = availability.get("auth_context") or {}
-    if context.get("changed"):
-        print(f"{indent}Authentication context changed (metadata only; not an account identity).")
-        if context.get("fingerprint"):
-            print(f"{indent}Authentication context fingerprint: {context['fingerprint']}")
-    retry = availability.get("quota_retry") or {}
-    if retry.get("state") == "pending":
-        print(f"{indent}Quota retry pending: {retry.get('task_id') or '-'}")
-
-
-def _print_provider_recovery(availability: dict[str, Any], *, indent: str) -> None:
-    """Print every decision-bearing recovery field from a cached availability projection."""
-    automatic = availability.get("automatic_recovery") or {}
-    if automatic.get("policy") == "hybrid":
-        print(f"{indent}Hybrid recovery: {automatic.get('state') or 'unknown'}")
-        print(f"{indent}Recovery retries remaining: {automatic.get('attempts_remaining', '-')}")
-        for key, label in (
-            ("next_attempt_at", "Next recovery attempt"),
-            ("hold_reason", "Recovery hold reason"),
-            ("active_task_id", "Recovery task"),
-            ("episode_id", "Recovery episode"),
-            ("evidence_revision", "Recovery evidence revision"),
-        ):
-            if automatic.get(key) is not None:
-                print(f"{indent}{label}: {automatic[key]}")
-        return
-    recovery = availability.get("recovery") or {}
-
-    def value(name: str) -> Any:
-        return recovery.get(name) or "-"
-
-    print(f"{indent}Evidence revision: {availability.get('evidence_revision') or '-'}")
-    print(f"{indent}Recovery: {value('state')}")
-    print(f"{indent}Recovery scope: {value('provider')} / {recovery.get('model') or 'provider default'}")
-    print(f"{indent}Shared availability key: {value('status_key')}")
-    print(f"{indent}Recovery permit: {value('permit_id')}")
-    print(f"{indent}Recovery expires: {value('expires_at')}")
-    print(f"{indent}Recovery task: {value('task_id')}")
-    print(f"{indent}Recovery outcome: {value('outcome')}")
-    if recovery.get("outcome_code"):
-        print(f"{indent}Recovery outcome code: {recovery['outcome_code']}")
-    print(f"{indent}Recovery next action: {value('next_action')}")
-
-
-def _provider_recovery(
-    *, provider: str | None, model: str | None, permit_id: str | None, as_json: bool,
-) -> int:
-    """Arm or revoke one permit without checking providers or starting inference."""
-    import sqlite3
-    from datetime import UTC, datetime
-
-    from . import provider_recovery
-    from .providers import ProfileError
-    from .service import TaskSpindleError, provider_availability
-    from .store import Store
-
-    paths = resolve_paths()
-    try:
-        with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
-            now = datetime.now(UTC)
-            if permit_id is not None:
-                result = provider_recovery.revoke(store, permit_id, now=now)
-            else:
-                profiles = _profiles(paths)
-                if provider not in profiles:
-                    raise ProfileError("PROFILE_UNKNOWN", "Unknown provider")
-                profile = profiles[provider]
-                selected_model = model or profile.model
-                availability = provider_availability(
-                    store,
-                    profile,
-                    now=now,
-                    model=selected_model,
-                    parent_env=os.environ,
-                )
-                revision = availability.get("evidence_revision")
-                if not isinstance(revision, str) or not revision:
-                    raise TaskSpindleError(
-                        "RECOVERY_EVIDENCE_UNAVAILABLE",
-                        "current cached provider evidence has no recovery revision",
-                    )
-                result = provider_recovery.arm(
-                    store,
-                    profile,
-                    evidence_revision=revision,
-                    now=now,
-                    model=selected_model,
-                    parent_env=os.environ,
-                )
-    except TaskSpindleError as exc:
-        if as_json:
-            print(json.dumps({"error": exc.to_error_body().model_dump(mode="json")}, sort_keys=True))
-        else:
-            print(f"taskspindle providers: {exc.code}: {exc}", file=sys.stderr)
-        return 1
-    except (ConfigError, ProfileError, OSError, sqlite3.Error):
-        if as_json:
-            print(json.dumps({"error": "PROVIDER_RECOVERY_UNAVAILABLE"}))
-        else:
-            print("taskspindle providers: controlled recovery could not be updated", file=sys.stderr)
-        return 1
-
-    if as_json:
-        print(json.dumps(result, indent=2, sort_keys=True))
-    else:
-        action = {
-            "armed": "Armed", "claimed": "Recovery attempt pending for",
-            "revoked": "Revoked", "expired": "Expired",
-        }.get(result.get("state"), "Recorded")
-        print(f"{action} controlled retry permit {result.get('permit_id')}.")
     return 0
 
 

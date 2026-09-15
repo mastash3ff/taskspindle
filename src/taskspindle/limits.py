@@ -289,9 +289,17 @@ _SAFE_REASONS = {
 _SAFE_SOURCES = frozenset({"acp_error", "rate_limit_event", "turn_ok", "native_auth_check"})
 
 
-def safe_provider_reason(state: Any) -> str | None:
-    """A fixed display reason for a provider availability state."""
-    return _SAFE_REASONS.get(state) if isinstance(state, str) else None
+def safe_provider_reason(state: Any, model: Any = None) -> str | None:
+    """A fixed display reason for a provider availability state.
+
+    ``model`` is never trusted prose: it is re-validated as a bounded identifier before it is
+    appended, the same shape :func:`classify_acp_error` already required to record it.
+    """
+    reason = _SAFE_REASONS.get(state) if isinstance(state, str) else None
+    if reason is None:
+        return None
+    safe_model = _model(model)
+    return f"{reason} (model: {safe_model})" if safe_model else reason
 
 
 def safe_provider_source(source: Any) -> str | None:
@@ -306,7 +314,7 @@ def safe_status_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if row is None:
         return None
     result = dict(row)
-    result["reason"] = safe_provider_reason(row.get("state"))
+    result["reason"] = safe_provider_reason(row.get("state"), row.get("affected_model"))
     result["source"] = safe_provider_source(row.get("source"))
     return result
 

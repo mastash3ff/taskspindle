@@ -38,9 +38,10 @@ produced.
   or LiteLLM-gateway harness is a configured profile that is never a default, never a fallback, and
   refuses to run without `allow_metered`.
 - **Limits are reported, not worked around.** A turn a provider refused for a usage or login
-  reason marks that provider throttled or logged out, with the reset time the provider gave;
-  `capabilities` and `doctor` say so, and the next `start_task` on it is refused with the other
-  provider named. Choosing is yours.
+  reason marks that provider throttled or logged out, with the reset time the provider gave, or
+  fifteen minutes when it gave none; `capabilities` and `doctor` say so, and the next `start_task`
+  on it is refused until that time passes. Choosing another provider, or overriding with
+  `ignore_provider_status`, is yours.
 - **Usage you can see.** Every turn's token counts are recorded from the wire, with an estimated
   cost at published rates that is labelled as an estimate. `usage_report`, `taskspindle usage` and
   the dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
@@ -92,14 +93,13 @@ moved underneath you is refused rather than clobbered.
 | --- | --- |
 | [install.md](docs/install.md) | requirements, installing, XDG locations, uninstalling |
 | [codex-registration.md](docs/codex-registration.md) | registering the server, the timeouts, granting a repository |
-| [tools.md](docs/tools.md) | all nineteen tools, the envelope, controlled recovery, and acceptance rules |
+| [tools.md](docs/tools.md) | all eighteen tools, the envelope, provider availability, and acceptance rules |
 | [configuration.md](docs/configuration.md) | `config.toml`, `taskspindle discover`, and what second-class providers may not do |
 | [dispatch-policy.md](docs/dispatch-policy.md) | shares, budgets, per-role model/effort, and how Codex reads the dispatch policy |
 | [antigravity.md](docs/antigravity.md) | native AGY login reuse, model selection, containment and release gates |
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
-| [native-overage.md](docs/native-overage.md) | Native extra usage policy, billing observations, and rollout |
 | [dashboard.md](docs/dashboard.md) | `taskspindle web`: task and worker inspection and its JSON API |
 | [rollback.md](docs/rollback.md) | backing it out without losing anything |
 

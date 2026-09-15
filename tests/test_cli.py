@@ -118,7 +118,7 @@ def test_providers_reads_cached_status_without_creating_task_database(
     assert cli.main(["providers", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert {row["id"] for row in report["providers"]} == {"claude", "grok", "agy"}
-    assert all(row["availability"]["state"] == "unknown" for row in report["providers"])
+    assert all(row["availability"]["state"] == "ok" for row in report["providers"])
     assert all("native_check" in row for row in report["providers"])
     assert all(row["native_check"]["eligible_hint"] is None for row in report["providers"])
     assert not (home / "state/taskspindle/taskspindle.sqlite3").exists()
@@ -351,147 +351,24 @@ def test_provider_filter_check_and_unknown_filter(home, monkeypatch, capsys):
     assert calls == ["grok"]
 
 
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ["providers", "--retry-next", "--check", "--provider", "grok"],
-        ["providers", "--retry-next", "--revoke-retry", "rp_example", "--provider", "grok"],
-        ["providers", "--check", "--revoke-retry", "rp_example"],
-        ["providers", "--retry-next"],
-        ["providers", "--retry-next", "--provider", "grok", "--model", ""],
-        ["providers", "--model", "grok-4"],
-        ["providers", "--revoke-retry", "rp_example", "--provider", "grok"],
-    ],
-)
-def test_provider_recovery_flags_reject_conflicting_or_incomplete_actions(
-    arguments: list[str],
-) -> None:
-    """Removing an action conflict or prerequisite check would admit an ambiguous mutation."""
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(arguments)
-    assert excinfo.value.code == 2
-
-
-def test_retry_next_uses_the_current_cached_revision_without_running_a_check(
-    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Using a caller-supplied/stale revision, or refreshing evidence, breaks bounded consent."""
-    import subprocess
-
-    from taskspindle import provider_recovery
-    from taskspindle.store import Store
-
-    database = home / "state/taskspindle/taskspindle.sqlite3"
-    database.parent.mkdir(parents=True)
-    with Store.open(database) as store:
-        store.set_provider_status(
-            "grok", "auth_expired", code="AUTHENTICATION_REQUIRED", source="acp_error"
-        )
-
-    def forbidden(*args: Any, **kwargs: Any) -> None:
-        pytest.fail("arming from cached evidence must not start a process")
-
-    seen: dict[str, Any] = {}
-
-    def arm(store, profile, *, evidence_revision, now, model=None, parent_env=None):
-        seen.update(
-            profile=profile.id,
-            evidence_revision=evidence_revision,
-            model=model,
-            parent_env=parent_env,
-        )
-        return {"state": "armed", "permit_id": "rp_example", "evidence_revision": evidence_revision}
-
-    monkeypatch.setattr(subprocess, "run", forbidden)
-    monkeypatch.setattr(provider_recovery, "arm", arm)
-
-    assert cli.main(["providers", "--retry-next", "--provider", "grok", "--model", "grok-4", "--json"]) == 0
-
-    result = json.loads(capsys.readouterr().out)
-    assert result["state"] == "armed"
-    assert result["permit_id"] == "rp_example"
-    assert seen["profile"] == "grok"
-    assert seen["model"] == "grok-4"
-    assert seen["evidence_revision"]
-
-
-def test_provider_text_status_shows_controlled_recovery_fields(
+def test_provider_text_status_shows_state_reset_and_reason(
     home: Path, capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Omitting the permit projection would leave non-JSON operators unable to use recovery."""
     from taskspindle.store import Store
 
     database = home / "state/taskspindle/taskspindle.sqlite3"
     database.parent.mkdir(parents=True)
     with Store.open(database) as store:
         store.set_provider_status(
-            "grok", "auth_expired", code="AUTHENTICATION_REQUIRED", source="acp_error"
+            "grok", "auth_expired", code="AUTHENTICATION_REQUIRED", source="acp_error",
+            reason="Provider authentication is required.",
         )
 
     assert cli.main(["providers", "--provider", "grok"]) == 0
     output = capsys.readouterr().out
-    assert "Evidence revision: " in output
-    assert "Recovery: none" in output
-    assert "Recovery permit: -" in output
-    assert "Recovery expires: -" in output
-    assert "Recovery task: -" in output
-    assert "Recovery outcome: -" in output
-    assert "Recovery next action: arm" in output
-
-
-def test_provider_text_status_shows_all_quota_windows_and_safe_auth_context(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    cli._print_quota_context({
-        "quota_restrictions": [
-            {"scope": "account", "model_family": "all", "window": "five_hour",
-             "reset": "2030-01-03T00:00:00Z", "source": "rate_limit_event",
-             "observed": "2030-01-02T23:00:00Z"},
-            {"scope": "model_family", "model_family": "grok-5", "window": "weekly",
-             "reset": "2030-01-09T00:00:00Z", "source": "native_auth_check",
-             "observed": "2030-01-02T23:01:00Z"},
-        ],
-        "auth_context": {"changed": True, "fingerprint": "context-new"},
-        "quota_retry": {"state": "pending", "task_id": "ts_post_reset"},
-    }, indent="  ")
-    output = capsys.readouterr().out
-    assert "window=five_hour" in output
-    assert "window=weekly" in output
-    assert "Authentication context changed (metadata only; not an account identity)." in output
-    assert "Authentication context fingerprint: context-new" in output
-    assert "Quota retry pending: ts_post_reset" in output
-
-
-def test_revoke_retry_revokes_by_permit_id_without_loading_profiles(
-    home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A revoke must not depend on provider configuration or perform provider work."""
-    from taskspindle import provider_recovery
-
-    seen: dict[str, Any] = {}
-
-    def revoke(store, permit_id, *, now):
-        seen.update(permit_id=permit_id, database=store.path)
-        return {"state": "revoked", "permit_id": permit_id}
-
-    monkeypatch.setattr(cli, "_profiles", lambda _: pytest.fail("revoke must not load profiles"))
-    monkeypatch.setattr(provider_recovery, "revoke", revoke)
-
-    assert cli.main(["providers", "--revoke-retry", "rp_example", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"permit_id": "rp_example", "state": "revoked"}
-    assert seen["permit_id"] == "rp_example"
-
-
-def test_revoke_retry_reports_a_safe_error_without_a_traceback(
-    home: Path, capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A missing permit is an operator-safe recovery code, never an implementation traceback."""
-    assert cli.main(["providers", "--revoke-retry", "rp_absent", "--json"]) == 1
-    output = capsys.readouterr()
-    error = json.loads(output.out)["error"]
-    assert error["code"] == "RECOVERY_NOT_FOUND"
-    assert output.err == ""
-    assert "traceback" not in output.out.lower()
+    assert "grok: auth_expired" in output
+    assert "Eligible again:" in output
+    assert "Reason: Provider authentication is required." in output
 
 
 # -- policy ----------------------------------------------------------------------------

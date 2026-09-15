@@ -33,15 +33,7 @@ from .models import (
 class ProviderStatusReader(Protocol):
     """The read interface needed to describe provider availability."""
 
-    def latest_recovery_permit(self, status_key: str) -> dict[str, Any] | None: ...
-
-    def get_native_check(self, provider: str) -> dict[str, Any] | None: ...
-
     def get_provider_status(self, provider: str) -> dict[str, Any] | None: ...
-
-    def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None: ...
-
-    def list_provider_model_status(self, provider: str) -> list[dict[str, Any]]: ...
 
 
 class UsageReader(ProviderStatusReader, Protocol):
@@ -54,13 +46,6 @@ class UsageReader(ProviderStatusReader, Protocol):
     def list_turn_usage(
         self, *, since: str | None = None, provider: str | None = None,
         task_id: str | None = None,
-    ) -> list[dict[str, Any]]: ...
-
-    def list_native_overage_turns(
-        self,
-        *,
-        since: str | None = None,
-        provider: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def list_provider_status(self) -> list[dict[str, Any]]: ...
@@ -736,6 +721,32 @@ ALTER TABLE tasks ADD COLUMN role TEXT;
 CREATE INDEX turns_started_idx ON turns(started_at);
 """
 
+# Collapses the provider refusal / quota / recovery / native-overage machinery to one rule:
+# ``provider_status`` records the last refusal, ``mark_provider_healthy`` clears it, and admission
+# reads it directly (see ``taskspindle.service.provider_availability``). Every table that recorded
+# manual recovery permits, hybrid recovery episodes/claims/evidence, quota windows/restrictions/
+# retries, or native-overage attempts/observations is disposable and dropped; the backup made
+# before upgrading is the recovery path if any of that history is ever needed again.
+_MIGRATION_12 = """
+ALTER TABLE tasks ADD COLUMN ignore_provider_status INTEGER NOT NULL DEFAULT 0;
+
+-- A model-scoped refusal (state 'model_unavailable') collapses into this same provider-wide
+-- row; the model it named is kept here, validated, rather than trusted from free-text prose.
+ALTER TABLE provider_status ADD COLUMN affected_model TEXT;
+
+DROP TABLE IF EXISTS provider_model_status;
+DROP TABLE IF EXISTS provider_recovery_permits;
+DROP TABLE IF EXISTS provider_auth_context;
+DROP TABLE IF EXISTS provider_quota_restrictions;
+DROP TABLE IF EXISTS provider_quota_retry_attempts;
+DROP TABLE IF EXISTS native_overage_attempts;
+DROP TABLE IF EXISTS native_overage_observations;
+DROP TABLE IF EXISTS recovery_episodes;
+DROP TABLE IF EXISTS recovery_claims;
+DROP TABLE IF EXISTS recovery_native_semantics;
+DROP TABLE IF EXISTS recovery_evidence;
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -748,6 +759,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (9, _MIGRATION_9),
     (10, _MIGRATION_10),
     (11, _MIGRATION_11),
+    (12, _MIGRATION_12),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1012,8 +1024,11 @@ class Store:
         data = record.model_dump()
         with self._guard(), self.transaction() as conn:
             present = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+            # A boolean column's ``False`` is the same absence a missing column would read back
+            # as, so it is never a reason to refuse an insert on an older, not-yet-migrated table.
             missing = [
-                column for column in TASK_COLUMNS if column not in present and data[column] is not None
+                column for column in TASK_COLUMNS
+                if column not in present and data[column] not in (None, False)
             ]
             if missing:
                 raise StoreError(f"tasks table lacks columns for: {', '.join(missing)}")
@@ -1154,7 +1169,6 @@ class Store:
         stop_reason: str | None = None,
         response: str | None = None,
         attribution: dict[str, Any] | None = None,
-        native_overage: dict[str, Any] | None = None,
     ) -> int:
         kind_value = kind.value if isinstance(kind, Enum) else kind
         columns = [
@@ -1181,9 +1195,6 @@ class Store:
             response,
             _json_or_none(attribution),
         ]
-        if self.schema_version() >= 9:
-            columns.append("native_overage")
-            values.append(_json_or_none(native_overage))
         with self._guard(), self.transaction() as conn:
             cur = conn.execute(
                 f"INSERT INTO turns({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
@@ -1225,245 +1236,8 @@ class Store:
         for row in rows:
             turn = dict(row)
             turn["attribution"] = _loads(turn["attribution"])
-            turn["native_overage"] = _loads(turn.get("native_overage"))
             turns.append(turn)
         return turns
-
-    def update_turn_native_overage(self, turn_id: int, fields: Mapping[str, Any]) -> None:
-        with self.transaction():
-            row = self._conn.execute("SELECT native_overage FROM turns WHERE id = ?", (turn_id,)).fetchone()
-            if row is None:
-                raise NotFoundError(f"no such turn: {turn_id}")
-            value = (_loads(row[0]) or {}) | dict(fields)
-            self._conn.execute(
-                "UPDATE turns SET native_overage = ? WHERE id = ?", (json.dumps(value), turn_id)
-            )
-
-    def list_native_overage_turns(
-        self, *, since: str | None = None, provider: str | None = None
-    ) -> list[dict[str, Any]]:
-        from .native_overage import unknown
-
-        conditions, params = [], []
-        for clause, value in (("r.started_at >= ?", since), ("t.provider = ?", provider)):
-            if value is not None:
-                conditions.append(clause)
-                params.append(value)
-        where = " WHERE " + " AND ".join(conditions) if conditions else ""
-        rows = self._conn.execute(
-            "SELECT r.id AS turn_id, r.task_id, r.revision, t.provider, t.mode, "
-            "COALESCE(t.resolved_model, t.requested_model) AS model, t.repository_id, "
-            "r.started_at AS captured_at, r.native_overage FROM turns r JOIN tasks t ON t.id = r.task_id"
-            + where
-            + " ORDER BY r.id",
-            params,
-        )
-        return [
-            dict(row) | {"native_overage": unknown() | (_loads(row["native_overage"]) or {})} for row in rows
-        ]
-
-    def get_native_overage_attempt(self, key: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM native_overage_attempts WHERE claim_key = ?", (key,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def list_native_overage_attempts(self) -> list[dict[str, Any]]:
-        return [dict(row) for row in self._conn.execute("SELECT * FROM native_overage_attempts")]
-
-    def claim_native_overage(
-        self, key: str, task_id: str, turn_id: int, evidence: Mapping[str, Any], policy_fingerprint: str
-    ) -> bool:
-        with self.transaction():
-            holder = self._conn.execute(
-                "SELECT 1 FROM native_overage_attempts WHERE status_key = ? AND auth_context = ? "
-                "AND model IS ? AND state IN ('claimed', 'prompting') AND turn_id != ? LIMIT 1",
-                (evidence["status_key"], evidence["auth_context"]["fingerprint"], evidence["model"], turn_id),
-            ).fetchone()
-            if holder:
-                return False
-            # Model selection may refine a pre-prompt claim. The old key records why
-            # it ended, and cannot remain an unexplained account-wide pending attempt.
-            previous = self._conn.execute(
-                "SELECT claim_key, state FROM native_overage_attempts WHERE turn_id = ? AND claim_key != ? "
-                "AND state IN ('claimed', 'prompting')",
-                (turn_id, key),
-            ).fetchall()
-            if any(row["state"] == "prompting" for row in previous):
-                return False
-            existing = self.get_native_overage_attempt(key)
-            if existing and existing["state"] == "superseded":
-                self._conn.execute("DELETE FROM native_overage_attempts WHERE claim_key = ?", (key,))
-                existing = None
-            if existing and not (
-                existing["state"] == "succeeded"
-                or (existing["state"] == "claimed" and existing["turn_id"] == turn_id)
-            ):
-                return False
-            for row in previous:
-                self._conn.execute(
-                    "UPDATE native_overage_attempts SET state = 'superseded', finished_at = ?, "
-                    "outcome_code = 'MODEL_REFINED_BEFORE_PROMPT' WHERE claim_key = ?",
-                    (now(), row["claim_key"]),
-                )
-            if existing:
-                return existing["state"] == "succeeded" or (
-                    existing["state"] == "claimed" and existing["turn_id"] == turn_id
-                )
-            self._conn.execute(
-                "INSERT INTO native_overage_attempts(claim_key, task_id, turn_id, status_key, "
-                "auth_context, model, evidence_fingerprints, policy_fingerprint, state, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', ?)",
-                (
-                    key,
-                    task_id,
-                    turn_id,
-                    evidence["status_key"],
-                    evidence["auth_context"]["fingerprint"],
-                    evidence["model"],
-                    json.dumps(evidence["evidence_fingerprints"]),
-                    policy_fingerprint,
-                    now(),
-                ),
-            )
-            return True
-
-    def mark_native_overage_prompting(self, key: str, turn_id: int) -> bool:
-        with self.transaction():
-            row = self._conn.execute("SELECT native_overage FROM turns WHERE id = ?", (turn_id,)).fetchone()
-            saved = _loads(row[0]) if row else None
-            if not saved or saved.get("prompt_started_at"):
-                return False
-            self.update_turn_native_overage(turn_id, {"prompt_started_at": now()})
-            self._conn.execute(
-                "UPDATE native_overage_attempts SET state = 'prompting' "
-                "WHERE claim_key = ? AND turn_id = ? AND state = 'claimed'",
-                (key, turn_id),
-            )
-            return True
-
-    def finish_native_overage(
-        self, turn_id: int, success: bool, code: str | None = None, *, final_claim_key: str | None = None
-    ) -> None:
-        with self.transaction():
-            row = self._conn.execute("SELECT native_overage FROM turns WHERE id = ?", (turn_id,)).fetchone()
-            saved = _loads(row[0]) if row else None
-            key = saved.get("claim_key") if saved else None
-            if not key:
-                return
-            if final_claim_key and final_claim_key != key:
-                original = self.get_native_overage_attempt(key)
-                if original:
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO native_overage_attempts "
-                        "SELECT ?, task_id, turn_id, status_key, auth_context, model, evidence_fingerprints, "
-                        "policy_fingerprint, state, created_at, finished_at, outcome_code "
-                        "FROM native_overage_attempts WHERE claim_key = ?",
-                        (final_claim_key, key),
-                    )
-                    clause = " AND state IN ('claimed', 'prompting')" if success else ""
-                    self._conn.execute(
-                        "UPDATE native_overage_attempts SET state = ?, finished_at = ?, outcome_code = ? "
-                        "WHERE claim_key = ?" + clause,
-                        ("succeeded" if success else "refused", now(), code, final_claim_key),
-                    )
-            # A sibling success cannot erase a refusal, even when it completed later.
-            clause = " AND state IN ('claimed', 'prompting')" if success else ""
-            self._conn.execute(
-                "UPDATE native_overage_attempts SET state = ?, finished_at = ?, outcome_code = ? "
-                "WHERE claim_key = ?" + clause,
-                ("succeeded" if success else "refused", now(), code, key),
-            )
-
-    def record_native_overage_observation(
-        self,
-        status_key: str,
-        task_id: str,
-        turn_id: int,
-        observed: Mapping[str, Any],
-        observed_at: str,
-        auth_context: str | None = None,
-    ) -> None:
-        from .quota import _time
-
-        with self.transaction():
-            prior = self.latest_native_overage_observation(status_key)
-            previous = prior["observed"] if prior and prior.get("auth_context") == auth_context else {}
-            incoming = dict(observed)
-            paid_fields = {"status", "disabled_reason", "resets_at"}
-            prior_blocked = previous.get("status") == "rejected" or previous.get("disabled_reason") not in {
-                None,
-                "fetch_error",
-                "unknown",
-            }
-            if prior_blocked and incoming.get("disabled_reason") in {"fetch_error", "unknown"}:
-                incoming.pop("disabled_reason", None)
-            paid_change = bool(paid_fields & incoming.keys())
-            affirmative = incoming.get("status") in {"allowed", "allowed_warning"} and (
-                incoming.get("disabled_reason") in {None, "fetch_error", "unknown"}
-            )
-            if paid_change and affirmative:
-                row = self._conn.execute(
-                    "SELECT started_at, native_overage FROM turns WHERE id = ?", (turn_id,)
-                ).fetchone()
-                saved = (_loads(row["native_overage"]) or {}) if row else {}
-                started = _time(saved.get("prompt_started_at") or (row["started_at"] if row else None))
-                denied_at = _time(previous.get("paid_observed_at"))
-                if (
-                    prior_blocked
-                    and previous.get("paid_turn_id") != turn_id
-                    and (started is None or denied_at is None or denied_at >= started)
-                ):
-                    # An already running sibling cannot erase a refusal observed after it began.
-                    incoming = {key: value for key, value in incoming.items() if key not in paid_fields}
-                    paid_change = False
-            same_source = previous.get("paid_turn_id") == turn_id
-            same_paid = bool(
-                paid_change
-                and same_source
-                and not (affirmative and prior_blocked)
-                and previous.get("paid_observed_at")
-                and all(previous.get(key) == value for key, value in incoming.items() if key in paid_fields)
-            )
-            if same_paid:
-                paid_change = False
-            if paid_change:
-                concrete_reason = incoming.get("disabled_reason") not in {None, "fetch_error", "unknown"}
-                concrete_denial = incoming.get("status") == "rejected" or concrete_reason
-                if (
-                    concrete_denial
-                    and "resets_at" not in incoming
-                    and (
-                        not same_source
-                        or not prior_blocked
-                        or incoming.get("disabled_reason") != previous.get("disabled_reason")
-                    )
-                ):
-                    previous = {key: value for key, value in previous.items() if key != "resets_at"}
-                generation = previous.get("paid_generation", 0)
-                if affirmative and prior_blocked:
-                    generation += 1
-                if "status" in incoming:
-                    # Explicit available status clears old disabled settings. A rejection
-                    # without a supplied reset never inherits a stale passed reset.
-                    clear = paid_fields if affirmative else {"status", "resets_at"}
-                    previous = {key: value for key, value in previous.items() if key not in clear}
-                incoming.update(
-                    paid_turn_id=turn_id, paid_observed_at=observed_at, paid_generation=generation
-                )
-            merged = previous | incoming
-            self._conn.execute(
-                "INSERT INTO native_overage_observations(status_key, task_id, turn_id, "
-                "observed, auth_context, source, observed_at) VALUES (?, ?, ?, ?, ?, 'rate_limit_event', ?)",
-                (status_key, task_id, turn_id, json.dumps(merged), auth_context, observed_at),
-            )
-
-    def latest_native_overage_observation(self, status_key: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM native_overage_observations WHERE status_key = ? ORDER BY id DESC LIMIT 1",
-            (status_key,),
-        ).fetchone()
-        return dict(row) | {"observed": _loads(row["observed"])} if row else None
 
     # -- checks ---------------------------------------------------------------------
 
@@ -1741,26 +1515,6 @@ class Store:
 
     # -- provider status --------------------------------------------------------------
 
-    def get_recovery_permit(self, permit_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM provider_recovery_permits WHERE permit_id = ?", (permit_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def get_task_recovery_permit(self, task_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM provider_recovery_permits WHERE task_id = ?", (task_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def latest_recovery_permit(self, status_key: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM provider_recovery_permits WHERE status_key = ? "
-            "ORDER BY (state IN ('armed', 'claimed')) DESC, created_at DESC, rowid DESC LIMIT 1",
-            (status_key,),
-        ).fetchone()
-        return dict(row) if row else None
-
     def set_provider_status(
         self,
         provider: str,
@@ -1773,9 +1527,33 @@ class Store:
         reset_at: str | None = None,
         task_id: str | None = None,
         observed_at: str | None = None,
+        affected_model: str | None = None,
     ) -> None:
         """Record what TaskSpindle last learned about a provider's willingness to take a turn."""
         with self._guard(), self.transaction() as conn:
+            if self.schema_version() >= 12:
+                conn.execute(
+                    "INSERT INTO provider_status(provider, state, code, window, reason, reset_at, "
+                    "observed_at, task_id, source, affected_model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(provider) DO UPDATE SET state = excluded.state, "
+                    "code = excluded.code, window = excluded.window, reason = excluded.reason, "
+                    "reset_at = excluded.reset_at, observed_at = excluded.observed_at, "
+                    "task_id = excluded.task_id, source = excluded.source, "
+                    "affected_model = excluded.affected_model",
+                    (
+                        provider,
+                        state,
+                        code,
+                        window,
+                        reason,
+                        reset_at,
+                        observed_at or now(),
+                        task_id,
+                        source,
+                        affected_model,
+                    ),
+                )
+                return
             conn.execute(
                 "INSERT INTO provider_status(provider, state, code, window, reason, reset_at, "
                 "observed_at, task_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -1795,36 +1573,6 @@ class Store:
                     source,
                 ),
             )
-            from .hybrid_recovery import record_refusal
-
-            record_refusal(self, provider, state, observed_at or now(), window=window)
-
-    def set_provider_model_status(
-        self,
-        provider: str,
-        model: str,
-        state: str,
-        *,
-        source: str,
-        code: str | None = None,
-        reason: str | None = None,
-        task_id: str | None = None,
-        observed_at: str | None = None,
-    ) -> None:
-        """Record a refusal that applies only to one provider model."""
-        with self._guard(), self.transaction() as conn:
-            conn.execute(
-                "INSERT INTO provider_model_status(provider, model, state, code, reason, "
-                "observed_at, task_id, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(provider, model) DO UPDATE SET state = excluded.state, "
-                "code = excluded.code, reason = excluded.reason, "
-                "observed_at = excluded.observed_at, task_id = excluded.task_id, "
-                "source = excluded.source",
-                (provider, model, state, code, reason, observed_at or now(), task_id, source),
-            )
-            from .hybrid_recovery import record_refusal
-
-            record_refusal(self, provider, state, observed_at or now(), model=model)
 
     def get_provider_status(self, provider: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -1832,52 +1580,14 @@ class Store:
         ).fetchone()
         return dict(row) if row else None
 
-    def list_recovery_episodes(self, status_key: str) -> list[dict[str, Any]]:
-        if self.schema_version() < 10:
-            return []
-        return [dict(row) for row in self._conn.execute(
-            "SELECT * FROM recovery_episodes WHERE status_key=? AND resolved_at IS NULL", (status_key,)
-        )]
-
-    def active_recovery_claim(self, status_key: str) -> dict[str, Any] | None:
-        if self.schema_version() < 10:
-            return None
-        row = self._conn.execute(
-            "SELECT * FROM recovery_claims WHERE status_key=? AND state IN ('claimed', 'prompting')",
-            (status_key,),
-        ).fetchone()
-        return dict(row) if row else None
-
-    def list_recovery_evidence(self, status_key: str) -> list[dict[str, Any]]:
-        if self.schema_version() < 10:
-            return []
-        return [dict(row) for row in self._conn.execute(
-            "SELECT * FROM recovery_evidence WHERE status_key=? ORDER BY revision", (status_key,)
-        )]
-
-    def get_provider_model_status(self, provider: str, model: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM provider_model_status WHERE provider = ? AND model = ?",
-            (provider, model),
-        ).fetchone()
-        return dict(row) if row else None
-
-    def list_provider_model_status(self, provider: str) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM provider_model_status WHERE provider = ? ORDER BY model", (provider,)
-        ).fetchall()
-        return [dict(row) for row in rows]
-
     def mark_provider_healthy(
         self,
         provider: str,
         *,
         expected: Mapping[str, Any] | None,
         task_id: str | None = None,
-        model: str | None = None,
-        expected_model: Mapping[str, Any] | None = None,
     ) -> bool:
-        """Record success and clear only statuses observed before this provider turn began.
+        """Record success and clear only a status observed before this provider turn began.
 
         Comparing and writing inside one immediate transaction protects against other worker
         processes. A sibling failure after that observation must survive this completion; the
@@ -1889,22 +1599,25 @@ class Store:
                 "SELECT * FROM provider_status WHERE provider = ?", (provider,)
             ).fetchone()
             current = dict(row) if row else None
+
             def comparable(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
                 if value is None:
                     return None
                 return {key: item for key, item in value.items() if key != "last_success_at"}
-            clear_account = comparable(current) == comparable(expected)
+
+            clear = comparable(current) == comparable(expected)
             if current is None:
                 conn.execute(
                     "INSERT INTO provider_status(provider, state, observed_at, task_id, source, "
                     "last_success_at) VALUES (?, 'ok', ?, ?, 'turn_ok', ?)",
                     (provider, stamp, task_id, stamp),
                 )
-            elif clear_account:
+            elif clear:
+                extra = ", affected_model = NULL" if self.schema_version() >= 12 else ""
                 conn.execute(
                     "UPDATE provider_status SET state = 'ok', code = NULL, window = NULL, "
                     "reason = NULL, reset_at = NULL, observed_at = ?, task_id = ?, "
-                    "source = 'turn_ok', last_success_at = ? WHERE provider = ?",
+                    "source = 'turn_ok', last_success_at = ?" + extra + " WHERE provider = ?",
                     (stamp, task_id, stamp, provider),
                 )
             else:
@@ -1913,50 +1626,13 @@ class Store:
                     "AND (last_success_at IS NULL OR last_success_at < ?)",
                     (stamp, provider, stamp),
                 )
-
-            clear_model = False
-            if model:
-                model_row = conn.execute(
-                    "SELECT * FROM provider_model_status WHERE provider = ? AND model = ?",
-                    (provider, model),
-                ).fetchone()
-                current_model = dict(model_row) if model_row else None
-                clear_model = comparable(current_model) == comparable(expected_model)
-                if current_model is None:
-                    conn.execute(
-                        "INSERT INTO provider_model_status(provider, model, state, observed_at, "
-                        "task_id, source, last_success_at) VALUES (?, ?, 'ok', ?, ?, 'turn_ok', ?)",
-                        (provider, model, stamp, task_id, stamp),
-                    )
-                elif clear_model:
-                    conn.execute(
-                        "UPDATE provider_model_status SET state = 'ok', code = NULL, reason = NULL, "
-                        "observed_at = ?, task_id = ?, source = 'turn_ok', last_success_at = ? "
-                        "WHERE provider = ? AND model = ?",
-                        (stamp, task_id, stamp, provider, model),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE provider_model_status SET last_success_at = ? "
-                        "WHERE provider = ? AND model = ? "
-                        "AND (last_success_at IS NULL OR last_success_at < ?)",
-                        (stamp, provider, model, stamp),
-                    )
-            if clear_account and self.schema_version() >= 10:
-                conn.execute("UPDATE recovery_episodes SET resolved_at=? WHERE status_key=? "
-                             "AND scope='account' AND refusal_kind != 'throttled' AND resolved_at IS NULL",
-                             (stamp, provider))
-            if model and clear_model and self.schema_version() >= 10:
-                conn.execute("UPDATE recovery_episodes SET resolved_at=? WHERE status_key=? "
-                             "AND scope='model' AND model=? AND resolved_at IS NULL",
-                             (stamp, provider, model))
-            return clear_account and (not model or clear_model)
+            return clear
 
     def list_provider_status(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM provider_status ORDER BY provider").fetchall()
         return [dict(row) for row in rows]
 
-    # -- auth context and durable quota evidence -------------------------------------
+    # -- task authentication context ---------------------------------------------------
 
     def get_task_auth_context(self, task_id: str) -> str | None:
         row = self._conn.execute(
@@ -1979,237 +1655,6 @@ class Store:
                 "ON CONFLICT(task_id) DO UPDATE SET observed_at = excluded.observed_at",
                 (task_id, auth_context, now()),
             )
-
-    def get_provider_auth_context(self, status_key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT auth_context FROM provider_auth_context WHERE status_key = ?", (status_key,)
-        ).fetchone()
-        return str(row[0]) if row else None
-
-    def set_provider_auth_context(self, status_key: str, auth_context: str) -> None:
-        """Store the latest opaque context without changing auth/access availability."""
-        if not auth_context:
-            raise StoreError("auth_context must not be empty")
-        with self._guard(), self.transaction() as conn:
-            conn.execute(
-                "INSERT INTO provider_auth_context(status_key, auth_context, observed_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(status_key) DO UPDATE SET auth_context = excluded.auth_context, "
-                "observed_at = excluded.observed_at",
-                (status_key, auth_context, now()),
-            )
-
-    def record_quota_restriction(
-        self,
-        status_key: str,
-        *,
-        scope: str,
-        period_key: str,
-        evidence_fingerprint: str,
-        source: str,
-        window: str | None = None,
-        model: str | None = None,
-        period_start: str | None = None,
-        reset_at: str | None = None,
-        observed_at: str | None = None,
-        task_id: str | None = None,
-        resolved_context: str | None = None,
-    ) -> dict[str, Any]:
-        """Record one exact quota refusal and supersede only its prior period generation."""
-        if scope not in {"account", "model_family", "model"}:
-            raise StoreError("invalid quota restriction scope")
-        if not status_key or not period_key or not evidence_fingerprint or not source:
-            raise StoreError("quota restriction identity must not be empty")
-        stamp = observed_at or now()
-        with self._guard(), self.transaction() as conn:
-            existing = conn.execute(
-                "SELECT * FROM provider_quota_restrictions WHERE status_key = ? "
-                "AND evidence_fingerprint = ?", (status_key, evidence_fingerprint)
-            ).fetchone()
-            if existing:
-                return dict(existing)
-            # A later rejection for the same observed period is authoritative.  Different periods
-            # remain independently enforceable, so an old weekly refusal cannot erase a daily one.
-            conn.execute(
-                "UPDATE provider_quota_restrictions SET resolved_at = ?, resolved_context = ? "
-                "WHERE status_key = ? AND scope = ? AND model IS ? AND window = ? AND period_key = ? "
-                "AND period_start IS ? AND resolved_at IS NULL",
-                (
-                    stamp, resolved_context, status_key, scope, model, window or period_key,
-                    period_key, period_start,
-                ),
-            )
-            cur = conn.execute(
-                "INSERT INTO provider_quota_restrictions(status_key, scope, model, window, period_key, "
-                "period_start, reset_at, observed_at, task_id, source, evidence_fingerprint, "
-                "resolved_context) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (status_key, scope, model, window or period_key, period_key, period_start, reset_at,
-                 stamp, task_id, source, evidence_fingerprint, resolved_context),
-            )
-            row = conn.execute(
-                "SELECT * FROM provider_quota_restrictions WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
-            from .hybrid_recovery import record_refusal
-
-            record_refusal(self, status_key, "throttled", stamp, window=window or period_key,
-                           model=model, quota_scope=scope)
-            return dict(row)
-
-    def list_quota_restrictions(
-        self, status_key: str | None = None, *, unresolved_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if status_key is not None:
-            clauses.append("status_key = ?")
-            params.append(status_key)
-        if unresolved_only:
-            clauses.append("resolved_at IS NULL")
-        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            "SELECT * FROM provider_quota_restrictions" + where + " ORDER BY observed_at, id", params
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def resolve_quota_restrictions(
-        self,
-        status_key: str,
-        fingerprints: Sequence[str],
-        *,
-        task_id: str | None = None,
-        resolved_at: str | None = None,
-        resolved_context: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Resolve only the exact evidence a successful ordinary attempt consumed."""
-        unique = tuple(dict.fromkeys(value for value in fingerprints if value))
-        if not unique:
-            return []
-        marks = ", ".join("?" for _ in unique)
-        stamp = resolved_at or now()
-        with self._guard(), self.transaction() as conn:
-            conn.execute(
-                "UPDATE provider_quota_restrictions SET resolved_at = ?, resolved_task_id = ?, "
-                "resolved_context = ? WHERE status_key = ? AND resolved_at IS NULL "
-                f"AND evidence_fingerprint IN ({marks})",
-                (stamp, task_id, resolved_context, status_key, *unique),
-            )
-            rows = conn.execute(
-                "SELECT * FROM provider_quota_restrictions WHERE status_key = ? "
-                f"AND evidence_fingerprint IN ({marks}) ORDER BY id", (status_key, *unique),
-            ).fetchall()
-            if self.schema_version() >= 10:
-                for row in rows:
-                    remaining = conn.execute(
-                        "SELECT 1 FROM provider_quota_restrictions WHERE status_key=? AND scope=? "
-                        "AND model IS ? AND window=? AND resolved_at IS NULL LIMIT 1",
-                        (status_key, row["scope"], row["model"], row["window"]),
-                    ).fetchone()
-                    if remaining is None:
-                        conn.execute("UPDATE recovery_episodes SET resolved_at=? WHERE status_key=? "
-                                     "AND scope=? AND quota_scope=? AND model=? AND resolved_at IS NULL",
-                                     (stamp, status_key, "quota:" + row["window"],
-                                      row["scope"], row["model"] or ""))
-            return [dict(row) for row in rows]
-
-    def get_active_quota_retry_claim(self, status_key: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM provider_quota_retry_attempts WHERE status_key = ? "
-            "AND state IN ('claimed', 'prompting') ORDER BY id DESC LIMIT 1", (status_key,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def get_task_quota_retry_claim(self, task_id: str) -> dict[str, Any] | None:
-        row = self._conn.execute(
-            "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
-        ).fetchone()
-        return dict(row) if row else None
-
-    def claim_quota_retry(
-        self, status_key: str, task_id: str, restriction_fingerprints: Sequence[str],
-    ) -> dict[str, Any] | None:
-        """Claim the one ordinary post-reset retry; terminal rows are immutable history."""
-        fingerprints = tuple(dict.fromkeys(value for value in restriction_fingerprints if value))
-        if not status_key or not task_id or not fingerprints:
-            raise StoreError("quota retry claim requires status key, task and evidence")
-        with self._guard(), self.transaction() as conn:
-            if self.schema_version() >= 10:
-                automatic = self.active_recovery_claim(status_key)
-                if automatic and automatic["task_id"] != task_id:
-                    return None
-            own = conn.execute(
-                "SELECT * FROM provider_quota_retry_attempts WHERE task_id = ?", (task_id,)
-            ).fetchone()
-            if own:
-                return dict(own)
-            active = conn.execute(
-                "SELECT 1 FROM provider_quota_retry_attempts WHERE status_key = ? "
-                "AND state IN ('claimed', 'prompting')", (status_key,)
-            ).fetchone()
-            if active:
-                return None
-            cur = conn.execute(
-                "INSERT INTO provider_quota_retry_attempts(status_key, task_id, restriction_fingerprints, "
-                "state, claimed_at) VALUES (?, ?, ?, 'claimed', ?)",
-                (status_key, task_id, json.dumps(fingerprints), now()),
-            )
-            row = conn.execute(
-                "SELECT * FROM provider_quota_retry_attempts WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
-            return dict(row)
-
-    def mark_quota_retry_prompting(self, task_id: str) -> dict[str, Any] | None:
-        with self._guard(), self.transaction() as conn:
-            conn.execute(
-                "UPDATE provider_quota_retry_attempts SET state = 'prompting', prompt_started_at = ? "
-                "WHERE task_id = ? AND state = 'claimed'", (now(), task_id),
-            )
-            return self.get_task_quota_retry_claim(task_id)
-
-    def refine_quota_retry(
-        self, task_id: str, restriction_fingerprints: Sequence[str],
-    ) -> dict[str, Any] | None:
-        """Narrow a conservative pre-prompt claim after exact model resolution.
-
-        This never touches a prompt that has begun and accepts an empty set when resolution
-        establishes that no ordinary retry is needed.  The original restriction rows remain
-        untouched for other model families.
-        """
-        fingerprints = tuple(dict.fromkeys(value for value in restriction_fingerprints if value))
-        with self._guard(), self.transaction() as conn:
-            cur = conn.execute(
-                "UPDATE provider_quota_retry_attempts SET restriction_fingerprints = ? "
-                "WHERE task_id = ? AND state = 'claimed'", (json.dumps(fingerprints), task_id),
-            )
-            if cur.rowcount != 1:
-                return None
-            return self.get_task_quota_retry_claim(task_id)
-
-    def finish_quota_retry(
-        self, task_id: str, outcome: str, *, code: str | None = None,
-    ) -> dict[str, Any] | None:
-        if outcome not in {"succeeded", "failed"}:
-            raise StoreError("invalid quota retry outcome")
-        with self._guard(), self.transaction() as conn:
-            conn.execute(
-                "UPDATE provider_quota_retry_attempts SET state = ?, finished_at = ?, outcome_code = ? "
-                "WHERE task_id = ? AND state IN ('claimed', 'prompting')",
-                (outcome, now(), code, task_id),
-            )
-            return self.get_task_quota_retry_claim(task_id)
-
-    def successful_quota_retry_fingerprints(self, status_key: str) -> set[str]:
-        rows = self._conn.execute(
-            "SELECT restriction_fingerprints FROM provider_quota_retry_attempts "
-            "WHERE status_key = ? AND state = 'succeeded' ORDER BY id", (status_key,)
-        ).fetchall()
-        result: set[str] = set()
-        for row in rows:
-            try:
-                values = json.loads(row[0])
-            except (TypeError, ValueError):
-                continue
-            if isinstance(values, list):
-                result.update(value for value in values if isinstance(value, str))
-        return result
 
     # -- turn usage -------------------------------------------------------------------
 
@@ -2405,9 +1850,6 @@ class Store:
                          (at, json.dumps(result), at if success else row["success_at"],
                           json.dumps(result) if success else row["success_json"],
                           provider, fingerprint, owner))
-            from .hybrid_recovery import record_native_evidence
-
-            record_native_evidence(self, provider, result, at)
             return True
 
     # -- provider windows -------------------------------------------------------------
@@ -2465,25 +1907,7 @@ class Store:
                     effective_fingerprint,
                 ),
             )
-            window_id = int(cur.lastrowid or 0)
-            # The legacy window writer remains a compatible ingestion surface.  Explicit rejected
-            # observations also enter the durable enforcement history; allowed telemetry never
-            # does.  Nested transactions join this one, so evidence is never half-recorded.
-            if status == "rejected":
-                self.record_quota_restriction(
-                    effective_key,
-                    scope=effective_scope,
-                    model=effective_model,
-                    window=window,
-                    period_key=effective_period,
-                    period_start=period_start,
-                    reset_at=resets_at,
-                    observed_at=stamp,
-                    task_id=task_id,
-                    source=source,
-                    evidence_fingerprint=effective_fingerprint,
-                )
-            return window_id
+            return int(cur.lastrowid or 0)
 
     def latest_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]:
         """The newest observation of every scoped provider-window period."""

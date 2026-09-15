@@ -489,8 +489,6 @@ function fileManagedPanel(fileManaged) {
   return h("section", { class: "panel" }, sectionHeading("File-managed", "config.toml"),
     h("dl", { class: "detail-grid compact" },
       labeledValue("Concurrency", null, { node: mappingBlock(managed.concurrency) }),
-      labeledValue("Native overage", null, { node: mappingBlock(managed.native_overage) }),
-      labeledValue("Provider recovery", null, { node: mappingBlock(managed.provider_recovery) }),
       labeledValue("Config file", managed.config_file, { mono: true }),
     ),
     h("p", { class: "panel-note", text: "Edited in config.toml and read on every refresh; the dashboard never writes it." }),

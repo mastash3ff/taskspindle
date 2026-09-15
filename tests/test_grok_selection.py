@@ -100,6 +100,5 @@ async def test_grok_explicit_selection_is_confirmed_after_open(tmp_path, kind, s
                 expected_logs = ([f"session model from ACP: {run.session_model}"]
                                  if run.session_model is not None else [])
                 assert logs == expected_logs
-                assert store.list_turns(task.id)[-1]["native_overage"]["session_model"] == run.session_model
             if kind is not TurnKind.INITIAL:
                 assert run.session_id == "original-session"

@@ -255,11 +255,9 @@ class StartTaskRequest(BaseModel):
     effort: str | None = None
     timeout_s: int = Field(default=1800, ge=60, le=14400)
     allow_metered: bool = False
-    #: Recognized legacy input. Admission rejects true with LEGACY_OVERRIDE_RETIRED;
-    #: recovery uses an explicitly authorized permit or the ordinary quota-retry claim.
+    #: An explicit coordinator override: admit this task even while the provider's status says
+    #: it is not eligible yet. There is no other bypass; a caller that sets this owns the decision.
     ignore_provider_status: bool = False
-    #: A single-use authorization bound to current refusal evidence and this new task.
-    recovery_permit_id: str | None = Field(default=None, min_length=1, max_length=128)
     #: The dispatch-policy role this task was assigned for; recorded for usage reporting only.
     role: str | None = Field(default=None, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
     # implement only
@@ -293,13 +291,6 @@ class StartTaskRequest(BaseModel):
 
     @model_validator(mode="after")
     def _check_mode(self) -> StartTaskRequest:
-        if self.recovery_permit_id is not None:
-            if self.ignore_provider_status:
-                raise ValueError("recovery_permit_id and ignore_provider_status are mutually exclusive")
-            if not self.recovery_permit_id.strip():
-                raise ValueError("recovery_permit_id must not be empty")
-            if self.model is not None and not self.model.strip():
-                raise ValueError("recovery model must not be empty")
         if self.mode is Mode.IMPLEMENT:
             missing = []
             if not self.repository:
@@ -340,6 +331,7 @@ class TaskRecord(BaseModel):
     resolved_effort: str | None = None
     timeout_s: int = 1800
     allow_metered: bool = False
+    ignore_provider_status: bool = False
     role: str | None = None
     acceptance_criteria: str | None = None
     path_prefixes: list[str] | None = None
@@ -399,7 +391,7 @@ TASK_JSON_COLUMNS: tuple[str, ...] = (
 )
 
 #: ``tasks`` columns stored as 0/1 integers.
-TASK_BOOL_COLUMNS: tuple[str, ...] = ("allow_metered",)
+TASK_BOOL_COLUMNS: tuple[str, ...] = ("allow_metered", "ignore_provider_status")
 
 #: Every ``tasks`` column, in model order.
 TASK_COLUMNS: tuple[str, ...] = tuple(TaskRecord.model_fields)

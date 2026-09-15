@@ -9,8 +9,8 @@ use on each provider, and where locally observed usage stands against targets an
 The policy lives in the state database (`dispatch_policy`, schema 11), not in `config.toml`.
 It is read fresh on every `capabilities()` call, every `dispatch_policy` call and every
 `start_task` admission, so an edit made in the dashboard or with `taskspindle policy` takes
-effect without restarting the MCP server. `[concurrency]`, `[native_overage]` and
-`[provider_recovery]` stay in `config.toml`; the dashboard shows them and never writes them.
+effect without restarting the MCP server. `[concurrency]` stays in `config.toml`; the dashboard
+shows it and never writes it.
 
 ## What the policy can express
 
@@ -155,7 +155,7 @@ the latter case `document_error` says why and `revision` still reports the store
 
 **`dispatch_policy(action="get"|"status")`** is a read-only tool. `get` returns
 `{policy, revision, fingerprint, updated_at, updated_by, source, document_error}`; `status`
-adds `status` and `file_managed: {config_file, concurrency, native_overage, provider_recovery}`.
+adds `status` and `file_managed: {config_file, concurrency}`.
 There is no `set` through MCP: the caller being steered does not rewrite its own steering.
 
 **`start_task(role=…)`** records the role the policy was applied for on the task, purely for

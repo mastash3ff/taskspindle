@@ -56,8 +56,99 @@ def test_open_creates_a_private_file_and_applies_every_migration(tmp_path: Path)
     mode = stat.S_IMODE(store.path.stat().st_mode)
     assert mode == 0o600
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
-    assert store.schema_version() == 11
+    assert store.schema_version() == 12
     store.close()
+
+
+def test_schema_12_migration_drops_the_collapsed_tables_and_keeps_the_rest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A schema-11 database with rows in every table the collapse retires still upgrades cleanly:
+    tasks, grants and provider_status survive, and the disposable tables are simply gone."""
+    from taskspindle import store as store_module
+
+    path = tmp_path / "state.sqlite3"
+    dropped_tables = (
+        "provider_model_status", "provider_recovery_permits", "provider_auth_context",
+        "provider_quota_restrictions", "provider_quota_retry_attempts",
+        "native_overage_attempts", "native_overage_observations",
+        "recovery_episodes", "recovery_claims", "recovery_native_semantics", "recovery_evidence",
+    )
+    with monkeypatch.context() as old:
+        old.setattr(store_module, "MIGRATIONS", store_module.MIGRATIONS[:11])
+        with Store.open(path) as store:
+            assert store.schema_version() == 11
+            task = make_task(store)
+            store.upsert_grant("repo1", "claude", "implement")
+            store.set_provider_status(
+                "claude", "throttled", code="PROVIDER_THROTTLED", source="acp_error",
+            )
+            turn_id = store.insert_turn(task.id, 1, "INITIAL")
+            store._conn.execute(
+                "INSERT INTO provider_model_status(provider, model, state, observed_at, source) "
+                "VALUES ('claude', 'claude-opus-5', 'model_unavailable', ?, 'acp_error')", (now(),),
+            )
+            store._conn.execute(
+                "INSERT INTO provider_recovery_permits(permit_id, provider, status_key, state, "
+                "evidence_revision, created_at, expires_at) VALUES ('rp_1', 'claude', 'claude', "
+                "'armed', 'ev1', ?, ?)", (now(), now()),
+            )
+            store._conn.execute(
+                "INSERT INTO provider_auth_context(status_key, auth_context, observed_at) "
+                "VALUES ('claude', 'ctx', ?)", (now(),),
+            )
+            store._conn.execute(
+                "INSERT INTO provider_quota_restrictions(status_key, scope, window, period_key, "
+                "observed_at, source, evidence_fingerprint) VALUES ('claude', 'account', "
+                "'five_hour', 'p1', ?, 'acp_error', 'fp1')", (now(),),
+            )
+            store._conn.execute(
+                "INSERT INTO provider_quota_retry_attempts(status_key, task_id, "
+                "restriction_fingerprints, state, claimed_at) VALUES ('claude', ?, '[]', "
+                "'claimed', ?)", (task.id, now()),
+            )
+            store._conn.execute(
+                "INSERT INTO native_overage_attempts(claim_key, task_id, turn_id, status_key, "
+                "auth_context, evidence_fingerprints, policy_fingerprint, state, created_at) "
+                "VALUES ('claim1', ?, ?, 'claude', 'ctx', '[]', 'pf1', 'claimed', ?)",
+                (task.id, turn_id, now()),
+            )
+            store._conn.execute(
+                "INSERT INTO native_overage_observations(status_key, task_id, turn_id, observed, "
+                "source, observed_at) VALUES ('claude', ?, ?, '{}', 'rate_limit_event', ?)",
+                (task.id, turn_id, now()),
+            )
+            store._conn.execute(
+                "INSERT INTO recovery_episodes(episode_id, status_key, scope, refusal_kind, "
+                "observed_at) VALUES ('ep1', 'claude', 'account', 'throttled', ?)", (now(),),
+            )
+            store._conn.execute(
+                "INSERT INTO recovery_claims(claim_id, status_key, provider, task_id, episodes, "
+                "auth_context, state, created_at) VALUES ('cl1', 'claude', 'claude', ?, '[]', "
+                "'ctx', 'claimed', ?)", (task.id, now()),
+            )
+            store._conn.execute(
+                "INSERT INTO recovery_native_semantics(status_key, payload) VALUES ('claude', '{}')"
+            )
+            store._conn.execute(
+                "INSERT INTO recovery_evidence(status_key, kind, observed_at) "
+                "VALUES ('claude', 'throttled', ?)", (now(),),
+            )
+            for table in dropped_tables:
+                assert store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+
+    with Store.open(path) as reopened:
+        assert reopened.schema_version() == 12
+        for table in dropped_tables:
+            with pytest.raises(sqlite3.OperationalError, match="no such table"):
+                reopened._conn.execute(f"SELECT * FROM {table}")
+        restored = reopened.get_task(task.id)
+        assert restored is not None
+        assert restored.id == task.id
+        assert reopened.grant_active("repo1", "claude", "implement")
+        status = reopened.get_provider_status("claude")
+        assert status["state"] == "throttled"
+        assert status["code"] == "PROVIDER_THROTTLED"
 
 
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
@@ -66,7 +157,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store.close()
     reopened = Store.open(tmp_path / "state" / "taskspindle.sqlite3")
     assert reopened.migrate() == []
-    assert reopened.schema_version() == 11
+    assert reopened.schema_version() == 12
     reopened.close()
 
 

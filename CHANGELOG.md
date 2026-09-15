@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+- **Provider refusal, quota, recovery, and native-overage machinery collapses to one rule.**
+  `provider_status` (per provider: `ok | throttled | auth_expired | access_denied |
+  model_unavailable`, `reset_at`, `observed_at`, `reason`, `source`, `last_success_at`) is written
+  by `limits.classify_acp_error` and `runner._record_provider_limit` after a refused turn, and
+  cleared by a successful one. `start_task` refuses a provider that is not `ok`
+  (`PROVIDER_UNAVAILABLE`) until the provider's own `reset_at`, or — when it gave none — fifteen
+  minutes after the refusal was observed; after that it is simply eligible again, one ordinary
+  attempt. `start_task` gains an explicit coordinator override, `ignore_provider_status: bool =
+  false`, replacing the retired `LEGACY_OVERRIDE_RETIRED` flag of the same name.
+  `capabilities.providers[].availability` is now exactly `{state, reset_at, eligible_at, reason}`.
+  A model-scoped refusal collapses into the same provider-level status, with the model named in
+  `reason`, instead of a separate per-model row.
+- **Deleted entirely:** manual recovery permits (`provider_recovery.py`, the `provider_recovery`
+  MCP tool), hybrid recovery (`hybrid_recovery.py`, its cooldown/trial/held states and
+  `[provider_recovery]` config), quota windows/restrictions/retries (`quota.py`,
+  `QUOTA_RETRY_PENDING`), and native extra usage (`native_overage.py`, `[native_overage]` config,
+  the `native_overage` blocks in `task_status`/`task_result`/`capabilities`, and the quota-failed
+  `continue_task` continuation path — a `FAILED` task can no longer be continued; start a new task
+  once its provider is eligible again). `provider_model_status` and `provider_auth_context` are
+  gone along with them. Native checks (`access_checks`, `doctor`, `capabilities(check_providers=
+  [...])`) are unchanged: they remain the on-demand, five-minute-cached "is this CLI logged in"
+  probe and never gate admission.
+- **Schema 12** drops the eleven now-dead tables (`provider_model_status`,
+  `provider_recovery_permits`, `provider_auth_context`, `provider_quota_restrictions`,
+  `provider_quota_retry_attempts`, `native_overage_attempts`, `native_overage_observations`,
+  `recovery_episodes`, `recovery_claims`, `recovery_native_semantics`, `recovery_evidence`) and
+  adds `tasks.ignore_provider_status` and `provider_status.affected_model`. `provider_status`,
+  `provider_windows`, tasks, and grants are unaffected; the data in the dropped tables was disposable
+  intermediate state, not the fact it led to. `[provider_recovery]` and `[native_overage]` in
+  `config.toml` are now accepted and ignored, with one warning line, so an existing config file
+  still loads.
+- The MCP server now exposes eighteen tools (`provider_recovery` removed). The CLI's
+  `providers --retry-next`/`--revoke-retry` flags and the `LEGACY_OVERRIDE_RETIRED` code are gone;
+  `providers` reports the same four-field availability. The dashboard's Workers page shows
+  provider status, reset/eligible time, and the last native check in place of the old quota/
+  recovery projections; the Policy page's file-managed panel drops the retired `[native_overage]`/
+  `[provider_recovery]` rows.
+
 ## v0.5.2
 
 - **Vendor versions are minimums, not pins.** Antigravity runs from PATH (or

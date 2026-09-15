@@ -83,28 +83,3 @@ def test_competing_writers_preserve_failure_whichever_transaction_wins(tmp_path:
         assert store.get_provider_status("grok")["last_success_at"] is not None
     finally:
         store.close()
-
-
-def test_model_success_preserves_a_newer_model_refusal_and_records_success(tmp_path: Path) -> None:
-    path = tmp_path / "state.sqlite3"
-    first = Store.open(path)
-    second = Store.open(path)
-    try:
-        observed_account = first.get_provider_status("claude")
-        observed_model = first.get_provider_model_status("claude", "opus")
-        second.set_provider_model_status(
-            "claude", "opus", "model_unavailable", source="newer_sibling",
-        )
-        assert not first.mark_provider_healthy(
-            "claude",
-            expected=observed_account,
-            model="opus",
-            expected_model=observed_model,
-        )
-        row = first.get_provider_model_status("claude", "opus")
-        assert row["state"] == "model_unavailable"
-        assert row["source"] == "newer_sibling"
-        assert row["last_success_at"] is not None
-    finally:
-        second.close()
-        first.close()

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from taskspindle import policy, provider_recovery, repos, runner, service
+from taskspindle import policy, repos, runner, service
 from taskspindle.config import Paths
 from taskspindle.models import (
     AcceptTaskRequest,
@@ -746,12 +746,11 @@ def test_capabilities_describes_the_providers_and_the_limits(harness: Harness) -
     }
     assert "not an OS sandbox" in capabilities["isolation"]
     availability = capabilities["providers"][0]["availability"]
-    assert availability["state"] == "unknown"
-    assert availability["suggested_alternative"] is None
+    assert availability == {"state": "ok", "reset_at": None, "eligible_at": None, "reason": None}
     assert capabilities["providers"][0]["windows"] == []
 
 
-def test_a_throttled_provider_is_refused_and_legacy_override_cannot_create_a_task(
+def test_a_throttled_provider_is_refused_until_reset_and_an_explicit_override_admits_it(
     harness: Harness, make_repo
 ) -> None:
     repo = make_repo()
@@ -773,74 +772,25 @@ def test_a_throttled_provider_is_refused_and_legacy_override_cannot_create_a_tas
     assert excinfo.value.code == service.PROVIDER_UNAVAILABLE
     assert excinfo.value.retryable is True
     assert excinfo.value.details["reset_at"] == "2999-01-01T00:00:00Z"
-    assert excinfo.value.details["window"] == "five_hour"
-    assert "captured current evidence" in excinfo.value.details["override"]
+    assert excinfo.value.details["code"] == "PROVIDER_THROTTLED"
     shown = harness.orchestrator.capabilities()["providers"][0]["availability"]
     assert shown["state"] == "throttled"
+    assert shown["eligible_at"] == "2999-01-01T00:00:00Z"
     assert store.list_tasks() == []
 
-    with pytest.raises(TaskSpindleError) as retired:
-        harness.orchestrator.start_task(implement_request(repo, ignore_provider_status=True))
-    assert retired.value.code == "LEGACY_OVERRIDE_RETIRED"
-    assert store.list_tasks() == []
+    task_id = harness.orchestrator.start_task(
+        implement_request(repo, ignore_provider_status=True)
+    )["task_id"]
+    assert store.get_task(task_id) is not None
 
-    profile = harness.orchestrator.profiles[AUTHOR]
-    evidence = provider_recovery.status(
-        store, profile, now=harness.orchestrator.clock(), parent_env=harness.orchestrator.parent_env,
-    )
-    with pytest.raises(TaskSpindleError) as no_quota_bypass:
-        harness.orchestrator.provider_recovery(
-            "arm", provider=AUTHOR, evidence_revision=evidence["evidence_revision"],
-        )
-    assert no_quota_bypass.value.code == "RECOVERY_NOT_ELIGIBLE"
-
-    # A throttle whose reset has passed is not a refusal at all.
+    # A throttle whose reset has passed is eligible again.
     store.set_provider_status(
         REVIEWER, "throttled", code="PROVIDER_THROTTLED", reset_at="2000-01-01T00:00:00Z",
         source="acp_error",
     )
     elapsed = harness.orchestrator.capabilities()["providers"][1]["availability"]
-    assert elapsed["state"] == "unknown"
-    assert elapsed["stale"] is True
-    assert elapsed["retry_eligible"] is True
-
-
-def test_retired_override_cannot_authorize_prompt_and_permit_stays_bound_to_model_evidence(
-    harness: Harness, make_repo,
-) -> None:
-    harness.defer()
-    repo = make_repo()
-    authorize(harness, repo)
-    store = harness.orchestrator.store
-    store.set_provider_status(
-        AUTHOR, "auth_expired", source="acp_error", reason="legacy-secret-account-value",
-    )
-    profile = harness.orchestrator.profiles[AUTHOR]
-    with pytest.raises(TaskSpindleError) as retired:
-        harness.orchestrator.start_task(implement_request(repo, model="model-a", ignore_provider_status=True))
-    assert retired.value.code == "LEGACY_OVERRIDE_RETIRED"
-    assert store.list_tasks() == []
-
-    evidence = provider_recovery.status(
-        store, profile, now=harness.orchestrator.clock(), model="model-a",
-        parent_env=harness.orchestrator.parent_env,
-    )
-    permit = harness.orchestrator.provider_recovery(
-        "arm", provider=AUTHOR, model="model-a", evidence_revision=evidence["evidence_revision"],
-    )
-    task_id = harness.orchestrator.start_task(implement_request(
-        repo, model="model-a", recovery_permit_id=permit["permit_id"],
-    ))["task_id"]
-    assert store.get_recovery_permit(permit["permit_id"])["state"] == "claimed"
-    store.set_provider_model_status(
-        AUTHOR, "model-a", "model_unavailable", source="rate_limit_event",
-    )
-    harness.run_pending()
-    task = store.get_task(task_id)
-    assert task.state is TaskState.FAILED
-    assert task.error["code"] == "RECOVERY_EVIDENCE_CHANGED"
-    assert store.get_recovery_permit(permit["permit_id"])["state"] == "failed"
-    assert "legacy-secret" not in json.dumps(store.list_events(task_id))
+    assert elapsed["state"] == "throttled"
+    assert elapsed["eligible_at"] == "2000-01-01T00:00:00Z"
 
 
 def test_usage_report_rolls_the_finished_tasks_up(harness: Harness, make_repo) -> None:
@@ -1788,30 +1738,22 @@ def test_a_paused_provider_does_not_refuse_admission(harness: Harness, make_repo
     assert started["state"] == TaskState.RESULT_READY.value
 
 
-def test_recovery_permit_requests_are_also_subject_to_an_enforced_budget(
+def test_an_ignored_provider_status_is_still_subject_to_an_enforced_budget(
     harness: Harness, make_repo
 ) -> None:
     repo = make_repo()
     build_candidate(harness, repo)  # records one turn for AUTHOR, exhausting a limit of one.
     store = harness.orchestrator.store
-    profile = harness.orchestrator.profiles[AUTHOR]
 
     store.set_provider_status(
         AUTHOR, "auth_expired", source="acp_error", reason="hit limit",
     )
-    evidence = provider_recovery.status(
-        store, profile, now=harness.orchestrator.clock(), parent_env=harness.orchestrator.parent_env,
-    )
-    armed = harness.orchestrator.provider_recovery(
-        "arm", provider=AUTHOR, evidence_revision=evidence["evidence_revision"],
-    )
-
     document = _enforced_budget_policy(harness.orchestrator.profiles, AUTHOR)
     policy.save(store, document, updated_by="test", if_revision=None, reason="test")
 
     with pytest.raises(TaskSpindleError) as excinfo:
         harness.orchestrator.start_task(
-            implement_request(repo, recovery_permit_id=armed["permit_id"])
+            implement_request(repo, ignore_provider_status=True)
         )
     assert excinfo.value.code == "POLICY_BUDGET_EXHAUSTED"
 
@@ -1826,8 +1768,6 @@ def test_dispatch_policy_tool_get_and_status(harness: Harness) -> None:
     assert "status" in status
     assert status["file_managed"]["config_file"] == str(harness.orchestrator.paths.config_file)
     assert "concurrency" in status["file_managed"]
-    assert "native_overage" in status["file_managed"]
-    assert "provider_recovery" in status["file_managed"]
 
     with pytest.raises(TaskSpindleError) as excinfo:
         harness.orchestrator.dispatch_policy("bogus")
