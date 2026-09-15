@@ -16,7 +16,10 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-EXPECTED_TOOLS = 18
+from taskspindle.server import TOOL_NAMES
+
+#: Derived from the server's own registry so a new tool cannot silently break this check.
+EXPECTED_TOOLS = len(TOOL_NAMES)
 
 
 async def probe() -> list[str]:
