@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.5.1
+
+Fixes from the 2026-09-15 audit (`docs/audit-2026-09-15.md`) and the provider readiness hotfix.
+
+- **Read-only tools are read-only.** `list_tasks`, `task_status`, `task_result`, `usage_report`
+  and `list_repository_policies` reconcile but never dispatch, and a tool's own error is no
+  longer replaced by a dispatch failure.
+- **`state_version` moves only on transitions.** Unit assignment, cleanup state and the
+  worker's own bookkeeping no longer bump it, so a version read from `task_status` stays valid
+  for `cancel_task` and `continue_task`.
+- **Interrupted tasks resume.** A failed worker unit left by a self-settled interrupt is reset
+  before the task is relaunched instead of colliding with `UNIT_START_FAILED`.
+- **Failures say why.** A spawn or handshake failure carries a redacted tail of the agent's
+  stderr and uses its first line as the message; an authentication-context change during a
+  refusal is recorded beside the refusal instead of replacing it. `doctor` warns when a Grok
+  hook source is a symlink, which Grok refuses.
+- **Worker liveness.** The worker writes `tasks/<id>/progress.json` (phase and monotonic
+  counters) and `task_status` reports it with `elapsed_s`, `heartbeat_age_s` and
+  `progress_age_s`, so a coordinator can tell a stuck worker from a slow one.
+- **Stricter permission gate.** A consult or review turn may use only the `read`, `fetch`,
+  `search` and `think` tool kinds; every other kind, including an adapter's unclassified
+  `other`, is refused. Delegation is recognised by tool name or by plain words, never by a file
+  name such as `agent.py`.
+- **Dashboard hardening.** Every route requires a loopback `Host` (DNS rebinding is refused;
+  a deliberate `--host 0.0.0.0` bind still works), and responses carry `nosniff`,
+  `no-referrer`, `DENY` framing and, for the page, a nonce-scoped content security policy.
+- **Secrets off argv.** Worker environment variables that are not public go to a 0600
+  `EnvironmentFile` in the task directory instead of `systemd-run --setenv`, and
+  `cleanup_task` removes it.
+- **Provider readiness.** Grok's version label is informational and readiness is probed through
+  its real read-only sandbox launch; Claude authentication is read with `claude auth status
+  --json`.
+- **Housekeeping.** The smoke test derives its tool count from the server; the dashboard's
+  JavaScript tests run in CI; stale `@v0.1.0`/`@v0.2.0` install pins are gone; `usage
+  --group-by role` renders; `[provider_recovery]` and `[ai_policy]` appear in the example
+  configuration.
+
 ## v0.5.0
 
 - **Dispatch policy.** A new `dispatch_policy` document (schema 11, with history) lets the
