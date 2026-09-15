@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.2
 
 - **Vendor versions are minimums, not pins.** Antigravity runs from PATH (or
   `TASKSPINDLE_AGY_SOURCE`) and must be at least `AGY_MIN_VERSION`; builds newer than
