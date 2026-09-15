@@ -31,6 +31,16 @@ warning to stderr; nothing stops you, but nothing behind that port asks who you 
 put this behind a public interface without your own reverse proxy and authentication in front of
 it.
 
+Every route, read or write, refuses a request whose `Host` header does not name this machine
+(`127.0.0.1`, `::1`, or `localhost`, with an optional port); a browser page served from anywhere
+else cannot DNS-rebind its way to reading task prompts or diffs even after your machine resolves
+the attacker's domain to loopback, because the rebound connection still carries the attacker's
+`Host`. This check looks only at `Host`, not the TCP peer, so a deliberate `--host 0.0.0.0` bind
+still serves LAN callers. Every response also carries `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`; `/api/*` responses add
+`Cache-Control: no-store`; and the HTML page carries a `Content-Security-Policy` that allows its
+one inline bootstrap script only via a fresh per-response nonce.
+
 Every task read goes through a connection opened `sqlite3.connect(..., mode=ro)` with
 `PRAGMA query_only=1`: a write attempt raises rather than mutating the database. The database file
 may not exist yet — `/api/health` says so, and every list renders empty instead of failing.

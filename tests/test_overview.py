@@ -33,7 +33,8 @@ def _paths(tmp_path: Path) -> Paths:
 
 
 def _client(paths: Paths) -> TestClient:
-    return TestClient(build_app(paths, PROFILES, clock=lambda: NOW))
+    # SecurityMiddleware refuses TestClient's default non-loopback Host header.
+    return TestClient(build_app(paths, PROFILES, clock=lambda: NOW), base_url="http://127.0.0.1")
 
 
 def _task(store: Store, state: TaskState, *, cleanup: CleanupState = CleanupState.RETAINED) -> str:

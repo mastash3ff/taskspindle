@@ -1,8 +1,11 @@
 """The Starlette application behind ``taskspindle web``.
 
 Task, provider and usage data stays read-only: the task database is opened ``mode=ro`` (see
-:mod:`.db`) and task artifacts are only read. Mutating routes are loopback-gated: ``/api/policy*``
-may write the ``dispatch_policy`` and ``dispatch_policy_history`` tables through :mod:`.policy_store`,
+:mod:`.db`) and task artifacts are only read. Every route - read or write - is gated by
+:class:`.security.SecurityMiddleware` on the HTTP ``Host`` header, which blocks DNS rebinding
+without breaking a deliberate ``--host 0.0.0.0`` bind; see that class's docstring for the
+reasoning. Mutating routes are additionally loopback-gated: ``/api/policy*`` may write the
+``dispatch_policy`` and ``dispatch_policy_history`` tables through :mod:`.policy_store`,
 whose SQLite authorizer refuses every other table and every schema change; ``/api/ai-policy`` invokes
 the optional fixed-argv adapter from ``config.toml`` and never writes the database or that file.
 """
@@ -25,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Mount, Route
@@ -42,7 +46,14 @@ from . import ai_policy
 from .ai_policy import AdapterFactory
 from .db import ReadOnlyStore
 from .policy_store import PolicyStore
-from .security import csrf_valid, no_store, read_json_object, same_origin, trusted_loopback
+from .security import (
+    SecurityMiddleware,
+    csrf_valid,
+    no_store,
+    read_json_object,
+    same_origin,
+    trusted_loopback,
+)
 
 __all__ = ["build_app"]
 
@@ -180,8 +191,27 @@ def build_app(
 
     @_guard
     def index(request: Request) -> Response:
+        # The only inline script is the theme bootstrap in <head>; everything else loads from
+        # /static. A per-response nonce lets the CSP below allow just that one inline script
+        # instead of falling back to 'unsafe-inline', which would allow any inline script.
+        nonce = secrets.token_urlsafe(16)
         html = (static_dir / "index.html").read_text(encoding="utf-8")
-        return HTMLResponse(html)
+        html = html.replace("<script>", f'<script nonce="{nonce}">', 1)
+        return HTMLResponse(
+            html,
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'self'; "
+                    f"script-src 'self' 'nonce-{nonce}'; "
+                    "style-src 'self'; "
+                    "img-src 'self' data:; "
+                    "connect-src 'self'; "
+                    "object-src 'none'; "
+                    "base-uri 'none'; "
+                    "frame-ancestors 'none'"
+                )
+            },
+        )
 
     # -- health ---------------------------------------------------------------------
 
@@ -686,6 +716,6 @@ def build_app(
         Route("/api/ai-policy", ai_policy_get_endpoint, methods=["GET"]),
         Route("/api/ai-policy", ai_policy_put_endpoint, methods=["PUT"]),
     ]
-    app = Starlette(routes=routes)
+    app = Starlette(routes=routes, middleware=[Middleware(SecurityMiddleware)])
     app.state.doctor_cache = {"result": None, "at": 0.0, "checked_at": None}
     return app

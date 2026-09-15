@@ -353,13 +353,72 @@ def test_history_list_and_single_revision_lookup(tmp_path: Path) -> None:
     assert not_numeric.json() == {"error": "POLICY_REVISION_NOT_FOUND"}
 
 
-def test_history_routes_are_not_loopback_gated(tmp_path: Path) -> None:
+def test_history_routes_are_host_gated_but_not_peer_gated(tmp_path: Path) -> None:
+    """Read routes trust a deliberate non-loopback bind (LAN peer, loopback Host) but refuse a
+    non-loopback Host outright, which is what a DNS-rebinding page would present."""
     paths = _paths(tmp_path)
     _seed_schema_11(paths)
-    client = _client(paths, peer="203.0.113.5")
+    lan_client = _client(paths, peer="203.0.113.5")
 
-    assert client.get("/api/policy/history").status_code == 200
-    assert client.get("/api/policy/history/1").status_code == 404
+    assert lan_client.get("/api/policy/history").status_code == 200
+    assert lan_client.get("/api/policy/history/1").status_code == 404
+
+    rebound_client = _client(paths, base_url="http://attacker.example:8765")
+
+    history_response = rebound_client.get("/api/policy/history")
+    assert history_response.status_code == 403
+    assert history_response.json() == {"error": "LOOPBACK_REQUIRED"}
+
+    tasks_response = rebound_client.get("/api/tasks")
+    assert tasks_response.status_code == 403
+    assert tasks_response.json() == {"error": "LOOPBACK_REQUIRED"}
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["127.0.0.1:8765", "localhost:8765", "[::1]:8765"],
+)
+def test_read_routes_accept_loopback_host_variants(tmp_path: Path, host: str) -> None:
+    # httpx's TestClient transport rejects an IPv6-literal netloc in the request URL itself, so
+    # the Host variant under test is supplied as an explicit header instead of via base_url.
+    paths = _paths(tmp_path)
+    _seed_schema_11(paths)
+    client = _client(paths)
+
+    response = client.get("/api/policy/history", headers={"Host": host})
+
+    assert response.status_code == 200
+
+
+def test_non_loopback_host_is_refused_on_a_read_route_even_from_a_loopback_peer(
+    tmp_path: Path,
+) -> None:
+    """DNS rebinding: a loopback TCP peer with a Host the attacker's page supplied must not read."""
+    paths = _paths(tmp_path)
+    _seed_schema_11(paths)
+    client = _client(paths, base_url="http://attacker.example:8765")
+
+    response = client.get("/api/tasks")
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "LOOPBACK_REQUIRED"}
+
+
+def test_responses_carry_defense_in_depth_headers(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _seed_schema_11(paths)
+    client = _client(paths)
+
+    api_response = client.get("/api/policy/history")
+    assert api_response.headers["x-content-type-options"] == "nosniff"
+    assert api_response.headers["referrer-policy"] == "no-referrer"
+    assert api_response.headers["x-frame-options"] == "DENY"
+    assert api_response.headers["cache-control"] == "no-store"
+
+    page_response = client.get("/")
+    assert page_response.headers["x-content-type-options"] == "nosniff"
+    assert page_response.headers["referrer-policy"] == "no-referrer"
+    assert page_response.headers["x-frame-options"] == "DENY"
 
 
 # -- PolicyStore authorizer ---------------------------------------------------------------------

@@ -36,7 +36,8 @@ def _paths(tmp_path: Path) -> Paths:
 
 def _client(tmp_path: Path) -> TestClient:
     app = build_app(_paths(tmp_path), PROFILES)
-    return TestClient(app)
+    # SecurityMiddleware refuses TestClient's default non-loopback Host header.
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def test_router_recognizes_the_policy_route(tmp_path: Path) -> None:

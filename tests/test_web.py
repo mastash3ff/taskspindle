@@ -57,7 +57,10 @@ def _paths(tmp_path: Path) -> Paths:
 
 def _client(paths: Paths) -> TestClient:
     app = build_app(paths, PROFILES, clock=lambda: NOW)
-    return TestClient(app)
+    # TestClient's default base_url ("http://testserver") sends a non-loopback Host header,
+    # which SecurityMiddleware now refuses on every route; every read route in this file is
+    # exercised as a loopback caller unless a test says otherwise.
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def _seed(paths: Paths) -> dict[str, Any]:
@@ -405,7 +408,9 @@ def test_provider_api_requests_model_scoped_shared_availability(
     profile = Profile(
         id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
     )
-    response = TestClient(build_app(_paths(tmp_path), {"agy": profile})).get("/api/providers")
+    response = TestClient(
+        build_app(_paths(tmp_path), {"agy": profile}), base_url="http://127.0.0.1"
+    ).get("/api/providers")
 
     assert response.status_code == 200
     assert response.json()["providers"][0]["availability"] == projection
@@ -426,7 +431,7 @@ def test_provider_api_reads_a_pre_model_status_database_without_migrating_it(
     profile = Profile(
         id="agy", auth="oauth", command=("agy",), first_class=True, model="gemini-test"
     )
-    client = TestClient(build_app(paths, {"agy": profile}))
+    client = TestClient(build_app(paths, {"agy": profile}), base_url="http://127.0.0.1")
 
     response = client.get("/api/providers")
 

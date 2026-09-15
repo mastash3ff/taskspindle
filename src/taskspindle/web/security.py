@@ -1,10 +1,12 @@
-"""Loopback, origin, CSRF and body-size guards shared by the dashboard's mutating routes.
+"""Loopback, origin, CSRF and body-size guards shared by the dashboard's routes.
 
-Every check here is defense in depth around a single fact: the dashboard binds to loopback and
-its mutating surfaces are the dispatch policy and the optional Codex AI-policy adapter. A request
-must resolve to the local machine at the TCP and HTTP layers, come from the page the dashboard
-itself served, and carry the per-process CSRF token that page received, before its body is even
-read.
+Every check here is defense in depth around a single fact: the dashboard binds to loopback.
+``SecurityMiddleware`` gates every route, read or write, on the HTTP ``Host`` header alone,
+which blocks DNS rebinding while still allowing a deliberate ``--host 0.0.0.0`` bind. The
+mutating surfaces - the dispatch policy and the optional Codex AI-policy adapter - additionally
+require a request that resolves to the local machine at the TCP layer too, comes from the page
+the dashboard itself served, and carries the per-process CSRF token that page received, before
+its body is even read.
 """
 
 from __future__ import annotations
@@ -15,10 +17,12 @@ import secrets
 from typing import Any
 from urllib.parse import urlsplit
 
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 __all__ = [
+    "SecurityMiddleware",
     "csrf_valid",
     "loopback_address",
     "loopback_host",
@@ -56,6 +60,37 @@ def trusted_loopback(request: Request) -> bool:
     """Require both the TCP peer and HTTP Host to resolve to the local machine."""
     peer = request.client.host if request.client is not None else ""
     return loopback_address(peer) and loopback_host(request.headers.get("host"))
+
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Gate every request on ``Host`` and attach defense-in-depth headers to every response.
+
+    The dashboard's actual trust boundary is the ``0600`` task database extended to a local
+    port (see ``docs/dashboard.md``), not the TCP peer: an operator who runs
+    ``taskspindle web --host 0.0.0.0`` has deliberately widened that boundary to the LAN and
+    already sees a stderr warning for it (``cli.py``). What must never work is a browser on
+    that operator's machine being tricked, via DNS rebinding, into sending a same-origin
+    request whose ``Host`` header still names this port while the TCP connection lands on a
+    remote attacker's server pretending to be ``127.0.0.1``. Checking only ``Host`` here -
+    every route, read or write - closes that hole without breaking a deliberate non-loopback
+    bind. The five mutating routes layer ``trusted_loopback`` (peer *and* Host) on top of this
+    for a second, stricter reason: their state changes should not depend on trusting the
+    network path at all when the operator hasn't chosen to widen it.
+    """
+
+    async def dispatch(
+        self, request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        if not loopback_host(request.headers.get("host")):
+            response: Response = no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
+        else:
+            response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 def same_origin(request: Request) -> bool:
