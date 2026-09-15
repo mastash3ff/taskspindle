@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,15 +68,21 @@ _CANCEL_TIMEOUT = 2.0
 _CLAUDE_MODEL_ID = re.compile(r"claude-[A-Za-z0-9][A-Za-z0-9._:\[\]-]*")
 
 #: Whole words in a tool-call title that mean the agent is trying to spawn helpers of its own.
-#: Whole words only: ``Edit src/tasks.py`` and ``Run pytest tests/test_task.py`` are ordinary work.
+#: Whole words only, and only in plain-word tokens: ``Edit src/agent.py`` and
+#: ``Run pytest tests/test_team.py`` name files, not helpers, so path-like tokens are skipped.
 _DELEGATION_WORDS = re.compile(r"\b(?:subagent|agent|team)\b", re.IGNORECASE)
+_PATH_LIKE = re.compile(r"[/\\.]")
+_TOKEN_EDGE = ",.;:!?()[]{}<>\"'`"
 
 #: Tool names that are delegation whatever they are titled with, matched at the start of the
 #: title so that a path or a sentence merely containing one of them is not caught.
 _DELEGATION_TOOLS = re.compile(r"^(?:Agent|Task|TeamCreate|SendMessage)\b")
 
 _DELEGATION_EXEMPT_KINDS = ("read", "fetch")
-_WRITE_KINDS = ("edit", "delete", "move", "execute")
+#: The only tool kinds a read-only (consult or review) task may use. Everything else -- the
+#: write kinds, ``execute``, and the catch-all ``other`` an adapter reports for a tool it does
+#: not classify -- is refused, so an unclassified shell tool cannot slip through a read-only turn.
+_READ_ONLY_KINDS = ("read", "fetch", "search", "think")
 
 READ_ONLY_VIOLATION = "READ_ONLY_VIOLATION"
 DELEGATION_ATTEMPT = "DELEGATION_ATTEMPT"
@@ -165,15 +171,30 @@ def sealed_env(env: Mapping[str, str]) -> dict[str, str]:
 
 
 def _is_delegation(title: str) -> bool:
-    """True when a tool-call title names one of the agent-spawning tools."""
-    return bool(_DELEGATION_TOOLS.match(title) or _DELEGATION_WORDS.search(title))
+    """Whether a tool-call title names a delegation tool or speaks of spawning helpers.
+
+    A delegation tool is recognised by name at the start of the title. Otherwise the title is
+    split into tokens and only plain-word tokens are searched for the delegation words: a token
+    holding a path separator or a dot is a file name (``agent.py``, ``src/team/``) and never counts.
+    """
+    if _DELEGATION_TOOLS.match(title):
+        return True
+    for raw in title.split():
+        token = raw.strip(_TOKEN_EDGE)
+        if not token or _PATH_LIKE.search(token):
+            continue
+        if _DELEGATION_WORDS.search(token):
+            return True
+    return False
 
 
 class PermissionPolicy:
     """TaskSpindle's answer to ``session/request_permission``.
 
     Delegation is refused unconditionally: a worker agent may not spawn agents of its own,
-    whatever the task mode. Writes are refused unless the task was started with write intent.
+    whatever the task mode. Without write intent only the read kinds (``read``, ``fetch``,
+    ``search``, ``think``) are allowed; every other kind, including an adapter's unclassified
+    ``other``, is a read-only violation.
     """
 
     def __init__(self, *, allow_writes: bool) -> None:
@@ -193,7 +214,7 @@ class PermissionPolicy:
             return self._deny(options), MODE_SWITCH_ATTEMPT
         if kind not in _DELEGATION_EXEMPT_KINDS and _is_delegation(title):
             return self._deny(options), DELEGATION_ATTEMPT
-        if not self.allow_writes and kind in _WRITE_KINDS:
+        if not self.allow_writes and kind not in _READ_ONLY_KINDS:
             return self._deny(options), READ_ONLY_VIOLATION
 
         allowed = self._pick(options, "allow")
@@ -235,6 +256,43 @@ class TurnCapture:
     #: Grok's non-standard ``retry_state`` updates: one bounded, sanitized summary per transport
     #: retry, so a turn that times out can say how it spent the budget.
     retries: list[dict[str, Any]] = field(default_factory=list)
+
+
+def progress_snapshot(capture: TurnCapture) -> dict[str, Any]:
+    """The turn's progress counters so far, from what the capture has already seen.
+
+    Shared between :class:`AcpWorker` and ``taskspindle.agy_cli.AgyCliWorker``, whose captures are
+    both a :class:`TurnCapture`, so the runner's ``progress.json`` counts activity the same way for
+    every provider family. Deliberately cheap: called on every observed update, potentially many
+    times a second.
+
+    ``tool_calls`` counts distinct tool invocations (by ``tool_call_id``, when the adapter gave
+    one); ``tool_call_updates`` counts every status update ACP sends about them, including the
+    same call reported more than once. AGY reports each of its steps once, with no separate
+    ``tool_call`` announcement, so counting by id rather than by ACP's two-phase ``kind`` is what
+    makes the two provider families comparable.
+    """
+    seen_ids: set[str] = set()
+    tool_calls = 0
+    for call in capture.tool_calls:
+        call_id = call.get("tool_call_id")
+        if isinstance(call_id, str):
+            if call_id in seen_ids:
+                continue
+            seen_ids.add(call_id)
+        tool_calls += 1
+    last_title = next(
+        (call["title"] for call in reversed(capture.tool_calls) if call.get("title")), None
+    )
+    return {
+        "tool_calls": tool_calls,
+        "tool_call_updates": len(capture.tool_calls),
+        "text_chars": sum(len(chunk) for chunk in capture.text),
+        "thought_chunks": capture.thoughts,
+        "permission_requests": len(capture.permission_events),
+        "violations": len(capture.violations),
+        "last_tool_title": last_title,
+    }
 
 
 @dataclass(frozen=True)
@@ -323,6 +381,7 @@ class AcpWorker:
         policy: PermissionPolicy,
         handshake_timeout: float = 60.0,
         late_update_grace: float = 0.0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         if not command:
             raise AcpError("ACP_SPAWN_FAILED", "empty command")
@@ -336,6 +395,10 @@ class AcpWorker:
         #: its turn summary *after* answering. Grok 1.0.13 sends ``turn_completed`` -- the update
         #: with the turn's token usage -- that way; the wait ends the moment it arrives.
         self._late_update_grace = late_update_grace
+        #: Told the turn's running counters (see :func:`progress_snapshot`) on every observed
+        #: update and permission request. The caller owns what it does with them -- this class
+        #: knows nothing about tasks or files -- and a callback that raises never breaks the turn.
+        self.on_progress = on_progress
 
         self._stack = contextlib.AsyncExitStack()
         self._conn: Any = None
@@ -515,6 +578,15 @@ class AcpWorker:
                 update,
                 xai_responses=event.message.get("method") == "_x.ai/session_notification",
             ))
+        if kind in ("agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"):
+            self._emit_progress()
+
+    def _emit_progress(self) -> None:
+        """Tell ``on_progress`` the turn's running counters. Never lets a bad hook fail the turn."""
+        if self.on_progress is None or self._capture is None:
+            return
+        with contextlib.suppress(Exception):
+            self.on_progress(progress_snapshot(self._capture))
 
     def _observe_configuration(self, update: dict[str, Any]) -> None:
         """Protect selected values even between configuration requests and turns."""
@@ -577,6 +649,7 @@ class AcpWorker:
         )
         if violation is not None and not already_observed:
             capture.violations.append(violation)
+        self._emit_progress()
 
     # -- sessions ----------------------------------------------------------------------------
 

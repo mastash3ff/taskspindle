@@ -157,9 +157,11 @@ Four things a task can do that TaskSpindle records rather than hides.
 - **`SCOPE_VIOLATION`** — the collapsed candidate touches a path outside the task's granted
   `path_prefixes`. The revision is still recorded, with the warning; it cannot be accepted, and a
   repair turn is allowed. Nothing is deleted.
-- **`READ_ONLY_VIOLATION`** — a review task tried to write. Every write permission request in
-  review mode is denied at the ACP boundary, and after the turn the review worktree must be clean;
-  if it is not, the violation is recorded.
+- **`READ_ONLY_VIOLATION`** — a consult or review task asked for a tool it may not use. Without
+  write intent the gate allows only the `read`, `fetch`, `search` and `think` tool kinds; every
+  other permission request — a write, a shell command, or an adapter's unclassified `other` — is
+  denied at the ACP boundary. After the turn the review worktree must be clean; if it is not, the
+  violation is recorded.
 - **`ROOT_MUTATION`** — the agent changed the root repository, outside its worktree. TaskSpindle
   snapshots the root's HEAD, branch and dirty state before dispatch and compares afterwards. Every
   task with a repository behind it is checked this way, `consult` and `review` included; only a
@@ -168,9 +170,12 @@ Four things a task can do that TaskSpindle records rather than hides.
   `root_mutation_acknowledged`, which is written to the event log with their summary. If the
   snapshot cannot be read the check did not run, and that is recorded as `ROOT_CHECK_SKIPPED`
   rather than passed.
-- **`DELEGATION_ATTEMPT`** — the agent asked for a subagent, team or delegation tool. The request
-  is denied and recorded. Both first-class profiles are launched with those tools disabled in the
-  first place; this catches the case where they are asked for anyway.
+- **`DELEGATION_ATTEMPT`** — the agent asked for a subagent, team or delegation tool. A request is
+  recognised by the tool's name (`Agent`, `Task`, `TeamCreate`, `SendMessage`) or by the words
+  *agent*, *subagent* or *team* standing alone in its title; a file name such as `agent.py` or a
+  path such as `src/team/` never counts. The request is denied and recorded. First-class
+  profiles are launched with those tools disabled in the first place; this catches the case
+  where they are asked for anyway.
 - **`MODE_SWITCH_ATTEMPT`** — the agent asked to leave the session mode it was put in (Claude's
   "Ready to code?" prompt on its way out of plan mode). Denied and recorded; the mode was chosen
   for the task, not by it.

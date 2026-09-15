@@ -22,9 +22,10 @@ produced.
   `RECOVERY_AMBIGUOUS` and waits for you.
 - **Read-only means read-only.** A consult or review runs a Claude worker in the adapter's `plan`
   session mode, so a write or a shell command becomes a permission request TaskSpindle refuses,
-  and a Grok worker in its `read-only` sandbox, where the kernel refuses the write itself; an
-  implement runs Claude in `default` mode so every write and command is decided by TaskSpindle's
-  own gate, not by your Claude settings.
+  and a Grok worker in its `read-only` sandbox, where the kernel refuses the write itself. On
+  top of that, TaskSpindle's own gate lets a read-only turn use only the `read`, `fetch`,
+  `search` and `think` tool kinds; an implement runs Claude in `default` mode so every write
+  and command is decided by that gate, not by your Claude settings.
 - **Credentials stay where they are.** The environment each agent sees is built by allowlist, not
   by filtering yours. Workers reuse cached authentication. `auth agy` checks the native CLI's
   existing Google login; credentials are never copied.
