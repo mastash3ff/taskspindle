@@ -29,6 +29,8 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff check .
       - run: uv run pytest -q
+      - name: Run the dashboard JavaScript tests
+        run: node --test tests/web_ui/*.test.mjs
       - run: uv build
       - name: Install the locked Claude adapter
         run: npm ci --ignore-scripts
