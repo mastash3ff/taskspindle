@@ -43,7 +43,7 @@ produced.
   on it is refused until that time passes. Choosing another provider, or overriding with
   `ignore_provider_status`, is yours.
 - **Usage you can see.** Every turn's token counts are recorded from the wire, with an estimated
-  cost at published rates that is labelled as an estimate. `usage_report`, `taskspindle usage` and
+  cost at published rates for all three providers, labelled as an estimate. `usage_report`, `taskspindle usage` and
   the dashboard (`taskspindle web`) roll them up with outcomes, timings and violations.
 - **Usage you can steer.** The dispatch policy — target shares, budgets, and per-role model and
   effort — is operator data edited on the dashboard's Policy page or with `taskspindle policy`.

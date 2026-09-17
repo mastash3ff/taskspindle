@@ -72,8 +72,11 @@ def test_turn_completed_keeps_grok_cost_ticks_raw() -> None:
     assert turn is not None
     assert turn.model == "grok-4.6-build"
     assert turn.duration_ms == 5197
-    assert turn.cost_estimate_usd is None
+    # Grok's own tick figure stays raw and unconverted. The estimate beside it is ours, computed
+    # from the published list price; see the real-turn agreement test below.
     assert turn.raw["costUsdTicks"] == 43475800
+    assert turn.cost_estimate_usd == pytest.approx(0.025574)
+    assert turn.price_table_version == "2026-09-16"
     assert usage.from_turn_completed({"elapsed_ms": 3}, model=None, duration_ms=None) is None
 
 
@@ -304,5 +307,53 @@ def test_grok_model_precedence_keeps_attribution_and_usage_together(
     assert collected.model == collected.usage.model == expected
     assert collected.usage.raw["modelUsage"] == backend
     assert collected.usage.input_tokens == 10
-    assert collected.usage.cost_estimate_usd is None
+    # A grok-* attribution prices; the bare profile id in the third case has no price row.
+    assert (collected.usage.cost_estimate_usd is None) is (not expected.startswith("grok-4"))
     assert collected.usage.source == usage.SOURCE_TURN_COMPLETED
+
+
+# -- prices beyond Anthropic -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "cache_read", "output_tokens", "ticks"),
+    [
+        (17144, 128, 634, 128_860_000),
+        (21030, 6144, 11512, 346_514_400),
+        (389004, 231680, 14043, 1_750_136_400),
+    ],
+)
+def test_the_grok_estimate_matches_what_grok_reported_for_the_same_turn(
+    input_tokens: int, cache_read: int, output_tokens: int, ticks: int
+) -> None:
+    # Three real grok-4.6 turns: Grok's own costUsdTicks is list-price USD x 3.4e9, with cached
+    # tokens counted inside inputTokens and reasoning inside outputTokens.
+    usd, version = usage.estimate_cost(
+        "grok-4.6", input_tokens=input_tokens, output_tokens=output_tokens,
+        cache_read_tokens=cache_read, cache_write_tokens=0,
+    )
+    assert round(usd * 3.4e9) == ticks
+    assert version == "2026-09-16"
+
+
+def test_antigravity_picker_ids_price_as_their_gemini_model() -> None:
+    pro, _ = usage.estimate_cost(
+        "gemini-3.1-pro-high", input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000, cache_write_tokens=0,
+    )
+    flash, version = usage.estimate_cost(
+        "gemini-3.8-flash-medium", input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000, cache_write_tokens=0,
+    )
+    assert pro == pytest.approx(2.0 + 12.0 + 0.2)
+    assert flash == pytest.approx(0.75 + 3.75 + 0.075)
+    assert version == "2026-09-16"
+
+
+def test_a_claude_row_keeps_the_anthropic_table_date_and_separate_cache_accounting() -> None:
+    usd, version = usage.estimate_cost(
+        "claude-sonnet-5", input_tokens=1_000_000, output_tokens=0,
+        cache_read_tokens=1_000_000, cache_write_tokens=0,
+    )
+    assert usd == pytest.approx(2.0 + 0.2)
+    assert version == usage.PRICE_TABLE_VERSION

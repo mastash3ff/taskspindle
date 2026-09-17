@@ -82,7 +82,11 @@ async def test_native_runner_records_real_session_model_selection_and_usage(tmp_
         turn = store.list_turns(task.id)[0]
         usage = store.get_turn_usage(turn["id"])
         assert usage["input_tokens"] == 12
+        # Attribution stays empty: the picker ID is what we asked for, not what answered. The
+        # cost beside it is priced from that selection.
         assert usage["model"] is None
+        assert usage["cost_estimate_usd"] > 0
+        assert usage["price_table_version"] == "2026-09-16"
         assert usage["source"] == "agy_cli_result"
         assert usage["raw"]["_agy_cli_cumulative"]["output_tokens"] == 3
         assert calls[0]["prior_usage"] is None

@@ -8,6 +8,8 @@ wrote -- and only the one file for this turn's session, never the rest of ``~/.c
 Costs are estimates: the number is what the same tokens would have cost at published API rates.
 OAuth sessions can consume provider-managed extra usage; an estimate is not proof of a charge. Grok
 reports its own ``costUsdTicks`` whose unit is not documented; it is kept raw and never converted.
+(Observed on grok 1.0.30: ticks == list-price USD x 3.4e9 with cached tokens counted inside
+``inputTokens`` and reasoning inside ``outputTokens``, which is how the Grok row below is applied.)
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ import json
 import re
 import statistics
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -40,12 +42,14 @@ __all__ = [
     "from_prompt_response",
     "from_turn_completed",
     "parse_since",
+    "priced_as",
     "report",
     "windows_report",
     "with_model",
 ]
 
-#: The date of the published Anthropic price list these rates were copied from.
+#: The date of the published Anthropic price list the Claude rates were copied from. Rows from
+#: another vendor carry their own date in ``_PRICE_AS_OF``.
 PRICE_TABLE_VERSION = "2026-06-24"
 
 #: USD per million tokens, by model-id prefix. Cache reads are 0.1x the input rate (0.025x on
@@ -60,7 +64,28 @@ PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
     "claude-sonnet-5": {"input": 2.0, "output": 10.0, "cache_read": 0.2, "cache_write": 2.5},
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write": 3.75},
     "claude-haiku-4-5": {"input": 1.0, "output": 5.0, "cache_read": 0.1, "cache_write": 1.25},
+    # xAI, https://docs.x.ai/docs/models read 2026-09-16: "grok-4.6 (< 200k prompt tokens) $2.00 /
+    # $0.50 cached / $6.00". A request whose prompt reaches 200k tokens is billed at double these
+    # rates; a turn's totals cannot tell, so the base tier is used and the estimate is a floor.
+    "grok-4.6": {"input": 2.0, "output": 6.0, "cache_read": 0.5, "cache_write": 0.0},
+    # Google, https://ai.google.dev/gemini-api/docs/pricing read 2026-09-16, paid Standard tier,
+    # output "including thinking tokens". Antigravity picker ids add an effort suffix
+    # (gemini-3.1-pro-high), which the prefix match absorbs. Pro is the <= 200k-token prompt tier
+    # ($4.00 / $18.00 / $0.40 above it); Flash is the rate "through December 31, 2026".
+    "gemini-3.1-pro": {"input": 2.0, "output": 12.0, "cache_read": 0.2, "cache_write": 0.0},
+    "gemini-3.8-flash": {"input": 0.75, "output": 3.75, "cache_read": 0.075, "cache_write": 0.0},
 }
+
+#: When a row that is not Anthropic's was copied, by model-id prefix.
+_PRICE_AS_OF: dict[str, str] = {
+    "grok-4.6": "2026-09-16",
+    "gemini-3.1-pro": "2026-09-16",
+    "gemini-3.8-flash": "2026-09-16",
+}
+
+#: Model-id prefixes whose reported input count already contains the cached tokens, so the cached
+#: part is priced at the cache rate and only the remainder at the input rate.
+_INPUT_INCLUDES_CACHE_READ = ("grok-",)
 
 #: Where a usage record came from.
 SOURCE_PROMPT_RESPONSE = "acp_prompt_response"
@@ -135,14 +160,16 @@ def estimate_cost(
     priced = _price_for(model)
     if priced is None:
         return None, None
-    _, prices = priced
+    prefix, prices = priced
+    if prefix.startswith(_INPUT_INCLUDES_CACHE_READ):
+        input_tokens = max((input_tokens or 0) - (cache_read_tokens or 0), 0)
     total = (
         (input_tokens or 0) * prices["input"]
         + (output_tokens or 0) * prices["output"]
         + (cache_read_tokens or 0) * prices["cache_read"]
         + (cache_write_tokens or 0) * prices["cache_write"]
     ) / 1_000_000
-    return round(total, 6), PRICE_TABLE_VERSION
+    return round(total, 6), _PRICE_AS_OF.get(prefix, PRICE_TABLE_VERSION)
 
 
 def _build(
@@ -228,7 +255,7 @@ def from_turn_completed(
         duration_ms=duration_ms if duration_ms is not None else api_ms,
         source=SOURCE_TURN_COMPLETED,
         raw=usage,
-        price=False,
+        price=True,
     )
 
 
@@ -322,6 +349,27 @@ def from_claude_session_file(
     )
 
 
+def priced_as(turn: TurnUsage, model: str | None) -> TurnUsage:
+    """The same record, costed as ``model``, with its attribution left alone.
+
+    For Antigravity the picker ID names the model TaskSpindle asked for, not the backend that
+    answered: it is good enough to price a turn, and not good enough to claim the turn ran on it.
+    A record that already has a cost keeps it.
+    """
+    if model is None or turn.cost_estimate_usd is not None:
+        return turn
+    cost, version = estimate_cost(
+        model,
+        input_tokens=turn.input_tokens,
+        output_tokens=turn.output_tokens,
+        cache_read_tokens=turn.cache_read_tokens,
+        cache_write_tokens=turn.cache_write_tokens,
+    )
+    if cost is None:
+        return turn
+    return TurnUsage(**{**asdict(turn), "cost_estimate_usd": cost, "price_table_version": version})
+
+
 def with_model(turn: TurnUsage, model: str | None) -> TurnUsage:
     """The same counts attributed to ``model``, priced again now that the model is known."""
     if model is None or model == turn.model:
@@ -374,12 +422,10 @@ def collect(
     if model is None and profile.family != "agy":
         model = profile.model
         if usage is not None:
-            # Update attribution without repricing the unpriced turn_completed record.
-            usage = replace(usage, model=model)
+            usage = with_model(usage, model)
     if usage is None and result.usage:
-        priced = profile.family == "claude" or profile.auth == "api_key"
         usage = from_prompt_response(
-            result.usage, model=model, duration_ms=duration_ms, price=priced
+            result.usage, model=model, duration_ms=duration_ms, price=True
         )
     if usage is None and session_path is not None:
         usage = from_claude_session_file(session_path, since=started_at, duration_ms=duration_ms)

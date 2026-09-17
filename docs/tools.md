@@ -530,8 +530,11 @@ Where the numbers come from, and what they are not:
 - **`cost_estimate_usd` is an estimate**, and always says so. OAuth sessions may consume native
   extra usage; this figure is not a reported charge. It prices tokens at published API rates from a
   static price table whose date is `price_table_version`, so seat usage can be compared and
-  budgeted. Grok's own cost figure is not converted, because its unit is not documented; a model
-  the table does not know has no estimate.
+  budgeted. The table covers Claude, Grok and the Gemini models Antigravity selects; a model it
+  does not know has no estimate, and the rate it used is named by `price_table_version`. Two
+  caveats on the figure: a Grok or Gemini Pro request whose prompt reaches 200k tokens is billed
+  by the vendor at double the rate used here, so the estimate is a floor; and Grok's own
+  `costUsdTicks` is still kept raw and never converted, because its unit is not documented.
 - **Outcomes, timings and violations** are computed from the task, turn, check and event tables
   on every call; nothing is aggregated ahead of time.
 - **Windows** are observed, never polled. For Claude, the adapter forwards the SDK's rate-limit

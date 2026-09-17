@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Cost estimates cover all three providers.** The price table gains `grok-4.6` and the Gemini
+  models Antigravity selects (`gemini-3.1-pro`, `gemini-3.8-flash`), each carrying the date its
+  rates were read from the vendor's own pricing page in `price_table_version`. A Grok turn's
+  estimate reproduces Grok's own reported `costUsdTicks` exactly on real turns; that raw figure is
+  still never converted. An Antigravity turn is priced as the model the task selected, while
+  `reported_model` keeps recording only what the backend itself said. Both vendors bill double
+  above a 200k-token prompt, so an estimate for a long turn is a floor.
+
 ## v0.6.0
 
 - **Provider refusal, quota, recovery, and native-overage machinery collapses to one rule.**

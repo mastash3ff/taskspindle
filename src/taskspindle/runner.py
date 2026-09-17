@@ -1188,6 +1188,9 @@ async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: Tu
             if model is not None:
                 break
     run.usage = usage.with_model(collected.usage, model) if collected.usage else None
+    if run.usage is not None and profile.family == "agy":
+        # Price the turn as the model the task selected without claiming it answered.
+        run.usage = usage.priced_as(run.usage, run.session_model or profile.model)
     # AGY's selected picker ID is a resolved request, not evidence of which
     # backend actually answered. Preserve the distinction when telemetry is absent.
     run.reported_model = (

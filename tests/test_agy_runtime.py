@@ -121,4 +121,6 @@ async def test_agy_usage_does_not_report_selected_models_as_observed(tmp_path, w
     assert run.usage.model == wire_model
     assert run.usage.input_tokens == 10
     assert run.usage.output_tokens == 2
-    assert run.usage.cost_estimate_usd is None
+    # Priced from the selected model, which never becomes the record's attribution.
+    assert run.usage.cost_estimate_usd == pytest.approx(0.0000150)
+    assert run.usage.price_table_version == "2026-09-16"
