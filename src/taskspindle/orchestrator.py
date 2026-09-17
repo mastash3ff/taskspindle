@@ -995,8 +995,8 @@ class Orchestrator:
                 initial = len(turns) == 1
                 if initial:
                     bound_context = self.store.get_task_auth_context(task.id)
-                    if (bound_context is not None
-                            and bound_context != auth_context.fingerprint(profile, self.parent_env)):
+                    current_context = auth_context.fingerprint(profile, self.parent_env)
+                    if not auth_context.matches(bound_context, current_context):
                         raise TaskSpindleError(
                             "AUTH_CONTEXT_CHANGED", "Authentication context changed before task admission.",
                         )

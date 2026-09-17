@@ -250,8 +250,13 @@ admission never triggers it. The checker starts a session-free native ACP proces
 billing extension, and retains only normalized percentage, weekly/monthly window, reset,
 timestamps, version, freshness, and safe status fields. The persistent cache is shared by OAuth
 model aliases of the same provider account. It coalesces concurrent checks for five minutes and
-invalidates on executable, auth mode, or relevant config/auth-file metadata changes; model and
-effort selection do not create separate account quota caches. It never starts inference, login, a
+invalidates on an executable or auth-mode change, and — for grok — on its own auth or config file
+metadata changing. The claude and agy variants instead embed the same auth-context fingerprint used
+to bind a task's admission to its login (`taskspindle.auth_context.fingerprint`): that fingerprint
+identifies a credential file's resolved location and inode, not its freshness, so an in-place OAuth
+token refresh (which rewrites the file's size and timestamps but not its identity) changes neither
+this cache nor a task's bound context, and never raises `AUTH_CONTEXT_CHANGED`. Model and effort
+selection do not create separate account quota caches. It never starts inference, login, a
 browser, or direct HTTP; it reads no credential contents and never upgrades the CLI. Unsupported
 versions keep quota unknown rather than trying another transport. Because the optional MCP
 parameter writes this diagnostic cache, `capabilities` is not advertised with a read-only

@@ -104,6 +104,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     usage.add_argument("--json", action="store_true", help="print the report as JSON")
 
+    reprice = sub.add_parser(
+        "reprice", help="re-run stored usage rows through the current price table"
+    )
+    reprice.add_argument("--since", help="ISO-8601, or shorthand like 7d, 24h, 30m")
+    reprice.add_argument("--provider", help="only this provider")
+    reprice.add_argument(
+        "--dry-run", action="store_true", help="report what would change; write nothing"
+    )
+    reprice.add_argument(
+        "--use-selected-model", action="store_true",
+        help="also price a row with no model recorded, from its task's resolved_model "
+             "(an inference, not an observed attribution -- the row's model column stays empty)",
+    )
+    reprice.add_argument("--json", action="store_true", help="print the report as JSON")
+
     policy = sub.add_parser("policy", help="inspect and edit the dispatch policy")
     policy_sub = policy.add_subparsers(dest="policy_command", metavar="POLICY_COMMAND")
 
@@ -188,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
         return _worker(args.task)
     if args.command == "usage":
         return _usage(args.since, args.provider, args.group_by, as_json=args.json)
+    if args.command == "reprice":
+        return _reprice(
+            args.since, args.provider,
+            dry_run=args.dry_run, use_selected_model=args.use_selected_model, as_json=args.json,
+        )
     if args.command == "policy":
         return _policy(parser, args)
     if args.command == "discover":
@@ -493,6 +513,65 @@ def _print_usage(report: dict[str, Any]) -> None:
         )
         print(f"{entry['provider']}: {entry['state']}" + (f"; windows: {marks}" if marks else ""))
     print(report["cost_note"])
+
+
+def _reprice(
+    since: str | None, provider: str | None, *,
+    dry_run: bool, use_selected_model: bool, as_json: bool,
+) -> int:
+    from . import usage
+    from .store import Store
+
+    paths = resolve_paths()
+    try:
+        with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+            result = usage.reprice(
+                store,
+                since=usage.parse_since(since),
+                provider=provider,
+                use_selected_model=use_selected_model,
+                dry_run=dry_run,
+            )
+    except (OSError, ValueError) as exc:
+        print(f"taskspindle reprice: {exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    _print_reprice(result)
+    return 0
+
+
+def _print_reprice(result: dict[str, Any]) -> None:
+    """A short summary; the JSON form carries every repriced and unpriced row."""
+    label = "reprice (dry run)" if result["dry_run"] else "reprice"
+    print(label + (f" since {result['since']}" if result["since"] else ""))
+    print(
+        f"{result['rows_examined']} examined, {result['rows_repriced']} repriced, "
+        f"{result['rows_unchanged']} already correct, {result['rows_unpriced']} left unpriced"
+    )
+    for entry in result["repriced"]:
+        old = (
+            f"{entry['old_cost_estimate_usd']:.6f}"
+            if entry["old_cost_estimate_usd"] is not None else "unpriced"
+        )
+        inferred = (
+            " (priced from the task's resolved_model, attribution left blank)"
+            if entry["model_source"] == "task.resolved_model" else ""
+        )
+        print(
+            f"  turn {entry['turn_id']} {entry['model']}: {old} -> "
+            f"{entry['new_cost_estimate_usd']:.6f} USD [{entry['price_table_version']}]{inferred}"
+        )
+    for entry in result["unpriced"]:
+        model = f" ({entry['model']})" if entry["model"] else ""
+        print(f"  turn {entry['turn_id']}{model}: {entry['reason']}")
+    if result["by_price_table_version"]:
+        versions = ", ".join(
+            f"{version}: {count}" for version, count in sorted(result["by_price_table_version"].items())
+        )
+        print(f"price table versions written: {versions}")
+    print(result["cost_note"])
 
 
 def _table(columns: list[str], rows: list[list[str]]) -> None:

@@ -170,6 +170,178 @@ def _seed(store: Store, provider: str, mode: Mode, *, state: TaskState, ms: int,
     return record.id
 
 
+def _seed_usage_row(
+    store: Store, provider: str, *,
+    model: str | None = None,
+    cost_estimate_usd: float | None = None,
+    price_table_version: str | None = None,
+    resolved_model: str | None = None,
+    input_tokens: int = 1000,
+    output_tokens: int = 100,
+    source: str = "acp_prompt_response",
+    raw: dict | None = None,
+    captured_at: str | None = None,
+) -> tuple[str, int]:
+    """One task with one turn and one fully-controlled ``turn_usage`` row, for reprice tests."""
+    record = create_task(
+        store, StartTaskRequest(provider=provider, mode=Mode.CONSULT, prompt="p"),
+        repository_id=None, auth_mode=AuthMode.OAUTH,
+    )
+    if resolved_model is not None:
+        store.update_task(record.id, None, bump_version=False, resolved_model=resolved_model)
+    turn_id = store.insert_turn(
+        record.id, 1, "initial",
+        started_at="2030-01-02T11:00:00.000000Z", ended_at="2030-01-02T11:00:01.000000Z",
+    )
+    store.insert_turn_usage(
+        turn_id, record.id, provider, model=model, input_tokens=input_tokens,
+        output_tokens=output_tokens, cache_read_tokens=0, cache_write_tokens=0,
+        reasoning_tokens=0, model_calls=1, duration_ms=1000,
+        cost_estimate_usd=cost_estimate_usd, cost_is_estimate=True,
+        price_table_version=price_table_version, source=source, raw=raw,
+    )
+    if captured_at is not None:
+        store._conn.execute(
+            "UPDATE turn_usage SET captured_at = ? WHERE turn_id = ?", (captured_at, turn_id)
+        )
+    return record.id, turn_id
+
+
+def test_reprice_prices_a_known_model_with_no_stored_cost(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _, turn_id = _seed_usage_row(store, "grok", model="grok-4.6", input_tokens=1_000_000)
+    expected_cost, expected_version = usage.estimate_cost(
+        "grok-4.6", input_tokens=1_000_000, output_tokens=100,
+        cache_read_tokens=0, cache_write_tokens=0,
+    )
+
+    result = usage.reprice(store)
+
+    assert result["rows_examined"] == 1
+    assert result["rows_repriced"] == 1
+    assert result["rows_unpriced"] == 0
+    entry = result["repriced"][0]
+    assert entry["turn_id"] == turn_id
+    assert entry["old_cost_estimate_usd"] is None
+    assert entry["new_cost_estimate_usd"] == expected_cost
+    assert entry["price_table_version"] == expected_version
+    assert result["by_price_table_version"] == {expected_version: 1}
+
+    row = store.list_turn_usage()[0]
+    assert row["cost_estimate_usd"] == expected_cost
+    assert row["price_table_version"] == expected_version
+
+
+def test_reprice_leaves_an_unknown_model_unpriced_and_reports_why(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    task_id, turn_id = _seed_usage_row(store, "claude", model="mystery-9")
+
+    result = usage.reprice(store)
+
+    assert result["rows_repriced"] == 0
+    assert result["rows_unpriced"] == 1
+    assert result["unpriced"] == [
+        {
+            "turn_id": turn_id, "task_id": task_id,
+            "model": "mystery-9", "reason": "model unknown to the price table",
+        }
+    ]
+
+
+def test_reprice_reports_a_row_with_no_model_as_no_model_recorded(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _seed_usage_row(store, "agy", model=None)
+
+    result = usage.reprice(store)
+
+    assert result["rows_unpriced"] == 1
+    assert result["unpriced"][0]["reason"] == "no model recorded"
+    assert result["unpriced"][0]["model"] is None
+
+
+def test_reprice_dry_run_reports_but_writes_nothing(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _seed_usage_row(store, "grok", model="grok-4.6", input_tokens=1_000_000)
+
+    result = usage.reprice(store, dry_run=True)
+
+    assert result["rows_repriced"] == 1
+    assert store.list_turn_usage()[0]["cost_estimate_usd"] is None
+
+
+def test_reprice_filters_by_since_and_provider(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _seed_usage_row(store, "grok", model="grok-4.6", captured_at="2029-01-01T00:00:00.000000Z")
+    _seed_usage_row(store, "claude", model="claude-sonnet-5", captured_at="2030-06-01T00:00:00.000000Z")
+
+    only_recent = usage.reprice(store, since="2030-01-01T00:00:00Z")
+    assert only_recent["rows_examined"] == 1
+
+    only_grok = usage.reprice(store, provider="grok")
+    assert only_grok["rows_examined"] == 1
+    assert only_grok["repriced"][0]["model"] == "grok-4.6"
+
+
+def test_reprice_preserves_every_other_column(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _, turn_id = _seed_usage_row(
+        store, "grok", model="grok-4.6", input_tokens=1_000_000,
+        source="acp_turn_completed", raw={"costUsdTicks": 123}, captured_at="2029-06-01T00:00:00.000000Z",
+    )
+    before = store.get_turn_usage(turn_id)
+
+    usage.reprice(store)
+
+    after = store.get_turn_usage(turn_id)
+    assert after["captured_at"] == before["captured_at"] == "2029-06-01T00:00:00.000000Z"
+    assert after["raw"] == before["raw"] == {"costUsdTicks": 123}
+    assert after["source"] == before["source"] == "acp_turn_completed"
+    assert after["cost_estimate_usd"] != before["cost_estimate_usd"]
+
+
+def test_reprice_running_twice_reports_the_second_run_as_unchanged(tmp_path: Path) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    _seed_usage_row(store, "grok", model="grok-4.6", input_tokens=1_000_000)
+
+    first = usage.reprice(store)
+    second = usage.reprice(store)
+
+    assert first["rows_repriced"] == 1
+    assert second["rows_repriced"] == 0
+    assert second["rows_unchanged"] == 1
+
+
+def test_reprice_use_selected_model_prices_from_the_task_and_leaves_attribution_null(
+    tmp_path: Path,
+) -> None:
+    store = Store.open(tmp_path / "s.sqlite3")
+    task_id, turn_id = _seed_usage_row(
+        store, "agy", model=None, input_tokens=1_000_000, resolved_model="gemini-3.1-pro-high",
+    )
+    expected_cost, expected_version = usage.estimate_cost(
+        "gemini-3.1-pro-high", input_tokens=1_000_000, output_tokens=100,
+        cache_read_tokens=0, cache_write_tokens=0,
+    )
+
+    without_flag = usage.reprice(store)
+    assert without_flag["rows_unpriced"] == 1
+    assert without_flag["unpriced"][0]["reason"] == "no model recorded"
+
+    result = usage.reprice(store, use_selected_model=True)
+
+    assert result["rows_unpriced"] == 0
+    entry = result["repriced"][0]
+    assert entry["model"] == "gemini-3.1-pro-high"
+    assert entry["model_source"] == "task.resolved_model"
+    assert entry["new_cost_estimate_usd"] == expected_cost
+
+    row = store.get_turn_usage(turn_id)
+    assert row["cost_estimate_usd"] == expected_cost
+    assert row["price_table_version"] == expected_version
+    assert row["model"] is None
+    assert store.get_task(task_id).resolved_model == "gemini-3.1-pro-high"
+
+
 def test_report_rolls_up_tokens_outcomes_and_timings(tmp_path: Path) -> None:
     store = Store.open(tmp_path / "s.sqlite3")
     _seed(store, "claude", Mode.CONSULT, state=TaskState.COMPLETED, ms=2000, tokens=1000)

@@ -26,7 +26,7 @@ from typing import Any, Literal
 from . import limits
 from .acp_client import TurnResult
 from .providers import Profile
-from .store import UsageReader
+from .store import Store, UsageReader
 
 __all__ = [
     "PRICES_USD_PER_MTOK",
@@ -44,6 +44,7 @@ __all__ = [
     "parse_since",
     "priced_as",
     "report",
+    "reprice",
     "windows_report",
     "with_model",
 ]
@@ -581,6 +582,109 @@ def report(
         },
         "violations": violations,
         "windows": windows_report(store, profiles or {}, moment),
+    }
+
+
+def reprice(
+    store: Store,
+    *,
+    since: str | None = None,
+    provider: str | None = None,
+    use_selected_model: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Re-run :func:`estimate_cost` over stored rows at the current price table.
+
+    Every row's token counts are taken exactly as stored -- nothing is re-collected from a
+    provider. This is both the one-off backfill for rows captured before their vendor was priced,
+    and the standing answer to a price table that has since changed: run it again and any row
+    whose stored cost no longer matches what the current table would charge is brought back into
+    line, priced or not.
+
+    A row with no ``model`` recorded (typically an Antigravity turn, whose picker ID names the
+    model TaskSpindle asked for rather than the backend that answered, so it is not stored as
+    attribution) is reported as unpriced with reason ``"no model recorded"`` -- never silently
+    skipped, and never priced from a guess. ``use_selected_model`` is an explicit opt-in that
+    prices such a row from its task's ``resolved_model`` instead, the same trust
+    :func:`priced_as` already gives an Antigravity turn's own row: good enough to cost the turn,
+    not good enough to claim the turn ran on it. The row's stored ``model`` column is left NULL
+    either way; only the price columns are written.
+    """
+    rows = store.list_turn_usage(since=since, provider=provider)
+    repriced: list[dict[str, Any]] = []
+    unpriced: list[dict[str, Any]] = []
+    by_version: dict[str, int] = {}
+    unchanged = 0
+    tasks: dict[str, Any] = {}
+
+    for row in rows:
+        model = row.get("model")
+        model_source = "recorded" if model else None
+        if model is None and use_selected_model:
+            task_id = str(row["task_id"])
+            if task_id not in tasks:
+                tasks[task_id] = store.get_task(task_id)
+            task = tasks[task_id]
+            if task is not None and task.resolved_model:
+                model = task.resolved_model
+                model_source = "task.resolved_model"
+        if model is None:
+            unpriced.append(
+                {
+                    "turn_id": row["turn_id"], "task_id": row["task_id"],
+                    "model": None, "reason": "no model recorded",
+                }
+            )
+            continue
+        cost, version = estimate_cost(
+            model,
+            input_tokens=row.get("input_tokens"),
+            output_tokens=row.get("output_tokens"),
+            cache_read_tokens=row.get("cache_read_tokens"),
+            cache_write_tokens=row.get("cache_write_tokens"),
+        )
+        if cost is None:
+            unpriced.append(
+                {
+                    "turn_id": row["turn_id"], "task_id": row["task_id"],
+                    "model": model, "reason": "model unknown to the price table",
+                }
+            )
+            continue
+        old_cost = row.get("cost_estimate_usd")
+        old_cost = float(old_cost) if old_cost is not None else None
+        if old_cost is not None and old_cost == cost and row.get("price_table_version") == version:
+            unchanged += 1
+            continue
+        repriced.append(
+            {
+                "turn_id": row["turn_id"], "task_id": row["task_id"],
+                "model": model, "model_source": model_source,
+                "old_cost_estimate_usd": old_cost, "new_cost_estimate_usd": cost,
+                "price_table_version": version,
+            }
+        )
+        by_version[version] = by_version.get(version, 0) + 1
+        if not dry_run:
+            store.set_turn_price(int(row["turn_id"]), cost, version)
+
+    return {
+        "since": since,
+        "provider": provider,
+        "dry_run": dry_run,
+        "use_selected_model": use_selected_model,
+        "rows_examined": len(rows),
+        "rows_repriced": len(repriced),
+        "rows_unpriced": len(unpriced),
+        "rows_unchanged": unchanged,
+        "repriced": repriced,
+        "unpriced": unpriced,
+        "by_price_table_version": by_version,
+        "cost_note": (
+            "cost_estimate_usd is what the tokens would cost at published API rates from the "
+            f"current price table (price_table_version records which; Claude's is {PRICE_TABLE_VERSION}); "
+            "it is not a reported charge. OAuth sessions can consume provider-managed extra usage."
+        ),
     }
 
 

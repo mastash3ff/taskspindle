@@ -535,6 +535,10 @@ Where the numbers come from, and what they are not:
   caveats on the figure: a Grok or Gemini Pro request whose prompt reaches 200k tokens is billed
   by the vendor at double the rate used here, so the estimate is a floor; and Grok's own
   `costUsdTicks` is still kept raw and never converted, because its unit is not documented.
+  When the table changes -- a new vendor rate, or a model that was previously unpriced -- run
+  `taskspindle reprice` to re-estimate stored rows from the token counts already on file and bring
+  their `cost_estimate_usd` and `price_table_version` back in line with the table current at the
+  time it runs; it never touches `captured_at`, `raw`, or which model a row is attributed to.
 - **Outcomes, timings and violations** are computed from the task, turn, check and event tables
   on every call; nothing is aggregated ahead of time.
 - **Windows** are observed, never polled. For Claude, the adapter forwards the SDK's rate-limit

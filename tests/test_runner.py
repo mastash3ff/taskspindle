@@ -1136,3 +1136,22 @@ def test_compose_prompt_states_the_rules_each_mode_needs(
     assert "Change only files under these path prefixes: src" in text
     assert "- pytest -q" in text
     assert "Do not spawn subagents" in text
+
+
+
+async def test_a_turn_that_reported_no_usage_says_so_in_the_worker_log(
+    store: Store, paths: Paths, script
+) -> None:
+    # Grok's token counts ride a late ``turn_completed`` update that a timeout or an error can
+    # outrun, and it has no fallback. A turn with no usage record is expected sometimes; what it
+    # must never be is silent, because the usage report would otherwise just be short a row.
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+    script_path = script({"response": "answered without reporting any usage"})
+
+    state = await run_task(store, paths, task, script_path)
+
+    assert state is TaskState.COMPLETED
+    turn = store.list_turns(task.id)[0]
+    assert store.get_turn_usage(turn["id"]) is None
+    log = (paths.state_dir / "tasks" / task.id / "worker.log").read_text(encoding="utf-8")
+    assert f"no usage reported by {task.provider}" in log

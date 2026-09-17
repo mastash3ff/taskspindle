@@ -171,6 +171,137 @@ def test_usage_prints_the_report_as_json_or_as_tables(
     assert "since must be" in capsys.readouterr().err
 
 
+def test_reprice_with_no_database_yet_examines_nothing(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["reprice", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["rows_examined"] == 0
+    assert printed["rows_repriced"] == 0
+
+
+def test_reprice_since_must_be_parseable(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["reprice", "--since", "yesterday"]) == 1
+    assert "since must be" in capsys.readouterr().err
+
+
+def test_reprice_prices_a_known_model_and_writes_it_back(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from taskspindle.store import Store
+    from tests.test_usage import _seed_usage_row
+
+    database = cli.resolve_paths().state_dir / "taskspindle.sqlite3"
+    with Store.open(database) as store:
+        _, turn_id = _seed_usage_row(store, "grok", model="grok-4.6", input_tokens=1_000_000)
+
+    assert cli.main(["reprice", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["rows_examined"] == 1
+    assert printed["rows_repriced"] == 1
+    assert printed["repriced"][0]["turn_id"] == turn_id
+    assert printed["repriced"][0]["old_cost_estimate_usd"] is None
+
+    with Store.open(database) as store:
+        row = store.get_turn_usage(turn_id)
+    assert row["cost_estimate_usd"] is not None
+    assert row["price_table_version"] is not None
+
+    assert cli.main(["reprice"]) == 0
+    text = capsys.readouterr().out
+    assert "1 examined" in text
+    assert "0 repriced" in text
+    assert "estimate" in text.lower()
+
+
+def test_reprice_dry_run_writes_nothing(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from taskspindle.store import Store
+    from tests.test_usage import _seed_usage_row
+
+    database = cli.resolve_paths().state_dir / "taskspindle.sqlite3"
+    with Store.open(database) as store:
+        _, turn_id = _seed_usage_row(store, "grok", model="grok-4.6", input_tokens=1_000_000)
+
+    assert cli.main(["reprice", "--dry-run", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["dry_run"] is True
+    assert printed["rows_repriced"] == 1
+
+    with Store.open(database) as store:
+        row = store.get_turn_usage(turn_id)
+    assert row["cost_estimate_usd"] is None
+    assert row["price_table_version"] is None
+
+
+def test_reprice_since_and_provider_filter_the_rows(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from taskspindle.store import Store
+    from tests.test_usage import _seed_usage_row
+
+    database = cli.resolve_paths().state_dir / "taskspindle.sqlite3"
+    with Store.open(database) as store:
+        _seed_usage_row(store, "grok", model="grok-4.6", captured_at="2029-01-01T00:00:00.000000Z")
+        _seed_usage_row(
+            store, "claude", model="claude-sonnet-5", captured_at="2030-06-01T00:00:00.000000Z"
+        )
+
+    assert cli.main(["reprice", "--json", "--since", "2030-01-01T00:00:00Z"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["rows_examined"] == 1
+    assert printed["repriced"][0]["model"] == "claude-sonnet-5"
+
+    assert cli.main(["reprice", "--json", "--provider", "grok"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["rows_examined"] == 1
+    assert printed["repriced"][0]["model"] == "grok-4.6"
+
+
+def test_reprice_leaves_an_unknown_model_unpriced_in_human_output(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from taskspindle.store import Store
+    from tests.test_usage import _seed_usage_row
+
+    database = cli.resolve_paths().state_dir / "taskspindle.sqlite3"
+    with Store.open(database) as store:
+        _seed_usage_row(store, "claude", model="mystery-9")
+
+    assert cli.main(["reprice"]) == 0
+    out = capsys.readouterr().out
+    assert "model unknown to the price table" in out
+    assert "mystery-9" in out
+
+
+def test_reprice_use_selected_model_prices_from_the_resolved_model_only_when_asked(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from taskspindle.store import Store
+    from tests.test_usage import _seed_usage_row
+
+    database = cli.resolve_paths().state_dir / "taskspindle.sqlite3"
+    with Store.open(database) as store:
+        _, turn_id = _seed_usage_row(
+            store, "agy", model=None, input_tokens=1_000_000, resolved_model="gemini-3.1-pro-high",
+        )
+
+    assert cli.main(["reprice", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["rows_unpriced"] == 1
+    assert printed["unpriced"][0]["reason"] == "no model recorded"
+
+    assert cli.main(["reprice", "--json", "--use-selected-model"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["rows_unpriced"] == 0
+    assert printed["repriced"][0]["model"] == "gemini-3.1-pro-high"
+    assert printed["repriced"][0]["model_source"] == "task.resolved_model"
+
+    with Store.open(database) as store:
+        row = store.get_turn_usage(turn_id)
+    assert row["model"] is None
+    assert row["cost_estimate_usd"] is not None
+
+
 def test_a_broken_config_is_one_failed_check_rather_than_a_traceback(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **A turn that reported no usage says so.** The worker log names the provider and revision
+  instead of leaving an unexplained gap in the usage report, and a store failure while recording
+  usage is logged rather than swallowed.
+- **Fix: an OAuth token refresh no longer looks like a different login.** `auth_context.fingerprint`
+  now hashes only a credential file's resolved location and identity (device and inode), not its
+  size or timestamps, so a routine token refresh (which rewrites the file in place) no longer
+  changes the fingerprint. This stops a task queued before a refresh and dispatched after it from
+  dying with a non-retryable `AUTH_CONTEXT_CHANGED`. The fingerprint format gains a version prefix
+  (`"2:<64 hex>"`); a stored value from a retired version is treated as unrecorded rather than
+  compared, since `set_task_auth_context` is immutable and cannot be re-stamped. `locator_digest` is
+  removed; `validate_contexts` now uses `fingerprint` directly.
+- **`taskspindle reprice` brings stored usage rows back in line with the current price table.** It
+  re-runs `estimate_cost` over the counts already on each `turn_usage` row and writes back only
+  `cost_estimate_usd` and `price_table_version`, leaving `captured_at`, `raw` and `source` alone;
+  `--dry-run`, `--since` and `--provider` all apply. A row with no model recorded (typically
+  Antigravity, whose picker ID is not attribution) is reported as unpriced unless the new
+  `--use-selected-model` flag opts in to pricing it from the task's `resolved_model`, without
+  writing that model as attribution.
 - **Cost estimates cover all three providers.** The price table gains `grok-4.6` and the Gemini
   models Antigravity selects (`gemini-3.1-pro`, `gemini-3.8-flash`), each carrying the date its
   rates were read from the vendor's own pricing page in `price_table_version`. A Grok turn's

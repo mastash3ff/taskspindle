@@ -1,7 +1,8 @@
-"""OAuth context fingerprints are location and metadata based, never credential based."""
+"""OAuth context fingerprints identify a credential's location and inode, never its freshness."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -84,7 +85,11 @@ def test_non_allowlisted_parent_auth_roots_do_not_change_worker_context(tmp_path
 
 
 @pytest.mark.parametrize("family", ["claude", "grok", "agy"])
-def test_fingerprint_changes_when_credential_metadata_changes(tmp_path: Path, family: str) -> None:
+def test_fingerprint_is_stable_across_an_in_place_credential_refresh(tmp_path: Path, family: str) -> None:
+    """A token refresh rewrites the same file in place, changing size and both timestamps.
+
+    The fingerprint must not change, since it is still the same login at the same location.
+    """
     profile = _profiles(tmp_path)[family]
     parent = _parent(tmp_path / "home")
     if family == "claude":
@@ -96,9 +101,9 @@ def test_fingerprint_changes_when_credential_metadata_changes(tmp_path: Path, fa
     location.parent.mkdir(parents=True)
     location.write_bytes(b"first fixture credential")
     before = auth_context.fingerprint(profile, parent)
-    location.write_bytes(b"second fixture credential with changed metadata")
+    location.write_bytes(b"second fixture credential, refreshed in place, different size and mtime")
 
-    assert auth_context.fingerprint(profile, parent) != before
+    assert auth_context.fingerprint(profile, parent) == before
 
 
 def test_fingerprint_never_reads_credential_contents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,7 +120,7 @@ def test_fingerprint_never_reads_credential_contents(tmp_path: Path, monkeypatch
     monkeypatch.setattr(Path, "read_text", forbidden)
     value = auth_context.fingerprint(profile, parent)
 
-    assert len(value) == 64
+    assert value.startswith("2:") and len(value) == len("2:") + 64
     assert "PRIVATE" not in value
 
 
@@ -129,6 +134,11 @@ def test_missing_credential_has_a_stable_fingerprint_and_creates_nothing(tmp_pat
 
 
 def test_same_profile_file_change_is_observable_without_a_context_conflict(tmp_path: Path) -> None:
+    """An in-place refresh of the bound credential is not a context conflict.
+
+    It also does not change the fingerprint ``validate_contexts`` would compare against a stored
+    value.
+    """
     profiles = _profiles(tmp_path)
     parent = _parent(tmp_path / "home")
     credential = Path(profiles["claude"].env["CLAUDE_CONFIG_DIR"]) / ".credentials.json"
@@ -138,4 +148,63 @@ def test_same_profile_file_change_is_observable_without_a_context_conflict(tmp_p
     credential.write_bytes(b"two credential bytes")
 
     auth_context.validate_contexts({"claude": profiles["claude"]}, parent)
-    assert auth_context.fingerprint(profiles["claude"], parent) != before
+    assert auth_context.fingerprint(profiles["claude"], parent) == before
+
+
+def test_a_different_resolved_path_changes_the_fingerprint(tmp_path: Path) -> None:
+    profile = _profiles(tmp_path)["claude"]
+    parent = _parent(tmp_path / "home")
+    other = replace(profile, env={**profile.env, "CLAUDE_CONFIG_DIR": str(tmp_path / "other-config")})
+
+    assert auth_context.fingerprint(profile, parent) != auth_context.fingerprint(other, parent)
+
+
+def test_a_different_inode_at_the_same_path_changes_the_fingerprint(tmp_path: Path) -> None:
+    profile = _profiles(tmp_path)["claude"]
+    parent = _parent(tmp_path / "home")
+    location = Path(profile.env["CLAUDE_CONFIG_DIR"]) / ".credentials.json"
+    location.parent.mkdir(parents=True)
+    location.write_bytes(b"first login")
+    before_ino = location.stat().st_ino
+    before = auth_context.fingerprint(profile, parent)
+
+    replacement = location.with_name(".credentials.json.new")
+    replacement.write_bytes(b"second login")
+    if replacement.stat().st_ino == before_ino:
+        pytest.skip("filesystem reused the same inode across os.replace")
+    os.replace(replacement, location)
+    assert location.stat().st_ino != before_ino
+
+    assert auth_context.fingerprint(profile, parent) != before
+
+
+def test_fingerprint_has_a_version_prefix(tmp_path: Path) -> None:
+    profile = _profiles(tmp_path)["agy"]
+    parent = _parent(tmp_path / "no-login")
+    value = auth_context.fingerprint(profile, parent)
+
+    assert value.startswith("2:")
+    assert len(value) == len("2:") + 64
+
+
+def test_matches_skips_comparison_for_a_stored_value_from_another_version(tmp_path: Path) -> None:
+    profile = _profiles(tmp_path)["claude"]
+    parent = _parent(tmp_path / "home")
+    current = auth_context.fingerprint(profile, parent)
+    stale = "1:" + "0" * 64
+
+    assert auth_context.matches(stale, current) is True
+    assert auth_context.matches(None, current) is True
+
+
+def test_matches_rejects_a_genuine_version_2_mismatch(tmp_path: Path) -> None:
+    profile = _profiles(tmp_path)["claude"]
+    parent = _parent(tmp_path / "home")
+    current = auth_context.fingerprint(profile, parent)
+    version, digest = current.split(":", 1)
+    flipped_digest = ("1" if digest[0] != "1" else "2") + digest[1:]
+    different = f"{version}:{flipped_digest}"
+
+    assert current != different
+    assert auth_context.matches(different, current) is False
+    assert auth_context.matches(current, current) is True

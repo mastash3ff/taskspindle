@@ -1658,6 +1658,19 @@ class Store:
 
     # -- turn usage -------------------------------------------------------------------
 
+    def set_turn_price(self, turn_id: int, cost: float | None, version: str | None) -> None:
+        """Rewrite only the price of a recorded turn, leaving everything else as it was.
+
+        ``insert_turn_usage`` is an upsert that stamps ``captured_at`` to now, which is right for a
+        freshly-collected turn and wrong for a reprice: the row was captured when the turn ran.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE turn_usage SET cost_estimate_usd = ?, price_table_version = ? "
+                "WHERE turn_id = ?",
+                (cost, version, turn_id),
+            )
+
     def insert_turn_usage(self, turn_id: int, task_id: str, provider: str, **fields: Any) -> int:
         """Record what one turn cost; a second record for the same turn replaces the first."""
         unknown = set(fields) - set(TURN_USAGE_FIELDS)

@@ -1389,6 +1389,31 @@ def test_stale_dispatch_snapshot_cannot_restart_finished_task(harness, make_repo
     assert harness.backend.started == before
 
 
+def test_a_stale_version_stored_auth_context_does_not_block_dispatch(harness, make_repo):
+    """A task queued under a retired fingerprint version must still dispatch.
+
+    ``set_task_auth_context`` is immutable, so a task queued before ``_CONTEXT_VERSION`` moved on
+    keeps its old-shape stored value forever; ``auth_context.matches`` must treat that as "no
+    expectation recorded" rather than fail every such task with ``AUTH_CONTEXT_CHANGED``.
+    """
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    first = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    second = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    assert harness.pending == [first]
+    assert harness.orchestrator.store.get_task(second).state == TaskState.QUEUED
+
+    harness.orchestrator.store._conn.execute(
+        "UPDATE task_provider_context SET auth_context = ? WHERE task_id = ?",
+        ("1:" + "0" * 64, second),
+    )
+
+    harness._run(harness.pending.pop(0))  # frees the AUTHOR lease held by the first task
+    assert harness.orchestrator.dispatch_queued() == [second]
+    assert harness.orchestrator.store.get_task(second).state != TaskState.FAILED
+
+
 def test_read_only_tools_never_dispatch_a_queued_task(harness, make_repo):
     """T2: doctor's kin -- list_repository_policies, list_tasks, task_status, task_result and
     usage_report -- must reconcile but never start a unit. Only start_task, continue_task and an

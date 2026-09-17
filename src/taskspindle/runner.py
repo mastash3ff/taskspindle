@@ -858,7 +858,7 @@ def _check_initial_auth_context(run: _Run, profile: Profile) -> str:
     current = auth_context.fingerprint(profile, os.environ)
     if run.revision == 1:
         expected = run.store.get_task_auth_context(run.task_id) or run.provider_auth_context_at_start
-        if expected is not None and expected != current:
+        if not auth_context.matches(expected, current):
             raise _Failure(
                 "AUTH_CONTEXT_CHANGED", "Authentication context changed before the initial prompt.",
             )
@@ -1535,11 +1535,18 @@ def _complete_turn(run: _Run) -> None:
                 "agent": run.agent_info or None,
             },
         )
-    if run.usage is not None:
-        with contextlib.suppress(StoreError):
+    if run.usage is None:
+        # Not every provider reports usage for every turn: Grok's counts ride a late
+        # ``turn_completed`` update that a timeout or an error can outrun, and it has no fallback.
+        # Say so once here rather than leaving an unexplained hole in the usage report.
+        run.log.write(f"no usage reported by {run.task.provider} for revision {run.revision}")
+    else:
+        try:
             run.store.insert_turn_usage(
                 run.turn_id, run.task_id, run.task.provider, **run.usage.as_fields()
             )
+        except StoreError as exc:
+            run.log.write(f"usage not recorded: {exc}")
 
 
 # -- entry point ----------------------------------------------------------------------------
