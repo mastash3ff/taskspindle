@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.1
 
 - **A turn that reported no usage says so.** The worker log names the provider and revision
   instead of leaving an unexplained gap in the usage report, and a store failure while recording
