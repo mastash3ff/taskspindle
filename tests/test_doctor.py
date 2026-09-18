@@ -185,6 +185,92 @@ def test_worker_container_omits_host_systemd_and_unmounted_provider_checks(paths
     assert not any(call[0] in ("systemctl", "systemd-run") for call in commands.calls)
 
 
+def test_live_worker_agy_sandbox_uses_real_launch_policy_and_synthetic_token(paths, monkeypatch):
+    from taskspindle import agy_cli_policy
+
+    monkeypatch.setattr(agy_cli_policy.shutil, "which", lambda *args, **kwargs: "/fixture/bwrap")
+    modes = []
+
+    def runner(argv, **kwargs):
+        if argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, "bubblewrap 0.10", "")
+        assert "--unshare-pid" in argv and "--clearenv" in argv and "--cap-drop" in argv
+        assert kwargs["timeout"] == doctor._UNIT_TIMEOUT
+        targets = {name: Path(path) for name, path in json.loads(argv[-1]).items()}
+        task_dir = targets["policy"].parent.parent
+        metadata = json.loads((task_dir / "agy-cli-launch.json").read_text())
+        mode = metadata["mode"]
+        modes.append(mode)
+        assert metadata["writable_scopes"] == ([str(targets["scope"].parent)] if mode == "implement" else [])
+        assert targets["token"].read_text() == "synthetic-doctor-fixture"
+        assert not str(targets["token"]).startswith("/must-not-read-real-home/")
+        assert not any(b"synthetic-doctor-fixture" in item.read_bytes()
+                       for item in task_dir.rglob("*") if item.is_file())
+        observed = {name: name == "scope" and mode == "implement" for name in targets}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(observed), "")
+
+    probe = doctor._Doctor(
+        profiles={"agy": profile("agy")}, paths=paths,
+        parent_env={"HOME": "/must-not-read-real-home", "TASKSPINDLE_WORKER_CONTAINER": "1"},
+        live_probes=True, runner=runner,
+    )
+    probe.agy_cli()
+    check = next(check for check in probe.checks if check.name == "agy_sandbox")
+    assert check.ok and not check.advisory
+    assert modes == ["implement", "consult"]
+    assert "synthetic token" in check.detail
+
+
+@pytest.mark.parametrize("failure", ["namespace", "unprotected_mounts", "consult_write"])
+def test_live_worker_agy_sandbox_fails_when_real_scope_cannot_be_enforced(paths, monkeypatch, failure):
+    from taskspindle import agy_cli_policy
+
+    monkeypatch.setattr(agy_cli_policy.shutil, "which", lambda *args, **kwargs: "/fixture/bwrap")
+
+    def runner(argv, **kwargs):
+        if argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, "bubblewrap 0.10", "")
+        if failure == "namespace":
+            return subprocess.CompletedProcess(argv, 1, "", "Creating new namespace failed")
+        if failure == "unprotected_mounts":
+            # Run the actual probe against its synthetic fixtures without the mount policy:
+            # writes succeed outside scope and the doctor must reject that concrete result.
+            return subprocess.run(argv[argv.index("--") + 1:], **kwargs)
+        targets = json.loads(argv[-1])
+        observed = {name: name == "scope" for name in targets}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(observed), "")
+
+    probe = doctor._Doctor(
+        profiles={"agy": profile("agy")}, paths=paths,
+        parent_env={"TASKSPINDLE_WORKER_CONTAINER": "1"}, live_probes=True, runner=runner,
+    )
+    probe.agy_cli()
+    check = next(check for check in probe.checks if check.name == "agy_sandbox")
+    assert not check.ok and not check.advisory
+    assert "sandbox" in check.detail
+    assert ("could not run" if failure == "namespace" else "did not enforce") in check.detail
+
+
+def test_nonlive_worker_agy_sandbox_marks_scope_unverified_without_launch(paths, monkeypatch):
+    from taskspindle import agy_cli_policy
+
+    monkeypatch.setattr(agy_cli_policy.shutil, "which", lambda *args, **kwargs: "/fixture/bwrap")
+    monkeypatch.setattr(agy_cli_policy, "prepare_launch", lambda *args: pytest.fail("sandbox launched"))
+
+    def runner(argv, **kwargs):
+        assert argv[1:] == ["--version"]
+        return subprocess.CompletedProcess(argv, 0, "bubblewrap 0.10", "")
+
+    probe = doctor._Doctor(
+        profiles={"agy": profile("agy")}, paths=paths,
+        parent_env={"TASKSPINDLE_WORKER_CONTAINER": "1"}, live_probes=False, runner=runner,
+    )
+    probe.agy_cli()
+    check = next(check for check in probe.checks if check.name == "agy_sandbox")
+    assert check.ok and check.advisory
+    assert "unverified (--no-live)" in check.detail
+
+
 def test_a_throttled_provider_is_an_advisory_check(paths: Paths, tmp_path: Path) -> None:
     install_adapter(paths, taskspindle.ADAPTER_VERSION)
     register_codex(tmp_path)

@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -488,7 +489,7 @@ class _Doctor:
                 detail += f"; {_newer_than_tested('Antigravity CLI', version, AGY_TESTED_MAX)}"
             return detail
 
-        @self.check("agy_sandbox")
+        @self.check("agy_sandbox", advisory=self.worker_container and not self.live_probes)
         def sandbox_probe() -> str:
             binary = shutil.which("bwrap", path=self.parent_env.get("PATH"))
             if binary is None:
@@ -496,15 +497,73 @@ class _Doctor:
             result = self.run([binary, "--version"])
             if result.returncode != 0:
                 raise RuntimeError("bubblewrap could not be started")
+            if self.worker_container and self.live_probes:
+                return self._agy_sandbox_scope()
             if self.worker_container:
-                result = self.run([
-                    binary, "--die-with-parent", "--unshare-all", "--ro-bind", "/", "/",
-                    "--proc", "/proc", "--dev", "/dev", "--", "/bin/true",
-                ])
-                if result.returncode != 0:
-                    raise RuntimeError("bubblewrap cannot create an isolated worker sandbox")
-                return "bubblewrap created an isolated mount and process namespace"
+                return "bubblewrap is installed; worker sandbox scope is unverified (--no-live)"
             return "bubblewrap is installed; task startup validates its isolated launch"
+
+    def _agy_sandbox_scope(self) -> str:
+        """Exercise the production mount policy using only disposable synthetic credentials."""
+        from .agy_cli_policy import prepare_launch
+
+        code = """
+import json, sys
+from pathlib import Path
+result = {}
+for name, target in json.loads(sys.argv[1]).items():
+    try:
+        Path(target).write_text('sandbox probe')
+        result[name] = True
+    except OSError:
+        result[name] = False
+print(json.dumps(result))
+"""
+        with tempfile.TemporaryDirectory(prefix="taskspindle-doctor-agy-") as raw:
+            root = Path(raw).resolve()
+            home, workspace = root / "home", root / "workspace"
+            home.mkdir()
+            (workspace / "src").mkdir(parents=True)
+            (workspace / ".git").mkdir()
+            token = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+            token.parent.mkdir(parents=True)
+            token.write_text("synthetic-doctor-fixture", encoding="utf-8")
+            targets = {
+                "scope": workspace / "src" / "owned.txt",
+                "outside": workspace / "outside.txt",
+                "git": workspace / ".git" / "config",
+                "control": workspace / "src" / "AGENTS.md",
+                "token": token,
+            }
+            for name, path in targets.items():
+                if name != "token":
+                    path.write_text("fixture", encoding="utf-8")
+            for mode in ("implement", "consult"):
+                task_dir = root / mode
+                argv = prepare_launch(
+                    Path(sys.executable), workspace, task_dir, home, mode,
+                    ("src",) if mode == "implement" else (), (),
+                )
+                protected = {**targets, "policy": task_dir / "agy-cli-policy" / "settings.json"}
+                result = self.run([
+                    *argv[:argv.index("--") + 1], sys.executable, "-c", code,
+                    json.dumps({name: str(path) for name, path in protected.items()}),
+                ], timeout=_UNIT_TIMEOUT)
+                if result.returncode != 0:
+                    raise RuntimeError(f"{mode} worker sandbox could not run (exit {result.returncode})")
+                try:
+                    observed = json.loads(result.stdout)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(f"{mode} worker sandbox returned no scope evidence") from exc
+                expected = {name: name == "scope" and mode == "implement" for name in protected}
+                if not isinstance(observed, dict) or any(
+                    observed.get(name) is not allowed for name, allowed in expected.items()
+                ):
+                    raise RuntimeError(f"{mode} worker sandbox did not enforce filesystem scope")
+        return (
+            "worker sandbox permits the implement scope and denies consult writes; "
+            "outside paths, git, controls, policy, and synthetic token are protected"
+        )
 
     def agy_oauth(self) -> None:
         from .agy_cli_adapter import agy_oauth_evidence
