@@ -133,7 +133,7 @@
 
 ## v0.5.1
 
-Fixes from the 2026-09-15 audit (`docs/audit-2026-09-15.md`) and the provider readiness hotfix.
+Fixes from the 2026-09-15 audit and the provider readiness hotfix.
 
 - **Read-only tools are read-only.** `list_tasks`, `task_status`, `task_result`, `usage_report`
   and `list_repository_policies` reconcile but never dispatch, and a tool's own error is no

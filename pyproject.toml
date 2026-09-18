@@ -48,7 +48,6 @@ packages = ["src/taskspindle"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src", "tests", "docs", "examples", "README.md", "LICENSE", "CHANGELOG.md"]
-exclude = ["docs/superpowers"]
 
 [tool.ruff]
 line-length = 110

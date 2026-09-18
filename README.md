@@ -96,8 +96,12 @@ moved underneath you is refused rather than clobbered.
 | [tools.md](docs/tools.md) | all eighteen tools, the envelope, provider availability, and acceptance rules |
 | [configuration.md](docs/configuration.md) | `config.toml`, `taskspindle discover`, and what second-class providers may not do |
 | [dispatch-policy.md](docs/dispatch-policy.md) | shares, budgets, per-role model/effort, and how Codex reads the dispatch policy |
+| [concurrency.md](docs/concurrency.md) | per-provider concurrent turn limits and qualifying an increase |
 | [antigravity.md](docs/antigravity.md) | native AGY login reuse, model selection, containment and release gates |
 | [platforms.md](docs/platforms.md) | the support matrix and WSL2 |
+| [docker-backend.md](docs/docker-backend.md) | the persistent controller, its sockets, and Docker execution authority |
+| [docker-image.md](docs/docker-image.md) | building the container image and staging provider executables |
+| [host-controls.md](docs/host-controls.md) | the private host-controls service for the dashboard's AI-mode adapter |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
 | [dashboard.md](docs/dashboard.md) | `taskspindle web`: task and worker inspection and its JSON API |
@@ -111,10 +115,13 @@ supported. Python 3.12+, Node 22+, git 2.38+. See
 
 ## Status
 
-v0.5.0 adds an operator-editable dispatch policy — target shares, budgets, and per-role model and
-effort, edited on the dashboard's Policy page or with `taskspindle policy` and read fresh by Codex
-on every `capabilities()` call — alongside native Antigravity support and configured second-class
-providers from earlier releases. See [dispatch-policy.md](docs/dispatch-policy.md) and
+v0.6.x adds review kinds (`standard` or an adversarial `review_kind`), coordinator-supplied
+`context_files`, session handles on `task_result`/`task_status` for picking up a candidate by
+hand, and reliable reporting when a worker turn ends with no output, on top of the
+operator-editable dispatch policy — target shares, budgets, and per-role model and effort, edited
+on the dashboard's Policy page or with `taskspindle policy` and read fresh by Codex on every
+`capabilities()` call — native Antigravity support, and configured second-class providers from
+earlier releases. See [dispatch-policy.md](docs/dispatch-policy.md) and
 [the Antigravity guide](docs/antigravity.md) for cached authentication, model selection and
 isolation requirements.
 
