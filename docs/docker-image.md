@@ -25,6 +25,13 @@ only at runtime, individually for the provider that needs them.
 Worker images must be configured by their inspected immutable image ID or
 repository digest. A service tag alone is insufficient for durable jobs.
 
+Managed preparation supplies the operator's effective Git `user.name` and
+`user.email` as `TASKSPINDLE_GIT_USER_NAME` and `TASKSPINDLE_GIT_USER_EMAIL` build
+arguments. Only these identity fields enter the image's system Git configuration;
+repository-local settings still override them. Host Git configuration, credential
+helpers, hooks, and signing keys are not copied. Preparation refuses a missing
+identity so acceptance cannot silently fail when committing a candidate.
+
 AGY and Grok jobs need the packaged restricted seccomp profile at
 `/opt/taskspindle/src/taskspindle/_container/agy-seccomp.json`. It permits
 the namespace and mount calls required by the existing bubblewrap policy.
