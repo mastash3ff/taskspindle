@@ -12,11 +12,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-# The two first-class provider profile ids. Profile ids themselves are free strings so that a
-# local configuration can name others; these are the ones TaskSpindle ships with.
-PROVIDER_CLAUDE = "claude"
-PROVIDER_GROK = "grok"
-
 MAX_SUBJECT_LENGTH = 72
 #: The request-level cap on ``context_files``; the operator's configured cap may be lower.
 MAX_CONTEXT_FILES_PER_REQUEST = 32
@@ -205,7 +200,6 @@ class Envelope(BaseModel):
 
 #: The named review stances a ``review`` task can take.
 ReviewKind = Literal["standard", "adversarial"]
-REVIEW_KINDS: tuple[str, ...] = ("standard", "adversarial")
 
 
 class ReviewTarget(BaseModel):

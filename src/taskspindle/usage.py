@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from . import limits
 from .acp_client import TurnResult
@@ -95,8 +95,6 @@ SOURCE_SESSION_FILE = "session_file"
 
 _SINCE_SHORTHAND = re.compile(r"^(\d+)([smhd])$")
 _SINCE_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
-
-GroupBy = Literal["provider", "day", "provider_day", "model", "mode", "repository_id"]
 
 
 @dataclass(frozen=True)

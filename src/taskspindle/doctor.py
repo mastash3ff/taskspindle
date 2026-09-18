@@ -41,7 +41,6 @@ from .setup import ADAPTER_BIN
 
 __all__ = [
     "GROK_TESTED_VERSIONS",
-    "GROK_VERSION_PREFIX",
     "MIN_GIT",
     "MIN_NODE",
     "Check",
@@ -58,9 +57,6 @@ MIN_NODE = (22,)
 
 #: Historical smoke-tested versions, retained as metadata rather than an admission allowlist.
 GROK_TESTED_VERSIONS = ("1.0.13", "1.0.30")
-
-#: Legacy exported name; readiness is established by protocol capabilities, not this label.
-GROK_VERSION_PREFIX = f"grok {GROK_TESTED_VERSIONS[0]}"
 
 #: ``systemctl --user is-system-running`` answers TaskSpindle can work with.
 _HEALTHY_SYSTEMD = frozenset({"running", "degraded"})

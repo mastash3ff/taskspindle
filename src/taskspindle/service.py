@@ -11,7 +11,7 @@ import secrets
 import shlex
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any, Protocol
+from typing import Any
 
 from . import limits
 from .models import (
@@ -927,37 +927,3 @@ def task_result(store: Store, task_id: str, *, profile: Profile | None = None) -
         session_id=record.session_id,
         resume=resume_handle(record, profile),
     )
-
-
-# -- collaborator protocols ---------------------------------------------------------
-
-
-class RepositoryResolver(Protocol):
-    """Resolves a user-supplied path to a repository identity.
-
-    ``resolve(path) -> (repository_id, common_dir, root_commit)`` is implemented in a later
-    task on top of ``git rev-parse``.
-    """
-
-    def resolve(self, path: str) -> tuple[str, str, str]: ...
-
-
-class WorktreeManager(Protocol):
-    """Creates and removes the detached worktree a task runs in.
-
-    ``create(task) -> worktree_path`` is implemented in a later task.
-    """
-
-    def create(self, task: TaskRecord) -> str: ...
-
-
-class UnitManager(Protocol):
-    """Starts and inspects the transient units that run workers and accepts.
-
-    ``start_worker(task) -> unit_name`` and ``unit_state(unit_name)`` are implemented in a
-    later task on top of ``systemd-run``.
-    """
-
-    def start_worker(self, task: TaskRecord) -> str: ...
-
-    def unit_state(self, unit_name: str) -> str: ...

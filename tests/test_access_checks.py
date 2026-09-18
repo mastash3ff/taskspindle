@@ -178,7 +178,7 @@ def test_agy_reuses_pin_and_cached_catalog_check_without_reading_token_or_persis
         assert not providers.env_violations(env)
         temporary.append(Path(kwargs["cwd"]))
         assert temporary[-1].is_dir() and env["TMPDIR"] == kwargs["cwd"]
-        output = (agy_cli_adapter.ADAPTER_VERSION if argv[-1] == "--version" else
+        output = (agy_cli_adapter.AGY_MIN_VERSION if argv[-1] == "--version" else
                   "gemini-private-one\tPRIVATE_MODEL_ONE\ngemini-private-two\tPRIVATE_MODEL_TWO\n")
         return subprocess.CompletedProcess(argv, 0, output, "PRIVATE_STDERR")
 

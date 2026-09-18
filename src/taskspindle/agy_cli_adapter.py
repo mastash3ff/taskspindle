@@ -36,10 +36,6 @@ AGY_MIN_VERSION = "1.1.26"
 #: replaces -- but it is surfaced as an advisory note, not silently treated as identical.
 AGY_TESTED_MAX = "1.2.3"
 
-#: Back-compat for call sites that still import a single "the adapter version" name. There is
-#: no longer one pinned build; this is the qualified floor.
-ADAPTER_VERSION = AGY_MIN_VERSION
-
 _TIMEOUT = 30.0
 _MODEL_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]*\Z")
 Runner = Callable[..., subprocess.CompletedProcess[str]]
