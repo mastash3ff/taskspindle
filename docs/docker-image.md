@@ -25,11 +25,11 @@ only at runtime, individually for the provider that needs them.
 Worker images must be configured by their inspected immutable image ID or
 repository digest. A service tag alone is insufficient for durable jobs.
 
-AGY jobs need the packaged restricted seccomp profile at
+AGY and Grok jobs need the packaged restricted seccomp profile at
 `/opt/taskspindle/src/taskspindle/_container/agy-seccomp.json`. It permits
 the namespace and mount calls required by the existing bubblewrap policy.
 Workers still run as UID 1000, with all capabilities dropped and
-no-new-privileges. Other providers and acceptance use Docker's default
+no-new-privileges. Claude and acceptance use Docker's default
 profile. See the profile's README for provenance and the exact additions.
 
 Before activation, verify the native provider handshakes in the configured
@@ -38,3 +38,7 @@ container with the AGY profile. These tests exercise real permitted scope
 writes, denied out-of-scope and Git/control writes, read-only OAuth token
 mounts, hidden inherited controls and child cancellation. An ABI/version
 check alone does not establish that containment works.
+
+The Python image uses Debian Trixie so Git supports `merge-tree --merge-base`,
+which candidate acceptance requires. The build verifies this feature in a
+disposable repository before installing TaskSpindle.
