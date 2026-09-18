@@ -246,8 +246,6 @@ def test_status_key_is_the_seat_for_oauth_and_the_id_for_a_key() -> None:
     key = Profile(id="claude-litellm", auth="api_key", command=("x",), base="claude")
     assert limits.status_key(seat) == "claude"
     assert limits.status_key(key) == "claude-litellm"
-    assert limits.suggested_alternative("claude") == "grok"
-    assert limits.suggested_alternative("claude-litellm") is None
 
 
 def test_rate_limit_window_reads_the_sdk_shape() -> None:

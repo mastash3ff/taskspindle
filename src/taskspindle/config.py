@@ -7,7 +7,6 @@ config, state, data and pinned runtimes, and reads the single TOML file the user
 from __future__ import annotations
 
 import os
-import sys
 import tomllib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -18,17 +17,13 @@ import taskspindle
 
 __all__ = [
     "ConfigError", "ContextFilesConfig", "Paths", "concurrency_limits", "context_files_config",
-    "load_config", "paths", "warn_retired_settings",
+    "load_config", "paths",
 ]
 
 #: Hard ceilings for ``[context_files]``; the table may lower them, never raise them.
 MAX_CONTEXT_FILE_BYTES = 1024 * 1024
 MAX_CONTEXT_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_CONTEXT_FILES = 32
-
-#: Config tables that once configured deleted machinery. They are accepted and ignored, with one
-#: warning, so a config file written for an older release still loads.
-_RETIRED_SETTINGS: tuple[str, ...] = ("provider_recovery", "native_overage")
 
 
 class ConfigError(Exception):
@@ -162,18 +157,3 @@ def context_files_config(settings: Mapping[str, Any]) -> ContextFilesConfig | No
     if unknown:
         raise ConfigError(f"[context_files] contains unknown key(s): {', '.join(sorted(unknown))}")
     return ContextFilesConfig(roots=tuple(roots), **values)
-
-
-def warn_retired_settings(settings: Mapping[str, Any]) -> None:
-    """Accept and ignore ``[provider_recovery]``/``[native_overage]``, with one warning line.
-
-    Both tables configured machinery this release deletes. A config file written for an older
-    release must still load; it just no longer does anything with these two tables.
-    """
-    present = [name for name in _RETIRED_SETTINGS if name in settings]
-    if present:
-        print(
-            f"taskspindle: [{'], ['.join(present)}] settings are retired and ignored; "
-            "provider refusals are now a single provider_status rule (see docs/configuration.md)",
-            file=sys.stderr,
-        )

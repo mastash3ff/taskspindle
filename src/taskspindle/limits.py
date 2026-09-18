@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .acp_client import AcpError, safe_retry_summary
-from .providers import Profile, opposite_provider
+from .providers import Profile
 
 __all__ = [
     "ACCESS_ERROR_KINDS",
@@ -47,7 +47,6 @@ __all__ = [
     "status_fingerprint",
     "status_key",
     "status_override_matches",
-    "suggested_alternative",
 ]
 
 #: The turn was refused because a usage, rate or credit limit was reached.
@@ -517,8 +516,3 @@ def rate_limit_window(info: Mapping[str, Any]) -> dict[str, Any]:
         "used_percent": used_percent,
         "resets_at": epoch_to_iso(info.get("resetsAt")),
     }
-
-
-def suggested_alternative(provider_id: str) -> str | None:
-    """The other first-class provider, when there is one; never chosen on the caller's behalf."""
-    return opposite_provider(provider_id)

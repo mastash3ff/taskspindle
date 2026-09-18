@@ -33,6 +33,10 @@
 - **The `rollback-concurrency` maintenance command is gone.** It reversed the schema 4 lease
   migration in place; restoring a pre-upgrade state backup now covers a runtime rollback instead.
   See [docs/rollback.md](docs/rollback.md).
+- **The "settings are retired and ignored" startup warning is gone.** `[provider_recovery]` and
+  `[native_overage]` are still accepted and ignored in `config.toml`, silently; the machinery
+  they once configured (manual/hybrid recovery permits, native-extra-usage policy) was deleted
+  in earlier releases. AGY's native launch policy no longer takes a `native_overage` parameter.
 
 ## v0.6.1
 

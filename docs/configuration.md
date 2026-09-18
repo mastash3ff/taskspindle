@@ -32,10 +32,9 @@ personal login. Setup, authentication and the enforced worker policy are describ
 Both tables configured machinery this release deletes: manual and hybrid recovery permits, and
 standing native-extra-usage policy. A provider refusal is now a single rule — see
 [architecture.md](architecture.md#provider-availability) — with no permit to arm, no cooldown
-ledger, and no per-profile spending policy. If either table is still present in `config.toml`, it
-is accepted and ignored, with one warning line on startup; delete it whenever convenient. There is
-no replacement key: a refusal is reported and waited out (or bypassed with `ignore_provider_status`
-on `start_task`), not configured.
+ledger, and no per-profile spending policy. A leftover table is ignored; delete it whenever
+convenient. There is no replacement key: a refusal is reported and waited out (or bypassed with
+`ignore_provider_status` on `start_task`), not configured.
 
 ## Dispatch policy
 

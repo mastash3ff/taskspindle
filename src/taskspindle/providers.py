@@ -42,7 +42,6 @@ __all__ = [
     "grok_overlay_path",
     "launch_command",
     "load_profiles",
-    "opposite_provider",
     "pinned_node",
     "profile_for_task",
     "reviewer_independent",
@@ -444,9 +443,6 @@ def load_profiles(
     from .auth_context import validate_contexts
 
     validate_contexts(profiles, parent_env if parent_env is not None else os.environ)
-    from .config import warn_retired_settings
-
-    warn_retired_settings(config)
     return profiles
 
 
@@ -537,15 +533,6 @@ def resume_command(family: str | None, session_id: str) -> tuple[str, ...] | Non
         return ("claude", "--resume", session_id)
     if family == "grok":
         return ("grok", "-r", session_id)
-    return None
-
-
-def opposite_provider(profile_id: str) -> str | None:
-    """The legacy Claude/Grok status suggestion, never a review eligibility rule."""
-    if profile_id == "claude":
-        return "grok"
-    if profile_id == "grok":
-        return "claude"
     return None
 
 

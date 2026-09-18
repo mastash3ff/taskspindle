@@ -26,7 +26,6 @@ from taskspindle.providers import (
     env_violations,
     grok_oauth_evidence,
     load_profiles,
-    opposite_provider,
     pinned_node,
     profile_for_task,
     reviewer_independent,
@@ -430,12 +429,8 @@ def test_profile_for_task_enforces_metering_and_modes(tmp_path: Path) -> None:
     assert unknown.value.code == "PROFILE_UNKNOWN"
 
 
-def test_opposite_and_independence(tmp_path: Path) -> None:
+def test_independence(tmp_path: Path) -> None:
     builtins = _builtins(tmp_path)
-
-    assert opposite_provider("claude") == "grok"
-    assert opposite_provider("grok") == "claude"
-    assert opposite_provider("metered") is None
 
     assert reviewer_independent(builtins["claude"], builtins["grok"]) is True
     assert reviewer_independent(builtins["claude"], builtins["claude"]) is False

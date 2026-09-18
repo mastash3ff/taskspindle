@@ -14,16 +14,6 @@
 #grok = 4
 #agy = 4
 #
-# Native extra usage is separate from API-key authentication. Every exact profile defaults
-# to observe_only. Provider-managed is standing authorization to use native paid allowance
-# after included allowance exhaustion; provider account settings control spending.
-# Observe-only is NOT a strict no-charge gate for Claude/Grok accounts with extra usage enabled.
-# See docs/native-overage.md. These commented examples do not enable spending.
-#[native_overage]
-#claude = "observe_only"
-#grok = "observe_only"
-#agy = "observe_only"
-#
 # Files a coordinator may hand to a worker with start_task(context_files=[...]). Absent means
 # the handoff is refused. Every root must be a directory the server can see; under the Docker
 # backend that means inside an [execution] mount. See docs/configuration.md.
@@ -67,13 +57,6 @@
 #command = ["opencode", "acp"]
 #modes = ["consult", "review"]
 #secret_env = ["OPENAI_API_KEY"]
-
-# Recovery after a provider refusal. `manual` (the default) waits for an explicit permit;
-# `hybrid` retries on the server's own schedule. See docs/configuration.md.
-#[provider_recovery]
-#claude = "manual"
-#grok = "manual"
-#agy = "manual"
 
 # Optional adapter the dashboard's Policy page calls to switch the Codex AI mode.
 # See docs/dashboard.md.
