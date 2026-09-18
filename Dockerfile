@@ -3,7 +3,7 @@
 # executable files claude, grok and agy. OAuth state is mounted at runtime.
 FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS node
 FROM ghcr.io/astral-sh/uv:0.10.12@sha256:72ab0aeb448090480ccabb99fb5f52b0dc3c71923bffb5e2e26517a1c27b7fec AS uv
-FROM python:3.13-slim-bookworm@sha256:c45a22ea000adfd9cda29364bbe7edd23001ce5cc2ad15857cfbf7766943b9ca
+FROM python:3.13-slim-trixie@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
 ARG TASKSPINDLE_HOME=/home/taskspindle
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
@@ -14,6 +14,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 taskspindle \
     && useradd --uid 1000 --gid 1000 --create-home --home-dir "${TASKSPINDLE_HOME}" taskspindle
+RUN python -c 'import subprocess; p = subprocess.run(["git", "merge-tree", "-h"], capture_output=True, text=True); assert "--merge-base" in p.stdout + p.stderr, "Git must support merge-tree --merge-base"'
 WORKDIR /opt/taskspindle
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
