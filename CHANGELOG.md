@@ -14,9 +14,15 @@
   parser and the acceptance rules are unchanged. The kind is recorded on the task, its review row
   and the `REVIEW_RECORDED` event, and shown on the dashboard. Schema 13 adds
   `tasks.review_kind` and `reviews.kind`; rows written before it read as `standard`. The shared
-  review rules now also tell the reviewer to stay inside the checkout and not follow `.git`'s
-  gitdir pointer: an adversarial Antigravity reviewer did exactly that, hit the sandbox's
-  refusal, and ended its turn with no output (`REVIEW_MALFORMED`).
+  review rules also tell the reviewer to stay inside the checkout.
+- **A turn that ends with nothing to say is reported as such.** An adversarial Antigravity
+  review read the worktree's `.git` pointer, followed it into the main repository, was refused
+  by the sandbox, and ended its turn with no output; TaskSpindle recorded `REVIEW_MALFORMED` with
+  empty details. Now `.git` is masked inside the Antigravity namespace (a pointer file becomes an
+  empty file, a directory an empty directory; git only ever runs on the host), the native adapter
+  records every tool step the CLI refused in the transcript's `permission_events`, a review turn
+  with no text fails `REVIEW_MALFORMED` with `details.empty_response` and the refused reads, and a
+  consult turn with no text completes with an `EMPTY_RESPONSE` warning that a follow-up clears.
 - **A coordinator can hand files to a worker.** `start_task` takes `context_files`, absolute
   paths the server reads under a new opt-in `[context_files]` allowlist and appends to the first
   turn, each framed with its path and size under a header that marks it as reference material.

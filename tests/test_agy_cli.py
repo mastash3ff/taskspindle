@@ -506,6 +506,68 @@ async def test_observed_tools_outside_fixed_policy_abort(tmp_path, mode, tool_na
     assert agent.last_result.capture.raw_update_count == 3  # Stop before processing a queued success.
 
 
+DENIED_PATH = "/repo/.git/worktrees/ts_x/HEAD"
+DENIAL = (
+    f'permission check failed for read_file "{DENIED_PATH}": user denied permission for '
+    f"read_file({DENIED_PATH})\nDo not attempt to circumvent this denial."
+)
+
+
+def denied_step(message=DENIAL, path=DENIED_PATH, index=2):
+    return step(
+        "",
+        index=index,
+        step_type="tool",
+        tool_name="view_file",
+        state="ERROR",
+        tool_info={
+            "name": "view_file",
+            "parameters": {"AbsolutePath": path},
+            "error": {"message": message, "type": "TOOL_ERROR"},
+        },
+    )
+
+
+async def test_denied_tool_step_is_evidence_not_an_abort(tmp_path):
+    agent = worker(tmp_path, mode="review", actions=[initial(), denied_step(), terminal("")])
+    result = await prompt(agent)
+    assert result.stop_reason == "end_turn"
+    assert result.text == ""
+    assert result.capture.violations == []
+    assert result.capture.tool_calls[0]["status"] == "ERROR"
+    assert result.capture.permission_events == [
+        {
+            "tool_call_id": "2",
+            "title": "view_file",
+            "kind": "other",
+            "option_id": None,
+            "violation": None,
+            "source": "agy_cli_tool_error",
+            "action": "denied",
+            "path": DENIED_PATH,
+            "message": DENIAL.split("\n", 1)[0],
+        }
+    ]
+    assert (tmp_path / "stderr.log").read_text().startswith("AGY CLI disposition=end_turn")
+
+
+async def test_tool_error_without_a_denial_is_recorded_as_error(tmp_path):
+    agent = worker(
+        tmp_path, mode="consult", actions=[initial(), denied_step("read failed: EIO"), terminal("ok")]
+    )
+    result = await prompt(agent)
+    assert result.text == "ok"
+    [event] = result.capture.permission_events
+    assert (event["action"], event["path"], event["message"]) == ("error", DENIED_PATH, "read failed: EIO")
+
+
+async def test_terminal_success_with_empty_response_is_an_empty_end_turn(tmp_path):
+    agent = worker(tmp_path, mode="review", actions=[initial(), terminal("")])
+    result = await prompt(agent)
+    assert (result.stop_reason, result.text) == ("end_turn", "")
+    assert result.capture.permission_events == []
+
+
 @pytest.mark.parametrize(
     "mode,tool_name",
     [

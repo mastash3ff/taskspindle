@@ -40,6 +40,9 @@ _COUNTERS = {
     "cache_write_tokens": "cached_write_tokens",
     "total_tokens": "total_tokens",
 }
+#: The parameters an Antigravity tool step names its target path in, first match wins.
+_PATH_PARAMETERS = ("AbsolutePath", "DirectoryPath", "SearchDirectory", "TargetFile")
+
 _STATUSES = {"SUCCESS", "ERROR", "CANCELED", "INTERRUPTED", "INVALID", "WAITING", "RUNNING"}
 _DELEGATION_TOOLS = {
     "start_subagent",
@@ -341,6 +344,36 @@ class AgyCliWorker:
         self.cumulative_usage = cumulative
         self._turn_usage = deltas
 
+    def _record_tool_error(self, index: int, tool_name: str, info: Any) -> None:
+        """A step the CLI refused or that failed, kept as evidence; never an abort.
+
+        The CLI's own permission layer answers a read outside the workspace with a denial and
+        carries on, and a turn that then ends with nothing to say would otherwise leave no trace
+        of why. The entry joins ``permission_events`` next to the ACP gate's refusals.
+        """
+        error = info.get("error") if isinstance(info, dict) else None
+        message = str(error.get("message") or "") if isinstance(error, dict) else ""
+        parameters = info.get("parameters") if isinstance(info, dict) else None
+        path = None
+        if isinstance(parameters, dict):
+            for key in _PATH_PARAMETERS:
+                if isinstance(parameters.get(key), str):
+                    path = parameters[key]
+                    break
+        self._capture.permission_events.append(
+            {
+                "tool_call_id": str(index),
+                "title": tool_name,
+                "kind": "other",
+                "option_id": None,
+                "violation": None,
+                "source": "agy_cli_tool_error",
+                "action": "denied" if "denied permission" in message else "error",
+                "path": path,
+                "message": message.split("\n", 1)[0][:200],
+            }
+        )
+
     def _guard_tool(self, step: dict[str, Any]) -> None:
         """Abort after prohibited observed activity; static policy/namespace prevents it."""
         from .agy_cli_policy import EDIT_TOOLS, READ_TOOLS
@@ -428,6 +461,8 @@ class AgyCliWorker:
                             raise _protocol("AGY emitted invalid tool details.")
                         tool[key] = step[key]
                 self._capture.tool_calls.append(tool)
+                if state == "ERROR":
+                    self._record_tool_error(index, tool_name, step.get("tool_info"))
             self._emit_progress()
             self._guard_tool(step)
         elif kind == "result":

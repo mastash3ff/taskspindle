@@ -54,7 +54,7 @@ from .models import (
 )
 from .providers import Profile, ProfileError
 from .repos import GitError, RepositoryIdentity, RootSnapshot
-from .review import ReviewParseError, parse_review_output
+from .review import REVIEW_MALFORMED, ReviewParseError, parse_review_output
 from .service import (
     LEASE_BUSY,
     TaskSpindleError,
@@ -361,6 +361,7 @@ _PER_TURN_WARNINGS = (
     "SCOPE_VIOLATION:",
     "ROOT_MUTATION:",
     "READ_ONLY_VIOLATION",
+    "EMPTY_RESPONSE",
     "DELEGATION_ATTEMPT",
     "MODE_SWITCH_ATTEMPT",
     ROOT_CHECK_SKIPPED,
@@ -1264,11 +1265,36 @@ def _record_violations(run: _Run, result: TurnResult) -> None:
 # -- finalisation ---------------------------------------------------------------------------
 
 
+def _empty_turn_details(result: TurnResult) -> dict[str, Any]:
+    """Why a turn that said nothing said nothing, from the evidence the capture kept."""
+    calls = result.capture.tool_calls
+    denied = [
+        event for event in result.capture.permission_events
+        if event.get("action") == "denied" or event.get("violation")
+    ]
+    return {
+        "empty_response": True,
+        "stop_reason": result.stop_reason,
+        "tool_calls": len({call.get("tool_call_id") for call in calls}),
+        "last_tool": calls[-1].get("title") if calls else None,
+        "last_tool_status": calls[-1].get("status") if calls else None,
+        "denied_reads": [event.get("path") or event.get("title") for event in denied][:10],
+    }
+
+
 async def _finalize(run: _Run, workspace: Path, result: TurnResult) -> TaskState:
     # Every mode is checked against the root snapshot: a consult or a review can write outside
     # its worktree just as easily as an implement can, and it is just as much a warning.
     _check_root(run)
     if run.task.mode is Mode.CONSULT:
+        if not result.text.strip():
+            # A consult that answered nothing still completes: a FAILED consult cannot be
+            # continued, and a follow-up turn is the way to get the answer.
+            run.warn(
+                "EMPTY_RESPONSE",
+                EventKind.WARNING,
+                {"warning": "EMPTY_RESPONSE", "revision": run.revision, **_empty_turn_details(result)},
+            )
         return _settle(run, TaskState.COMPLETED, "consult turn finished", response=result.text)
     if run.task.mode is Mode.REVIEW:
         return _finalize_review(run, workspace, result)
@@ -1285,10 +1311,25 @@ def _finalize_review(run: _Run, workspace: Path, result: TurnResult) -> TaskStat
         )
         return _settle(run, TaskState.COMPLETED, "review discarded", response=result.text)
 
+    if not result.text.strip():
+        raise _Failure(
+            REVIEW_MALFORMED,
+            "the reviewer ended its turn without any output",
+            details=_empty_turn_details(result),
+        )
     try:
         review = parse_review_output(result.text)
     except ReviewParseError as exc:
-        raise _Failure(exc.code, exc.detail) from exc
+        calls = result.capture.tool_calls
+        raise _Failure(
+            exc.code,
+            exc.detail,
+            details={
+                "text_length": len(result.text),
+                "tool_calls": len({call.get("tool_call_id") for call in calls}),
+                "last_tool": calls[-1].get("title") if calls else None,
+            },
+        ) from exc
 
     target = run.task.review_target or {}
     subject_task_id = target.get("task_id") or run.task_id

@@ -153,7 +153,14 @@ live under `refs/taskspindle/<task_id>/rev/<n>` so they are never on a branch yo
 
 ## Violations
 
-Four things a task can do that TaskSpindle records rather than hides.
+Five things a task can do that TaskSpindle records rather than hides.
+
+- **`EMPTY_RESPONSE`** — a consult turn ended without any text. The task still completes, because
+  a failed consult cannot be continued and a follow-up turn is the way to get the answer; the
+  warning's event carries what the turn did instead (tool calls, the last tool and its status,
+  and any reads the sandbox or permission gate refused). A review that says nothing fails
+  `REVIEW_MALFORMED` with the same evidence. The Antigravity adapter records every tool step the
+  native CLI refused in the transcript's `permission_events` so that evidence exists.
 
 - **`SCOPE_VIOLATION`** — the collapsed candidate touches a path outside the task's granted
   `path_prefixes`. The revision is still recorded, with the warning; it cannot be accepted, and a

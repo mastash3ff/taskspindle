@@ -587,6 +587,85 @@ async def test_a_review_that_dirties_its_worktree_is_completed_without_a_verdict
     assert event_kinds(store, task.id).count(EventKind.READ_ONLY_VIOLATION.value) == 2
 
 
+async def test_a_review_with_no_output_fails_as_malformed_with_evidence(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    subject = seed_subject(store)
+    task = seed_task(
+        store,
+        paths,
+        mode=Mode.REVIEW,
+        repo=make_repo(),
+        review_target={
+            "kind": "candidate",
+            "task_id": subject.id,
+            "candidate_sha": subject.candidate_sha,
+        },
+    )
+
+    state = await run_task(store, paths, task, script({"response": ""}))
+
+    assert state is TaskState.FAILED
+    error = store.get_task(task.id).error
+    assert error["code"] == "REVIEW_MALFORMED"
+    assert "without any output" in error["message"]
+    assert error["details"]["empty_response"] is True
+    assert error["details"]["stop_reason"] == "end_turn"
+    assert error["details"]["tool_calls"] == 0
+    assert error["details"]["denied_reads"] == []
+    assert store.get_review_for(task.id) is None
+
+
+async def test_an_empty_review_lists_the_reads_the_gate_refused(
+    store: Store, paths: Paths, make_repo, script
+) -> None:
+    subject = seed_subject(store)
+    task = seed_task(
+        store,
+        paths,
+        mode=Mode.REVIEW,
+        repo=make_repo(),
+        review_target={
+            "kind": "candidate",
+            "task_id": subject.id,
+            "candidate_sha": subject.candidate_sha,
+        },
+    )
+
+    state = await run_task(
+        store, paths, task, script({"response": "", "write": {"path": "asked.txt", "content": "x"}})
+    )
+
+    assert state is TaskState.FAILED
+    error = store.get_task(task.id).error
+    assert error["code"] == "REVIEW_MALFORMED"
+    assert error["details"]["empty_response"] is True
+    assert error["details"]["tool_calls"] == 1
+    assert len(error["details"]["denied_reads"]) == 1
+    assert "READ_ONLY_VIOLATION" in store.get_task(task.id).warnings
+
+
+async def test_a_consult_with_no_output_completes_with_an_empty_response_warning(
+    store: Store, paths: Paths, script
+) -> None:
+    task = seed_task(store, paths, mode=Mode.CONSULT)
+
+    state = await run_task(store, paths, task, script({"response": ""}))
+
+    assert state is TaskState.COMPLETED
+    final = store.get_task(task.id)
+    assert final.response == ""
+    assert final.warnings == ["EMPTY_RESPONSE"]
+    payload = next(
+        event["payload"]
+        for event in store.list_events(task.id)
+        if event["kind"] == EventKind.WARNING.value and event["payload"].get("warning") == "EMPTY_RESPONSE"
+    )
+    assert payload["empty_response"] is True
+    assert payload["tool_calls"] == 0
+    assert runner._carried_warnings(["EMPTY_RESPONSE", "OTHER"]) == ["OTHER"]
+
+
 async def test_a_review_that_is_not_json_fails_as_malformed(
     store: Store, paths: Paths, make_repo, script
 ) -> None:
@@ -606,7 +685,10 @@ async def test_a_review_that_is_not_json_fails_as_malformed(
     state = await run_task(store, paths, task, script({"malformed_review": True}))
 
     assert state is TaskState.FAILED
-    assert store.get_task(task.id).error["code"] == "REVIEW_MALFORMED"
+    error = store.get_task(task.id).error
+    assert error["code"] == "REVIEW_MALFORMED"
+    assert error["details"]["text_length"] > 0
+    assert "empty_response" not in error["details"]
     assert store.get_review_for(task.id) is None
 
 

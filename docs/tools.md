@@ -600,7 +600,11 @@ The same report is `taskspindle usage` on the command line, and the usage panel 
 
 A `review` task is asked for exactly one JSON object, and `REVIEW_MALFORMED` is recorded if it does
 not produce one. Fenced or surrounded by prose is fine; the parser takes the innermost JSON object
-it can find.
+it can find. A reviewer that ends its turn with no text at all fails the same way, and the error's
+`details` then say what the turn did instead: `empty_response`, `stop_reason`, `tool_calls`,
+`last_tool`, `last_tool_status` and `denied_reads` (the paths or tools a sandbox or the permission
+gate refused). A consult turn with no text does not fail; it completes with an `EMPTY_RESPONSE`
+warning carrying the same evidence, which a follow-up turn that answers clears.
 
 The reviewer is given the change itself: a candidate review's prompt carries the subject's
 recorded diff, and a snapshot review's carries `git diff <expected_head> <snapshot>`, cut at 96 KiB
@@ -670,6 +674,7 @@ invalidates the review: get a new one.
 | `REVIEWER_NOT_INDEPENDENT` | the reviewer is not a genuinely different agent |
 | `DIFF_NOT_FULLY_RETRIEVED` | the whole diff has not been read |
 | `REVIEW_REQUIRED` / `REVIEW_STALE` / `REVIEW_BLOCKED` | the review gate |
+| `REVIEW_MALFORMED` | a review task produced no JSON review object; with no text at all, `details` carries `empty_response`, `stop_reason`, `tool_calls`, `last_tool`, `last_tool_status` and `denied_reads` |
 | `CANDIDATE_MISMATCH` | the candidate moved since it was inspected |
 | `TARGET_MOVED` | the repository head is not where the request said |
 | `CHECKS_FAILED` | verification commands did not all pass |
