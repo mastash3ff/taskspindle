@@ -61,7 +61,11 @@ def request(
         error = response.get("error")
         if not isinstance(error, dict):
             raise RemoteError("CONTROL_PROTOCOL_ERROR", "Invalid control error response")
-        raise RemoteError(str(error.get("code", "CONTROL_FAILED")), str(error.get("message", "Control failed")))
+        code, message = error.get("code"), error.get("message")
+        if (not isinstance(code, str) or not isinstance(message, str)
+                or len(code) > 128 or len(message) > 4096):
+            raise RemoteError("CONTROL_PROTOCOL_ERROR", "Invalid control error response")
+        raise RemoteError(code, message)
     if "result" not in response:
         raise RemoteError("CONTROL_PROTOCOL_ERROR", "Missing control result")
     return response["result"]

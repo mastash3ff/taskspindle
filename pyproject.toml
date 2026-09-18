@@ -16,6 +16,7 @@ classifiers = [
   "Topic :: Software Development :: Build Tools",
 ]
 dependencies = [
+  "docker>=7.1,<8",
   "fastmcp>=3.3,<4",
   "agent-client-protocol==0.12.0",
   "pydantic>=2.7,<3",
@@ -29,6 +30,7 @@ Changelog = "https://github.com/mastash3ff/taskspindle/blob/main/CHANGELOG.md"
 
 [project.scripts]
 taskspindle = "taskspindle.cli:main"
+taskspindle-controller = "taskspindle.controller:main"
 
 [dependency-groups]
 dev = [
