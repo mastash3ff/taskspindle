@@ -14,7 +14,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 taskspindle \
     && useradd --uid 1000 --gid 1000 --create-home --home-dir "${TASKSPINDLE_HOME}" taskspindle
-RUN python -c 'import subprocess; p = subprocess.run(["git", "merge-tree", "-h"], capture_output=True, text=True); assert "merge-base <commit>" in p.stdout + p.stderr, "Git must support merge-tree --merge-base"'
+RUN python -c 'import subprocess,tempfile; d = tempfile.TemporaryDirectory(); subprocess.run(["git", "init", "-q", d.name], check=True); p = subprocess.run(["git", "merge-tree", "-h"], cwd=d.name, capture_output=True, text=True); assert "merge-base" in p.stdout + p.stderr, "Git must support merge-tree --merge-base"'
 WORKDIR /opt/taskspindle
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
