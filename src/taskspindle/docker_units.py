@@ -402,7 +402,9 @@ class DockerBackend:
                 # Stop waits then kills all remaining processes in the container namespace.
                 container.stop(timeout=30)
                 container.reload()
-                self._observe(record, container)
+                observed = self._observe(record, container)
+                if observed.kind in {"active", "unknown"}:
+                    raise UnitError("UNIT_STOP_FAILED", "Docker has not confirmed container termination")
             except Exception as exc:
                 raise UnitError("UNIT_STOP_FAILED", "Docker could not confirm container termination") from exc
 

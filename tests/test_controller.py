@@ -55,7 +55,9 @@ def test_private_socket_round_trip_and_error_redaction(controller, tmp_path):
 
 def test_worker_interruption_reconciles_before_returning_status(controller, monkeypatch):
     calls = []
-    controller.backend.interrupt_workers = lambda: calls.append("stop")
+    controller.backend.interrupt_workers = lambda: calls.append("stop") or {
+        "admission_open": False, "engine_reachable": True, "jobs": [], "unsettled_integrations": 0,
+    }
     controller.backend.status = lambda: calls.append("status") or {"active_reservations": 0}
     module = SimpleNamespace(reconcile_interrupted_workers=lambda *args: calls.append("reconcile"))
     monkeypatch.setitem(sys.modules, "taskspindle.worker_diagnostics", module)
@@ -78,3 +80,38 @@ def test_reconcile_keeps_active_workers_and_does_not_dispatch(controller):
                 "jobs": [{"kind": "worker", "state": "active"}]}
     controller.backend.status = lambda: snapshot
     assert controller.dispatch("reconcile", {}) is snapshot
+
+
+def test_interruption_does_not_recover_until_all_jobs_are_observed_dead(controller):
+    controller.backend.interrupt_workers = lambda: {
+        "admission_open": False, "engine_reachable": True, "jobs": [{"state": "unknown"}],
+        "unsettled_integrations": 0,
+    }
+    with pytest.raises(UnitError) as caught:
+        controller.dispatch("interrupt_workers", {})
+    assert caught.value.code == "UNIT_STOP_FAILED"
+
+
+def test_recovery_holds_fence_against_concurrent_open(controller, monkeypatch):
+    entered, proceed, opened = threading.Event(), threading.Event(), threading.Event()
+    controller.backend.status = lambda: {
+        "admission_open": False, "engine_reachable": True, "jobs": [], "unsettled_integrations": 0,
+    }
+    controller.backend.set_admission = lambda value: opened.set()
+
+    def reconcile(*args):
+        entered.set()
+        assert proceed.wait(3)
+
+    monkeypatch.setitem(sys.modules, "taskspindle.worker_diagnostics",
+                        SimpleNamespace(reconcile_interrupted_workers=reconcile))
+    recovering = threading.Thread(target=controller.dispatch, args=("reconcile", {}))
+    recovering.start()
+    assert entered.wait(2)
+    opening = threading.Thread(target=controller.dispatch, args=("set_admission", {"open": True}))
+    opening.start()
+    assert not opened.wait(0.05)
+    proceed.set()
+    recovering.join(3)
+    opening.join(3)
+    assert opened.is_set()

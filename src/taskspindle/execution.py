@@ -19,7 +19,8 @@ class ControllerClient:
 
     def _call(self, operation: str, arguments: Mapping[str, Any] | None = None) -> Any:
         try:
-            return request(self.socket_path, operation, arguments, timeout=90)
+            return request(self.socket_path, operation, arguments,
+                           timeout=300 if operation == "interrupt_workers" else 90)
         except RemoteError as exc:
             code = exc.code
             if operation == "start" and code in {

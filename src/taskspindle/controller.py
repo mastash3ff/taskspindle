@@ -32,8 +32,16 @@ def _arguments(arguments: Any, fields: set[str]) -> dict[str, Any]:
 class Controller:
     def __init__(self, backend: Any, resolved: Any, settings: Mapping[str, Any]) -> None:
         self.backend, self.paths, self.settings = backend, resolved, settings
+        self._mutation_lock = threading.RLock()
 
     def dispatch(self, operation: Any, arguments: Any, *, diagnostics: bool = False) -> Any:
+        # Keep the fence closed across a whole stop/recovery sweep, including against `open`.
+        if not diagnostics and operation in {"start", "set_admission", "interrupt_workers", "reconcile"}:
+            with self._mutation_lock:
+                return self._dispatch(operation, arguments, diagnostics=diagnostics)
+        return self._dispatch(operation, arguments, diagnostics=diagnostics)
+
+    def _dispatch(self, operation: Any, arguments: Any, *, diagnostics: bool = False) -> Any:
         if diagnostics:
             if operation != "doctor":
                 raise RemoteError("CONTROL_FORBIDDEN", "Operation is not available on this socket")
@@ -46,7 +54,11 @@ class Controller:
             _arguments(arguments, set())
             method = "admission_open" if operation == "admission" else operation
             if operation == "interrupt_workers":
-                self.backend.interrupt_workers()
+                snapshot = self.backend.interrupt_workers()
+                if (snapshot.get("admission_open") is not False
+                        or snapshot.get("engine_reachable") is not True
+                        or snapshot.get("jobs") != [] or snapshot.get("unsettled_integrations") != 0):
+                    raise UnitError("UNIT_STOP_FAILED", "Worker interruption is not fully observed")
                 from .worker_diagnostics import reconcile_interrupted_workers
                 reconcile_interrupted_workers(self.backend, self.paths, self.settings)
                 return self.backend.status()
