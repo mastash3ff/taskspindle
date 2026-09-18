@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.2
 
 - **`task_result` and `task_status` hand over the worker's session.** Both now carry
   `session_id` and a `resume` handle: for a Claude or Grok task the native `claude --resume <id>`
