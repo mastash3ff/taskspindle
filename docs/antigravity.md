@@ -67,8 +67,11 @@ settings and other CLI conversations are not inherited or modified.
 Consult/review expose read tools and deny file writes, shell execution, MCP, browser
 actions and delegation. The filesystem is read-only outside explicitly writable
 private runtime state. Implementation adds file-editing tools only for its declared
-worktree scope. Git and control paths in directories present at launch are protected
-immediately; controls inside newly created nested directories are masked before a
+worktree scope. Git and control paths in directories present at launch are masked
+immediately: a `.git` directory is bound to an empty directory and a linked worktree's
+`.git` pointer file to an empty file, so the model never sees the main repository's
+gitdir path, which the sandbox would refuse. Git runs only on the host, before and after
+the turn. Controls inside newly created nested directories are masked before a
 resumed turn. Before creating a candidate, TaskSpindle rejects any changed path
 containing a Git or agent-control component, including those in new directories.
 Declare an existing containing directory when a new file is to be created.

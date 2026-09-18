@@ -156,6 +156,7 @@ for name in {list(map(str, targets))!r}:
     except OSError:
         result[name] = False
 result['hook_hidden'] = not Path({str(workspace / '.agents' / 'hooks.json')!r}).exists()
+result['git_hidden'] = not Path({str(workspace / '.git' / 'config')!r}).exists()
 result['global_hidden'] = not Path({str(home / '.gemini' / 'GEMINI.md')!r}).exists()
 result['api_env_absent'] = 'GEMINI_API_KEY' not in os.environ
 state = Path({str(home / '.gemini' / 'antigravity-cli' / 'state-probe')!r})
@@ -167,6 +168,7 @@ print(json.dumps(result))
     assert result[str(targets[0])] is (mode == "implement")
     assert all(result[str(p)] is False for p in targets[1:])
     assert result["hook_hidden"] and result["global_hidden"] and result["api_env_absent"]
+    assert result["git_hidden"]
     assert result["state_writable"]
     assert not (home / ".gemini" / "antigravity-cli" / "state-probe").exists()
 
@@ -183,7 +185,7 @@ def test_continuation_preserves_private_state_but_rewrites_controls(layout) -> N
     assert "command(*)" in json.loads(settings.read_text())["permissions"]["deny"]
 
 
-def test_full_workspace_scope_keeps_git_controls_and_native_token_read_only(layout) -> None:
+def test_full_workspace_scope_masks_git_and_keeps_native_token_read_only(layout) -> None:
     home, workspace, task = layout
     token = home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
     inode = token.stat().st_ino
@@ -210,6 +212,35 @@ print(json.dumps(result))
     assert result.pop("same_token_inode")
     assert not any(result.values())
     assert (workspace / "new-file.txt").exists()
+
+
+@pytest.mark.parametrize("mode,prefixes", [("consult", ()), ("implement", ("src",))])
+def test_git_directory_is_masked_empty(layout, mode, prefixes) -> None:
+    _, workspace, task = layout
+    argv = launch(layout, mode, prefixes)
+    triples = list(zip(argv, argv[1:], argv[2:], strict=False))
+    assert ("--ro-bind", str(task / "agy-cli-policy" / "empty"), str(workspace / ".git")) in triples
+    assert not any(t[0] == "--ro-bind" and t[1] == str(workspace / ".git") for t in triples)
+    assert json.loads((task / "agy-cli-launch.json").read_text())["git_masked"] is True
+
+
+@pytest.mark.parametrize("mode,prefixes", [("consult", ()), ("implement", ("src",)), ("implement", (".",))])
+def test_git_pointer_file_is_masked_blank(layout, mode, prefixes) -> None:
+    """A linked worktree's ``.git`` names the main repository's gitdir; the model never sees it."""
+    _, workspace, task = layout
+    shutil.rmtree(workspace / ".git")
+    (workspace / ".git").write_text("gitdir: /elsewhere/.git/worktrees/ts_x\n")
+    argv = launch(layout, mode, prefixes)
+    triples = list(zip(argv, argv[1:], argv[2:], strict=False))
+    assert ("--ro-bind", str(task / "agy-cli-policy" / "empty-file"), str(workspace / ".git")) in triples
+    code = f"""
+import json
+from pathlib import Path
+git = Path({str(workspace / '.git')!r})
+print(json.dumps({{"text": git.read_text(), "is_file": git.is_file()}}))
+"""
+    assert _run_inside(argv, code) == {"text": "", "is_file": True}
+    assert (workspace / ".git").read_text().startswith("gitdir:")
 
 
 def test_native_child_stays_in_transport_process_group(layout) -> None:

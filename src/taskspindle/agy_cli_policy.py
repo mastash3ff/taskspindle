@@ -9,7 +9,7 @@ Native commands are always disabled; TaskSpindle executes verification commands.
 Writable directory scopes permit new files. Existing file scopes permit in-place
 edits only (atomic replacement of a bind-mounted file fails). Missing scopes fail
 closed; callers must declare an existing containing directory for new files.
-Existing control paths are protected by mounts. Future control paths also depend
+Existing control paths are masked by mounts. Future control paths also depend
 on immutable native deny rules, because mounting absent paths would mutate the
 worktree. The native implicit manage_task tool still requires runtime monitoring.
 """
@@ -200,8 +200,12 @@ def prepare_launch(
     for path in _controls(workspace):
         if path.is_symlink():
             raise ValueError(f"workspace control path must not be a symlink: {path}")
-        source = path if path.name == ".git" else empty if path.is_dir() else blank
-        mount("--ro-bind", source, path)
+        # ``.git`` is masked like every other control. A linked worktree's ``.git`` is a
+        # pointer file naming the main repository's gitdir, a path outside the workspace that
+        # the sandbox then refuses; a model that reads the pointer follows it into that refusal.
+        # Nothing inside the namespace runs git: every git command is the host's, before and
+        # after the turn.
+        mount("--ro-bind", empty if path.is_dir() else blank, path)
     global_agents = home / ".agents"
     if global_agents.exists():
         if global_agents.is_symlink():
@@ -238,6 +242,7 @@ def prepare_launch(
         "writable_scopes": [str(path) for path in scopes], "private_state": str(state),
         "credential_refresh": "read-only; reauthenticate with native CLI if expired",
         "verification_commands_external": len(verification_commands), "shell_tools": False,
+        "git_masked": True,
         "declared_tools": list(tools), "implicit_tools_require_monitoring": ["manage_task"],
         "future_control_paths_require_native_deny_rules": True,
         "companion_bin": str(companion_bin) if companion_bin.is_dir() else None,
