@@ -38,6 +38,37 @@ def test_role_must_be_a_short_lowercase_key(role: str) -> None:
         StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="q", role=role)
 
 
+def test_review_kind_defaults_to_standard() -> None:
+    request = StartTaskRequest(
+        provider="grok",
+        mode=Mode.REVIEW,
+        prompt="q",
+        review_target=ReviewTarget(kind="candidate", task_id="ts_1", candidate_sha="a" * 40),
+    )
+    assert request.review_kind == "standard"
+    assert request.model_copy(update={"review_kind": "adversarial"}).review_kind == "adversarial"
+
+
+CONSULT_FIELDS = {"provider": "grok", "mode": Mode.CONSULT, "prompt": "q"}
+
+
+@pytest.mark.parametrize("fields", [CONSULT_FIELDS, IMPLEMENT_FIELDS])
+def test_a_non_standard_review_kind_is_review_only(fields: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="review only"):
+        StartTaskRequest(**fields, review_kind="adversarial")
+
+
+def test_an_unknown_review_kind_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        StartTaskRequest(
+            provider="grok",
+            mode=Mode.REVIEW,
+            prompt="q",
+            review_target=ReviewTarget(kind="candidate", task_id="ts_1", candidate_sha="a" * 40),
+            review_kind="hostile",
+        )
+
+
 def test_role_is_recorded_as_given() -> None:
     request = StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="q", role="code-reviewer_2")
     assert request.role == "code-reviewer_2"

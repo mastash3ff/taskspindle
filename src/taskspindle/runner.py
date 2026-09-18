@@ -142,6 +142,21 @@ Output only the JSON object.
 """.strip()
 
 
+_ADVERSARIAL_REVIEW_PREAMBLE = """
+Adversarial review. Assume this change is wrong until you have shown otherwise: your job is to
+break it, not to approve it. Hunt deliberately for wrong or missing edge cases and off-by-one
+errors; unhandled failures and error paths; ordering, concurrency and state bugs; security holes
+(injection, path traversal, secrets, privilege, unsafe file handling); silent behaviour changes
+and incompatible interface changes; tests that pass without proving the stated acceptance
+criteria; and anything the summary claims that the diff does not actually do. Every finding must
+cite the exact file and line and say how to trigger the fault. Do not pad with style remarks.
+Give PASS only after looking for all of the above and finding nothing.
+""".strip()
+
+#: The instruction prefix each review kind puts before the shared review rules.
+_REVIEW_PREAMBLES: dict[str, str] = {"standard": "", "adversarial": _ADVERSARIAL_REVIEW_PREAMBLE}
+
+
 def _review_subject(task: TaskRecord) -> str:
     """A one-line description of what a review task is looking at."""
     raw = task.review_target or {}
@@ -201,6 +216,9 @@ def compose_prompt(
         return f"{task.prompt}\n\n{rules}"
     if task.mode is Mode.REVIEW:
         rules = _REVIEW_RULES.format(subject=_review_subject(task))
+        preamble = _REVIEW_PREAMBLES.get(task.review_kind or "standard", "")
+        if preamble:
+            rules = f"{preamble}\n\n{rules}"
         return f"{rules}\n\n{task.prompt}{review_diff_section(review_diff)}"
     return task.prompt
 
@@ -1237,12 +1255,14 @@ def _finalize_review(run: _Run, workspace: Path, result: TurnResult) -> TaskStat
     target = run.task.review_target or {}
     subject_task_id = target.get("task_id") or run.task_id
     candidate_sha = target.get("candidate_sha") or target.get("expected_head")
+    kind = run.task.review_kind or "standard"
     run.store.insert_review(
         run.task_id,
         subject_task_id,
         candidate_sha,
         run.task.provider,
         review,
+        kind=kind,
     )
     run.store.append_event(
         run.task_id,
@@ -1252,6 +1272,7 @@ def _finalize_review(run: _Run, workspace: Path, result: TurnResult) -> TaskStat
             "candidate_sha": candidate_sha,
             "verdict": review.verdict.value,
             "findings": len(review.findings),
+            "kind": kind,
         },
     )
     return _settle(run, TaskState.COMPLETED, "review recorded", response=result.text)

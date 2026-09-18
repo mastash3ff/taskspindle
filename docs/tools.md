@@ -205,6 +205,7 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `verification_commands` | string[]\|null | `null` | **implement only, required**; may be `[]` |
 | `candidate_message` | string\|null | `null` | **implement only, required**; one line, ≤ 72 characters |
 | `review_target` | object\|null | `null` | **review only, required** |
+| `review_kind` | `"standard"`\|`"adversarial"` | `"standard"` | review only; the reviewer's stance, recorded on the task and its review — see [the review contract](#the-review-contract) |
 | `role` | string\|null | `null` | matches `^[a-z][a-z0-9_-]*$`, at most 32 characters; recorded on the task for reporting only, does not select a provider or change admission |
 
 `review_target` is either
@@ -266,6 +267,7 @@ Returns `{"tasks": [<task view>]}`, newest first.
 `error`, `unit_name`, `heartbeat_at`, and the four timestamps. A task in `RECOVERY_AMBIGUOUS` also
 carries `evidence` and `manual_action` — see [recovery.md](recovery.md). Errors: `TASK_NOT_FOUND`.
 
+A review task's view also carries `review_kind`; it is `null` on every other mode.
 `task_status` also returns `resume`, the same [native resume handle](#reopening-a-workers-session)
 `task_result` carries, or `null` before the worker has opened a session.
 
@@ -595,6 +597,17 @@ the kernel refuses the write itself.
 - `verdict`: `PASS`, `CONCERN` or `BLOCK`.
 - `severity`: `low`, `medium`, `high` or `critical`.
 - `line` is 1-based. Finding ids must be non-empty and unique. No extra fields are accepted.
+
+**Review kinds.** `review_kind` picks the reviewer's stance without changing the contract. A
+`standard` review is the fixed defect review above. An `adversarial` review puts a preamble ahead
+of the same rules telling the reviewer to assume the change is wrong and hunt for the evidence:
+edge cases, error paths, ordering and state bugs, security holes, silent behaviour changes, tests
+that pass without proving the acceptance criteria, and claims the diff does not deliver. Both
+produce the same JSON, both are parsed the same way, and `accept_task` applies the same disposition
+rules to both. The kind is recorded on the review task (`task_status.review_kind`,
+`task_result.attribution.review_kind`) and on the review row, so a dashboard or a later gate can
+tell which stance a candidate has been through. Nothing currently requires an adversarial review;
+run one when the candidate touches something you would not want a polite reviewer to wave past.
 
 **Disposition rules**, enforced by `accept_task` when `require_review` is set:
 

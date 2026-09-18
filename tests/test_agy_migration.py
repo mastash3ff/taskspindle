@@ -22,7 +22,7 @@ def test_schema_two_upgrade_preserves_records_and_adds_nullable_selection(tmp_pa
                 for column in store_module.TASK_COLUMNS
                 if column not in {
                     "resolved_model", "resolved_effort", "provider_family", "role",
-                    "ignore_provider_status",
+                    "ignore_provider_status", "review_kind",
                 }
             ),
         )
@@ -75,7 +75,7 @@ def test_schema_two_upgrade_preserves_records_and_adds_nullable_selection(tmp_pa
             before = {table: _rows(store, table) for table in tables}
 
     with Store.open(path) as store:
-        assert store.schema_version() == 12
+        assert store.schema_version() == 13
         assert store.migrate() == []
         for table in tables:
             after = _rows(store, table)
@@ -86,9 +86,13 @@ def test_schema_two_upgrade_preserves_records_and_adds_nullable_selection(tmp_pa
                     assert row.pop("provider_family") is None
                     assert row.pop("role") is None
                     assert row.pop("ignore_provider_status") == 0
+                    assert row.pop("review_kind") is None
             if table == "turns":
                 for row in after:
                     assert row.pop("native_overage") is None
+            if table == "reviews":
+                for row in after:
+                    assert row.pop("kind") == "standard"
             assert after == before[table]
         migrated = store.get_task(task.id)
         assert migrated.session_id == "retained-session"

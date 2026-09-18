@@ -1138,6 +1138,25 @@ def test_compose_prompt_states_the_rules_each_mode_needs(
     assert "Do not spawn subagents" in text
 
 
+def test_review_kind_selects_the_preamble_and_leaves_the_contract_alone(
+    store: Store, paths: Paths
+) -> None:
+    target = {"kind": "candidate", "task_id": "ts_000000000009", "candidate_sha": "c" * 40}
+    review = seed_task(store, paths, mode=Mode.REVIEW, prompt="look hard", review_target=target)
+    standard = runner.compose_prompt(review, TurnKind.INITIAL)
+    assert standard.startswith("You are reviewing code.")
+    assert standard.endswith("Output only the JSON object.\n\nlook hard")
+
+    adversarial = runner.compose_prompt(
+        review.model_copy(update={"review_kind": "adversarial"}), TurnKind.INITIAL
+    )
+    assert adversarial.startswith("Adversarial review. Assume this change is wrong")
+    assert adversarial.endswith(standard)
+    assert runner.compose_prompt(
+        review.model_copy(update={"review_kind": "adversarial"}), TurnKind.CONTINUE, continuation="more"
+    ).startswith("Continue.")
+
+
 
 async def test_a_turn_that_reported_no_usage_says_so_in_the_worker_log(
     store: Store, paths: Paths, script

@@ -207,7 +207,9 @@ def whole_diff(harness: Harness, task_id: str, page: int = 262144) -> bytes:
             return body
 
 
-def review_candidate(harness: Harness, repo: Path, task_id: str) -> str:
+def review_candidate(
+    harness: Harness, repo: Path, task_id: str, *, review_kind: str = "standard"
+) -> str:
     """Run an independent review of the task's candidate and return the review task id."""
     status = harness.orchestrator.task_status(task_id)
     started = harness.orchestrator.start_task(
@@ -219,6 +221,7 @@ def review_candidate(harness: Harness, repo: Path, task_id: str) -> str:
             review_target=ReviewTarget(
                 kind="candidate", task_id=task_id, candidate_sha=status["candidate_sha"]
             ),
+            review_kind=review_kind,
         )
     )
     assert started["state"] == TaskState.COMPLETED.value
@@ -632,6 +635,43 @@ def test_the_review_turn_is_given_the_candidate_diff(harness: Harness, make_repo
     assert "```diff" in prompt
     assert "src/new.txt" in prompt
     assert "+hello" in prompt
+
+
+def test_an_adversarial_review_is_briefed_recorded_and_accepted_like_any_other(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+
+    review_id = review_candidate(harness, repo, task_id, review_kind="adversarial")
+
+    o = harness.orchestrator
+    prompt = o.store.list_turns(review_id)[0]["prompt"]
+    assert prompt.startswith("Adversarial review. Assume this change is wrong")
+    assert "Output only the JSON object." in prompt
+    assert o.task_status(review_id)["review_kind"] == "adversarial"
+    assert o.task_result(review_id)["attribution"]["review_kind"] == "adversarial"
+    assert o.store.get_review_for(review_id)["kind"] == "adversarial"
+    recorded = next(e for e in o.store.list_events(review_id) if e["kind"] == "REVIEW_RECORDED")
+    assert recorded["payload"]["kind"] == "adversarial"
+    assert o.task_status(task_id)["review_kind"] is None
+
+    accepted = o.accept_task(accept_request(harness, repo, task_id, review_id))
+    assert accepted["state"] == TaskState.ACCEPTING.value
+
+
+def test_a_standard_review_records_its_kind_without_a_preamble(harness: Harness, make_repo) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    whole_diff(harness, task_id)
+
+    review_id = review_candidate(harness, repo, task_id)
+
+    o = harness.orchestrator
+    assert o.store.list_turns(review_id)[0]["prompt"].startswith("You are reviewing code.")
+    assert o.task_status(review_id)["review_kind"] == "standard"
+    assert o.store.get_review_for(review_id)["kind"] == "standard"
 
 
 def test_a_reviewer_that_is_not_independent_is_refused(harness: Harness, make_repo) -> None:

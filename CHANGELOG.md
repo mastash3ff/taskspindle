@@ -8,6 +8,12 @@
   pick up a near-miss candidate by hand instead of rejecting and re-dispatching; for an
   Antigravity task, or an unknown family, a note explaining why no shell command exists. The
   handle follows the task's recorded provider family, never the live profile.
+- **Reviews have a kind.** `start_task` takes `review_kind` (`standard`, the default, or
+  `adversarial`) on a review task. An adversarial review briefs the reviewer to assume the change
+  is wrong and hunt for defects, security holes and untested claims; the output contract, the
+  parser and the acceptance rules are unchanged. The kind is recorded on the task, its review row
+  and the `REVIEW_RECORDED` event, and shown on the dashboard. Schema 13 adds
+  `tasks.review_kind` and `reviews.kind`; rows written before it read as `standard`.
 
 ## v0.6.1
 

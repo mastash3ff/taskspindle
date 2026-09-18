@@ -225,7 +225,7 @@ async function candidatePanel(task, review, signal, route) {
   if ((!task.candidate_sha || !Number.isInteger(task.candidate_revision) || task.candidate_revision < 1) && review) {
     verdictBadge.replaceWith(badge(review.verdict || "pending", review.verdict || "Not reviewed"));
     panel.append(
-      h("div", { class: "review-summary" }, definitionList([["Verdict", review.verdict], ["Reviewer", review.provider], ["Candidate", review.candidate_sha, true]], "compact"), review.summary ? h("p", { text: review.summary }) : null),
+      h("div", { class: "review-summary" }, definitionList([["Verdict", review.verdict], ["Kind", review.kind || "standard"], ["Reviewer", review.provider], ["Candidate", review.candidate_sha, true]], "compact"), review.summary ? h("p", { text: review.summary }) : null),
       h("p", { class: "panel-note" }, "This review belongs to ", h("a", { href: routeHref("tasks", review.subject_task_id, { tab: "changes", candidate: review.candidate_sha }), class: "mono", text: review.subject_task_id }), ". Finding locations open that candidate with its recorded SHA guard."),
     );
     if (review.findings?.length) panel.append(table(["Severity", "Location", "Evidence", "Remedy"], review.findings.map((finding) => {
@@ -295,7 +295,7 @@ async function candidatePanel(task, review, signal, route) {
   if (candidateChanged) return panel;
   let selectedFindingTarget = null;
   if (review) {
-    panel.append(h("div", { class: "review-summary" }, definitionList([["Verdict", review.verdict], ["Reviewer", review.provider], ["Candidate", review.candidate_sha, true]], "compact"), review.summary ? h("p", { text: review.summary }) : null));
+    panel.append(h("div", { class: "review-summary" }, definitionList([["Verdict", review.verdict], ["Kind", review.kind || "standard"], ["Reviewer", review.provider], ["Candidate", review.candidate_sha, true]], "compact"), review.summary ? h("p", { text: review.summary }) : null));
     if (review.findings?.length) panel.append(table(["Severity", "Location", "Evidence", "Remedy"], review.findings.map((finding) => {
       const anchor = diffNode?.querySelector(`#${CSS.escape(diffAnchor(finding.path, finding.line))}`);
       const href = detailHref(task, route, "changes", { candidate: task.candidate_sha, file: finding.path, finding: finding.id });

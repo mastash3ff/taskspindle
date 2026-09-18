@@ -56,7 +56,7 @@ def test_open_creates_a_private_file_and_applies_every_migration(tmp_path: Path)
     mode = stat.S_IMODE(store.path.stat().st_mode)
     assert mode == 0o600
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
-    assert store.schema_version() == 12
+    assert store.schema_version() == 13
     store.close()
 
 
@@ -138,7 +138,7 @@ def test_schema_12_migration_drops_the_collapsed_tables_and_keeps_the_rest(
                 assert store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
 
     with Store.open(path) as reopened:
-        assert reopened.schema_version() == 12
+        assert reopened.schema_version() == 13
         for table in dropped_tables:
             with pytest.raises(sqlite3.OperationalError, match="no such table"):
                 reopened._conn.execute(f"SELECT * FROM {table}")
@@ -151,13 +151,26 @@ def test_schema_12_migration_drops_the_collapsed_tables_and_keeps_the_rest(
         assert status["code"] == "PROVIDER_THROTTLED"
 
 
+def test_schema_13_gives_every_review_a_kind(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    task = make_task(store)
+    review = make_task(store, task_id="ts_000000000002", provider="grok")
+    output = ReviewOutput(verdict=Verdict.PASS, summary="fine", findings=[], checks=[])
+    store.insert_review(review.id, task.id, "c" * 40, "grok", output)
+    assert store.get_review_for(review.id)["kind"] == "standard"
+    assert store.get_task(task.id).review_kind is None
+    stored = store.update_task(review.id, None, review_kind="adversarial")
+    assert stored.review_kind == "adversarial"
+    store.close()
+
+
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store = make_store(tmp_path)
     assert store.migrate() == []
     store.close()
     reopened = Store.open(tmp_path / "state" / "taskspindle.sqlite3")
     assert reopened.migrate() == []
-    assert reopened.schema_version() == 12
+    assert reopened.schema_version() == 13
     reopened.close()
 
 

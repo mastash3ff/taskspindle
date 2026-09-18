@@ -747,6 +747,14 @@ DROP TABLE IF EXISTS recovery_native_semantics;
 DROP TABLE IF EXISTS recovery_evidence;
 """
 
+# A review task records which stance it took; a review row keeps it so acceptance and the
+# dashboard can tell a standard defect review from an adversarial one. Rows written before this
+# migration were all standard.
+_MIGRATION_13 = """
+ALTER TABLE tasks ADD COLUMN review_kind TEXT;
+ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'standard';
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -760,6 +768,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (10, _MIGRATION_10),
     (11, _MIGRATION_11),
     (12, _MIGRATION_12),
+    (13, _MIGRATION_13),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1432,22 +1441,37 @@ class Store:
         candidate_sha: str | None,
         provider: str,
         output: ReviewOutput,
+        *,
+        kind: str = "standard",
     ) -> int:
+        columns = [
+            "review_task_id", "subject_task_id", "candidate_sha", "provider", "verdict",
+            "summary", "findings", "checks", "kind", "created_at",
+        ]
+        values: list[Any] = [
+            review_task_id,
+            subject_task_id,
+            candidate_sha,
+            provider,
+            output.verdict.value,
+            output.summary,
+            json.dumps([finding.model_dump(mode="json") for finding in output.findings]),
+            json.dumps(output.checks),
+            kind,
+            now(),
+        ]
         with self._guard(), self.transaction() as conn:
+            present = {row[1] for row in conn.execute("PRAGMA table_info(reviews)")}
+            if "kind" not in present:
+                # A not-yet-migrated table reads every review back as standard, so only a
+                # non-standard kind is something it cannot hold.
+                if kind != "standard":
+                    raise StoreError("reviews table lacks a kind column")
+                del values[columns.index("kind")]
+                columns.remove("kind")
+            placeholders = ", ".join("?" for _ in columns)
             cur = conn.execute(
-                "INSERT INTO reviews(review_task_id, subject_task_id, candidate_sha, provider, "
-                "verdict, summary, findings, checks, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    review_task_id,
-                    subject_task_id,
-                    candidate_sha,
-                    provider,
-                    output.verdict.value,
-                    output.summary,
-                    json.dumps([finding.model_dump(mode="json") for finding in output.findings]),
-                    json.dumps(output.checks),
-                    now(),
-                ),
+                f"INSERT INTO reviews({', '.join(columns)}) VALUES ({placeholders})", values
             )
             return int(cur.lastrowid or 0)
 

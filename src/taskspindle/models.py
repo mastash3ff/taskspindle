@@ -201,6 +201,11 @@ class Envelope(BaseModel):
     error: ErrorBody | None = None
 
 
+#: The named review stances a ``review`` task can take.
+ReviewKind = Literal["standard", "adversarial"]
+REVIEW_KINDS: tuple[str, ...] = ("standard", "adversarial")
+
+
 class ReviewTarget(BaseModel):
     """What a ``review`` task is asked to look at."""
 
@@ -267,6 +272,10 @@ class StartTaskRequest(BaseModel):
     candidate_message: str | None = None
     # review only
     review_target: ReviewTarget | None = None
+    #: The reviewer's stance. ``standard`` is the fixed defect review; ``adversarial`` tells the
+    #: reviewer to assume the change is wrong and hunt for the evidence. The output contract and
+    #: the acceptance rules are identical for both.
+    review_kind: ReviewKind = "standard"
 
     @field_validator("provider", "prompt")
     @classmethod
@@ -307,6 +316,8 @@ class StartTaskRequest(BaseModel):
                 raise ValueError(f"implement mode requires: {', '.join(missing)}")
         elif self.mode is Mode.REVIEW and self.review_target is None:
             raise ValueError("review mode requires review_target")
+        if self.mode is not Mode.REVIEW and self.review_kind != "standard":
+            raise ValueError("review_kind is review only")
         return self
 
 
@@ -338,6 +349,7 @@ class TaskRecord(BaseModel):
     verification_commands: list[str] | None = None
     candidate_message: str | None = None
     review_target: dict[str, Any] | None = None
+    review_kind: str | None = None
     base_head: str | None = None
     target_head: str | None = None
     branch: str | None = None
@@ -420,6 +432,7 @@ class TaskView(BaseModel):
     resolved_model: str | None = None
     resolved_effort: str | None = None
     role: str | None = None
+    review_kind: str | None = None
     reported_model: str | None = None
     oauth_evidence: dict[str, Any] = Field(default_factory=dict)
     candidate_sha: str | None = None

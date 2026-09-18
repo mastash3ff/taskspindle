@@ -401,6 +401,7 @@ def create_task(
         verification_commands=request.verification_commands,
         candidate_message=request.candidate_message,
         review_target=(request.review_target.model_dump(mode="json") if request.review_target else None),
+        review_kind=request.review_kind if request.mode is Mode.REVIEW else None,
         created_at=stamp,
         updated_at=stamp,
     )
@@ -643,6 +644,8 @@ def _bound_review(
             "the reviewer must be a different provider from the author",
             details={"provider": record.provider, "review_task_id": request.review_task_id},
         )
+    # ``review["kind"]`` (standard or adversarial) is recorded but not gated: a future
+    # ``require_review_kind`` on the acceptance request would compare it here.
     return review
 
 
@@ -820,6 +823,7 @@ def task_view(record: TaskRecord) -> TaskView:
         resolved_model=record.resolved_model,
         resolved_effort=record.resolved_effort,
         role=record.role,
+        review_kind=record.review_kind,
         reported_model=record.reported_model,
         oauth_evidence=record.oauth_evidence or {},
         candidate_sha=record.candidate_sha,
@@ -908,6 +912,7 @@ def task_result(store: Store, task_id: str, *, profile: Profile | None = None) -
             "reported_model": record.reported_model or latest.get("reported_model"),
             "gateway_host": latest.get("gateway_host"),
             "agent": latest.get("agent"),
+            "review_kind": record.review_kind,
         },
         warnings=list(record.warnings or []),
         quota_warnings=[
