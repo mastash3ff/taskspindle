@@ -82,26 +82,35 @@ persist intent -> create -> persist Docker ID -> start -> observe terminal state
 launch may exist and reservations must remain intact. Engine outages never report
 `not_found`. Created-but-unconfirmed containers remain uncertain. Terminal OOM,
 exit, and signal evidence is persisted before Docker cleanup and survives it.
-A later turn uses a new generation; prior evidence is archived. No prompt or
+A later turn uses a new generation; prior evidence is archived. A prior turn still
+running produces `UNIT_PREVIOUS_TURN_ACTIVE`, so the new turn remains queued. No prompt or
 integration action is replayed autonomously.
 
 ## Controller commands
 
 `taskspindle-controller serve` reads `TASKSPINDLE_CONFIG` and serves both sockets.
 `--jobs-socket` and `--diagnostics-socket` override their configured paths. The
-same executable offers `status`, `fence`, `open`, and `interrupt-workers` clients.
+same executable offers `status`, `fence`, `open`, `reconcile`, and `interrupt-workers` clients.
 Success is JSON and exit 0; failures are bounded JSON errors and exit 1.
 
 Status reports `backend`, `admission_open`, `engine_reachable`, active or uncertain
-`jobs` (`unit`, `kind`, `task_id`, `state`), and `unsettled_integrations` (null when
-the database cannot be inspected). It excludes argv and environment. An unknown
+`jobs` (`unit`, `kind`, `task_id`, `state`), `unsettled_integrations`,
+`active_reservations`, and `nonterminal_worker_tasks` (counts are null when
+the database cannot be inspected). Integration counts include ACCEPTING task rows
+even if their journal is missing. It excludes argv and environment. An unknown
 engine or journal inventory is not evidence that shutdown is safe.
 
 Fencing is serialized with launch reservations and persisted across restarts.
 A fenced launch returns `UNIT_ADMISSION_CLOSED`. `interrupt-workers` fences first,
 refuses any active or unsettled accept/journal, and stops workers with the full
-grace period. It retains records for ordinary task recovery and never reopens the
-fence automatically. Stopping the controller does not stop independent jobs.
+grace period. It then runs one bounded worker recovery sweep to settle interrupted
+tasks and leases, and reports the resulting status. Recovery never dispatches queues.
+The explicit `reconcile` operation requires a closed fence, a reachable engine, no
+active or unknown jobs, and no unsettled integration. `fence` calls this operation
+after closing admission; active workers remain running and are reported for the
+lifecycle helper to refuse shutdown. Both paths retain the fence across failures.
+Safe stack shutdown requires empty jobs and zero integration, reservation, and
+nonterminal worker counts. Stopping the controller alone does not stop independent jobs.
 
 The diagnostics socket accepts only `doctor` with a boolean `live` argument. Each
 provider probe uses the worker image, security settings, selected auth mounts,

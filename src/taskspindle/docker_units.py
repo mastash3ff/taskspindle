@@ -62,6 +62,8 @@ def _read(path: Path) -> dict[str, Any] | None:
 
 class DockerBackend:
     """Persist intent before Engine calls; never interpret transport failure as absence."""
+    requires_inactive_previous_turn = True
+
     def __init__(self, paths: Paths, settings: Mapping[str, Any], *, client: Any = None) -> None:
         self.paths, self.settings = paths, settings
         self.config = settings.get("execution", {})
@@ -303,7 +305,7 @@ class DockerBackend:
                 if container is not None:
                     observed = self._observe(record, container)
                     if observed.kind == "active" and record["identity"] != identity:
-                        raise UnitError("UNIT_PREVIOUS_TURN_ACTIVE", "An earlier turn still owns the running job")
+                        raise UnitError("UNIT_PREVIOUS_TURN_ACTIVE", "An earlier turn still owns the job")
                     if record["identity"] == identity and observed.kind != "unknown":
                         return
                 if record["phase"] not in {"retired", "failed", "finished"}:
@@ -457,17 +459,28 @@ class DockerBackend:
             admission = _read(self.directory / "admission.json")
             try:
                 with self._database() as connection:
-                    unsettled = connection.execute("SELECT COUNT(*) FROM integration_journal").fetchone()[0]
+                    unsettled = connection.execute(
+                        "SELECT COUNT(*) FROM (SELECT task_id FROM integration_journal "
+                        "UNION SELECT id FROM tasks WHERE state='ACCEPTING')",
+                    ).fetchone()[0]
+                    reservations = connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0]
+                    nonterminal = connection.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE state IN ('RUNNING', 'PREPARING', 'CANCELLING')",
+                    ).fetchone()[0]
             except UnitError:
-                unsettled = None
+                unsettled = reservations = nonterminal = None
             return {"backend": "docker", "admission_open": admission is None or admission.get("open") is True,
-                    "engine_reachable": reachable, "jobs": jobs, "unsettled_integrations": unsettled}
+                    "engine_reachable": reachable, "jobs": jobs, "unsettled_integrations": unsettled,
+                    "active_reservations": reservations, "nonterminal_worker_tasks": nonterminal}
 
     def interrupt_workers(self) -> dict[str, Any]:
         # Fence first; never reopen automatically even if the guard or stop fails.
         self.set_admission(False)
         with self._database() as connection:
-            journal = connection.execute("SELECT 1 FROM integration_journal LIMIT 1").fetchone()
+            journal = connection.execute(
+                "SELECT task_id FROM integration_journal UNION SELECT id FROM tasks WHERE state='ACCEPTING' "
+                "LIMIT 1",
+            ).fetchone()
         snapshot = self.status()
         if journal or any(job["kind"] == "accept" for job in snapshot["jobs"]):
             raise UnitError("ACCEPT_IN_FLIGHT", "An integration is active or unsettled")

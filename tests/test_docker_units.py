@@ -96,10 +96,11 @@ def setup(tmp_path):
     paths = Paths(config, state, tmp_path / "data", tmp_path / "runtime")
     with sqlite3.connect(state / "taskspindle.sqlite3") as db:
         db.executescript("""
-            CREATE TABLE tasks(id TEXT, provider TEXT, provider_family TEXT);
+            CREATE TABLE tasks(id TEXT, provider TEXT, provider_family TEXT, state TEXT);
             CREATE TABLE turns(id INTEGER, task_id TEXT);
+            CREATE TABLE leases(task_id TEXT);
             CREATE TABLE integration_journal(task_id TEXT, started_at TEXT, candidate_sha TEXT);
-            INSERT INTO tasks VALUES ('ts_one', 'claude', 'claude');
+            INSERT INTO tasks VALUES ('ts_one', 'claude', 'claude', 'RUNNING');
             INSERT INTO turns VALUES (1, 'ts_one');
         """)
     auth = tmp_path / "claude-auth"
@@ -355,3 +356,24 @@ def test_probe_lost_create_reply_is_cleaned_without_inference_replay(setup):
     assert caught.value.code == "DIAGNOSTIC_FAILED"
     assert not client.containers.values
     assert client.containers.created[0][3].starts == 0
+
+
+def test_status_includes_readonly_reservations_and_nonterminal_tasks(setup):
+    backend, _ = setup
+    with sqlite3.connect(backend.paths.state_dir / "taskspindle.sqlite3") as db:
+        db.execute("INSERT INTO leases VALUES ('ts_one')")
+    status = backend.status()
+    assert status["active_reservations"] == 1
+    assert status["nonterminal_worker_tasks"] == 1
+    assert status["unsettled_integrations"] == 0
+    assert not status["jobs"]
+
+
+def test_accepting_task_without_journal_still_blocks_worker_interruption(setup):
+    backend, _ = setup
+    with sqlite3.connect(backend.paths.state_dir / "taskspindle.sqlite3") as db:
+        db.execute("UPDATE tasks SET state='ACCEPTING'")
+    with pytest.raises(UnitError) as caught:
+        backend.interrupt_workers()
+    assert caught.value.code == "ACCEPT_IN_FLIGHT"
+    assert backend.status()["unsettled_integrations"] == 1

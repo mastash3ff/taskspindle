@@ -12,6 +12,8 @@ from .units import SystemdUserBackend, UnitError, UnitState
 
 
 class ControllerClient:
+    requires_inactive_previous_turn = True
+
     def __init__(self, socket_path: Path | str) -> None:
         self.socket_path = Path(socket_path)
 
@@ -60,6 +62,9 @@ class ControllerClient:
 
     def interrupt_workers(self) -> dict[str, Any]:
         return self._call("interrupt_workers")
+
+    def reconcile(self) -> dict[str, Any]:
+        return self._call("reconcile")
 
 
 def unit_backend(paths: Paths, settings: Mapping[str, Any],

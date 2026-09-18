@@ -45,7 +45,26 @@ class Controller:
         if operation in {"admission", "status", "interrupt_workers"}:
             _arguments(arguments, set())
             method = "admission_open" if operation == "admission" else operation
+            if operation == "interrupt_workers":
+                self.backend.interrupt_workers()
+                from .worker_diagnostics import reconcile_interrupted_workers
+                reconcile_interrupted_workers(self.backend, self.paths, self.settings)
+                return self.backend.status()
             return getattr(self.backend, method)()
+        if operation == "reconcile":
+            _arguments(arguments, set())
+            snapshot = self.backend.status()
+            if snapshot.get("admission_open") is not False:
+                raise UnitError("UNIT_ADMISSION_OPEN", "Recovery requires closed admission")
+            if snapshot.get("engine_reachable") is not True or snapshot.get("unsettled_integrations") != 0:
+                raise UnitError(
+                    "UNIT_QUERY_FAILED", "Recovery requires a reachable engine and no integrations",
+                )
+            if snapshot.get("jobs"):
+                return snapshot
+            from .worker_diagnostics import reconcile_interrupted_workers
+            reconcile_interrupted_workers(self.backend, self.paths, self.settings)
+            return self.backend.status()
         if operation == "set_admission":
             args = _arguments(arguments, {"open"})
             if type(args["open"]) is not bool:
@@ -178,7 +197,9 @@ def serve(controller: Controller, jobs: Path, diagnostics: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="taskspindle-controller")
-    parser.add_argument("command", choices=["serve", "status", "fence", "open", "interrupt-workers"])
+    parser.add_argument(
+        "command", choices=["serve", "status", "fence", "open", "interrupt-workers", "reconcile"],
+    )
     parser.add_argument("--jobs-socket", type=Path)
     parser.add_argument("--diagnostics-socket", type=Path)
     args = parser.parse_args(argv)
@@ -199,7 +220,12 @@ def main(argv: list[str] | None = None) -> int:
         client = ControllerClient(jobs)
         if args.command in {"fence", "open"}:
             client.set_admission(args.command == "open")
-        result = client.interrupt_workers() if args.command == "interrupt-workers" else client.status()
+        if args.command == "interrupt-workers":
+            result = client.interrupt_workers()
+        elif args.command in {"fence", "reconcile"}:
+            result = client.reconcile()
+        else:
+            result = client.status()
         print(json.dumps(result, separators=(",", ":")))
         return 0
     except (ConfigError, UnitError, RemoteError) as exc:
