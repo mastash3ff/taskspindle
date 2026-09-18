@@ -28,7 +28,7 @@ mounts = [
   {source = "/absolute/taskspindle/config.toml", target = "/absolute/taskspindle/config.toml", read_only = true},
   {source = "/absolute/repository", target = "/absolute/repository", read_only = false},
 ]
-# Optional reviewed AGY namespace profile; only AGY workers and probes use it.
+# Optional reviewed namespace profile; AGY and Grok workers and probes use it.
 seccomp_profile = "/opt/taskspindle/src/taskspindle/_container/agy-seccomp.json"
 
 [execution.provider_mounts]
@@ -60,7 +60,7 @@ The image supplies Python, provider CLIs, and the adapter. Worker PATH is
 | Capabilities | all dropped |
 | Privilege escalation | no-new-privileges |
 | Root filesystem | readonly; bounded writable /tmp |
-| Seccomp | Docker default; optional reviewed profile for AGY only |
+| Seccomp | Docker default; optional reviewed namespace profile for AGY and Grok |
 
 ## Launch and recovery
 

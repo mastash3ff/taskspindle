@@ -313,14 +313,22 @@ def test_probe_uses_auth_and_config_with_private_state_and_cleans_up(setup):
     assert not list(backend.directory.glob("taskspindle-*.json"))
 
 
-def test_restrictive_seccomp_applies_only_agy(setup, tmp_path):
+@pytest.mark.parametrize("provider", ["agy", "grok", "claude", None])
+@pytest.mark.parametrize("probe", [False, True])
+def test_restrictive_seccomp_applies_only_namespace_providers(setup, tmp_path, provider, probe):
     backend, _ = setup
     profile = tmp_path / "seccomp.json"
     profile.write_text(json.dumps({"defaultAction": "SCMP_ACT_ERRNO", "syscalls": []}))
     backend.config["seccomp_profile"] = str(profile)
-    assert len(backend._options("agy")["security_opt"]) == 2
-    assert len(backend._options("claude")["security_opt"]) == 1
-    assert len(backend._options(None)["security_opt"]) == 1
+    options = backend._options(provider, probe=probe)
+    expected = ["no-new-privileges:true"]
+    if provider in {"agy", "grok"}:
+        expected.append('seccomp={"defaultAction":"SCMP_ACT_ERRNO","syscalls":[]}')
+    assert options["security_opt"] == expected
+    assert options["cap_drop"] == ["ALL"]
+    assert options["user"] == "1000:1000"
+    assert options["read_only"] is True
+    assert options["privileged"] is False
 
 
 def test_malformed_terminal_evidence_cannot_authorize_relaunch_or_cleanup(setup):

@@ -231,7 +231,7 @@ class DockerBackend:
 
     def _options(self, provider: str | None, *, probe: bool = False) -> dict[str, Any]:
         security = ["no-new-privileges:true"]
-        if provider == "agy" and self.config.get("seccomp_profile"):
+        if provider in {"agy", "grok"} and self.config.get("seccomp_profile"):
             profile = Path(self.config["seccomp_profile"])
             if not profile.is_absolute():
                 raise ConfigError("execution.seccomp_profile must be absolute")
@@ -240,7 +240,9 @@ class DockerBackend:
                 if not isinstance(value, dict) or value.get("defaultAction") != "SCMP_ACT_ERRNO":
                     raise ValueError
             except (OSError, ValueError) as exc:
-                raise ConfigError("AGY seccomp profile must be a readable restrictive JSON profile") from exc
+                raise ConfigError(
+                    "Worker seccomp profile must be a readable restrictive JSON profile",
+                ) from exc
             security.append("seccomp=" + json.dumps(value, separators=(",", ":")))
         return dict(user=self.user, mounts=self._mounts(provider, probe=probe), init=True,
                     use_config_proxy=False,
