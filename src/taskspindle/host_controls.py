@@ -12,17 +12,20 @@ import contextlib
 import fcntl
 import json
 import os
-from pathlib import Path
 import socketserver
 import stat
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 from . import rpc
 from .config import ConfigError, load_config, paths
 from .web.ai_policy import (
-    HOSTS, AdapterError, invoke_configured_adapter, parse_adapter_payload,
+    HOSTS,
+    AdapterError,
+    invoke_configured_adapter,
+    parse_adapter_payload,
     parse_use_request,
 )
 
