@@ -19,8 +19,11 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 RUN python -c 'import subprocess,tempfile; d = tempfile.TemporaryDirectory(); subprocess.run(["git", "init", "-q", d.name], check=True); p = subprocess.run(["git", "merge-tree", "-h"], cwd=d.name, capture_output=True, text=True); assert "merge-base" in p.stdout + p.stderr, "Git must support merge-tree --merge-base"'
 RUN if [ -n "$TASKSPINDLE_GIT_USER_NAME$TASKSPINDLE_GIT_USER_EMAIL" ]; then \
       test -n "$TASKSPINDLE_GIT_USER_NAME" && test -n "$TASKSPINDLE_GIT_USER_EMAIL" \
-      && git config --system user.name "$TASKSPINDLE_GIT_USER_NAME" \
-      && git config --system user.email "$TASKSPINDLE_GIT_USER_EMAIL"; \
+      && git config --file "${TASKSPINDLE_HOME}/.gitconfig" user.name "$TASKSPINDLE_GIT_USER_NAME" \
+      && git config --file "${TASKSPINDLE_HOME}/.gitconfig" user.email "$TASKSPINDLE_GIT_USER_EMAIL"; \
+    fi
+RUN if [ -n "$TASKSPINDLE_GIT_USER_NAME" ]; then \
+      GIT_CONFIG_NOSYSTEM=1 HOME="$TASKSPINDLE_HOME" git config --get user.name; \
     fi
 WORKDIR /opt/taskspindle
 COPY pyproject.toml uv.lock README.md LICENSE ./

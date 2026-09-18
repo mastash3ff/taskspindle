@@ -27,7 +27,7 @@ repository digest. A service tag alone is insufficient for durable jobs.
 
 Managed preparation supplies the operator's effective Git `user.name` and
 `user.email` as `TASKSPINDLE_GIT_USER_NAME` and `TASKSPINDLE_GIT_USER_EMAIL` build
-arguments. Only these identity fields enter the image's system Git configuration;
+arguments. Only these identity fields enter the image user's Git configuration;
 repository-local settings still override them. Host Git configuration, credential
 helpers, hooks, and signing keys are not copied. Preparation refuses a missing
 identity so acceptance cannot silently fail when committing a candidate.
