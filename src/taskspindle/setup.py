@@ -23,11 +23,7 @@ import json
 import os
 import platform
 import shutil
-import stat
 import subprocess
-import tempfile
-import urllib.request
-import zipfile
 from collections.abc import Callable, Mapping
 from importlib import resources
 from pathlib import Path
@@ -382,83 +378,6 @@ def install_runtime(
         "node": str(node),
         "config_file": str(paths.config_file),
         "created_config": created,
-    }
-
-
-def _download_agy_archive(url: str, target: Path) -> None:
-    """Fetch the pinned Google distribution without inheriting proxy or credential settings."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(url, timeout=60) as response, target.open("wb") as output:
-        if response.geturl() != url:
-            raise SetupError("the pinned Antigravity download redirected unexpectedly")
-        shutil.copyfileobj(response, output)
-
-
-def install_agy_acp_runtime(
-    paths: Paths,
-    *,
-    downloader: Callable[[str, Path], None] | None = None,
-) -> dict[str, Any]:
-    """Install Google's separately pinned Linux ACP server; leave the terminal CLI alone."""
-    from .agy_adapter import (
-        ADAPTER_FILES,
-        ADAPTER_ID,
-        ADAPTER_VERSION,
-        DOWNLOAD_URL,
-        adapter_command,
-        prepare_agy_home,
-    )
-    from .providers import ProfileError
-
-    if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
-        raise SetupError("Antigravity ACP 1.1.1 setup currently supports Linux x86-64 only")
-    runtime_dir = _private(paths.runtime_dir)
-    destination = runtime_dir / ADAPTER_ID / ADAPTER_VERSION
-    installed = destination.is_dir() and not destination.is_symlink() and all(
-        (destination / name).is_file() and not (destination / name).is_symlink()
-        and (destination / name).stat().st_size > 0 and os.access(destination / name, os.X_OK)
-        for name in ADAPTER_FILES
-    )
-    try:
-        if not installed:
-            if destination.exists():
-                raise SetupError(
-                    f"incomplete pinned adapter directory: {destination}; move it aside and rerun setup"
-                )
-            destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            with tempfile.TemporaryDirectory(prefix=".agy-install-", dir=destination.parent) as raw:
-                temporary = Path(raw)
-                archive = temporary / "adapter.zip"
-                (downloader or _download_agy_archive)(DOWNLOAD_URL, archive)
-                extracted = temporary / "extracted"
-                extracted.mkdir(mode=0o700)
-                with zipfile.ZipFile(archive) as bundle:
-                    names = bundle.namelist()
-                    if len(names) != len(ADAPTER_FILES) or set(names) != set(ADAPTER_FILES):
-                        raise SetupError(
-                            "the Antigravity archive does not contain exactly the expected executables"
-                        )
-                    for name in ADAPTER_FILES:
-                        member = bundle.getinfo(name)
-                        kind = stat.S_IFMT(member.external_attr >> 16)
-                        if member.is_dir() or member.file_size == 0 or kind not in (0, stat.S_IFREG):
-                            raise SetupError(f"the Antigravity archive has an invalid executable: {name}")
-                        target = extracted / name
-                        with bundle.open(member) as source, target.open("wb") as output:
-                            shutil.copyfileobj(source, output)
-                        target.chmod(0o700)
-                extracted.rename(destination)
-        _private(paths.state_dir)
-        _private(paths.data_dir)
-        home = prepare_agy_home(paths.data_dir)
-        created = _write_config(paths.config_file)
-    except (OSError, ValueError, zipfile.BadZipFile, ProfileError) as exc:
-        raise SetupError(f"Antigravity ACP setup failed: {exc}") from exc
-    return {
-        "provider": "agy", "adapter_package": ADAPTER_ID, "adapter_version": ADAPTER_VERSION,
-        "runtime_dir": str(runtime_dir), "adapter_dir": str(destination),
-        "command": list(adapter_command(runtime_dir)), "agy_home": str(home),
-        "already_installed": installed, "config_file": str(paths.config_file), "created_config": created,
     }
 
 

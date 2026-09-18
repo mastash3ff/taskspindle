@@ -574,32 +574,6 @@ print(json.dumps(result))
             return (f"cached catalog available; {evidence['model_count']} Gemini models advertised; "
                     "entitlement unverified")
 
-    def agy_acp_oauth(self) -> None:
-        """Legacy ACP cache evidence; not used for the native built-in provider."""
-        from .agy_adapter import agy_oauth_evidence
-
-        @self.check("agy_acp_oauth")
-        def probe() -> str:
-            agy_oauth_evidence(self.profiles["agy"])
-            return "private oauth-personal cache exists; validity is checked by session creation"
-
-    async def _agy_acp(self) -> Check:
-        """Initialize only: this probe never authenticates or creates a model session."""
-        from .agy_adapter import ADAPTER_VERSION, AUTH_METHOD, validate_agy_home
-
-        profile = self.profiles["agy"]
-        try:
-            validate_agy_home(profile)
-            with tempfile.TemporaryDirectory(prefix="taskspindle-doctor-") as raw:
-                init = await self._init_probe(profile, Path(raw))
-            if init is None or not init.load_session or AUTH_METHOD not in init.auth_method_ids:
-                raise RuntimeError("Antigravity must advertise load_session and oauth-personal")
-            if init.agent_info.get("version") not in (ADAPTER_VERSION, f"agy_acp_server_{ADAPTER_VERSION}"):
-                raise RuntimeError(f"Antigravity did not report pinned ACP version {ADAPTER_VERSION}")
-        except Exception as exc:
-            return Check("agy_acp", False, f"{type(exc).__name__}: {exc}")
-        return Check("agy_acp", True, f"Antigravity ACP {ADAPTER_VERSION}: load_session and oauth-personal")
-
     def _missing_secrets(self, profile: Profile) -> list[str]:
         """The secrets an ``api_key`` profile declares that this environment does not have."""
         if profile.auth != "api_key":
