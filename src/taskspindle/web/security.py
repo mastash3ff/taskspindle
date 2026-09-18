@@ -2,17 +2,21 @@
 
 Every check here is defense in depth around a single fact: the dashboard binds to loopback.
 ``SecurityMiddleware`` gates every route, read or write, on the HTTP ``Host`` header alone,
-which blocks DNS rebinding while still allowing a deliberate ``--host 0.0.0.0`` bind. The
-mutating surfaces - the dispatch policy and the optional Codex AI-policy adapter - additionally
-require a request that resolves to the local machine at the TCP layer too, comes from the page
-the dashboard itself served, and carries the per-process CSRF token that page received, before
-its body is even read.
+which blocks DNS rebinding while still allowing a deliberate ``--host 0.0.0.0`` bind. An operator
+running behind a private VPN may name exact remote ``Host`` netlocs in ``[web] allowed_hosts``
+(see :mod:`.remote`); that only widens which ``Host`` values this check accepts. The mutating
+surfaces - the dispatch policy and the optional Codex AI-policy adapter - additionally require a
+request that resolves to the local machine at the TCP layer too, comes from the page the
+dashboard itself served, and carries the per-process CSRF token that page received, before its
+body is even read - unless ``[web] allow_remote_policy`` is also set and the request's ``Host``
+is one of those same configured remote netlocs.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import json
+import re
 import secrets
 from typing import Any
 from urllib.parse import urlsplit
@@ -27,7 +31,10 @@ __all__ = [
     "loopback_address",
     "loopback_host",
     "no_store",
+    "parse_netloc",
     "read_json_object",
+    "remote_allowed_host",
+    "remote_policy_allowed",
     "same_origin",
     "trusted_loopback",
 ]
@@ -62,6 +69,72 @@ def trusted_loopback(request: Request) -> bool:
     return loopback_address(peer) and loopback_host(request.headers.get("host"))
 
 
+_HOSTNAME_LABEL = r"[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME_RE = re.compile(rf"^{_HOSTNAME_LABEL}(\.{_HOSTNAME_LABEL})*$")
+
+
+def _valid_host_token(hostname: str) -> bool:
+    """A numeric IPv4/IPv6 literal or a syntactically valid DNS hostname; nothing else."""
+    try:
+        ipaddress.ip_address(hostname.split("%", 1)[0])
+        return True
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.fullmatch(hostname))
+
+
+def _has_forbidden_netloc_char(value: str) -> bool:
+    """Reject path/query/fragment/userinfo delimiters, and any raw whitespace or C0 control."""
+    return any(
+        character in "/?#@" or ord(character) < 0x20 or character == "\x7f" or character.isspace()
+        for character in value
+    )
+
+
+def parse_netloc(value: str) -> tuple[str, int | None] | None:
+    """Parse ``host[:port]`` strictly: no path, query, fragment, userinfo, control, or whitespace."""
+    if not value or _has_forbidden_netloc_char(value):
+        return None
+    try:
+        parsed = urlsplit(f"//{value}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if hostname is None or port == 0 or not _valid_host_token(hostname):
+        return None
+    return hostname, port
+
+
+def remote_allowed_host(value: str | None, allowed_hosts: frozenset[str]) -> bool:
+    """True when ``value`` (the request's ``Host``) exactly names a configured remote netloc.
+
+    Comparison is by parsed ``(hostname, port)``, not raw string equality, so ``allowed_hosts``
+    entries and incoming ``Host`` headers agree on case and an implicit default port; nothing here
+    accepts a prefix, suffix, or wildcard match.
+    """
+    if not value:
+        return False
+    parsed = parse_netloc(value)
+    if parsed is None:
+        return False
+    return any(parse_netloc(candidate) == parsed for candidate in allowed_hosts)
+
+
+def remote_policy_allowed(
+    request: Request, *, allow_remote_policy: bool, allowed_hosts: frozenset[str]
+) -> bool:
+    """Replace the loopback-peer requirement only for an explicit opt-in and an explicit Host.
+
+    A caller-supplied ``Forwarded``/``X-Forwarded-*`` header is never consulted here; only the
+    ``Host`` this connection actually negotiated counts, so a request cannot claim to be a
+    configured remote host it did not actually arrive as.
+    """
+    if trusted_loopback(request):
+        return True
+    return allow_remote_policy and remote_allowed_host(request.headers.get("host"), allowed_hosts)
+
+
 class SecurityMiddleware(BaseHTTPMiddleware):
     """Gate every request on ``Host`` and attach defense-in-depth headers to every response.
 
@@ -73,15 +146,23 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     request whose ``Host`` header still names this port while the TCP connection lands on a
     remote attacker's server pretending to be ``127.0.0.1``. Checking only ``Host`` here -
     every route, read or write - closes that hole without breaking a deliberate non-loopback
-    bind. The five mutating routes layer ``trusted_loopback`` (peer *and* Host) on top of this
-    for a second, stricter reason: their state changes should not depend on trusting the
-    network path at all when the operator hasn't chosen to widen it.
+    bind. ``allowed_hosts`` extends this same Host allowlist with exact, operator-configured
+    remote netlocs (see ``docs/dashboard.md``); it is empty unless ``[web] allowed_hosts`` names
+    them. The five mutating routes layer ``remote_policy_allowed`` (peer-and-Host loopback, or an
+    explicit remote opt-in) on top of this for a second, stricter reason: their state changes
+    should not depend on trusting the network path at all when the operator hasn't chosen to
+    widen it.
     """
+
+    def __init__(self, app: Any, allowed_hosts: frozenset[str] = frozenset()) -> None:
+        super().__init__(app)
+        self._allowed_hosts = allowed_hosts
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        if not loopback_host(request.headers.get("host")):
+        host = request.headers.get("host")
+        if not (loopback_host(host) or remote_allowed_host(host, self._allowed_hosts)):
             response: Response = no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
         else:
             response = await call_next(request)

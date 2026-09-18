@@ -8,6 +8,8 @@ reasoning. Mutating routes are additionally loopback-gated: ``/api/policy*`` may
 ``dispatch_policy`` and ``dispatch_policy_history`` tables through :mod:`.policy_store`,
 whose SQLite authorizer refuses every other table and every schema change; ``/api/ai-policy`` invokes
 the optional fixed-argv adapter from ``config.toml`` and never writes the database or that file.
+``[web]`` in that same config file may explicitly opt a handful of exact remote ``Host`` netlocs
+into all of the above (see :mod:`.remote`); every default stays loopback-only otherwise.
 """
 
 from __future__ import annotations
@@ -46,13 +48,14 @@ from . import ai_policy
 from .ai_policy import AdapterFactory
 from .db import ReadOnlyStore
 from .policy_store import PolicyStore
+from .remote import forward_doctor, load_remote_access_config
 from .security import (
     SecurityMiddleware,
     csrf_valid,
     no_store,
     read_json_object,
+    remote_policy_allowed,
     same_origin,
-    trusted_loopback,
 )
 
 __all__ = ["build_app"]
@@ -159,11 +162,19 @@ def build_app(
     adapter_factory = ai_policy_adapter_factory or ai_policy.default_adapter_factory
     csrf_token = secrets.token_urlsafe(32)
     ai_policy_lock = asyncio.Lock()
+    remote_config = load_remote_access_config(paths.config_file)
     # The dashboard serves assets from an unpacked filesystem installation (including wheels).
     static_dir = importlib.resources.files("taskspindle.web") / "static"
 
     def _store() -> ReadOnlyStore:
         return ReadOnlyStore(db_path)
+
+    def _policy_allowed(request: Request) -> bool:
+        return remote_policy_allowed(
+            request,
+            allow_remote_policy=remote_config.allow_remote_policy,
+            allowed_hosts=remote_config.allowed_hosts,
+        )
 
     async def _doctor(app_state: Any, *, live: bool) -> dict[str, Any]:
         cache = app_state.doctor_cache
@@ -171,16 +182,21 @@ def build_app(
             elapsed = time.monotonic() - cache["at"]
             if cache["result"] is not None and elapsed < _DOCTOR_CACHE_SECONDS:
                 return cache["result"]
-        with _store() as store:
-            status_rows = store.list_provider_status()
-        result = await run_doctor_async(
-            profiles=profiles,
-            paths=paths,
-            parent_env=os.environ,
-            live_probes=live,
-            provider_status=status_rows,
-            now=clock(),
-        )
+        if remote_config.diagnostics_socket is not None:
+            # A container cannot truthfully run these checks against the host it runs on; a
+            # trusted controller does, and we never fall back to probing the container itself.
+            result = await forward_doctor(remote_config.diagnostics_socket, live=live)
+        else:
+            with _store() as store:
+                status_rows = store.list_provider_status()
+            result = await run_doctor_async(
+                profiles=profiles,
+                paths=paths,
+                parent_env=os.environ,
+                live_probes=live,
+                provider_status=status_rows,
+                now=clock(),
+            )
         if not live:
             cache["result"] = result
             cache["at"] = time.monotonic()
@@ -221,7 +237,7 @@ def build_app(
             schema_version = store.schema_version()
             db_exists = store.exists
         with policy_store_factory() as pstore:
-            policy_writable = pstore.available
+            policy_writable = pstore.available and _policy_allowed(request)
         return JSONResponse(
             {
                 "schema_version": schema_version,
@@ -500,13 +516,13 @@ def build_app(
 
     @_guard
     def policy_get_endpoint(request: Request) -> Response:
-        if not trusted_loopback(request):
+        if not _policy_allowed(request):
             return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
         return no_store(_policy_payload(clock()))
 
     @_guard
     async def policy_put_endpoint(request: Request) -> Response:
-        if not trusted_loopback(request):
+        if not _policy_allowed(request):
             return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
         if not same_origin(request):
             return no_store({"error": "ORIGIN_REQUIRED"}, status=403)
@@ -544,7 +560,7 @@ def build_app(
 
     @_guard
     async def policy_reset_endpoint(request: Request) -> Response:
-        if not trusted_loopback(request):
+        if not _policy_allowed(request):
             return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
         if not same_origin(request):
             return no_store({"error": "ORIGIN_REQUIRED"}, status=403)
@@ -649,7 +665,7 @@ def build_app(
 
     @_guard
     async def ai_policy_get_endpoint(request: Request) -> Response:
-        if not trusted_loopback(request):
+        if not _policy_allowed(request):
             return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
         hosts, adapter, missing_error = _ai_policy_setup()
         async with ai_policy_lock:
@@ -664,7 +680,7 @@ def build_app(
 
     @_guard
     async def ai_policy_put_endpoint(request: Request) -> Response:
-        if not trusted_loopback(request):
+        if not _policy_allowed(request):
             return no_store({"error": "LOOPBACK_REQUIRED"}, status=403)
         if not same_origin(request):
             return no_store({"error": "ORIGIN_REQUIRED"}, status=403)
@@ -712,6 +728,9 @@ def build_app(
         Route("/api/ai-policy", ai_policy_get_endpoint, methods=["GET"]),
         Route("/api/ai-policy", ai_policy_put_endpoint, methods=["PUT"]),
     ]
-    app = Starlette(routes=routes, middleware=[Middleware(SecurityMiddleware)])
+    app = Starlette(
+        routes=routes,
+        middleware=[Middleware(SecurityMiddleware, allowed_hosts=remote_config.allowed_hosts)],
+    )
     app.state.doctor_cache = {"result": None, "at": 0.0, "checked_at": None}
     return app

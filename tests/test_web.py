@@ -59,8 +59,10 @@ def _client(paths: Paths) -> TestClient:
     app = build_app(paths, PROFILES, clock=lambda: NOW)
     # TestClient's default base_url ("http://testserver") sends a non-loopback Host header,
     # which SecurityMiddleware now refuses on every route; every read route in this file is
-    # exercised as a loopback caller unless a test says otherwise.
-    return TestClient(app, base_url="http://127.0.0.1")
+    # exercised as a loopback caller unless a test says otherwise. TestClient's default peer
+    # ("testclient", not numeric) would also fail the stricter loopback-peer-and-Host guard that
+    # /api/health now reports through `policy_writable`, so give it a real loopback peer too.
+    return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
 
 
 def _seed(paths: Paths) -> dict[str, Any]:

@@ -8,6 +8,7 @@ connection an authorizer restricts to them (see :mod:`.app` and :mod:`.policy_st
 
 from __future__ import annotations
 
+import sys
 import threading
 import webbrowser
 from typing import TYPE_CHECKING
@@ -30,9 +31,14 @@ def serve(
     """Build the dashboard app and serve it until interrupted; returns the process exit code."""
     import uvicorn
 
+    from ..config import ConfigError
     from .app import build_app
 
-    app = build_app(paths, profiles)
+    try:
+        app = build_app(paths, profiles)
+    except ConfigError as exc:
+        print(f"taskspindle web: {exc}", file=sys.stderr)
+        return 1
     url = f"http://{host}:{port}"
     print(f"taskspindle web: {url}")
     if open_browser:

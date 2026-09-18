@@ -29,17 +29,28 @@ The dashboard binds `127.0.0.1` by default and has no user login. The task datab
 trust boundary to a local port instead of adding a second one. Binding any other address prints a
 warning to stderr; nothing stops you, but nothing behind that port asks who you are either. Do not
 put this behind a public interface without your own reverse proxy and authentication in front of
-it.
+it. There is still no app-level login or HTTPS here: an operator who widens access is expected to
+be relying on a network boundary they already trust (a private VPN), not on this dashboard to
+authenticate callers.
 
 Every route, read or write, refuses a request whose `Host` header does not name this machine
-(`127.0.0.1`, `::1`, or `localhost`, with an optional port); a browser page served from anywhere
-else cannot DNS-rebind its way to reading task prompts or diffs even after your machine resolves
-the attacker's domain to loopback, because the rebound connection still carries the attacker's
-`Host`. This check looks only at `Host`, not the TCP peer, so a deliberate `--host 0.0.0.0` bind
-still serves LAN callers. Every response also carries `X-Content-Type-Options: nosniff`,
-`Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`; `/api/*` responses add
-`Cache-Control: no-store`; and the HTML page carries a `Content-Security-Policy` that allows its
-one inline bootstrap script only via a fresh per-response nonce.
+(`127.0.0.1`, `::1`, or `localhost`, with an optional port), or exactly match one of the netlocs an
+operator has explicitly named in `[web] allowed_hosts` (see [Remote access](#remote-access) below,
+empty by default); a browser page served from anywhere else cannot DNS-rebind its way to reading
+task prompts or diffs even after your machine resolves the attacker's domain to loopback, because
+the rebound connection still carries the attacker's `Host`. Note what this check is *not*: `Host`
+is a plain, client-supplied HTTP header, not a credential, so this is a restriction on what a
+*browser* will let a rebound page send, not an authentication check on the caller. It looks only at
+the actual negotiated `Host`, never the TCP peer or any `Forwarded`/`X-Forwarded-*` header a caller
+could set to anything, so a deliberate `--host 0.0.0.0` bind still serves LAN callers, and naming a
+remote netloc in `allowed_hosts` does too. The thing actually being trusted when either is widened
+is the network path to this port — a LAN, or a private VPN an operator has already approved —
+exactly as the loopback bind always trusted the local machine's own network stack; this dashboard
+adds no login or TLS of its own on top of that. Every response also carries
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`;
+`/api/*` responses add `Cache-Control: no-store`; and the HTML page carries a
+`Content-Security-Policy` that allows its one inline bootstrap script only via a fresh per-response
+nonce.
 
 Every task read goes through a connection opened `sqlite3.connect(..., mode=ro)` with
 `PRAGMA query_only=1`: a write attempt raises rather than mutating the database. The database file
@@ -48,17 +59,18 @@ Overview and Workers use only that cached state. Loading either page starts no p
 native quota check, doctor probe, browser, or billing collection.
 
 The Policy page holds the dashboard's mutating routes. Dispatch-policy writes require: a loopback
-peer and matching `Host`; a same-origin `Origin`; the per-process `X-TaskSpindle-CSRF` header, whose
+peer and matching `Host` (or, when explicitly enabled, a request that satisfies the remote opt-in
+described below); a same-origin `Origin`; the per-process `X-TaskSpindle-CSRF` header, whose
 token is served by the page's own GET; a JSON object body of at most 64 KiB; and a state database
 already at schema 11 — the dashboard never migrates, so an older database answers
 `503 POLICY_UNAVAILABLE` instead. Underneath that, the dashboard's write connection carries a SQLite
 authorizer that permits writes to only the two policy tables; every task table stays read-only even
 on that connection, so a bug in the Policy page cannot touch task history.
 
-`GET`/`PUT /api/ai-policy` uses the same loopback peer and `Host` checks; `PUT` also requires
-same-origin `Origin`, the process CSRF token, and a JSON object body of at most 64 KiB. The browser
-cannot supply an executable, argv, or filesystem path. The only process the dashboard will spawn is
-the optional trusted adapter from TaskSpindle's existing `config.toml`:
+`GET`/`PUT /api/ai-policy` uses the same loopback-or-remote-opt-in and `Host` checks; `PUT` also
+requires same-origin `Origin`, the process CSRF token, and a JSON object body of at most 64 KiB. The
+browser cannot supply an executable, argv, or filesystem path. The only process the dashboard will
+spawn is the optional trusted adapter from TaskSpindle's existing `config.toml`:
 
 ```toml
 [ai_policy]
@@ -75,6 +87,57 @@ new Codex sessions only.
 Every other page and route remains exactly what it was: a read-only connection with
 `PRAGMA query_only=1`, no provider process, no native quota check, no doctor probe, no browser, no
 billing collection.
+
+### Remote access
+
+Running the dashboard in a container behind a private VPN (see the Compose deployment) means the
+TCP peer the container observes is never `127.0.0.1`, even for a legitimate call. Rather than widen
+trust implicitly, `taskspindle web` reads an explicit opt-in from the same `config.toml`:
+
+```toml
+[web]
+allowed_hosts = ["192.168.0.100:8765"]
+allow_remote_policy = true
+diagnostics_socket = "/run/taskspindle/diagnostics/control.sock"
+```
+
+- `allowed_hosts` names exact `host[:port]` netlocs, compared by parsed hostname and port — never a
+  prefix, wildcard, or substring — that `SecurityMiddleware` accepts on **every** route in addition
+  to the built-in loopback names. It is empty by default; an absent `[web]` table or an absent
+  `allowed_hosts` key changes nothing. Listing a remote host here alone only widens *read* access to
+  the same routes any loopback caller already reaches.
+- `allow_remote_policy` additionally lets the dispatch-policy and AI-policy GET/write routes accept
+  a request whose `Host` exactly matches a configured `allowed_hosts` entry, in place of the
+  loopback-peer requirement. It is `false` by default. Same-origin `Origin`, the CSRF header, the
+  body-size limit, and the schema-11 SQLite authorizer are unconditional and still apply. Neither
+  setting ever consults a `Forwarded` or `X-Forwarded-*` header — only the `Host` this connection
+  actually negotiated (and, for the loopback path, the actual TCP peer) counts, so a caller cannot
+  claim to be a trusted remote host it did not arrive as.
+- A field that is simply absent keeps its loopback-only default, evaluated independently per
+  field. A field that *is* present but malformed (wrong type, an unparsable host, a relative
+  diagnostics path, `[web]` itself not a table) is a configuration mistake, not a hint to guess a
+  safer reading of it: `taskspindle web` refuses to start and prints why, the same way a malformed
+  `[concurrency]` table already does, rather than silently degrading that setting to its default or
+  falling back to a local check it cannot truthfully perform.
+- `/api/health.policy_writable` reflects the actual outcome for the calling request: `true` only
+  when the policy schema is ready *and* this specific caller's `Host`/peer would pass the guard
+  above.
+
+### Diagnostics forwarding
+
+A dashboard running in a container cannot truthfully run `taskspindle doctor`'s checks against the
+host it runs on. When `[web] diagnostics_socket` names an absolute path to a private Unix control
+socket, `GET /api/doctor` (live or not) forwards its request to a trusted controller process over
+that socket instead of ever probing the container itself, via a bounded (90 s) newline-JSON
+request-response exchange asking for operation `"doctor"` with argument `{"live": bool}`. A
+missing or refused socket, or a reply that does not exactly match the `{ok: bool, checks:
+[{name: str, ok: bool, detail: str, advisory: bool}, ...]}` shape `taskspindle doctor` itself
+produces, is reported as a clear `{"ok": false, "status": "unavailable", "error": <code>}` result —
+the dashboard never falls back to running the check itself on either failure. The non-live response
+cache behaves exactly as it does without a socket configured. `diagnostics_socket` is absent by
+default, which retains the original local-check behavior; a *present* but malformed value (not an
+absolute path string) fails startup clearly rather than silently falling back to that default — see
+above.
 
 ## What it shows
 
@@ -153,19 +216,20 @@ route are `405`. Errors are JSON, never a traceback.
 | `/api/policy/reset` | POST `{if_revision}`: the GET payload after saving the defaults |
 | `/api/policy/history?limit=50` | GET: `{history: [{revision, updated_at, updated_by, fingerprint, reason}]}` |
 | `/api/policy/history/{revision}` | GET: `{revision, policy, updated_at, updated_by, reason}`; `404 POLICY_REVISION_NOT_FOUND` |
-| `/api/ai-policy` | GET: `{hosts, applies_to: "new_sessions", csrf_token}` from the configured adapter (`action: "status"`). Missing adapter: per-host `unavailable`. `Cache-Control: no-store`. Loopback peer and `Host` required. |
+| `/api/ai-policy` | GET: `{hosts, applies_to: "new_sessions", csrf_token}` from the configured adapter (`action: "status"`). Missing adapter: per-host `unavailable`. `Cache-Control: no-store`. Loopback peer and `Host` required, or the `[web]` remote opt-in. |
 | `/api/ai-policy` | PUT `{mode, hosts, expected_revisions}`: `{hosts, results, applies_to: "new_sessions", csrf_token}` after `action: "use"`. `409 AI_POLICY_APPLY_FAILED` when any host fails (including a stale revision); the body still carries fresh per-host status. Never a top-level success when any host failed. |
 
 The policy `PUT`/`POST` routes and `PUT /api/ai-policy` are the dashboard's mutating routes, and
-only they carry the guards described under [Trust model](#trust-model) — loopback peer and `Host`,
-same-origin `Origin` and the `X-TaskSpindle-CSRF` header on writes, and a bounded JSON body.
-Dispatch-policy writes also use the schema-11 SQLite authorizer limiting writes to the two policy
-tables. AI-policy writes never touch those tables or `config.toml`; they send JSON to the configured
-adapter on stdin and read JSON on stdout. `/api/health.read_only` reflects that: it is `false`
-because the process has mutating routes, while `task_database_read_only` stays `true` because the
-task tables are never in them. `policy_writable` is false when the dispatch-policy guards would
-refuse a write regardless of the request (for example, not bound to loopback);
-`policy_schema_ready` is false below schema 11.
+only they carry the guards described under [Trust model](#trust-model) — a loopback peer and
+`Host` (or the `[web]` remote opt-in), same-origin `Origin` and the `X-TaskSpindle-CSRF` header on
+writes, and a bounded JSON body. Dispatch-policy writes also use the schema-11 SQLite authorizer
+limiting writes to the two policy tables. AI-policy writes never touch those tables or
+`config.toml`; they send JSON to the configured adapter on stdin and read JSON on stdout.
+`/api/health.read_only` reflects that: it is `false` because the process has mutating routes, while
+`task_database_read_only` stays `true` because the task tables are never in them. `policy_writable`
+is `true` only when the dispatch-policy schema is ready *and* the calling request would itself pass
+the guard above (loopback, or the explicit remote opt-in); `policy_schema_ready` is false below
+schema 11.
 
 The AI-policy adapter contract is stdin
 `{action: "status"|"use", hosts, mode (use only), expected_revisions (required for use)}` and
