@@ -107,6 +107,23 @@ class DockerBackend:
                 "reserved", "creating", "created", "starting", "started", "finished", "failed", "retired",
             }:
                 raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid launch state")
+            if not isinstance(record["identity"], str):
+                raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid turn identity")
+            if "container_id" in record and not isinstance(record["container_id"], str):
+                raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid container ID")
+            evidence = record.get("evidence")
+            if evidence is not None:
+                template = asdict(UnitState("", "", "", ""))
+                if (not isinstance(evidence, dict) or set(evidence) != set(template)
+                        or any(not isinstance(evidence[key], str) for key in (
+                            "load_state", "active_state", "sub_state", "result",
+                        )) or any(evidence[key] is not None and type(evidence[key]) is not int
+                                  for key in ("exec_main_status", "main_pid"))):
+                    raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid exit evidence")
+            if record["phase"] in {"finished", "retired"} and (
+                evidence is None or UnitState(**evidence).kind not in {"success", "exit", "oom", "signal"}
+            ):
+                raise UnitError("UNIT_RECORD_INVALID", "Terminal execution record has no terminal evidence")
         return record
 
     def _save(self, record: dict[str, Any]) -> None:
@@ -224,6 +241,7 @@ class DockerBackend:
                 raise ConfigError("AGY seccomp profile must be a readable restrictive JSON profile") from exc
             security.append("seccomp=" + json.dumps(value, separators=(",", ":")))
         return dict(user=self.user, mounts=self._mounts(provider, probe=probe), init=True,
+                    use_config_proxy=False,
                     restart_policy={"Name": "no"}, auto_remove=False, cap_drop=["ALL"],
                     security_opt=security, privileged=False, read_only=True,
                     tmpfs={"/tmp": "rw,nosuid,nodev,size=512m,mode=1777"},
@@ -284,8 +302,9 @@ class DockerBackend:
                     raise UnitError("UNIT_START_UNCERTAIN", "Earlier launch cannot be inspected") from exc
                 if container is not None:
                     observed = self._observe(record, container)
-                    if (observed.kind == "active"
-                            or (record["identity"] == identity and observed.kind != "unknown")):
+                    if observed.kind == "active" and record["identity"] != identity:
+                        raise UnitError("UNIT_PREVIOUS_TURN_ACTIVE", "An earlier turn still owns the running job")
+                    if record["identity"] == identity and observed.kind != "unknown":
                         return
                 if record["phase"] not in {"retired", "failed", "finished"}:
                     raise UnitError("UNIT_START_UNCERTAIN", "An earlier launch has an unsettled outcome")
@@ -474,18 +493,28 @@ class DockerBackend:
         uid = self.user.split(":")[0]
         options["tmpfs"][str(self.paths.state_dir)] = f"rw,nosuid,nodev,uid={uid},mode=700"
         container = None
+        name = f"taskspindle-probe-{uuid.uuid4().hex}"
         try:
             self.client.images.get(self.image)
-            container = self.client.containers.create(
-                self.image, list(argv), name=f"taskspindle-probe-{uuid.uuid4().hex}",
-                labels={"taskspindle.owner": self.owner, "taskspindle.kind": "diagnostic"},
-                environment={"HOME": os.environ.get("HOME", "/home/bsheffield"),
-                             "XDG_STATE_HOME": str(self.paths.state_dir.parent), **(env or {}),
-                             "TASKSPINDLE_CONFIG": str(self.paths.config_file),
-                             "TASKSPINDLE_WORKER_CONTAINER": "1",
-                             "PATH": "/opt/taskspindle/.venv/bin:/usr/local/bin:/usr/bin:/bin",
-                             "XDG_DATA_HOME": "/opt/taskspindle/data"}, **options,
-            )
+            try:
+                container = self.client.containers.create(
+                    self.image, list(argv), name=name,
+                    labels={"taskspindle.owner": self.owner, "taskspindle.kind": "diagnostic"},
+                    environment={"HOME": os.environ.get("HOME", "/home/bsheffield"),
+                                 "XDG_STATE_HOME": str(self.paths.state_dir.parent), **(env or {}),
+                                 "TASKSPINDLE_CONFIG": str(self.paths.config_file),
+                                 "TASKSPINDLE_WORKER_CONTAINER": "1",
+                                 "PATH": "/opt/taskspindle/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+                                 "XDG_DATA_HOME": "/opt/taskspindle/data"}, **options,
+                )
+            except Exception:
+                # Recover an accepted create with a lost reply so its owned container is cleaned.
+                recovered = self.client.containers.get(name)
+                labels = recovered.attrs.get("Config", {}).get("Labels", {})
+                if (labels.get("taskspindle.owner") == self.owner
+                        and labels.get("taskspindle.kind") == "diagnostic"):
+                    container = recovered
+                raise
             container.start()
             result = container.wait(timeout=timeout)
             stdout = container.logs(stdout=True, stderr=False, tail=1000)[-65536:].decode("utf-8", "replace")

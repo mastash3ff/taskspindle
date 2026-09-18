@@ -320,3 +320,38 @@ def test_restrictive_seccomp_applies_only_agy(setup, tmp_path):
     assert len(backend._options("agy")["security_opt"]) == 2
     assert len(backend._options("claude")["security_opt"]) == 1
     assert len(backend._options(None)["security_opt"]) == 1
+
+
+def test_malformed_terminal_evidence_cannot_authorize_relaunch_or_cleanup(setup):
+    backend, _ = setup
+    launch(backend)
+    path = backend.directory / "taskspindle-worker-ts_one.json"
+    record = json.loads(path.read_text())
+    record["phase"] = "finished"
+    record["evidence"] = {"result": "success"}
+    path.write_text(json.dumps(record))
+    for method in (backend.show, backend.reset_failed):
+        with pytest.raises(UnitError) as caught:
+            method("taskspindle-worker-ts_one")
+        assert caught.value.code == "UNIT_RECORD_INVALID"
+
+
+def test_running_older_turn_is_not_acknowledged_as_new_launch(setup):
+    backend, client = setup
+    launch(backend)
+    with sqlite3.connect(backend.paths.state_dir / "taskspindle.sqlite3") as db:
+        db.execute("INSERT INTO turns VALUES (2, 'ts_one')")
+    with pytest.raises(UnitError) as caught:
+        launch(backend)
+    assert caught.value.code == "UNIT_PREVIOUS_TURN_ACTIVE"
+    assert len(client.containers.created) == 1
+
+
+def test_probe_lost_create_reply_is_cleaned_without_inference_replay(setup):
+    backend, client = setup
+    client.containers.create_failure = "after"
+    with pytest.raises(UnitError) as caught:
+        backend.run_probe("claude", ["taskspindle", "doctor", "--json", "--no-live"])
+    assert caught.value.code == "DIAGNOSTIC_FAILED"
+    assert not client.containers.values
+    assert client.containers.created[0][3].starts == 0
