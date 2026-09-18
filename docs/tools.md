@@ -207,11 +207,34 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `review_target` | object\|null | `null` | **review only, required** |
 | `review_kind` | `"standard"`\|`"adversarial"` | `"standard"` | review only; the reviewer's stance, recorded on the task and its review — see [the review contract](#the-review-contract) |
 | `role` | string\|null | `null` | matches `^[a-z][a-z0-9_-]*$`, at most 32 characters; recorded on the task for reporting only, does not select a provider or change admission |
+| `context_files` | string[]\|null | `null` | absolute paths under the operator's `[context_files]` roots whose contents are copied into the worker's first turn — see [handing over context](#handing-over-context) |
 
 `review_target` is either
 `{"kind": "candidate", "task_id": …, "candidate_sha": …}` — review another task's staged candidate —
 or `{"kind": "snapshot", "repository": …, "expected_head": …, "paths": [...]}`, which commits the
 current working tree to `refs/taskspindle/snapshots/<id>` and reviews that.
+
+#### Handing over context
+
+`context_files` lets the coordinator hand a worker what it already knows — a design note, a
+failing log, a transcript excerpt — instead of retyping it into `prompt`. The server reads each
+file under the operator's `[context_files]` allowlist (see
+[configuration.md](configuration.md#context_files)) and appends them to the first turn after
+the prompt, each framed as `--- BEGIN CONTEXT FILE n/N: <path> (<bytes> bytes) ---` … `--- END
+CONTEXT FILE n/N ---`, under a header telling the worker they are reference material copied at
+dispatch time, possibly stale, and not part of the repository. The exact text is kept as the
+task's `context_files` artifact (`state_dir/tasks/<id>/context_files.md`), and the paths are
+recorded on the task (`task_status.context_files`). Only the initial turn carries them;
+`continue_task` does not repeat them.
+
+Every path is checked before any row is written, so a refusal leaves no task behind. The
+request itself must give absolute, canonical paths with no `..` segment. The read then refuses,
+as `INVALID_REQUEST` with `details.code` set to one of: `CONTEXT_FILES_DISABLED` (no
+`[context_files]` table), `CONTEXT_PATH_DENIED` (not under an allowed root, or unresolvable),
+`CONTEXT_FILE_UNSAFE` (a symlink anywhere in the path, not a regular file, more than one hard
+link, or a NUL byte), `CONTEXT_FILE_TOO_LARGE` (over the per-file or per-task byte cap) and
+`CONTEXT_FILES_TOO_MANY`. Under the Docker backend the server reads from inside the runtime
+container, so only paths beneath an `[execution]` mount can ever be handed over.
 
 One call, in full:
 
@@ -268,6 +291,7 @@ Returns `{"tasks": [<task view>]}`, newest first.
 carries `evidence` and `manual_action` — see [recovery.md](recovery.md). Errors: `TASK_NOT_FOUND`.
 
 A review task's view also carries `review_kind`; it is `null` on every other mode.
+`context_files` lists the paths handed over at dispatch, empty when there were none.
 `task_status` also returns `resume`, the same [native resume handle](#reopening-a-workers-session)
 `task_result` carries, or `null` before the worker has opened a session.
 

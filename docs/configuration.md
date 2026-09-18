@@ -150,6 +150,28 @@ agent that speaks ACP 0.12 over stdio can be configured this way; whether it hon
 denial or a cancel is between you and that agent. Harnesses with no ACP stdio endpoint are out of
 scope: there is no other transport.
 
+## `[context_files]`
+
+Absent by default, which means `start_task(context_files=...)` is refused with
+`CONTEXT_FILES_DISABLED`. Present, it is the allowlist under which the server reads files a
+coordinator hands to a worker (see [tools.md](tools.md#handing-over-context)):
+
+```toml
+[context_files]
+roots = ["/home/me/notes", "/home/me/projects"]
+max_file_bytes = 262144    # per file; ceiling 1 MiB
+max_total_bytes = 1048576  # per task; ceiling 4 MiB
+max_files = 16             # per task; ceiling 32
+```
+
+`roots` is required and every entry must be an absolute path to a directory that exists **from
+where the server runs**. Under the Docker backend that is inside the runtime container, so a
+root must be one of `[execution].mounts` or lie beneath one, and the table belongs in the
+container's config file rather than the host's. Roots are resolved once at load; a file is read
+only if its canonical path is beneath a root, contains no symlink, is a regular file with a
+single hard link, and is within the caps. The caps are separate from the 96 KiB review diff
+limit, so a review can carry both. Any malformed field raises `ConfigError` at startup.
+
 ## `[ai_policy]`
 
 An optional fixed-argv adapter for Codex AI-mode policies, invoked by the dashboard's Policy page. The

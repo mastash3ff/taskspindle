@@ -17,6 +17,7 @@ import pytest
 
 from taskspindle import repos, runner, service, units, worktrees
 from taskspindle.config import Paths
+from taskspindle.context_files import ContextFile
 from taskspindle.models import (
     AuthMode,
     EventKind,
@@ -1136,6 +1137,39 @@ def test_compose_prompt_states_the_rules_each_mode_needs(
     assert "Change only files under these path prefixes: src" in text
     assert "- pytest -q" in text
     assert "Do not spawn subagents" in text
+
+
+def test_context_section_frames_each_file_and_only_initial_turns_carry_it(
+    store: Store, paths: Paths, make_repo
+) -> None:
+    files = [
+        ContextFile(path="/notes/design.md", text="be careful\n", size=11),
+        ContextFile(path="/notes/api.json", text="{}", size=2),
+    ]
+    section = runner.context_section(files)
+    assert section.startswith("\n\nContext handed over by the coordinator.")
+    first = (
+        "--- BEGIN CONTEXT FILE 1/2: /notes/design.md (11 bytes) ---\n"
+        "be careful\n\n--- END CONTEXT FILE 1/2 ---"
+    )
+    second = "--- BEGIN CONTEXT FILE 2/2: /notes/api.json (2 bytes) ---\n{}\n--- END CONTEXT FILE 2/2 ---"
+    assert first in section
+    assert second in section
+    assert runner.context_section([]) == ""
+
+    consult = seed_task(store, paths, mode=Mode.CONSULT, prompt="what shape?")
+    assert runner.compose_prompt(consult, TurnKind.INITIAL, context=section) == f"what shape?{section}"
+    assert runner.compose_prompt(consult, TurnKind.CONTINUE, continuation="more") == "Continue.\n\nmore"
+
+    built = seed_task(store, paths, mode=Mode.IMPLEMENT, repo=make_repo("ctx"), verification=("true",))
+    text = runner.compose_prompt(built, TurnKind.INITIAL, context=section)
+    assert text.startswith(f"do the thing{section}\n\n")
+    assert text.endswith("Finish with a short summary of what changed.")
+
+    target = {"kind": "candidate", "task_id": "ts_000000000009", "candidate_sha": "c" * 40}
+    review = seed_task(store, paths, mode=Mode.REVIEW, prompt="look", review_target=target)
+    text = runner.compose_prompt(review, TurnKind.INITIAL, review_diff=b"+x", context=section)
+    assert text.endswith(f"```{section}")
 
 
 def test_review_kind_selects_the_preamble_and_leaves_the_contract_alone(

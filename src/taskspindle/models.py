@@ -18,6 +18,8 @@ PROVIDER_CLAUDE = "claude"
 PROVIDER_GROK = "grok"
 
 MAX_SUBJECT_LENGTH = 72
+#: The request-level cap on ``context_files``; the operator's configured cap may be lower.
+MAX_CONTEXT_FILES_PER_REQUEST = 32
 
 
 class Mode(StrEnum):
@@ -276,6 +278,9 @@ class StartTaskRequest(BaseModel):
     #: reviewer to assume the change is wrong and hunt for the evidence. The output contract and
     #: the acceptance rules are identical for both.
     review_kind: ReviewKind = "standard"
+    #: Absolute paths of files whose contents are copied into the worker's first turn, read by
+    #: the server under the operator's ``[context_files]`` allowlist. Any mode.
+    context_files: list[str] | None = None
 
     @field_validator("provider", "prompt")
     @classmethod
@@ -290,6 +295,25 @@ class StartTaskRequest(BaseModel):
         if value is None:
             return None
         return [_check_path_prefix(entry) for entry in value]
+
+    @field_validator("context_files")
+    @classmethod
+    def _check_context_files(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        if len(value) > MAX_CONTEXT_FILES_PER_REQUEST:
+            raise ValueError(f"at most {MAX_CONTEXT_FILES_PER_REQUEST} context files per task")
+        seen: list[str] = []
+        for item in value:
+            if not item or "\x00" in item:
+                raise ValueError("context file paths must be non-empty text")
+            if not item.startswith("/"):
+                raise ValueError(f"context file {item!r} must be an absolute path")
+            if any(part == ".." for part in item.split("/")):
+                raise ValueError(f"context file {item!r} must not contain a '..' segment")
+            if item not in seen:
+                seen.append(item)
+        return seen
 
     @field_validator("candidate_message")
     @classmethod
@@ -350,6 +374,7 @@ class TaskRecord(BaseModel):
     candidate_message: str | None = None
     review_target: dict[str, Any] | None = None
     review_kind: str | None = None
+    context_files: list[str] | None = None
     base_head: str | None = None
     target_head: str | None = None
     branch: str | None = None
@@ -393,6 +418,7 @@ class TaskRecord(BaseModel):
 #: ``tasks`` columns stored as JSON text.
 TASK_JSON_COLUMNS: tuple[str, ...] = (
     "path_prefixes",
+    "context_files",
     "verification_commands",
     "review_target",
     "oauth_evidence",
@@ -433,6 +459,7 @@ class TaskView(BaseModel):
     resolved_effort: str | None = None
     role: str | None = None
     review_kind: str | None = None
+    context_files: list[str] = Field(default_factory=list)
     reported_model: str | None = None
     oauth_evidence: dict[str, Any] = Field(default_factory=dict)
     candidate_sha: str | None = None

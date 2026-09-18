@@ -14,6 +14,13 @@
   parser and the acceptance rules are unchanged. The kind is recorded on the task, its review row
   and the `REVIEW_RECORDED` event, and shown on the dashboard. Schema 13 adds
   `tasks.review_kind` and `reviews.kind`; rows written before it read as `standard`.
+- **A coordinator can hand files to a worker.** `start_task` takes `context_files`, absolute
+  paths the server reads under a new opt-in `[context_files]` allowlist and appends to the first
+  turn, each framed with its path and size under a header that marks it as reference material.
+  The text is kept as the task's `context_files` artifact and the paths on the task. Reads
+  refuse symlinks, hard links, non-regular files, binary content and anything over the
+  configured caps, before any task row exists. Without the table the request is refused with
+  `CONTEXT_FILES_DISABLED`. Schema 14 adds `tasks.context_files`.
 
 ## v0.6.1
 

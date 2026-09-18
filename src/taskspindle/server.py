@@ -24,7 +24,7 @@ from pydantic import BaseModel, ValidationError
 
 from . import doctor as doctor_module
 from . import providers, units
-from .config import Paths, concurrency_limits, load_config
+from .config import Paths, concurrency_limits, context_files_config, load_config
 from .config import paths as default_paths
 from .models import (
     AcceptTaskRequest,
@@ -483,6 +483,7 @@ def build_orchestrator(
         boot=units.boot_id(),
         parent_env=env,
         concurrency=concurrency_limits(settings, profiles),
+        context_files=context_files_config(settings),
     )
     return orchestrator, store
 

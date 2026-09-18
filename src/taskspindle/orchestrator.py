@@ -36,9 +36,11 @@ from . import (
     worktrees,
 )
 from .config import (
+    ContextFilesConfig,
     Paths,
     concurrency_limits,
 )
+from .context_files import ContextFile, read_context_files
 from .integration import Journal
 from .models import (
     ACTIVE_STATES,
@@ -57,7 +59,7 @@ from .models import (
 )
 from .providers import Profile, ProfileError
 from .repos import GitError, RepositoryIdentity, RootSnapshot
-from .runner import compose_prompt
+from .runner import compose_prompt, context_section
 from .service import (
     ACCEPT_BLOCKED,
     ACCEPT_FAILED,
@@ -215,9 +217,12 @@ class Orchestrator:
         parent_env: Mapping[str, str],
         clock: Callable[[], datetime] = utcnow,
         concurrency: Mapping[str, int] | None = None,
+        context_files: ContextFilesConfig | None = None,
     ) -> None:
         self.store = store
         self.paths = paths
+        #: The ``[context_files]`` allowlist; None means ``start_task(context_files=...)`` is refused.
+        self.context_files = context_files
         self.profiles = dict(profiles)
         self.concurrency = concurrency_limits({"concurrency": dict(concurrency or {})}, profiles)
         self.units = units
@@ -663,6 +668,8 @@ class Orchestrator:
                 model=model, parent_env=self.parent_env,
             )
             placement = self._placement(request)
+            # Read the handed-over files before any row exists, so a refused path leaves no task.
+            context = read_context_files(request.context_files or [], self.context_files)
             with self.store.transaction():
                 if placement.repository_id:
                     require_grant(
@@ -689,7 +696,7 @@ class Orchestrator:
                 self.store.set_task_auth_context(
                     record.id, auth_context.fingerprint(profile, self.parent_env),
                 )
-            self._prepare(record, request, placement)
+            self._prepare(record, request, placement, context=context)
             self.dispatch_queued()
             final = require_task(self.store, record.id)
         return _acknowledge(final)
@@ -806,6 +813,8 @@ class Orchestrator:
         record: TaskRecord,
         request: StartTaskRequest,
         placement: _Placement,
+        *,
+        context: Sequence[ContextFile] = (),
     ) -> None:
         """Put the task's workspace on disk, open its first turn, and queue it."""
         try:
@@ -818,13 +827,30 @@ class Orchestrator:
             raise TaskSpindleError(INVALID_REQUEST, str(exc), details={"code": exc.code}) from exc
 
         task = self.store.update_task(record.id, None, bump_version=False, **fields)
+        section = context_section(context)
+        if section:
+            self._write_context_bundle(task.id, section)
         self.store.insert_turn(
             task.id,
             task.candidate_revision + 1,
             TurnKind.INITIAL.value,
-            prompt=compose_prompt(task, TurnKind.INITIAL, review_diff=self._review_diff(task, placement)),
+            prompt=compose_prompt(
+                task,
+                TurnKind.INITIAL,
+                review_diff=self._review_diff(task, placement),
+                context=section,
+            ),
         )
         transition(self.store, task.id, TaskState.QUEUED, reason="prepared")
+
+    def _write_context_bundle(self, task_id: str, section: str) -> None:
+        """Keep the exact context text the first turn carried, as an artifact of revision 0."""
+        path = self.task_dir(task_id) / "context_files.md"
+        payload = section.encode("utf-8")
+        path.write_bytes(payload)
+        self.store.insert_artifact(
+            task_id, 0, "context_files", "sha256:" + _digest(payload), len(payload), str(path)
+        )
 
     def _review_diff(self, task: TaskRecord, placement: _Placement) -> bytes | None:
         """The change a review task looks at, so a reviewer that cannot run git still sees it.

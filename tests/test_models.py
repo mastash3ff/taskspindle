@@ -69,6 +69,22 @@ def test_an_unknown_review_kind_is_rejected() -> None:
         )
 
 
+def test_context_files_default_to_none_and_deduplicate() -> None:
+    assert StartTaskRequest(**CONSULT_FIELDS).context_files is None
+    request = StartTaskRequest(**CONSULT_FIELDS, context_files=["/a/b.md", "/c.md", "/a/b.md"])
+    assert request.context_files == ["/a/b.md", "/c.md"]
+    assert StartTaskRequest(**IMPLEMENT_FIELDS, context_files=["/a.md"]).context_files == ["/a.md"]
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [["relative.md"], ["/a/../etc/passwd"], [""], ["/has\x00nul"], [f"/f{i}" for i in range(33)]],
+)
+def test_bad_context_file_paths_are_rejected(paths: list[str]) -> None:
+    with pytest.raises(ValidationError):
+        StartTaskRequest(**CONSULT_FIELDS, context_files=paths)
+
+
 def test_role_is_recorded_as_given() -> None:
     request = StartTaskRequest(provider="grok", mode=Mode.CONSULT, prompt="q", role="code-reviewer_2")
     assert request.role == "code-reviewer_2"

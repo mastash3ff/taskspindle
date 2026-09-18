@@ -402,6 +402,7 @@ def create_task(
         candidate_message=request.candidate_message,
         review_target=(request.review_target.model_dump(mode="json") if request.review_target else None),
         review_kind=request.review_kind if request.mode is Mode.REVIEW else None,
+        context_files=request.context_files or None,
         created_at=stamp,
         updated_at=stamp,
     )
@@ -824,6 +825,7 @@ def task_view(record: TaskRecord) -> TaskView:
         resolved_effort=record.resolved_effort,
         role=record.role,
         review_kind=record.review_kind,
+        context_files=list(record.context_files or []),
         reported_model=record.reported_model,
         oauth_evidence=record.oauth_evidence or {},
         candidate_sha=record.candidate_sha,

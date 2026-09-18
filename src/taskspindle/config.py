@@ -17,8 +17,14 @@ from typing import Any
 import taskspindle
 
 __all__ = [
-    "ConfigError", "Paths", "concurrency_limits", "load_config", "paths", "warn_retired_settings",
+    "ConfigError", "ContextFilesConfig", "Paths", "concurrency_limits", "context_files_config",
+    "load_config", "paths", "warn_retired_settings",
 ]
+
+#: Hard ceilings for ``[context_files]``; the table may lower them, never raise them.
+MAX_CONTEXT_FILE_BYTES = 1024 * 1024
+MAX_CONTEXT_TOTAL_BYTES = 4 * 1024 * 1024
+MAX_CONTEXT_FILES = 32
 
 #: Config tables that once configured deleted machinery. They are accepted and ignored, with one
 #: warning, so a config file written for an older release still loads.
@@ -96,6 +102,66 @@ def concurrency_limits(settings: Mapping[str, Any], providers: Iterable[str]) ->
         if type(limit) is not int or limit < 1:
             raise ConfigError(f"concurrency.{provider} must be a positive integer")
     return {provider: configured.get(provider, 1) for provider in sorted(names)}
+
+
+@dataclass(frozen=True)
+class ContextFilesConfig:
+    """The operator's allowlist for ``start_task(context_files=...)``.
+
+    ``roots`` are the only directories a coordinator may hand files from. Under the Docker
+    backend the server reads them from inside the runtime container, so each root must also be
+    one of ``[execution].mounts`` or lie beneath one.
+    """
+
+    roots: tuple[Path, ...]
+    max_file_bytes: int = 256 * 1024
+    max_total_bytes: int = 1024 * 1024
+    max_files: int = 16
+
+
+def context_files_config(settings: Mapping[str, Any]) -> ContextFilesConfig | None:
+    """Read ``[context_files]``; an absent table means the handoff is off.
+
+    Once the table is present every field it names must be well-formed, exactly as ``[web]``
+    and ``[concurrency]`` behave: a relative root, a root that is not a directory here, or a
+    limit that is not a positive integer within its ceiling raises :class:`ConfigError`.
+    """
+    table = settings.get("context_files")
+    if table is None:
+        return None
+    if not isinstance(table, dict):
+        raise ConfigError("[context_files] must be a table")
+    raw_roots = table.get("roots")
+    if not isinstance(raw_roots, list) or not raw_roots:
+        raise ConfigError("[context_files] roots must be a non-empty list of absolute directory paths")
+    roots: list[Path] = []
+    for item in raw_roots:
+        if not isinstance(item, str) or not item or "\x00" in item or not Path(item).is_absolute():
+            raise ConfigError("[context_files] roots must be absolute directory paths")
+        root = Path(item).resolve()
+        if not root.is_dir():
+            raise ConfigError(
+                f"[context_files] root is not a directory from where the server runs: {item} "
+                "(under the Docker backend it must be inside an [execution] mount)"
+            )
+        roots.append(root)
+    limits = {
+        "max_file_bytes": MAX_CONTEXT_FILE_BYTES,
+        "max_total_bytes": MAX_CONTEXT_TOTAL_BYTES,
+        "max_files": MAX_CONTEXT_FILES,
+    }
+    values: dict[str, int] = {}
+    for key, ceiling in limits.items():
+        if key not in table:
+            continue
+        value = table[key]
+        if type(value) is not int or value < 1 or value > ceiling:
+            raise ConfigError(f"[context_files] {key} must be an integer between 1 and {ceiling}")
+        values[key] = value
+    unknown = set(table) - {"roots", *limits}
+    if unknown:
+        raise ConfigError(f"[context_files] contains unknown key(s): {', '.join(sorted(unknown))}")
+    return ContextFilesConfig(roots=tuple(roots), **values)
 
 
 def warn_retired_settings(settings: Mapping[str, Any]) -> None:

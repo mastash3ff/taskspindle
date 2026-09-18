@@ -755,6 +755,12 @@ ALTER TABLE tasks ADD COLUMN review_kind TEXT;
 ALTER TABLE reviews ADD COLUMN kind TEXT NOT NULL DEFAULT 'standard';
 """
 
+# The absolute paths a coordinator handed to a task as context, for the record; the copied
+# text itself lives in the task's ``context_files`` artifact and first turn.
+_MIGRATION_14 = """
+ALTER TABLE tasks ADD COLUMN context_files TEXT;
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -769,6 +775,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (11, _MIGRATION_11),
     (12, _MIGRATION_12),
     (13, _MIGRATION_13),
+    (14, _MIGRATION_14),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.

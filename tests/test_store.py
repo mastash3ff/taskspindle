@@ -56,7 +56,7 @@ def test_open_creates_a_private_file_and_applies_every_migration(tmp_path: Path)
     mode = stat.S_IMODE(store.path.stat().st_mode)
     assert mode == 0o600
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
-    assert store.schema_version() == 13
+    assert store.schema_version() == 14
     store.close()
 
 
@@ -138,7 +138,7 @@ def test_schema_12_migration_drops_the_collapsed_tables_and_keeps_the_rest(
                 assert store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
 
     with Store.open(path) as reopened:
-        assert reopened.schema_version() == 13
+        assert reopened.schema_version() == 14
         for table in dropped_tables:
             with pytest.raises(sqlite3.OperationalError, match="no such table"):
                 reopened._conn.execute(f"SELECT * FROM {table}")
@@ -170,7 +170,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store.close()
     reopened = Store.open(tmp_path / "state" / "taskspindle.sqlite3")
     assert reopened.migrate() == []
-    assert reopened.schema_version() == 13
+    assert reopened.schema_version() == 14
     reopened.close()
 
 

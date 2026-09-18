@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from taskspindle import policy, repos, runner, service
-from taskspindle.config import Paths
+from taskspindle.config import ContextFilesConfig, Paths
 from taskspindle.models import (
     AcceptTaskRequest,
     AuthMode,
@@ -635,6 +635,63 @@ def test_the_review_turn_is_given_the_candidate_diff(harness: Harness, make_repo
     assert "```diff" in prompt
     assert "src/new.txt" in prompt
     assert "+hello" in prompt
+
+
+def test_context_files_are_refused_without_configuration_and_leave_no_task(
+    harness: Harness, tmp_path: Path
+) -> None:
+    note = tmp_path / "note.md"
+    note.write_text("remember this\n", encoding="utf-8")
+    assert harness.orchestrator.context_files is None
+    with pytest.raises(TaskSpindleError) as caught:
+        harness.orchestrator.start_task(
+            StartTaskRequest(
+                provider=AUTHOR, mode=Mode.CONSULT, prompt="think", timeout_s=60,
+                context_files=[str(note)],
+            )
+        )
+    assert caught.value.code == service.INVALID_REQUEST
+    assert caught.value.details["code"] == "CONTEXT_FILES_DISABLED"
+    assert harness.orchestrator.list_tasks()["tasks"] == []
+
+
+def test_context_files_reach_the_first_turn_and_are_kept_as_an_artifact(
+    harness: Harness, tmp_path: Path
+) -> None:
+    root = tmp_path / "ctx"
+    root.mkdir()
+    note = root / "note.md"
+    note.write_text("remember this\n", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n", encoding="utf-8")
+    harness.orchestrator.context_files = ContextFilesConfig(roots=(root.resolve(),))
+
+    with pytest.raises(TaskSpindleError) as caught:
+        harness.orchestrator.start_task(
+            StartTaskRequest(
+                provider=AUTHOR, mode=Mode.CONSULT, prompt="think", timeout_s=60,
+                context_files=[str(outside)],
+            )
+        )
+    assert caught.value.details["code"] == "CONTEXT_PATH_DENIED"
+    assert harness.orchestrator.list_tasks()["tasks"] == []
+
+    started = harness.orchestrator.start_task(
+        StartTaskRequest(
+            provider=AUTHOR, mode=Mode.CONSULT, prompt="think", timeout_s=60,
+            context_files=[str(note)],
+        )
+    )
+    task_id = started["task_id"]
+    o = harness.orchestrator
+    prompt = o.store.list_turns(task_id)[0]["prompt"]
+    assert prompt.startswith("think\n\nContext handed over by the coordinator.")
+    assert f"--- BEGIN CONTEXT FILE 1/1: {note} (14 bytes) ---\nremember this\n" in prompt
+    artifact = o.store.get_artifact(task_id, 0, "context_files")
+    assert artifact is not None
+    assert Path(artifact["path"]).read_text(encoding="utf-8") == prompt[len("think"):]
+    assert o.task_status(task_id)["context_files"] == [str(note)]
+    assert o.store.get_task(task_id).context_files == [str(note)]
 
 
 def test_an_adversarial_review_is_briefed_recorded_and_accepted_like_any_other(

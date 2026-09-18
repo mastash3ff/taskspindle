@@ -21,11 +21,11 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from . import (
     auth_context,
@@ -157,6 +157,39 @@ Give PASS only after looking for all of the above and finding nothing.
 _REVIEW_PREAMBLES: dict[str, str] = {"standard": "", "adversarial": _ADVERSARIAL_REVIEW_PREAMBLE}
 
 
+class HandedFile(Protocol):
+    """What :func:`context_section` needs from a file: its path, text and byte size."""
+
+    @property
+    def path(self) -> str: ...
+    @property
+    def text(self) -> str: ...
+    @property
+    def size(self) -> int: ...
+
+
+_CONTEXT_HEADER = """
+Context handed over by the coordinator. These files are reference material copied at dispatch
+time; they are not part of the repository unless their path says so, and they may be stale.
+Read them before starting.
+""".strip()
+
+
+def context_section(files: Sequence[HandedFile]) -> str:
+    """The prompt section carrying coordinator-supplied files, or "" when there are none."""
+    if not files:
+        return ""
+    count = len(files)
+    parts = [_CONTEXT_HEADER]
+    for index, item in enumerate(files, start=1):
+        parts.append(
+            f"--- BEGIN CONTEXT FILE {index}/{count}: {item.path} ({item.size} bytes) ---\n"
+            f"{item.text}\n"
+            f"--- END CONTEXT FILE {index}/{count} ---"
+        )
+    return "\n\n" + "\n\n".join(parts)
+
+
 def _review_subject(task: TaskRecord) -> str:
     """A one-line description of what a review task is looking at."""
     raw = task.review_target or {}
@@ -195,17 +228,20 @@ def compose_prompt(
     *,
     continuation: str | None = None,
     review_diff: bytes | None = None,
+    context: str | None = None,
 ) -> str:
     """Build the text of one turn.
 
     It lives here rather than in the server so that both sides compose turns the same way: the
     server writes the prompt into the pending turn row, and the worker sends whatever it finds
-    there.
+    there. ``context`` is the :func:`context_section` of the coordinator's handed-over files;
+    only the initial turn carries it.
     """
     if kind is TurnKind.REPAIR:
         return f"Continue in this same session and worktree.\n\n{continuation or task.prompt}"
     if kind is TurnKind.CONTINUE:
         return f"Continue.\n\n{continuation or task.prompt}"
+    context = context or ""
     if task.mode is Mode.IMPLEMENT:
         commands = task.verification_commands or []
         rules = _IMPLEMENT_RULES.format(
@@ -213,14 +249,14 @@ def compose_prompt(
             criteria=(task.acceptance_criteria or "").strip(),
             commands="\n".join(f"- {command}" for command in commands) or "- (none)",
         )
-        return f"{task.prompt}\n\n{rules}"
+        return f"{task.prompt}{context}\n\n{rules}"
     if task.mode is Mode.REVIEW:
         rules = _REVIEW_RULES.format(subject=_review_subject(task))
         preamble = _REVIEW_PREAMBLES.get(task.review_kind or "standard", "")
         if preamble:
             rules = f"{preamble}\n\n{rules}"
-        return f"{rules}\n\n{task.prompt}{review_diff_section(review_diff)}"
-    return task.prompt
+        return f"{rules}\n\n{task.prompt}{review_diff_section(review_diff)}{context}"
+    return f"{task.prompt}{context}"
 
 
 # -- internal control flow ------------------------------------------------------------------
