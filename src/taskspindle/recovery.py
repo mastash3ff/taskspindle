@@ -169,6 +169,7 @@ def reconcile(
                     moment=moment,
                     stale_after_s=stale_after_s,
                     accept_recover=accept_recover,
+                    workers_only=workers_only,
                 )
             except (TaskSpindleError, UnitError) as exc:
                 action = _strand(store, task, f"{_RECONCILE_FAILED}:{exc.code}")
@@ -221,6 +222,7 @@ def _reconcile_task(
     moment: datetime,
     stale_after_s: int,
     accept_recover: Callable[[TaskRecord], AcceptOutcome] | None,
+    workers_only: bool = False,
 ) -> ReconcileAction | None:
     unit_state: UnitState | None = None
     lease = store.get_lease(task.provider, task.id)
@@ -243,7 +245,24 @@ def _reconcile_task(
         return None
     elif not task.unit_name and task.state in _AWAITING_DISPATCH and _has_pending_turn(store, task):
         # A continuation that lost the race for its provider's lease. Its turn is written and
-        # waiting; the next dispatch pass will start it. There is no unit to ask about.
+        # waiting. After explicit interruption, its previous runner may have left a signed
+        # lease even though the continuation deliberately cleared the task's unit identity.
+        if (
+            workers_only and lease and lease["pid"] is not None
+            and lease["unit_name"] == worker_unit_name(task.id)
+        ):
+            previous = backend.show(worker_unit_name(task.id))
+            if previous.kind in {*_BY_KIND, "not_found"}:
+                with store.transaction():
+                    fresh = store.get_task(task.id)
+                    if (
+                        fresh is not None and fresh.state_version == task.state_version
+                        and fresh.state == task.state and fresh.unit_name is None
+                        and store.get_lease(task.provider, task.id) == lease
+                        and _has_pending_turn(store, fresh)
+                    ):
+                        store.release_lease(task.provider, task.id)
+                        return _strand(store, fresh, "previous_worker_lease_released")
         return None
     else:
         unit_state = backend.show(_unit_for(task))

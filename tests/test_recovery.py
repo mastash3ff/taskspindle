@@ -489,3 +489,43 @@ def test_post_interrupt_sweep_settles_hard_killed_worker_without_dispatch_or_acc
         assert store.get_task(accepting.id).state is TaskState.ACCEPTING
         assert store.read_journal(accepting.id)["phase"] == "probing"
     assert backend.started == []
+
+
+@pytest.mark.parametrize("state", [TaskState.REPAIRING, TaskState.RESUMING])
+@pytest.mark.parametrize("observation", ["dead", "active", "unknown", "unavailable", "unsigned"])
+def test_post_interrupt_preserves_pending_continuation_and_releases_only_proven_old_lease(
+    tmp_path, monkeypatch, state, observation,
+):
+    from taskspindle import units, worker_diagnostics
+    from taskspindle.config import Paths
+
+    paths = Paths(tmp_path / "config.toml", tmp_path / "state", tmp_path / "data", tmp_path / "runtime")
+    monkeypatch.setattr(units, "boot_id", lambda: BOOT)
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        task = make_task(store, state=state, unit=None, boot_id=None, lease=False)
+        store.update_task(task.id, None, session_id="session", candidate_sha="candidate")
+        store.insert_turn(
+            task.id, 2, "repair" if state is TaskState.REPAIRING else "resume", prompt="next turn",
+        )
+        store.acquire_lease(
+            PROVIDER, task.id, worker_unit_name(task.id), None if observation == "unsigned" else 4242, BOOT,
+        )
+        before_task = store.get_task(task.id)
+        before_turns = store.list_turns(task.id)
+        before_lease = store.get_lease(PROVIDER, task.id)
+    unit_state = {
+        "active": ACTIVE,
+        "unknown": UnitState("loaded", "unknown", "unknown", "unknown"),
+    }.get(observation, SIGNALLED)
+    backend = FakeUnitBackend({worker_unit_name(task.id): unit_state})
+    if observation == "unavailable":
+        def unavailable(unit):
+            raise UnitError("UNIT_QUERY_FAILED", "controller unavailable")
+
+        backend.on_show = unavailable
+    worker_diagnostics.reconcile_interrupted_workers(backend, paths, {})
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        assert store.get_task(task.id) == before_task
+        assert store.list_turns(task.id) == before_turns
+        assert store.get_lease(PROVIDER, task.id) == (None if observation == "dead" else before_lease)
+    assert backend.started == []
