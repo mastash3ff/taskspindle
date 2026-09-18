@@ -37,7 +37,6 @@ from .models import (
 from .orchestrator import DIFF_PAGE_BYTES, Orchestrator
 from .service import INVALID_REQUEST, MANUAL_RECOVERY_REQUIRED, TaskSpindleError
 from .store import Store
-from .units import SystemdUserBackend
 
 __all__ = ["INTERNAL", "READ_ONLY_TOOLS", "TOOL_NAMES", "build_server", "main"]
 
@@ -227,6 +226,7 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
                 live_probes=live_probes,
                 provider_status=orchestrator.store.list_provider_status(),
                 now=orchestrator.clock(),
+                settings=load_config(orchestrator.paths.config_file),
             ),
         )
 
@@ -473,11 +473,13 @@ def build_orchestrator(
         data_dir=resolved.data_dir,
         parent_env=env,
     )
+    from .execution import unit_backend
+
     orchestrator = Orchestrator(
         store=store,
         paths=resolved,
         profiles=profiles,
-        units=SystemdUserBackend(),
+        units=unit_backend(resolved, settings, parent_env=env),
         boot=units.boot_id(),
         parent_env=env,
         concurrency=concurrency_limits(settings, profiles),

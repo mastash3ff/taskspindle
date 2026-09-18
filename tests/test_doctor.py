@@ -171,6 +171,20 @@ def test_a_healthy_machine_passes_every_check(paths: Paths, tmp_path: Path) -> N
     assert checks["child_env_shell"]["ok"] is True
 
 
+def test_worker_container_omits_host_systemd_and_unmounted_provider_checks(paths, tmp_path):
+    commands = RecordedRunner()
+    report = run(
+        paths, tmp_path, commands,
+        parent_env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin", "TASKSPINDLE_WORKER_CONTAINER": "1"},
+    )
+    checks = by_name(report)
+    assert checks["worker_container"]["ok"] is True
+    assert "systemd_user" not in checks and "transient_unit" not in checks
+    assert "claude_oauth" not in checks and "grok_cli" not in checks
+    assert "git" in checks and "node" in checks and "child_env_shell" in checks
+    assert not any(call[0] in ("systemctl", "systemd-run") for call in commands.calls)
+
+
 def test_a_throttled_provider_is_an_advisory_check(paths: Paths, tmp_path: Path) -> None:
     install_adapter(paths, taskspindle.ADAPTER_VERSION)
     register_codex(tmp_path)

@@ -313,7 +313,11 @@ def _doctor(*, live_probes: bool, as_json: bool) -> int:
         paths=paths,
         parent_env=os.environ,
         live_probes=live_probes,
-        provider_status=_provider_status(paths),
+        provider_status=(
+            [] if os.environ.get("TASKSPINDLE_WORKER_CONTAINER") == "1"
+            else _provider_status(paths)
+        ),
+        settings=settings,
     )
     return _report(report, as_json=as_json)
 

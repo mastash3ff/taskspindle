@@ -36,6 +36,7 @@ from taskspindle.orchestrator import Orchestrator
 from taskspindle.providers import Profile
 from taskspindle.service import TaskSpindleError
 from taskspindle.store import Store
+from taskspindle.units import UnitError, worker_unit_name
 from tests.fakes.units import ACTIVE, EXITED, SUCCESS, FakeUnitBackend
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -427,6 +428,145 @@ def test_default_accept_needs_no_review_and_no_diff_receipts(harness: Harness, m
     )
 
     assert accepted["state"] == TaskState.ACCEPTING.value
+
+
+@pytest.mark.parametrize("failure_code", ["UNIT_START_UNCERTAIN", "UNIT_TIMEOUT"])
+def test_uncertain_worker_start_keeps_capacity_and_never_replays(harness, make_repo, failure_code):
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.defer()
+
+    def lost_reply(unit, argv):
+        raise UnitError(failure_code, "launch reply was lost")
+
+    harness.backend.on_start = lost_reply
+    with pytest.raises(TaskSpindleError, match="launch reply was lost") as raised:
+        harness.orchestrator.start_task(implement_request(repo))
+    assert raised.value.code == "UNIT_START_UNCERTAIN"
+    task = harness.orchestrator.store.list_tasks()[0]
+    assert task.state is TaskState.QUEUED
+    assert task.unit_name == worker_unit_name(task.id)
+    assert harness.orchestrator.store.get_lease(AUTHOR, task.id) is not None
+    assert task.error["code"] == "UNIT_START_UNCERTAIN"
+    harness.orchestrator.reconcile()
+    assert harness.orchestrator.dispatch_queued() == []
+    assert len(harness.backend.started) == 1
+    harness._run(task.id)
+    assert harness.orchestrator.store.get_task(task.id).state is TaskState.RESULT_READY
+    assert len(harness.backend.started) == 1
+
+
+def test_uncertain_accept_retains_committed_journal_until_recovery(harness, make_repo):
+    from taskspindle import integration
+    from taskspindle.integration import Journal
+
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    request = accept_request(
+        harness, repo, task_id, None, require_review=False, require_diff_receipts=False,
+        require_root_stability=False, diff_digest=None,
+    )
+
+    def commit_then_lose_reply(unit, argv):
+        stored = harness.orchestrator.store.read_journal(task_id)
+        task = harness.orchestrator.store.get_task(task_id)
+        identity = harness.orchestrator._identity_for(task.repository_id)
+        journal = Journal(
+            task_id=task_id, phase=stored["phase"], target_head=stored["target_head"],
+            candidate_sha=stored["candidate_sha"], changed_paths=tuple(stored["changed_paths"]),
+        )
+
+        def save(value):
+            harness.orchestrator.store.write_journal(
+                task_id, value.phase, target_head=value.target_head,
+                candidate_sha=value.candidate_sha, changed_paths=value.changed_paths,
+            )
+
+        integration.stage_candidate(identity, journal=journal, save=save)
+        integration.commit_staged(
+            identity, journal=replace(journal, phase="staged"), save=save, message="Add the thing",
+        )
+        raise UnitError("UNIT_START_UNCERTAIN", "launch reply was lost")
+
+    harness.backend.on_start = commit_then_lose_reply
+    before = len(harness.backend.started)
+    with pytest.raises(TaskSpindleError) as raised:
+        harness.orchestrator.accept_task(request)
+    assert raised.value.code == "UNIT_START_UNCERTAIN"
+    store = harness.orchestrator.store
+    assert store.get_task(task_id).state is TaskState.ACCEPTING
+    assert store.read_journal(task_id)["phase"] == "committed"
+    committed = repos.current_head(repo)
+    harness.orchestrator.reconcile()  # The accept process is still observed running.
+    assert store.read_journal(task_id)["phase"] == "committed"
+    harness.backend.set(store.get_task(task_id).unit_name, SUCCESS)
+    harness.orchestrator.reconcile()
+    assert store.get_task(task_id).state is TaskState.ACCEPTED
+    assert store.read_journal(task_id) is None
+    assert repos.current_head(repo) == committed
+    assert len(harness.backend.started) == before + 1
+
+
+def test_shared_admission_fence_blocks_queue_cancel_and_failure_dispatch(harness, make_repo):
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.backend.admission_open = lambda: False
+    first = harness.orchestrator.start_task(implement_request(repo))
+    second = harness.orchestrator.start_task(implement_request(repo))
+    assert first["state"] == second["state"] == TaskState.QUEUED.value
+    harness.orchestrator.cancel_task(first["task_id"], first["state_version"])
+    with pytest.raises(TaskSpindleError):
+        harness.orchestrator.cancel_task("ts_missing", 1)
+    assert harness.backend.started == []
+    assert harness.orchestrator.store.list_leases() == []
+    assert harness.orchestrator.store.get_task(second["task_id"]).state is TaskState.QUEUED
+    harness.backend.admission_open = lambda: True
+    assert harness.orchestrator.dispatch_queued() == [second["task_id"]]
+
+
+def test_admission_closing_at_start_restores_queue_and_releases_reservation(harness, make_repo):
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.backend.admission_open = lambda: True
+
+    def fenced(*args, **kwargs):
+        harness.backend.admission_open = lambda: False
+        raise UnitError("UNIT_ADMISSION_CLOSED", "admission closed")
+
+    harness.backend.start = fenced
+    result = harness.orchestrator.start_task(implement_request(repo))
+    task = harness.orchestrator.store.get_task(result["task_id"])
+    assert task.state is TaskState.QUEUED
+    assert task.unit_name is None and task.boot_id is None
+    assert task.error is None
+    assert harness.orchestrator.store.list_leases() == []
+    assert len(harness.orchestrator.store.list_turns(task.id)) == 1
+
+
+@pytest.mark.parametrize("close_at_start", [False, True])
+def test_accept_fence_never_launches_or_keeps_a_false_integration_journal(harness, make_repo, close_at_start):
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    request = accept_request(
+        harness, repo, task_id, None, require_review=False, require_diff_receipts=False,
+        require_root_stability=False, diff_digest=None,
+    )
+    started = len(harness.backend.started)
+    head = repos.current_head(repo)
+    harness.backend.admission_open = lambda: close_at_start
+
+    def fenced(*args, **kwargs):
+        harness.backend.admission_open = lambda: False
+        raise UnitError("UNIT_ADMISSION_CLOSED", "admission closed")
+
+    harness.backend.start = fenced
+    with pytest.raises(TaskSpindleError) as raised:
+        harness.orchestrator.accept_task(request)
+    assert raised.value.code == "UNIT_ADMISSION_CLOSED"
+    assert harness.orchestrator.store.read_journal(task_id) is None
+    assert harness.orchestrator.store.get_task(task_id).state is TaskState.RESULT_READY
+    assert len(harness.backend.started) == started
+    assert repos.current_head(repo) == head
 
 
 def test_default_accept_refuses_the_candidates_own_failed_checks(

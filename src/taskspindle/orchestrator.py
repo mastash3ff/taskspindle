@@ -949,6 +949,8 @@ class Orchestrator:
         RESUMING task that lost the race for its provider's lease is picked up here too, oldest
         first, which is the only thing that would ever start it.
         """
+        if not self._admission_open():
+            return []
         started: list[str] = []
         runnable: list[TaskRecord] = []
         for state in DISPATCHABLE_STATES:
@@ -957,6 +959,25 @@ class Orchestrator:
             if self._start_worker(task):
                 started.append(task.id)
         return started
+
+    def _admission_open(self) -> bool:
+        """Read the controller's shared fence; legacy local backends are always open."""
+        check = getattr(self.units, "admission_open", None)
+        if check is None:
+            return True
+        try:
+            return bool(check())
+        except UnitError as exc:
+            raise TaskSpindleError(exc.code, str(exc), retryable=True) from exc
+
+    def _uncertain_start(self, task_id: str, unit: str, exc: UnitError) -> TaskSpindleError:
+        """Keep the reservation and journal until observation can settle a lost reply."""
+        error = {
+            "code": "UNIT_START_UNCERTAIN", "message": str(exc), "retryable": False,
+            "details": {"task_id": task_id, "unit": unit, "action": "reconcile before retrying"},
+        }
+        self.store.update_task(task_id, None, bump_version=False, error=error)
+        return TaskSpindleError(**error)
 
     def _reset_stale_unit(self, unit: str) -> None:
         """Forget a previous run's dead unit before its name is reused.
@@ -978,6 +999,8 @@ class Orchestrator:
 
     def _start_worker(self, task: TaskRecord) -> bool:
         """Claim capacity and publish task identity before starting its unit outside the lock."""
+        if not self._admission_open():
+            return False
         unit = units.worker_unit_name(task.id)
         try:
             with self.store.transaction():
@@ -1028,6 +1051,18 @@ class Orchestrator:
                 properties=units.WORKER_PROPERTIES,
             )
         except UnitError as exc:
+            if exc.code in ("UNIT_START_UNCERTAIN", "UNIT_TIMEOUT"):
+                raise self._uncertain_start(task.id, unit, exc) from exc
+            if exc.code == "UNIT_ADMISSION_CLOSED":
+                # The controller rejected the request before launching anything. Restore the
+                # queued turn and its original identity, without inventing a failed attempt.
+                with self.store.transaction():
+                    self.store.release_lease(task.provider, task.id)
+                    self.store.update_task(
+                        task.id, None, bump_version=False,
+                        unit_name=task.unit_name, worker_pid=task.worker_pid, boot_id=task.boot_id,
+                    )
+                return False
             self.store.release_lease(task.provider, task.id)
             self._fail(
                 task.id,
@@ -1314,6 +1349,10 @@ class Orchestrator:
     def accept_task(self, request: AcceptTaskRequest) -> dict[str, Any]:
         """Gate an acceptance, journal it, and hand the root commit to the accept unit."""
         with self._cycle():
+            if not self._admission_open():
+                raise TaskSpindleError(
+                    "UNIT_ADMISSION_CLOSED", "Worker admission is closed.", retryable=True,
+                )
             unit = units.accept_unit_name(request.task_id)
             with self.store.transaction():
                 record = check_acceptance(self.store, request)
@@ -1343,6 +1382,7 @@ class Orchestrator:
                     changed_paths=list(record.changed_paths or []),
                 )
                 updated = apply_acceptance(self.store, request, unit_name=unit)
+                self.store.update_task(record.id, None, bump_version=False, boot_id=self.boot)
             try:
                 self.units.start(
                     unit,
@@ -1352,9 +1392,11 @@ class Orchestrator:
                     properties=units.WORKER_PROPERTIES,
                 )
             except UnitError as exc:
+                if exc.code in ("UNIT_START_UNCERTAIN", "UNIT_TIMEOUT"):
+                    raise self._uncertain_start(record.id, unit, exc) from exc
                 self._abandon_accept(updated, exc)
                 raise TaskSpindleError(
-                    UNIT_START_FAILED,
+                    exc.code if exc.code == "UNIT_ADMISSION_CLOSED" else UNIT_START_FAILED,
                     f"the accept unit could not be started: {exc}",
                     retryable=True,
                     details={"task_id": record.id, "unit": unit},

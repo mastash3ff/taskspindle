@@ -34,7 +34,7 @@ import taskspindle
 from . import limits, providers
 from .acp_client import AcpWorker, InitInfo, PermissionPolicy
 from .agy_policy import AgyPermissionPolicy
-from .config import Paths
+from .config import Paths, load_config
 from .providers import Profile
 from .setup import ADAPTER_BIN
 
@@ -152,6 +152,7 @@ class _Doctor:
         self.profiles = dict(profiles)
         self.paths = paths
         self.parent_env = dict(parent_env)
+        self.worker_container = self.parent_env.get("TASKSPINDLE_WORKER_CONTAINER") == "1"
         self.live_probes = live_probes
         self.runner = runner
         #: Rows of ``provider_status``, read by the caller on its own thread: the store's sqlite
@@ -191,27 +192,34 @@ class _Doctor:
         """Ask every question: the ACP handshakes on this loop, everything else in a thread."""
         live: list[Check] = []
         if self.live_probes:
-            live.append(await self._grok_acp())
+            if not self.worker_container or "grok" in self.profiles:
+                live.append(await self._grok_acp())
             live.extend(await self._configured_acp())
         await asyncio.to_thread(self._collect_blocking, live)
 
     def _collect_blocking(self, live: list[Check]) -> None:
         self.git()
-        self.systemd_user()
-        if self.live_probes:
-            self.transient_unit()
+        if self.worker_container:
+            self.checks.append(Check("worker_container", True, "checks execute inside the worker image"))
+        else:
+            self.systemd_user()
+            if self.live_probes:
+                self.transient_unit()
         self.node()
-        self.adapter()
-        self.grok_cli()
-        self.grok_sandbox_hooks()
-        self.claude_oauth()
+        if not self.worker_container or any(profile.family == "claude" for profile in self.profiles.values()):
+            self.adapter()
+            self.claude_oauth()
+        if not self.worker_container or "grok" in self.profiles:
+            self.grok_cli()
+            self.grok_sandbox_hooks()
         if "agy" in self.profiles:
             self.agy_cli()
             if self.live_probes:
                 self.agy_oauth()
         self.checks.extend(live)
         self.child_envs()
-        self.codex_registration()
+        if not self.worker_container:
+            self.codex_registration()
         self.profile_commands()
         self.provider_availability()
 
@@ -488,6 +496,14 @@ class _Doctor:
             result = self.run([binary, "--version"])
             if result.returncode != 0:
                 raise RuntimeError("bubblewrap could not be started")
+            if self.worker_container:
+                result = self.run([
+                    binary, "--die-with-parent", "--unshare-all", "--ro-bind", "/", "/",
+                    "--proc", "/proc", "--dev", "/dev", "--", "/bin/true",
+                ])
+                if result.returncode != 0:
+                    raise RuntimeError("bubblewrap cannot create an isolated worker sandbox")
+                return "bubblewrap created an isolated mount and process namespace"
             return "bubblewrap is installed; task startup validates its isolated launch"
 
     def agy_oauth(self) -> None:
@@ -605,8 +621,36 @@ async def run_doctor_async(
     runner: Runner = subprocess.run,
     provider_status: Sequence[Mapping[str, Any]] = (),
     now: datetime | None = None,
+    settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ask every question and report the answers; advisory failures never fail the run."""
+    if parent_env.get("TASKSPINDLE_WORKER_CONTAINER") != "1":
+        configured = settings if settings is not None else load_config(paths.config_file)
+        execution = configured.get("execution", {})
+        if execution.get("backend", "systemd") == "docker":
+            from .rpc import RemoteError, request
+
+            socket = execution.get("diagnostics_socket")
+            if not socket or not Path(socket).is_absolute():
+                return {"ok": False, "checks": [Check(
+                    "worker_diagnostics", False, "execution.diagnostics_socket must be an absolute path",
+                ).as_dict()]}
+            try:
+                return await asyncio.to_thread(
+                    request, Path(socket), "doctor", {"live": live_probes}, timeout=300,
+                )
+            except (RemoteError, OSError) as exc:
+                return {"ok": False, "checks": [Check(
+                    "worker_diagnostics", False, str(exc),
+                ).as_dict()]}
+    else:
+        selected = parent_env.get("TASKSPINDLE_PROBE_PROVIDER")
+        if selected:
+            if selected not in profiles:
+                return {"ok": False, "checks": [Check(
+                    "worker_provider", False, f"Unknown worker profile: {selected}",
+                ).as_dict()]}
+            profiles = {selected: profiles[selected]}
     doctor = _Doctor(
         profiles=profiles,
         paths=paths,
@@ -631,6 +675,7 @@ def run_doctor(
     live_probes: bool = True,
     runner: Runner = subprocess.run,
     provider_status: Sequence[Mapping[str, Any]] = (),
+    settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """:func:`run_doctor_async` for a caller that owns no event loop, such as the CLI."""
     return asyncio.run(
@@ -641,5 +686,6 @@ def run_doctor(
             live_probes=live_probes,
             runner=runner,
             provider_status=provider_status,
+            settings=settings,
         )
     )

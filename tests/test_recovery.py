@@ -230,6 +230,7 @@ def test_one_task_that_systemd_cannot_answer_for_does_not_end_the_sweep(store: S
     assert actions[broken.id].to_state is None
     assert actions[broken.id].reason == "reconcile_failed:UNIT_QUERY_FAILED"
     assert store.get_task(broken.id).state is TaskState.RUNNING
+    assert store.get_lease(PROVIDER, broken.id) is not None
     assert recovery_reasons(store, broken.id) == ["reconcile_failed:UNIT_QUERY_FAILED"]
     # The next task was still reconciled.
     assert actions[other.id].to_state == TaskState.INTERRUPTED.value

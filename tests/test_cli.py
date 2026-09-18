@@ -106,6 +106,21 @@ def test_doctor_marks_each_check_and_fails_on_a_real_failure(
     ]
 
 
+def test_worker_doctor_does_not_open_live_state(home, monkeypatch, capsys):
+    monkeypatch.setenv("TASKSPINDLE_WORKER_CONTAINER", "1")
+    monkeypatch.setattr(cli, "_provider_status", lambda _: pytest.fail("live state was read"))
+    seen = {}
+
+    def probe(**kwargs):
+        seen.update(kwargs)
+        return _report(_check("worker_container", True))
+
+    monkeypatch.setattr(doctor, "run_doctor", probe)
+    assert cli.main(["doctor", "--json"]) == 0
+    assert seen["provider_status"] == []
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 def test_providers_reads_cached_status_without_creating_task_database(
     home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:
