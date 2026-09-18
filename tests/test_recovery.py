@@ -451,3 +451,41 @@ def test_newly_reserved_unit_gets_startup_grace(store):
     store.touch_lease(task.id, stamp(-1))
     assert run(store, FakeUnitBackend()) == []
     assert store.get_task(task.id).state == TaskState.QUEUED
+
+
+@pytest.mark.parametrize("state", [TaskState.RUNNING, TaskState.QUEUED])
+def test_post_interrupt_sweep_settles_hard_killed_worker_without_dispatch_or_accept_changes(
+    tmp_path, monkeypatch, state,
+):
+    from taskspindle import units, worker_diagnostics
+    from taskspindle.config import Paths
+
+    paths = Paths(tmp_path / "config.toml", tmp_path / "state", tmp_path / "data", tmp_path / "runtime")
+    monkeypatch.setattr(units, "boot_id", lambda: BOOT)
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        worker = make_task(store, state=state)
+        if state is TaskState.QUEUED:
+            store.release_lease(PROVIDER, worker.id)
+            store.acquire_lease(PROVIDER, worker.id, worker_unit_name(worker.id), None, BOOT)
+        queued = make_task(store, state=TaskState.QUEUED, unit=None, boot_id=None, lease=False)
+        accepting = make_task(store, state=TaskState.ACCEPTING, unit="accept", lease=False)
+        store.write_journal(
+            accepting.id, "probing", target_head="target", candidate_sha="candidate", changed_paths=[],
+        )
+        store.update_task(
+            worker.id, None, session_id="preserved-session", candidate_sha="preserved-candidate",
+        )
+    backend = FakeUnitBackend({
+        worker_unit_name(worker.id): UnitState("loaded", "failed", "failed", "signal", 137),
+        accept_unit_name(accepting.id): SIGNALLED,
+    })
+    worker_diagnostics.reconcile_interrupted_workers(backend, paths, {})
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        settled = store.get_task(worker.id)
+        assert settled.state is TaskState.INTERRUPTED
+        assert settled.session_id == "preserved-session" and settled.candidate_sha == "preserved-candidate"
+        assert store.get_lease(PROVIDER, worker.id) is None
+        assert store.get_task(queued.id).state is TaskState.QUEUED
+        assert store.get_task(accepting.id).state is TaskState.ACCEPTING
+        assert store.read_journal(accepting.id)["phase"] == "probing"
+    assert backend.started == []

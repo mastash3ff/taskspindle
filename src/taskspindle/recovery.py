@@ -136,12 +136,16 @@ def reconcile(
     now: datetime,
     stale_after_s: int = 30,
     accept_recover: Callable[[TaskRecord], AcceptOutcome] | None = None,
+    workers_only: bool = False,
 ) -> list[ReconcileAction]:
     """Settle every task that claims to be active but may no longer be.
 
     ``accept_recover`` is the server's closure around
     :func:`taskspindle.integration.recover_journal`; without it an interrupted accept is left to
     the ordinary unit rules, which never touch the repository.
+
+    ``workers_only`` is the controller's post-interrupt sweep: acceptance states and their
+    journals remain for the normal server recovery path.
 
     One task can never end the sweep: a systemd hiccup, or a task that moved underneath us while
     a worker finalised, is recorded as an action with no target state and the next task is
@@ -151,6 +155,11 @@ def reconcile(
     actions: list[ReconcileAction] = []
     for state in sorted(ACTIVE_STATES):
         for task in store.list_tasks(state=state.value, limit=_SCAN_LIMIT):
+            if workers_only and (
+                task.state is TaskState.ACCEPTING
+                or (task.unit_name or "").startswith("taskspindle-accept-")
+            ):
+                continue
             try:
                 action = _reconcile_task(
                     store,

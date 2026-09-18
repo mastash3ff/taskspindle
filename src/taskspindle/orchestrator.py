@@ -1002,6 +1002,18 @@ class Orchestrator:
         if not self._admission_open():
             return False
         unit = units.worker_unit_name(task.id)
+        previous_unit = None
+        if getattr(self.units, "requires_inactive_previous_turn", False):
+            # A completed turn can publish its result before its container finishes cleanup.
+            # Do not reserve the next turn's lease while the old runner can still release it.
+            try:
+                previous_unit = self.units.show(unit)
+                if previous_unit.kind == "active":
+                    return False
+                if previous_unit.kind not in ("success", "exit", "signal", "oom", "not_found"):
+                    raise UnitError("UNIT_START_UNCERTAIN", "Previous worker state is unresolved.")
+            except UnitError as exc:
+                raise TaskSpindleError(exc.code, str(exc), retryable=True) from exc
         try:
             with self.store.transaction():
                 fresh = self.store.get_task(task.id)
@@ -1030,6 +1042,15 @@ class Orchestrator:
                     )
                     if not provider_eligible(availability, self.clock()):
                         return False
+                prior_lease = self.store.get_lease(task.provider, task.id)
+                if (
+                    previous_unit is not None and task.unit_name is None
+                    and prior_lease is not None and prior_lease["pid"] is not None
+                ):
+                    # A pending continuation cleared its identity, but a killed previous
+                    # runner may have left its signed lease. Observed exit makes release safe;
+                    # unsigned reservations can belong to an in-flight launch and stay held.
+                    self.store.release_lease(task.provider, task.id)
                 if not self.store.acquire_lease(
                     task.provider, task.id, unit, None, self.boot,
                     limit=self.concurrency.get(task.provider, 1),
@@ -1053,7 +1074,7 @@ class Orchestrator:
         except UnitError as exc:
             if exc.code in ("UNIT_START_UNCERTAIN", "UNIT_TIMEOUT"):
                 raise self._uncertain_start(task.id, unit, exc) from exc
-            if exc.code == "UNIT_ADMISSION_CLOSED":
+            if exc.code in ("UNIT_ADMISSION_CLOSED", "UNIT_PREVIOUS_TURN_ACTIVE"):
                 # The controller rejected the request before launching anything. Restore the
                 # queued turn and its original identity, without inventing a failed attempt.
                 with self.store.transaction():

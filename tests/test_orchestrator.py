@@ -759,6 +759,79 @@ def test_continuing_a_candidate_opens_a_repair_turn(harness: Harness, make_repo)
     assert harness.backend.started[-1][0] == f"taskspindle-worker-{task_id}"
 
 
+@pytest.mark.parametrize("abandoned_lease", [False, True])
+def test_container_continuation_waits_for_previous_process_exit_before_reserving(
+    harness, make_repo, abandoned_lease,
+):
+    task_id = build_candidate(harness, make_repo())
+    harness.defer()
+    harness.backend.requires_inactive_previous_turn = True
+    store = harness.orchestrator.store
+    unit = worker_unit_name(task_id)
+    assert harness.backend.show(unit).kind == "active"
+    assert store.get_lease(AUTHOR, task_id) is None
+    if abandoned_lease:
+        assert store.acquire_lease(AUTHOR, task_id, unit, 4242, BOOT)
+    prior_lease = store.get_lease(AUTHOR, task_id)
+    prior = store.get_task(task_id)
+    result = harness.orchestrator.continue_task(task_id, prior.state_version, "next turn")
+    assert result["state"] == TaskState.REPAIRING.value
+    assert store.get_task(task_id).unit_name is None
+    assert store.get_lease(AUTHOR, task_id) == prior_lease
+    assert len(harness.backend.started) == 1
+    # The old process's late finally block has no new turn's lease available to delete.
+    if not abandoned_lease:
+        assert store.release_lease(AUTHOR, task_id) is False
+    harness.backend.set(unit, SUCCESS)
+    assert harness.orchestrator.dispatch_queued() == [task_id]
+    assert store.get_lease(AUTHOR, task_id) is not None
+    assert store.get_lease(AUTHOR, task_id)["pid"] is None
+    assert len(harness.backend.started) == 2
+    assert len([turn for turn in store.list_turns(task_id) if turn["ended_at"] is None]) == 1
+
+
+@pytest.mark.parametrize("existing_lease", [False, True])
+def test_container_previous_turn_query_failure_preserves_queue_and_lease(harness, make_repo, existing_lease):
+    task_id = build_candidate(harness, make_repo())
+    harness.backend.requires_inactive_previous_turn = True
+    store = harness.orchestrator.store
+    if existing_lease:
+        assert store.acquire_lease(AUTHOR, task_id, worker_unit_name(task_id), 4242, BOOT)
+    lease = store.get_lease(AUTHOR, task_id)
+
+    def unavailable(unit):
+        raise UnitError("UNIT_QUERY_FAILED", "controller unavailable")
+
+    harness.backend.on_show = unavailable
+    prior = store.get_task(task_id)
+    with pytest.raises(TaskSpindleError) as raised:
+        harness.orchestrator.continue_task(task_id, prior.state_version, "next turn")
+    assert raised.value.code == "UNIT_QUERY_FAILED"
+    assert store.get_task(task_id).state is TaskState.REPAIRING
+    assert store.get_lease(AUTHOR, task_id) == lease
+    assert len(harness.backend.started) == 1
+
+
+def test_previous_turn_launch_race_restores_pending_turn_without_failure(harness, make_repo):
+    task_id = build_candidate(harness, make_repo())
+    harness.backend.requires_inactive_previous_turn = True
+    harness.backend.set(worker_unit_name(task_id), SUCCESS)
+    store = harness.orchestrator.store
+
+    def previous_turn_active(unit, *args, **kwargs):
+        harness.backend.set(unit, ACTIVE)
+        raise UnitError("UNIT_PREVIOUS_TURN_ACTIVE", "previous turn is still exiting")
+
+    harness.backend.start = previous_turn_active
+    prior = store.get_task(task_id)
+    result = harness.orchestrator.continue_task(task_id, prior.state_version, "next turn")
+    pending = store.get_task(task_id)
+    assert result["state"] == TaskState.REPAIRING.value
+    assert pending.unit_name is None and pending.error is None
+    assert store.get_lease(AUTHOR, task_id) is None
+    assert len(harness.backend.started) == 1
+
+
 def test_continuing_a_task_that_cannot_take_a_turn_is_refused(
     harness: Harness, make_repo
 ) -> None:

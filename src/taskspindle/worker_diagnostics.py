@@ -1,6 +1,7 @@
-"""Bounded readiness probes using the controller's real worker configuration.
+"""Bounded worker readiness probes and explicit post-interrupt reconciliation.
 
-Only initialize/auth metadata checks run: no task, model prompt, or live database is used.
+Doctor uses only initialize/auth metadata probes, without tasks, prompts, or the live database.
+The separate post-interrupt callback settles live worker records without dispatching work.
 """
 
 from __future__ import annotations
@@ -8,12 +9,32 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from . import providers
 from .config import Paths
 from .doctor import Check
+
+
+def reconcile_interrupted_workers(backend: Any, paths: Paths, settings: Mapping[str, Any]) -> None:
+    """Settle workers after admission closes and interruption confirms they stopped.
+
+    Startup grace is unnecessary after confirmed interruption. An unavailable or uncertain
+    backend still retains its task and lease under the ordinary recovery rules.
+    """
+    from . import recovery, units
+    from .store import Store
+
+    database = paths.state_dir / "taskspindle.sqlite3"
+    if not database.exists():
+        return
+    with Store.open(database) as store:
+        recovery.reconcile(
+            store, backend, boot=units.boot_id(), now=datetime.now(UTC),
+            stale_after_s=0, workers_only=True,
+        )
 
 
 def doctor_report(
