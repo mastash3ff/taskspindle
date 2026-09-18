@@ -127,6 +127,8 @@ _REVIEW_RULES = """
 You are reviewing code. This is a read-only task: do not edit, create or delete any file, and do
 not run anything that changes the working tree. Do not spawn subagents. The working directory is
 checked out at the subject, so you can read any file; the change under review is given below.
+Stay inside this checkout: do not open .git or follow its gitdir pointer elsewhere, and treat a
+refused read as a boundary to respect, not as something to work around or report.
 Subject: {subject}
 Output only the JSON object below, matching this schema exactly:
 {{"verdict": "PASS" | "CONCERN" | "BLOCK",

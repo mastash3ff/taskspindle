@@ -1179,6 +1179,7 @@ def test_review_kind_selects_the_preamble_and_leaves_the_contract_alone(
     review = seed_task(store, paths, mode=Mode.REVIEW, prompt="look hard", review_target=target)
     standard = runner.compose_prompt(review, TurnKind.INITIAL)
     assert standard.startswith("You are reviewing code.")
+    assert "do not open .git or follow its gitdir pointer" in standard
     assert standard.endswith("Output only the JSON object.\n\nlook hard")
 
     adversarial = runner.compose_prompt(
