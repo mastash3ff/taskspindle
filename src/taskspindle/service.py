@@ -8,6 +8,7 @@ those rules into tool behaviour -- git, systemd, the filesystem -- lives in
 from __future__ import annotations
 
 import secrets
+import shlex
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -31,7 +32,7 @@ from .models import (
     TaskView,
     Verdict,
 )
-from .providers import Profile
+from .providers import RESUMABLE_FAMILIES, Profile, resume_command
 from .store import ProviderStatusReader, StaleStateVersionError, Store, now
 
 # -- error codes --------------------------------------------------------------------
@@ -838,7 +839,51 @@ def task_view(record: TaskRecord) -> TaskView:
     )
 
 
-def task_result(store: Store, task_id: str) -> TaskResult:
+def resume_handle(record: TaskRecord, profile: Profile | None = None) -> dict[str, Any] | None:
+    """How a human reopens the worker's session outside TaskSpindle, or None without a session.
+
+    The handle follows the record's immutable provider family, never the live profile, so an
+    alias that was re-based since the task ran cannot point the operator at the wrong CLI. What
+    happens in a reopened session is outside TaskSpindle's containment: nothing done there is
+    recorded and the task's mode restrictions no longer apply.
+    """
+    if not record.session_id:
+        return None
+    family = record.provider_family
+    if family is None and record.provider in RESUMABLE_FAMILIES:
+        family = record.provider
+    argv = resume_command(family, record.session_id)
+    cwd = record.worktree_path or record.scratch_repo
+    env: dict[str, str] = {}
+    if argv and family == "claude" and profile is not None:
+        config_dir = profile.env.get("CLAUDE_CONFIG_DIR")
+        if config_dir:
+            env["CLAUDE_CONFIG_DIR"] = config_dir
+    note: str | None = None
+    if argv is None:
+        if family == "agy":
+            note = (
+                "agy conversations live in the task's private state directory that only the "
+                "sandboxed worker mounts; they cannot be reopened from a shell"
+            )
+        else:
+            note = "no native resume command is known for this provider family; session_id is the raw ACP id"
+    elif record.cleanup_state is not CleanupState.RETAINED:
+        note = "the task workspace was cleaned up; the session is keyed to that directory and may not reopen"
+    elif not cwd:
+        note = "the task has no recorded workspace; run the command from the directory the worker used"
+    return {
+        "family": family,
+        "session_id": record.session_id,
+        "cwd": cwd,
+        "argv": list(argv) if argv else None,
+        "command": shlex.join(argv) if argv else None,
+        "env": env,
+        "note": note,
+    }
+
+
+def task_result(store: Store, task_id: str, *, profile: Profile | None = None) -> TaskResult:
     """Assemble the ``task_result`` payload for a task."""
     record = require_task(store, task_id)
     checks: list[CheckRecord] = store.list_checks(task_id, record.candidate_revision)
@@ -872,6 +917,8 @@ def task_result(store: Store, task_id: str) -> TaskResult:
         ],
         usage=usage_rows,
         transcript_locator=record.transcript_path,
+        session_id=record.session_id,
+        resume=resume_handle(record, profile),
     )
 
 

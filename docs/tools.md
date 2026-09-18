@@ -266,6 +266,9 @@ Returns `{"tasks": [<task view>]}`, newest first.
 `error`, `unit_name`, `heartbeat_at`, and the four timestamps. A task in `RECOVERY_AMBIGUOUS` also
 carries `evidence` and `manual_action` — see [recovery.md](recovery.md). Errors: `TASK_NOT_FOUND`.
 
+`task_status` also returns `resume`, the same [native resume handle](#reopening-a-workers-session)
+`task_result` carries, or `null` before the worker has opened a session.
+
 `state_version` increments on every transition. Hold on to it: the four tools that change a task
 require the version you last saw, and answer `STALE_STATE_VERSION` if something moved underneath
 you.
@@ -289,7 +292,7 @@ stuck worker: cancel it.
 `task_id`. Returns `{"task_id", "state", "response", "checks": [{"command", "exit_code", "ok",
 "duration_ms", "stdout_tail", "stderr_tail"}], "attribution": {"provider", "auth_mode",
 "requested_model", "reported_model", "gateway_host", "agent"}, "warnings", "quota_warnings",
-"usage", "transcript_locator"}`.
+"usage", "transcript_locator", "session_id", "resume"}`.
 
 `attribution` makes metered work visible: an `api_key` profile shows `auth_mode: "api_key"`
 and the gateway's host, without its URL path or token. `agent` names the adapter and version.
@@ -308,6 +311,24 @@ usage, rate, credit or login refusal a turn of this task ran into, each as
 "cache_write_tokens", "reasoning_tokens", "model_calls", "duration_ms", "cost_estimate_usd",
 "cost_is_estimate", "price_table_version", "source", "raw", "captured_at"}`. See
 [`usage_report`](#usage_report) for what the cost is and is not.
+
+#### Reopening a worker's session
+
+`session_id` is the provider's own session id for the worker, and `resume` says how a human
+reopens it outside TaskSpindle: `{"family", "session_id", "cwd", "argv", "command", "env",
+"note"}`. For a Claude or Grok task, `command` is the native CLI invocation (`claude --resume
+<id>` or `grok -r <id>`); run it from `cwd` (the task's worktree, or its scratch repository for a
+consult without one) with `env` applied, because both CLIs key their session store to the
+directory the worker ran in. For an Antigravity task, or a profile of an unknown family, `argv`
+and `command` are `null` and `note` says why: an agy conversation lives in the task's private
+state directory that only the sandboxed worker mounts. `note` also warns when the workspace has
+already been cleaned up. The handle follows the task's recorded provider family, never the
+current profile configuration.
+
+This is a hand-off, not a continuation. Whatever happens in a reopened session is outside
+TaskSpindle's containment: it is not recorded on the task, the task's mode restrictions no longer
+apply, and a candidate the worker built is unaffected unless you commit on top of it yourself.
+Use [`continue_task`](#continue_task) to keep working inside the record instead.
 
 ### `task_diff` — **not** read-only
 

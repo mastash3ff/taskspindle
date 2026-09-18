@@ -88,6 +88,7 @@ from .service import (
     require_provider_available,
     require_task,
     require_task_profile,
+    resume_handle,
     task_result,
     task_view,
     transition,
@@ -1134,6 +1135,7 @@ class Orchestrator:
                 _seconds_since(progress.get("updated_at"), moment) if progress else None
             )
             view["timeout_s"] = record.timeout_s
+            view["resume"] = resume_handle(record, self.profiles.get(record.provider))
         return view
 
     def _read_progress(self, task_id: str) -> dict[str, Any] | None:
@@ -1164,7 +1166,9 @@ class Orchestrator:
     def task_result(self, task_id: str) -> dict[str, Any]:
         """What a finished turn produced: its answer, its checks and its attribution."""
         with self._observe():
-            result = task_result(self.store, task_id).model_dump(mode="json")
+            record = require_task(self.store, task_id)
+            profile = self.profiles.get(record.provider)
+            result = task_result(self.store, task_id, profile=profile).model_dump(mode="json")
         return result
 
     def usage_report(

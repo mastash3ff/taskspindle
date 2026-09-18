@@ -468,6 +468,10 @@ class TaskResult(BaseModel):
     #: Token usage of the task's turns, newest last; empty when the agent reported none.
     usage: list[dict[str, Any]] = Field(default_factory=list)
     transcript_locator: str | None = None
+    #: The worker's provider session id, as ``task_status`` shows it.
+    session_id: str | None = None
+    #: How a human reopens that session natively, when the provider family allows it.
+    resume: dict[str, Any] | None = None
 
 
 class ReviewFinding(BaseModel):

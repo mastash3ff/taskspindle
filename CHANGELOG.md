@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **`task_result` and `task_status` hand over the worker's session.** Both now carry
+  `session_id` and a `resume` handle: for a Claude or Grok task the native `claude --resume <id>`
+  or `grok -r <id>` invocation plus the directory and environment to run it from, so a human can
+  pick up a near-miss candidate by hand instead of rejecting and re-dispatching; for an
+  Antigravity task, or an unknown family, a note explaining why no shell command exists. The
+  handle follows the task's recorded provider family, never the live profile.
+
 ## v0.6.1
 
 - **A turn that reported no usage says so.** The worker log names the provider and revision

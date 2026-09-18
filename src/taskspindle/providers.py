@@ -519,6 +519,27 @@ def session_mode(profile: Profile, mode: str) -> str | None:
     return CLAUDE_SESSION_MODES.get(mode)
 
 
+#: The families whose stored session id is a native, shell-resumable session.
+RESUMABLE_FAMILIES = ("claude", "grok")
+
+
+def resume_command(family: str | None, session_id: str) -> tuple[str, ...] | None:
+    """The native CLI argv that reopens ``session_id`` for ``family``, or None.
+
+    Claude and Grok store the ACP session under the task's working directory using the very id
+    TaskSpindle recorded, so their own ``--resume`` flags reopen it from that directory. An agy
+    conversation lives in the task's private state directory that only the sandboxed worker
+    mounts, and an unknown family has no known resume flag; both yield None.
+    """
+    if not session_id:
+        return None
+    if family == "claude":
+        return ("claude", "--resume", session_id)
+    if family == "grok":
+        return ("grok", "-r", session_id)
+    return None
+
+
 def opposite_provider(profile_id: str) -> str | None:
     """The legacy Claude/Grok status suggestion, never a review eligibility rule."""
     if profile_id == "claude":
