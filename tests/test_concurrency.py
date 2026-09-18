@@ -1,4 +1,4 @@
-"""Per-provider capacity, independent processes, and operational schema rollback."""
+"""Per-provider capacity and independent processes."""
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 
@@ -7,7 +7,7 @@ import pytest
 from taskspindle import store as store_module
 from taskspindle.config import ConfigError, concurrency_limits
 from taskspindle.models import TaskState
-from taskspindle.store import Store, StoreError
+from taskspindle.store import Store
 from tests.test_store import make_task
 
 
@@ -80,33 +80,6 @@ def test_schema_three_upgrade_preserves_leases_and_history(tmp_path, monkeypatch
             assert after == rows
         other = make_task(store, "ts_000000000002")
         assert store.acquire_lease("claude", other.id, "new-unit", 456, "boot", limit=4)
-
-
-def test_rollback_requires_drained_state_and_preserves_history(tmp_path, monkeypatch):
-    path = tmp_path / "state.sqlite3"
-    with monkeypatch.context() as old:
-        old.setattr(store_module, "MIGRATIONS", store_module.MIGRATIONS[:4])
-        with Store.open(path) as store:
-            task = make_task(store)
-            store.append_event(task.id, "WARNING", {"note": "preserved"})
-            store.upsert_grant("repo1", "claude", "implement")
-            with pytest.raises(StoreError, match="drain"):
-                store.rollback_concurrency_schema()
-            store.update_task(task.id, None, state=TaskState.COMPLETED)
-            store.acquire_lease("claude", task.id, "unit", None, "boot")
-            with pytest.raises(StoreError, match="drain"):
-                store.rollback_concurrency_schema()
-            store.release_lease("claude", task.id)
-            store.rollback_concurrency_schema()
-            assert store.schema_version() == 3
-            assert store.get_task(task.id).state == TaskState.COMPLETED
-            assert store.list_events(task.id)[0]["payload"] == {"note": "preserved"}
-            assert store.grant_active("repo1", "claude", "implement")
-            columns = {row["name"]: row for row in store._conn.execute("PRAGMA table_info(leases)")}
-            assert columns["provider"]["pk"] == 1
-    # A later intentional re-upgrade remains safe.
-    with Store.open(path) as store:
-        assert store.schema_version() == 14
 
 
 def _dispatch(args):

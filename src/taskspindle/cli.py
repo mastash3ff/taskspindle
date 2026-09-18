@@ -169,10 +169,6 @@ def build_parser() -> argparse.ArgumentParser:
     web.add_argument("--port", type=int, default=8765, help="port to bind (default: 8765)")
     web.add_argument("--open", action="store_true", help="open the page in a browser")
 
-    rollback = sub.add_parser(
-        "rollback-concurrency", help="after draining jobs and stopping MCP servers, reverse schema 4 only"
-    )
-    rollback.add_argument("--database", required=True, help="explicit existing SQLite database path")
     return parser
 
 
@@ -187,8 +183,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
-    if args.command == "rollback-concurrency":
-        return _rollback_concurrency(args.database)
     if args.command == "setup":
         return _setup(args.runtime_dir, args.npm, args.provider)
     if args.command == "auth":
@@ -219,25 +213,6 @@ def main(argv: list[str] | None = None) -> int:
         return _accept(args.task)
     parser.error(f"unrecognized command: {args.command}")
     return 2
-
-
-def _rollback_concurrency(database: str) -> int:
-    """Maintenance deliberately avoids Store.open, which would auto-upgrade the schema."""
-    from .store import Store, StoreError
-
-    path = Path(database)
-    if not path.is_file():
-        print("taskspindle rollback-concurrency: database must be an existing file", file=sys.stderr)
-        return 1
-    try:
-        with Store(path) as store:
-            store.rollback_concurrency_schema()
-    except (StoreError, OSError) as exc:
-        print(f"taskspindle rollback-concurrency: {exc}", file=sys.stderr)
-        return 1
-    print("Restored schema 3 lease layout; task history and grants preserved. "
-          "Start only the previous runtime.")
-    return 0
 
 
 # -- setup ---------------------------------------------------------------------------

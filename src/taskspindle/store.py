@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .models import (
-    ACTIVE_STATES,
     TASK_BOOL_COLUMNS,
     TASK_COLUMNS,
     TASK_JSON_COLUMNS,
@@ -936,30 +935,6 @@ class Store:
     def schema_version(self) -> int:
         row = self._conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
         return int(row[0]) if row and row[0] is not None else 0
-
-    def rollback_concurrency_schema(self) -> None:
-        """Reverse only schema 4 after operators stop MCP servers and drain worker jobs.
-
-        History and grants are untouched. Use ``Store(path)`` rather than ``Store.open`` for
-        this maintenance operation, since open intentionally migrates forward.
-        """
-        with self._guard(), self.transaction() as conn:
-            if self.schema_version() != 4:
-                raise StoreError("concurrency rollback requires schema 4")
-            states = (*(state.value for state in ACTIVE_STATES), "RECOVERY_AMBIGUOUS")
-            placeholders = ",".join("?" for _ in states)
-            if conn.execute("SELECT 1 FROM leases LIMIT 1").fetchone() or conn.execute(
-                f"SELECT 1 FROM tasks WHERE state IN ({placeholders}) LIMIT 1", states
-            ).fetchone() or conn.execute("SELECT 1 FROM integration_journal LIMIT 1").fetchone():
-                raise StoreError("drain all active/queued jobs, leases and accepts before rollback")
-            conn.execute("DROP TABLE leases")
-            conn.execute("""CREATE TABLE leases (
-                provider TEXT PRIMARY KEY,
-                task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                unit_name TEXT, pid INTEGER, boot_id TEXT,
-                acquired_at TEXT NOT NULL, heartbeat_at TEXT
-            )""")
-            conn.execute("DELETE FROM schema_migrations WHERE version = 4")
 
     # -- repositories ---------------------------------------------------------------
 

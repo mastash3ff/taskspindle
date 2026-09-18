@@ -441,44 +441,6 @@ def test_usage_with_group_by_role_includes_the_role_column(
     assert "123" in output
 
 
-def test_concurrency_rollback_cli_is_explicit_and_preserves_records(home, capsys, monkeypatch):
-    from taskspindle import store as store_module
-    from taskspindle.models import TaskState
-    from taskspindle.store import Store
-    from tests.test_store import make_task
-
-    database = home / "fixture.sqlite3"
-    # This maintenance command is deliberately specific to the old v4 lease layout.
-    monkeypatch.setattr(store_module, "MIGRATIONS", [m for m in store_module.MIGRATIONS if m[0] <= 4])
-    with Store.open(database) as store:
-        task = make_task(store)
-        assert cli.main(["rollback-concurrency", "--database", str(database)]) == 1
-        assert store.schema_version() == 4
-        store.update_task(task.id, None, state=TaskState.CANCELLED)
-    assert cli.main(["rollback-concurrency", "--database", str(database)]) == 0
-    with Store(database) as store:
-        assert store.schema_version() == 3
-        assert store.get_task(task.id).state == TaskState.CANCELLED
-    assert "history and grants preserved" in capsys.readouterr().out
-
-
-def test_concurrency_rollback_refuses_newer_schema_without_mutation(home):
-    from taskspindle.store import Store
-
-    database = home / "fixture.sqlite3"
-    with Store.open(database) as store:
-        version = store.schema_version()
-        assert version > 4
-        assert cli.main(["rollback-concurrency", "--database", str(database)]) == 1
-        assert store.schema_version() == version
-
-
-def test_concurrency_rollback_does_not_create_missing_database(home):
-    path = home / "absent.sqlite3"
-    assert cli.main(["rollback-concurrency", "--database", str(path)]) == 1
-    assert not path.exists()
-
-
 def test_provider_filter_check_and_unknown_filter(home, monkeypatch, capsys):
     from taskspindle import grok_checks
     calls = []

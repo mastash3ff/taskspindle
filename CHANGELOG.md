@@ -30,6 +30,9 @@
   refuse symlinks, hard links, non-regular files, binary content and anything over the
   configured caps, before any task row exists. Without the table the request is refused with
   `CONTEXT_FILES_DISABLED`. Schema 14 adds `tasks.context_files`.
+- **The `rollback-concurrency` maintenance command is gone.** It reversed the schema 4 lease
+  migration in place; restoring a pre-upgrade state backup now covers a runtime rollback instead.
+  See [docs/rollback.md](docs/rollback.md).
 
 ## v0.6.1
 

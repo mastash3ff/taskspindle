@@ -84,15 +84,5 @@ To reduce concurrency, set the limits back to one and restart the connected MCP 
 they all use the same limits. Existing workers finish normally. Do not run mixed configurations
 against the shared database and assume the lowest value will govern other clients.
 
-Runtime rollback also needs the previous lease schema. After draining work, stopping all MCP
-processes and workers, and backing up the current database, run this command with the newer
-runtime and the explicit existing database path:
-
-```sh
-taskspindle rollback-concurrency --database /absolute/path/to/taskspindle.sqlite3
-```
-
-The command requires schema 4, no leases or active tasks, no ambiguous recovery tasks, and no
-integration journal entries. It reverses only the lease migration in one transaction and
-preserves task history and grants. Then start only the previous runtime: starting the newer
-runtime again upgrades the schema. Do not restore an old database backup over newer task history.
+There is no in-place schema downgrade for the lease table. To roll back the runtime after this
+upgrade, restore the pre-upgrade backup; see [rollback.md](rollback.md).
