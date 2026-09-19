@@ -2,7 +2,7 @@ import { aiPolicyEpoch, isAiPolicyApplying, renderAiPolicyCard } from "../ai-pol
 import { getJSON, postJSON, putJSON } from "../api.js";
 import { badge, captureViewState, formatDate, h, labeledValue, relativeTime, restoreViewState, safeJSON, sectionHeading } from "../dom.js";
 
-const FAMILY_ORDER = ["claude", "grok", "agy"];
+const FAMILY_ORDER = ["claude", "grok", "agy", "muse"];
 const STATE_TONE = { active: "positive", paused: "warning", budget_exhausted: "danger" };
 const WINDOWS = ["day", "week"];
 const ROLE_KEY_RE = /^[a-z][a-z0-9_-]{0,31}$/;

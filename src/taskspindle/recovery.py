@@ -287,6 +287,10 @@ def _reconcile_task(
     if task.state is TaskState.CANCELLING:
         # The cancel got what it asked for: the unit is gone.
         return _apply(store, task, TaskState.CANCELLED, reason)
+    from .muse import unresolved_commands
+
+    if task.state is not TaskState.ACCEPTING and unresolved_commands(store, task):
+        target, reason = TaskState.RECOVERY_AMBIGUOUS, "muse_command_outcome_unknown"
     permitted = _permitted(task.state, target)
     if permitted is None:
         if task.state is TaskState.PREPARING:

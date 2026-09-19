@@ -85,6 +85,7 @@ class AuthMode(StrEnum):
 
     OAUTH = "oauth"
     API_KEY = "api_key"
+    SUBSCRIPTION = "subscription"
 
 
 class TurnKind(StrEnum):

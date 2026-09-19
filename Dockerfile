@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
-# Supply a build context named provider-binaries containing ONLY the three
-# executable files claude, grok and agy. OAuth state is mounted at runtime.
+# Supply a build context named provider-binaries containing the required
+# executables claude, grok and agy, plus the optional pinned raw Muse binary as
+# muse. OAuth and session state are mounted or created only at runtime.
 FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS node
 FROM ghcr.io/astral-sh/uv:0.10.12@sha256:72ab0aeb448090480ccabb99fb5f52b0dc3c71923bffb5e2e26517a1c27b7fec AS uv
 FROM python:3.13-slim-trixie@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
@@ -29,9 +30,13 @@ WORKDIR /opt/taskspindle
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
-COPY --from=provider-binaries --chmod=0755 /claude /usr/local/bin/claude
-COPY --from=provider-binaries --chmod=0755 /grok /usr/local/bin/grok
-COPY --from=provider-binaries --chmod=0755 /agy /usr/local/bin/agy
+RUN --mount=type=bind,from=provider-binaries,source=/,target=/tmp/provider-binaries \
+    install -m 0755 /tmp/provider-binaries/claude /usr/local/bin/claude \
+    && install -m 0755 /tmp/provider-binaries/grok /usr/local/bin/grok \
+    && install -m 0755 /tmp/provider-binaries/agy /usr/local/bin/agy \
+    && if [ -f /tmp/provider-binaries/muse ]; then \
+         install -m 0755 /tmp/provider-binaries/muse /usr/local/bin/muse; \
+       fi
 ENV PATH="/opt/taskspindle/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
     HOME="${TASKSPINDLE_HOME}" \
     XDG_DATA_HOME="/opt/taskspindle/data" \
@@ -40,6 +45,10 @@ ENV PATH="/opt/taskspindle/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
 RUN mkdir -p /opt/taskspindle/data /run/taskspindle/jobs /run/taskspindle/diagnostics /run/taskspindle/ai \
     && chown -R 1000:1000 /opt/taskspindle/data /run/taskspindle "${TASKSPINDLE_HOME}"
 USER 1000:1000
-RUN taskspindle setup
+RUN taskspindle setup \
+    && if [ -x /usr/local/bin/muse ]; then \
+         runtime_dir="$(python -c 'from taskspindle.config import paths; print(paths().runtime_dir)')" \
+         && install -m 0755 /usr/local/bin/muse "$runtime_dir/muse"; \
+       fi
 WORKDIR ${TASKSPINDLE_HOME}
 CMD ["taskspindle", "web", "--host", "0.0.0.0", "--port", "8765"]

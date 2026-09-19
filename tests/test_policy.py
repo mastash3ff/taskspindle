@@ -57,7 +57,7 @@ def _turn(store: Store, task_id: str, provider: str, *, age: timedelta, tokens: 
 
 def test_defaults_seed_every_profile_and_the_six_skill_roles(profiles) -> None:
     default = policy.defaults(profiles)
-    assert set(default.providers) == {"claude", "grok", "agy", "claude-alias"}
+    assert set(default.providers) == {"claude", "grok", "agy", "muse", "claude-alias"}
     assert default.providers["claude"].advertised_models == ["haiku", "sonnet", "opus[1m]"]
     assert default.providers["claude"].models_without_effort == ["haiku"]
     assert default.providers["claude-alias"].advertised_models == ["haiku", "sonnet", "opus[1m]"]

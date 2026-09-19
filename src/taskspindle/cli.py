@@ -62,11 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     setup = sub.add_parser("setup", help="install the pinned adapter runtime and lay out the dirs")
     setup.add_argument("--runtime-dir", help="install into this directory instead of the default")
     setup.add_argument("--npm", default="npm", help="the npm executable to use (default: npm)")
-    setup.add_argument("--provider", choices=("claude", "agy"), default="claude",
+    setup.add_argument("--provider", choices=("claude", "agy", "muse"), default="claude",
                        help="adapter to install (default: claude)")
+    setup.add_argument("--binary", help="explicit raw Muse binary to verify and stage offline")
 
     auth = sub.add_parser("auth", help="check the existing native provider login")
-    auth.add_argument("provider", choices=("agy",))
+    auth.add_argument("provider", choices=("agy", "muse"))
     auth.add_argument("--runtime-dir", help="use an explicitly installed adapter runtime directory")
 
     doctor = sub.add_parser("doctor", help="check everything TaskSpindle needs before it runs")
@@ -184,8 +185,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 2
     if args.command == "setup":
-        return _setup(args.runtime_dir, args.npm, args.provider)
+        if args.provider == "muse" and not args.binary:
+            parser.error("setup --provider muse requires --binary with an explicit raw binary path")
+        if args.binary and args.provider != "muse":
+            parser.error("--binary is only supported with --provider muse")
+        return _setup(args.runtime_dir, args.npm, args.provider, binary=args.binary)
     if args.command == "auth":
+        if args.provider == "muse":
+            from .muse import QUALIFICATION_REASON
+
+            print(QUALIFICATION_REASON, file=sys.stderr)
+            return 1
         return _auth_agy(args.runtime_dir)
     if args.command == "doctor":
         return _doctor(live_probes=not args.no_live, as_json=args.json)
@@ -218,12 +228,19 @@ def main(argv: list[str] | None = None) -> int:
 # -- setup ---------------------------------------------------------------------------
 
 
-def _setup(runtime_dir: str | None, npm: str, provider: str = "claude") -> int:
+def _setup(runtime_dir: str | None, npm: str, provider: str = "claude", *, binary: str | None = None) -> int:
     from .setup import SetupError, install_agy_runtime, install_runtime
 
     paths = resolve_paths(runtime_dir)
     try:
-        report = install_agy_runtime(paths) if provider == "agy" else install_runtime(paths, npm=npm)
+        if provider == "muse":
+            from .muse_setup import install_muse_runtime
+
+            if binary is None:
+                raise SetupError("Muse setup requires an explicit raw binary path")
+            report = install_muse_runtime(paths, Path(binary))
+        else:
+            report = install_agy_runtime(paths) if provider == "agy" else install_runtime(paths, npm=npm)
     except SetupError as exc:
         print(f"taskspindle setup: {exc}", file=sys.stderr)
         return 1
@@ -234,6 +251,11 @@ def _setup(runtime_dir: str | None, npm: str, provider: str = "claude") -> int:
         print(f"node    {report['node']}")
     if provider == "agy":
         print("check the existing CLI login with taskspindle auth agy")
+    if provider == "muse":
+        from .muse import QUALIFICATION_REASON
+
+        print(f"sha256  {report['sha256']}")
+        print(QUALIFICATION_REASON)
     print(f"config  {report['config_file']} ({'written' if report['created_config'] else 'kept'})")
     return 0
 

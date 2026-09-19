@@ -285,7 +285,9 @@ _SAFE_REASONS = {
     "model_unavailable": "The requested model is unavailable.",
 }
 
-_SAFE_SOURCES = frozenset({"acp_error", "rate_limit_event", "turn_ok", "native_auth_check"})
+_SAFE_SOURCES = frozenset({
+    "acp_error", "rate_limit_event", "turn_ok", "native_auth_check", "muse_msp", "muse_msp_terminal",
+})
 
 
 def safe_provider_reason(state: Any, model: Any = None) -> str | None:
@@ -400,6 +402,18 @@ def classify_acp_error(exc: AcpError, *, family: str, model: str | None = None) 
     data = cause.get("rpc_data")
     raw_error_kind = data.get("errorKind") if isinstance(data, Mapping) else None
     error_kind = raw_error_kind if isinstance(raw_error_kind, str) else None
+
+    if family == "muse":
+        # MSP's stable terminal enum identifies authentication, but not quota or
+        # model availability. Never infer billing state from arbitrary error prose.
+        if exc.code == PROVIDER_AUTH_EXPIRED and cause.get("msp_error_kind") == "authRequired":
+            return Classification(
+                PROVIDER_AUTH_EXPIRED, "auth_expired", None, None, False,
+                _SAFE_REASONS["auth_expired"], source="muse_msp_terminal",
+            )
+        return Classification(
+            exc.code, None, None, None, False, str(exc), source="muse_msp",
+        )
 
     # These are normalized by the native AGY adapter from terminal diagnostics. ACP wire
     # errors and arbitrary task/tool text cannot acquire this provenance from their wording.

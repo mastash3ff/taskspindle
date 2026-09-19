@@ -664,18 +664,44 @@ async def _run_turn(
 
     stderr_path = run.dir / f"agent-{run.revision}.stderr"
     native = profile.family == "agy"
-    worker = _native_agy_worker(run, profile, workspace, stderr_path) if native else AcpWorker(
-        command=providers.launch_command(profile, task.mode.value),
-        env=run.child_env,
-        cwd=workspace,
-        stderr_path=stderr_path,
-        policy=_permission_policy(profile, task, workspace),
-        late_update_grace=LATE_UPDATE_GRACE_S.get(profile.family, 0.0),
-        on_progress=run.progress.on_progress if run.progress is not None else None,
-    )
+    is_muse = profile.family == "muse"
+    if is_muse:
+        from .muse import unresolved_commands
+
+        if unresolved_commands(run.store, run.task):
+            return _settle(run, TaskState.RECOVERY_AMBIGUOUS, "Muse command outcome remains unresolved")
+    if is_muse:
+        worker = _native_muse_worker(run, profile, workspace, stderr_path)
+    elif native:
+        worker = _native_agy_worker(run, profile, workspace, stderr_path)
+    else:
+        worker = AcpWorker(
+            command=providers.launch_command(profile, task.mode.value),
+            env=run.child_env,
+            cwd=workspace,
+            stderr_path=stderr_path,
+            policy=_permission_policy(profile, task, workspace),
+            late_update_grace=LATE_UPDATE_GRACE_S.get(profile.family, 0.0),
+            on_progress=run.progress.on_progress if run.progress is not None else None,
+        )
     try:
         async with worker as agent:
-            if native:
+            if is_muse:
+                run.agent_info = dict(agent.init.agent_info) if agent.init else {}
+                if run.kind is TurnKind.INITIAL:
+                    await agent.new_session()
+                else:
+                    if not run.task.session_id:
+                        raise AcpError("RESUME_UNAVAILABLE", "Muse task has no retained session")
+                    await agent.load_session(run.task.session_id)
+                run.session_model = agent.session_model
+                run.task = run.store.update_task(
+                    run.task_id, None, bump_version=False,
+                    resolved_model=agent.session_model, resolved_effort=agent.session_effort,
+                )
+                result = await _prompt(run, agent, cancel_event)
+                _journal_muse_outcome(run, agent)
+            elif native:
                 catalog = await cli_model_catalog(agent.command, run.child_env, workspace)
                 _configure_native_agy(run, profile, catalog)
                 from .agy_cli_adapter import AGY_MIN_VERSION, verify_cli_version
@@ -707,6 +733,8 @@ async def _run_turn(
         # The client retains updates even when prompt/cancel/timeout raises. Capture
         # them before settling so failure never discards useful partial work.
         run.result = worker.last_result
+        if is_muse and getattr(worker, "command_settled", False):
+            _journal_muse_outcome(run, worker)
         if run.result is not None:
             await _record_usage(run, profile, workspace, run.result)
             _record_violations(run, run.result)
@@ -723,6 +751,11 @@ async def _run_turn(
             return _settle_cancelled(run)
         if exc.code == "RESUME_UNAVAILABLE":
             raise _Interrupted("RESUME_UNAVAILABLE", str(exc)) from exc
+        if exc.code == "RECOVERY_AMBIGUOUS":
+            return _settle(
+                run, TaskState.RECOVERY_AMBIGUOUS, "Muse turn dispatch outcome is uncertain",
+                error={"code": exc.code, "message": str(exc), "retryable": False},
+            )
         if run.prompt_started_at is None:
             _check_initial_auth_context(run, profile)
         verdict = limits.classify_acp_error(
@@ -777,6 +810,47 @@ async def _run_turn(
     if run.cancelled or result.stop_reason == "cancelled":
         return _settle_cancelled(run)
     return await _finalize(run, workspace, result)
+
+
+def _journal_muse_outcome(run: _Run, worker: Any) -> None:
+    if worker.command_id:
+        run.store.append_event(run.task_id, EventKind.WARNING, {
+            "code": "MUSE_COMMAND_OUTCOME", "command_id": worker.command_id,
+            "session_id": run.session_id, "turn_id": run.turn_id,
+        })
+
+
+def _native_muse_worker(run: _Run, profile: Profile, workspace: Path, stderr_path: Path) -> Any:
+    from .muse import isolated_environment, require_qualified
+    from .muse_msp import MuseWorker
+
+    try:
+        require_qualified()
+    except ProfileError as exc:
+        raise _Failure(exc.code, str(exc)) from exc
+    if len(profile.command) != 1:
+        raise _Failure("PROFILE_INVALID", "Muse requires one staged executable")
+
+    def remember_session(session_id: str) -> None:
+        if run.task.session_id and run.task.session_id != session_id:
+            raise AcpError("RESUME_UNAVAILABLE", "Muse returned a different session")
+        run.session_id = session_id
+        run.task = run.store.update_task(run.task_id, None, bump_version=False, session_id=session_id)
+
+    def journal_command(command_id: str) -> None:
+        run.store.append_event(run.task_id, EventKind.WARNING, {
+            "code": "MUSE_COMMAND_INTENT", "command_id": command_id,
+            "session_id": run.session_id, "turn_id": run.turn_id,
+        })
+
+    return MuseWorker(
+        command=providers.launch_command(profile, run.task.mode.value),
+        env=isolated_environment(run.dir, run.child_env), cwd=workspace, stderr_path=stderr_path,
+        on_session=remember_session, on_command=journal_command, mode=run.task.mode.value,
+        model=run.task.resolved_model or run.task.requested_model or profile.model,
+        effort=run.task.resolved_effort or run.task.requested_effort or profile.effort,
+        on_progress=run.progress.on_progress if run.progress is not None else None,
+    )
 
 
 def _native_agy_worker(run: _Run, profile: Profile, workspace: Path, stderr_path: Path) -> AgyCliWorker:
@@ -953,6 +1027,14 @@ def _pre_spawn_evidence(
     checked the same way the built-in is, and an ``api_key`` profile is never asked for an OAuth
     seat it does not have.
     """
+    if profile.family == "muse":
+        from .muse import require_qualified
+
+        try:
+            require_qualified()
+        except ProfileError as exc:
+            raise _Failure(exc.code, str(exc)) from exc
+        return None
     if profile.auth != "oauth":
         return {"auth": profile.auth}
     if profile.family == "claude":
@@ -1234,7 +1316,7 @@ async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: Tu
         duration_ms=duration_ms,
         started_at=run.prompt_started_at,
         # AGY picker IDs describe our selection, not the backend that answered.
-        session_model=None if profile.family == "agy" else run.session_model,
+        session_model=None if profile.family in {"agy", "muse"} else run.session_model,
     )
     model = collected.model
     session_path = usage.claude_session_path(profile, workspace, run.session_id, home)
@@ -1252,7 +1334,7 @@ async def _record_usage(run: _Run, profile: Profile, workspace: Path, result: Tu
     # backend actually answered. Preserve the distinction when telemetry is absent.
     run.reported_model = (
         result.capture.model_ids[0] if result.capture.model_ids else None
-    ) if profile.family == "agy" else model
+    ) if profile.family in {"agy", "muse"} else model
 
 
 def _record_violations(run: _Run, result: TurnResult) -> None:

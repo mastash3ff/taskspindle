@@ -183,10 +183,10 @@ class DockerBackend:
                 row = connection.execute("SELECT MAX(id) FROM turns WHERE task_id=?", (task_id,)).fetchone()
                 identity = str(row[0])
                 family = task["provider_family"] or task["provider"]
-                if family not in {"claude", "grok", "agy"}:
+                if family not in {"claude", "grok", "agy", "muse"}:
                     profile = self._profiles().get(task["provider"])
                     family = profile.family if profile else None
-                if family not in {"claude", "grok", "agy"}:
+                if family not in {"claude", "grok", "agy", "muse"}:
                     raise UnitError("UNIT_START_FAILED", "Task provider family is not configured")
         return kind, task_id, identity, family
 
@@ -495,10 +495,10 @@ class DockerBackend:
     def run_probe(self, provider: str, argv: Sequence[str], *, env: Mapping[str, str] | None = None,
                   timeout: float = 90) -> dict[str, Any]:
         family = provider
-        if family not in {"claude", "grok", "agy"}:
+        if family not in {"claude", "grok", "agy", "muse"}:
             profile = self._profiles().get(provider)
             family = profile.family if profile else None
-        if family not in {"claude", "grok", "agy"} or not 0 < timeout <= 90:
+        if family not in {"claude", "grok", "agy", "muse"} or not 0 < timeout <= 90:
             raise UnitError("UNIT_INVALID", "Invalid diagnostic provider or timeout")
         options = self._options(family, probe=True)
         # Config is needed to reconstruct provider profiles. Runtime tools are image-baked.
@@ -518,11 +518,12 @@ class DockerBackend:
                     self.image, list(argv), name=name,
                     labels={"taskspindle.owner": self.owner, "taskspindle.kind": "diagnostic"},
                     environment={"HOME": os.environ.get("HOME", "/home/bsheffield"),
-                                 "XDG_STATE_HOME": str(self.paths.state_dir.parent), **(env or {}),
+                                 "XDG_STATE_HOME": str(self.paths.state_dir.parent),
+                                 "XDG_DATA_HOME": "/opt/taskspindle/data", **(env or {}),
                                  "TASKSPINDLE_CONFIG": str(self.paths.config_file),
                                  "TASKSPINDLE_WORKER_CONTAINER": "1",
-                                 "PATH": "/opt/taskspindle/.venv/bin:/usr/local/bin:/usr/bin:/bin",
-                                 "XDG_DATA_HOME": "/opt/taskspindle/data"}, **options,
+                                 "PATH": "/opt/taskspindle/.venv/bin:/usr/local/bin:/usr/bin:/bin"},
+                    **options,
                 )
             except Exception:
                 # Recover an accepted create with a lost reply so its owned container is cleaned.

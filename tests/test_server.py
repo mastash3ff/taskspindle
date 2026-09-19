@@ -356,8 +356,8 @@ def test_build_orchestrator_loads_configured_capacity(paths, monkeypatch):
     paths.config_file.write_text("[concurrency]\nclaude = 4\ngrok = 4\nagy = 4\n")
     orchestrator, store = build_orchestrator(paths=paths, parent_env={"HOME": str(paths.state_dir)})
     try:
-        assert orchestrator.concurrency == {"claude": 4, "grok": 4, "agy": 4}
-        assert orchestrator.capabilities()["limits"]["concurrent_turns_per_provider"] == 4
+        assert orchestrator.concurrency == {"claude": 4, "grok": 4, "agy": 4, "muse": 1}
+        assert orchestrator.capabilities()["limits"]["concurrent_turns_per_provider"] == 1
     finally:
         store.close()
 

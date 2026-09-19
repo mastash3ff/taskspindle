@@ -226,7 +226,8 @@ def from_prompt_response(
         reasoning_tokens=_int(usage.get("thought_tokens")),
         model_calls=None,
         duration_ms=duration_ms,
-        source="agy_cli_result" if "_agy_cli_cumulative" in usage else SOURCE_PROMPT_RESPONSE,
+        source=("muse_msp" if usage.get("_muse_msp") is True else
+                "agy_cli_result" if "_agy_cli_cumulative" in usage else SOURCE_PROMPT_RESPONSE),
         raw=usage,
         price=price,
     )
@@ -418,7 +419,7 @@ def collect(
         usage = from_turn_completed(capture.turn_completed, model=model, duration_ms=duration_ms)
         if usage is not None and model is None:
             model = usage.model
-    if model is None and profile.family != "agy":
+    if model is None and profile.family not in {"agy", "muse"}:
         model = profile.model
         if usage is not None:
             usage = with_model(usage, model)

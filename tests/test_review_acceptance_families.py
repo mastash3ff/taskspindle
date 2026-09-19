@@ -116,7 +116,7 @@ def test_different_builtin_families_remain_independent_with_api_auth(
         harness.orchestrator.profiles[provider] = replace(
             harness.orchestrator.profiles[provider],
             first_class=True,
-            base="muse" if provider == api_provider else "claude",
+            base="grok" if provider == api_provider else "claude",
             auth="api_key" if provider == api_provider else "oauth",
         )
     repo = make_repo()

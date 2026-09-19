@@ -251,6 +251,9 @@ def defaults(profiles: Mapping[str, Any]) -> DispatchPolicy:
     for name in sorted(profiles):
         seed = _SEEDS.get(_family(profiles[name]), {})
         providers[name] = ProviderPolicy(**{key: list(values) for key, values in seed.items()})
+        if _family(profiles[name]) == "muse":
+            providers[name].enabled = False
+            providers[name].note = "Disabled pending subscription-route and tool-containment qualification."
     first_class = [name for name in _PREFERENCE_ORDER if name in profiles]
     roles: dict[str, RolePolicy] = {}
     for role, spec in DEFAULT_ROLES.items():

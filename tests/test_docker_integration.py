@@ -1,12 +1,20 @@
 """Controller-facing core contracts, without a Docker daemon or provider inference."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from taskspindle import doctor, rpc, worker_diagnostics
 from taskspindle.config import Paths
 from taskspindle.providers import Profile
+
+
+def test_dockerfile_muse_stage_is_optional_and_runtime_pinned():
+    dockerfile = (Path(__file__).parents[1] / "Dockerfile").read_text()
+    assert "if [ -f /tmp/provider-binaries/muse ]" in dockerfile
+    assert "install -m 0755 /tmp/provider-binaries/muse /usr/local/bin/muse" in dockerfile
+    assert 'install -m 0755 /usr/local/bin/muse "$runtime_dir/muse"' in dockerfile
 
 
 @pytest.fixture

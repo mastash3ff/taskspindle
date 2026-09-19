@@ -34,6 +34,11 @@ def check_native_access(profile: Profile, parent_env: Mapping[str, str]) -> dict
         "model_ids": None,
         "detail": "No approved native access check is available for this profile.",
     }
+    if profile.family == "muse":
+        from .muse import QUALIFICATION_REASON
+
+        result.update(source="muse_qualification", detail=QUALIFICATION_REASON)
+        return result
     if profile.auth != "oauth" or profile.secret_env or profile.family not in {"claude", "agy"}:
         return result
 
@@ -309,6 +314,11 @@ def cached_native_check(
         "checking": False,
         "detail": "No current native quota observation is available.",
     }
+    if profile.family == "muse":
+        from .muse import QUALIFICATION_REASON
+
+        result.update(source="muse_qualification", detail=QUALIFICATION_REASON)
+        return result
     if not _eligible(profile):
         return result
     reader = getattr(store, "get_native_check", None)

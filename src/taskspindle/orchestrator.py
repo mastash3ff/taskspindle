@@ -27,6 +27,7 @@ import taskspindle
 from . import (
     auth_context,
     integration,
+    muse,
     policy,
     providers,
     recovery,
@@ -411,6 +412,7 @@ class Orchestrator:
                     "modes": sorted(profile.modes),
                     "model": profile.model,
                     "adapter": providers.adapter_metadata(profile),
+                    **({"qualification": muse.qualification()} if profile.family == "muse" else {}),
                     "native_check": checks.get(profile.id)
                     or cached_native_check(self.store, profile, self.parent_env, now=now),
                     "gateway_host": profile.gateway_host,
@@ -1324,6 +1326,13 @@ class Orchestrator:
         with self._cycle():
             record = require_task(self.store, task_id)
             _require_version(record, expected_state_version)
+            if muse.unresolved_commands(self.store, record):
+                raise TaskSpindleError(
+                    MANUAL_RECOVERY_REQUIRED,
+                    "Muse has an unresolved command; establish its outcome before continuing. "
+                    "Automatic replay could duplicate side effects.",
+                    details={"task_id": task_id},
+                )
             if record.state is TaskState.RECOVERY_AMBIGUOUS:
                 record = self._settle_ambiguous(record, expected_state_version)
             kind, target = _CONTINUATIONS.get(

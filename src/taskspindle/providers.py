@@ -5,7 +5,8 @@ is allowed to see, how it authenticates, and which task modes it may serve. Thre
 built in and first class -- ``claude`` (the pinned ``claude-agent-acp`` adapter), ``grok`` (the
 native ``grok agent ... stdio`` endpoint), and the vendor's native Antigravity CLI (``agy``),
 resolved from ``PATH`` rather than a private copy, all OAuth-only. Anything else is a configured,
-second-class profile from ``[providers.<id>]`` in ``config.toml``.
+second-class profile from ``[providers.<id>]`` in ``config.toml``. The experimental
+``muse`` built-in requires a qualified subscription route and remains disabled.
 
 The child environment is built by *allowlist*, never by filtering the parent: a name reaches the
 agent only because this module put it there. :func:`env_violations` is the belt to that braces --
@@ -52,7 +53,7 @@ __all__ = [
 ]
 
 #: The providers TaskSpindle ships with. Their ids are reserved.
-FIRST_CLASS: tuple[str, ...] = ("claude", "grok", "agy")
+FIRST_CLASS: tuple[str, ...] = ("claude", "grok", "agy", "muse")
 
 #: Every task mode. A profile serves all three unless its config narrows the set.
 ALL_MODES = frozenset({"consult", "review", "implement"})
@@ -144,7 +145,7 @@ class Profile:
     """One launchable provider configuration."""
 
     id: str
-    auth: Literal["oauth", "api_key"]
+    auth: Literal["oauth", "api_key", "subscription"]
     command: tuple[str, ...]
     env: Mapping[str, str] = field(default_factory=dict)
     secret_env: tuple[str, ...] = ()
@@ -275,6 +276,7 @@ def builtin_profiles(
     ``taskspindle doctor``.
     """
     from .agy_cli_adapter import adapter_command
+    from .muse import command as muse_command
 
     resolved_env = parent_env if parent_env is not None else os.environ
     claude_env = {"CLAUDE_CONFIG_DIR": str(home / ".claude")}
@@ -307,6 +309,10 @@ def builtin_profiles(
         "agy": Profile(
             id="agy", auth="oauth", command=adapter_command(home, parent_env=resolved_env),
             env={},
+            first_class=True,
+        ),
+        "muse": Profile(
+            id="muse", auth="subscription", command=muse_command(runtime_dir),
             first_class=True,
         ),
     }
@@ -364,6 +370,8 @@ def _configured_profile(
         raise _invalid(profile_id, f"base must be one of {', '.join(FIRST_CLASS)}")
     if base_id == "agy" and table.get("auth") != "oauth":
         raise _invalid(profile_id, "Antigravity profiles require personal OAuth")
+    if base_id == "muse":
+        raise _invalid(profile_id, "Muse aliases are unavailable until subscription and policy qualification")
     base = builtins[base_id] if base_id is not None else None
 
     auth = table.get("auth")
@@ -457,6 +465,10 @@ def profile_for_task(
     profile = profiles.get(provider_id)
     if profile is None:
         raise ProfileError("PROFILE_UNKNOWN", f"no such provider: {provider_id!r}")
+    if profile.family == "muse":
+        from .muse import require_qualified
+
+        require_qualified()
     if mode not in profile.modes:
         raise ProfileError("MODE_NOT_ALLOWED", f"provider {provider_id!r} does not serve mode {mode!r}")
     if profile.auth == "api_key" and not allow_metered:
@@ -472,7 +484,7 @@ def with_task_selection(profile: Profile, *, model: str | None, effort: str | No
 
     AGY resolves its own selection against its authenticated model catalog.
     """
-    if profile.family not in {"claude", "grok"} or (model is None and effort is None):
+    if profile.family not in {"claude", "grok", "muse"} or (model is None and effort is None):
         return profile
     if not profile.first_class:
         raise ProfileError(
@@ -499,6 +511,10 @@ def launch_command(profile: Profile, mode: str) -> tuple[str, ...]:
     Every other case is the profile's own command, unchanged.
     """
     command = profile.command
+    if profile.family == "muse":
+        # Read-only modes block shell writes as well as the native file-write tools.
+        flags = ("--disable-write", "--disable-shell") if mode != "implement" else ()
+        return (*command, "serve", *flags)
     if profile.family != "grok" or mode == "implement" or not command:
         return command
     try:
@@ -558,6 +574,14 @@ def adapter_metadata(profile: Profile) -> dict[str, str | None]:
     accepted (see :data:`taskspindle.agy_cli_adapter.AGY_TESTED_MAX`); whether one is in use is
     reported live by ``taskspindle doctor``, not here.
     """
+    if profile.family == "muse":
+        from .muse import MUSE_BUILD, MUSE_SCHEMA_FINGERPRINT, MUSE_VERSION
+
+        return {
+            "protocol": "msp", "package": "muse-code", "version": MUSE_VERSION,
+            "tested_build": MUSE_BUILD, "schema_fingerprint": MUSE_SCHEMA_FINGERPRINT,
+            "qualification": "disabled",
+        }
     if profile.family == "agy":
         from .agy_cli_adapter import ADAPTER_ID, AGY_MIN_VERSION, AGY_TESTED_MAX, PROTOCOL
 

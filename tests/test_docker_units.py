@@ -258,6 +258,18 @@ def test_accept_gets_no_auth_mount_and_interrupt_refuses_journal(setup):
     assert not client.containers.created[0][3].stops
 
 
+def test_muse_worker_is_allowlisted_without_other_provider_auth(setup):
+    backend, client = setup
+    with sqlite3.connect(backend.paths.state_dir / "taskspindle.sqlite3") as db:
+        db.execute("UPDATE tasks SET provider='muse', provider_family='muse'")
+    launch(backend)
+    options = client.containers.created[0][2]
+    assert {mount["Source"] for mount in options["mounts"]} == {str(backend.paths.state_dir)}
+    assert options["read_only"] is True
+    assert options["cap_drop"] == ["ALL"]
+    assert options["privileged"] is False
+
+
 def test_resource_security_and_image_runtime_contract(setup):
     backend, client = setup
     launch(backend)
@@ -311,6 +323,29 @@ def test_probe_uses_auth_and_config_with_private_state_and_cleans_up(setup):
     assert all(mount["Source"] != str(backend.paths.state_dir) for mount in options["mounts"])
     assert not client.containers.values
     assert not list(backend.directory.glob("taskspindle-*.json"))
+
+
+def test_muse_probe_uses_task_home_without_other_provider_auth(setup):
+    backend, client = setup
+    muse_home = backend.paths.state_dir / "ts_muse" / "muse-home"
+    environment = {
+        "HOME": str(muse_home),
+        "XDG_CONFIG_HOME": str(muse_home / ".config"),
+        "XDG_CACHE_HOME": str(muse_home / ".cache"),
+        "XDG_DATA_HOME": str(muse_home / ".local/share"),
+        "XDG_STATE_HOME": str(muse_home / ".local/state"),
+    }
+    result = backend.run_probe(
+        "muse", [str(backend.paths.runtime_dir / "muse"), "serve"], env=environment,
+    )
+    assert result["exit_code"] == 0
+    _, command, options, _ = client.containers.created[0]
+    assert command == [str(backend.paths.runtime_dir / "muse"), "serve"]
+    assert all(options["environment"][key] == value for key, value in environment.items())
+    assert {mount["Source"] for mount in options["mounts"]} == {str(backend.paths.config_file)}
+    assert options["read_only"] is True
+    assert options["cap_drop"] == ["ALL"]
+    assert options["privileged"] is False
 
 
 @pytest.mark.parametrize("provider", ["agy", "grok", "claude", None])

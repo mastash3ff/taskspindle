@@ -103,6 +103,7 @@ moved underneath you is refused rather than clobbered.
 | [docker-image.md](docs/docker-image.md) | building the container image and staging provider executables |
 | [host-controls.md](docs/host-controls.md) | the private host-controls service for the dashboard's AI-mode adapter |
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
+| [muse.md](docs/muse.md) | experimental Muse MSP adapter, offline setup, and unresolved enablement gates |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
 | [dashboard.md](docs/dashboard.md) | `taskspindle web`: task and worker inspection and its JSON API |
 | [rollback.md](docs/rollback.md) | backing it out without losing anything |

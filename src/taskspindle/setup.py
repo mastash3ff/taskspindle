@@ -60,7 +60,8 @@ _TIMEOUT = 900.0
 EXAMPLE_CONFIG = """\
 # TaskSpindle configuration.
 #
-# Every key is optional. Built-in providers are `claude`, `grok`, and `agy`, all OAuth-only.
+# Every key is optional. Active built-ins are `claude`, `grok`, and `agy`, all OAuth-only.
+# Experimental `muse` remains disabled pending subscription and containment qualification.
 # AGY uses a separately pinned native CLI and its existing personal login; see docs/antigravity.md.
 #
 # Target shares, budgets, and per-role model/effort are NOT set here: edit them with

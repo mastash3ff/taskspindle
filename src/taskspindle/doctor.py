@@ -213,6 +213,8 @@ class _Doctor:
             self.agy_cli()
             if self.live_probes:
                 self.agy_oauth()
+        if "muse" in self.profiles:
+            self.muse_cli()
         self.checks.extend(live)
         self.child_envs()
         if not self.worker_container:
@@ -226,7 +228,11 @@ class _Doctor:
             row = self.provider_status.get(limits.status_key(profile))
 
             @self.check(f"availability_{profile_id}", advisory=True)
-            def probe(row: Mapping[str, Any] | None = row) -> str:
+            def probe(row: Mapping[str, Any] | None = row, profile: Profile = profile) -> str:
+                if profile.family == "muse":
+                    from .muse import QUALIFICATION_REASON
+
+                    raise RuntimeError(QUALIFICATION_REASON)
                 state = limits.effective_state(row, self.now)
                 if state in ("ok", "unknown"):
                     if row and row.get("state") == "throttled":
@@ -616,10 +622,25 @@ print(json.dumps(result))
                 raise RuntimeError(f"{config} has no {_CODEX_MARKER} section")
             return f"{config} registers taskspindle"
 
+    def muse_cli(self) -> None:
+        """Offline protocol qualification is independent of subscription eligibility."""
+        from .muse import QUALIFICATION_REASON
+
+        self.checks.append(Check("muse_qualification", False, QUALIFICATION_REASON, advisory=True))
+        if not self.live_probes:
+            return
+
+        @self.check("muse_binary", advisory=True)
+        def probe() -> str:
+            from .muse_setup import verify_muse_binary
+
+            result = verify_muse_binary(Path(self.profiles["muse"].command[0]))
+            return f"MSP schema verified offline; sha256={result['sha256']}; subscription unverified"
+
     def profile_commands(self) -> None:
         for profile_id, profile in sorted(self.profiles.items()):
 
-            @self.check(f"profile_{profile_id}_command")
+            @self.check(f"profile_{profile_id}_command", advisory=profile.family == "muse")
             def probe(profile: Profile = profile) -> str:
                 argv0 = profile.command[0]
                 found = shutil.which(argv0)
