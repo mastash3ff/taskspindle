@@ -87,7 +87,7 @@ def profile_for(script_path: Path, provider: str = PROVIDER) -> Profile:
     """The fake agent as a provider profile; its script travels in the profile environment."""
     return Profile(
         id=provider,
-        auth="oauth",
+        auth="oauth", billing_type="subscription",
         command=AGENT_ARGV,
         env={"PYTHONPATH": str(REPO_ROOT), "TASKSPINDLE_FAKE_SCRIPT": str(script_path)},
     )

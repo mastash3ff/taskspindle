@@ -212,6 +212,9 @@ async def probe_initialize(
     profile: Profile, parent_env: Mapping[str, str], workspace: Path, *, timeout: float = 30.0,
 ) -> InitInfo | None:
     """Initialize an installed agent, without authentication, sessions or prompts."""
+    from .enrollment import require_enabled
+
+    require_enabled(profile)
     env = providers.build_child_env(profile, parent_env, task_tmp=workspace / "tmp")
     (workspace / "tmp").mkdir(parents=True, exist_ok=True)
     worker = AcpWorker(
@@ -329,10 +332,10 @@ class _Doctor:
 
             @self.check(f"availability_{profile_id}", advisory=True)
             def probe(row: Mapping[str, Any] | None = row, profile: Profile = profile) -> str:
-                if profile.family == "muse":
-                    from .muse import QUALIFICATION_REASON
+                if profile.family in {"muse", "opencode-go"}:
+                    from .enrollment import check
 
-                    raise RuntimeError(QUALIFICATION_REASON)
+                    raise RuntimeError(check(profile)["reason"])
                 state = limits.effective_state(row, self.now)
                 if state in ("ok", "unknown"):
                     if row and row.get("state") == "throttled":
@@ -537,6 +540,8 @@ class _Doctor:
         """
         checks: list[Check] = []
         for profile_id, profile in sorted(self.profiles.items()):
+            if profile.family in {"muse", "opencode-go"}:
+                continue
             if profile.first_class and profile.family != "claude":
                 continue
             if profile.family == "agy":
@@ -684,6 +689,9 @@ print(json.dumps(result))
 
     async def _init_probe(self, profile: Profile, workspace: Path) -> InitInfo | None:
         """Start the agent, keep what it said about itself at ``initialize``, and stop it."""
+        from .enrollment import require_enabled
+
+        require_enabled(profile)
         return await probe_initialize(profile, self.parent_env, workspace, timeout=_TIMEOUT)
 
     def child_envs(self) -> None:
@@ -727,20 +735,11 @@ print(json.dumps(result))
         from .muse import QUALIFICATION_REASON
 
         self.checks.append(Check("muse_qualification", False, QUALIFICATION_REASON, advisory=True))
-        if not self.live_probes:
-            return
-
-        @self.check("muse_binary", advisory=True)
-        def probe() -> str:
-            from .muse_setup import verify_muse_binary
-
-            result = verify_muse_binary(Path(self.profiles["muse"].command[0]))
-            return f"MSP schema verified offline; sha256={result['sha256']}; subscription unverified"
 
     def profile_commands(self) -> None:
         for profile_id, profile in sorted(self.profiles.items()):
 
-            @self.check(f"profile_{profile_id}_command", advisory=profile.family == "muse")
+            @self.check(f"profile_{profile_id}_command", advisory=profile.family in {"muse", "opencode-go"})
             def probe(profile: Profile = profile) -> str:
                 argv0 = profile.command[0]
                 found = shutil.which(argv0)

@@ -95,7 +95,7 @@ def fake_profile(profile_id: str, script_path: Path, *, unbuffered: bool = False
     argv.extend(["-m", "tests.fakes.fake_agent"])
     return Profile(
         id=profile_id,
-        auth="oauth",
+        auth="oauth", billing_type="subscription",
         command=tuple(argv),
         env={"PYTHONPATH": str(REPO_ROOT), "TASKSPINDLE_FAKE_SCRIPT": str(script_path)},
     )
@@ -780,7 +780,7 @@ def test_builtin_candidate_review_pairings(
     }))
     for provider_id in {author_id, reviewer_id}:
         harness.orchestrator.profiles[provider_id] = Profile(
-            id=provider_id, auth="oauth", command=("adapter",), first_class=True
+            id=provider_id, auth="oauth", billing_type="subscription", command=("adapter",), first_class=True
         )
     harness.orchestrator.authorize_repository(str(repo), [reviewer_id], [Mode.REVIEW.value])
     harness.defer()
@@ -2206,7 +2206,7 @@ def test_a_policy_that_no_longer_parses_falls_back_to_the_file_limits(
 
 def _first_class(harness: Harness, provider_id: str) -> None:
     harness.orchestrator.profiles[provider_id] = Profile(
-        id=provider_id, auth="oauth", command=("adapter",), first_class=True
+        id=provider_id, auth="oauth", billing_type="subscription", command=("adapter",), first_class=True
     )
 
 
@@ -2259,7 +2259,7 @@ def test_a_fanout_group_takes_one_live_member_per_provider_family(harness: Harne
     for provider_id in ("claude", "grok"):
         _first_class(harness, provider_id)
     harness.orchestrator.profiles["claude-two"] = Profile(
-        id="claude-two", auth="oauth", command=("adapter",), base="claude"
+        id="claude-two", auth="oauth", billing_type="subscription", command=("adapter",), base="claude"
     )
     harness.defer()
 

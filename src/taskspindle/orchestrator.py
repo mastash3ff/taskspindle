@@ -26,6 +26,7 @@ import taskspindle
 
 from . import (
     auth_context,
+    enrollment,
     integration,
     muse,
     policy,
@@ -466,10 +467,16 @@ class Orchestrator:
                     "first_class": profile.first_class,
                     "second_class": not profile.first_class,
                     "auth": profile.auth,
+                    "auth_method": profile.auth_method,
+                    "billing_type": profile.billing_type,
+                    "account_scope": profile.account_scope,
+                    "quota_scope": profile.quota_scope,
+                    "model_family": profile.underlying_family,
                     "modes": sorted(profile.modes),
                     "model": profile.model,
                     "adapter": providers.adapter_metadata(profile),
-                    **({"qualification": muse.qualification()} if profile.family == "muse" else {}),
+                    **({"qualification": enrollment.check(profile)}
+                       if profile.family in {"muse", "opencode-go"} else {}),
                     "native_check": checks.get(profile.id)
                     or cached_native_check(self.store, profile, self.parent_env, now=now),
                     "gateway_host": profile.gateway_host,

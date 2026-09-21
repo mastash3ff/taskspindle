@@ -16,14 +16,16 @@ def test_native_selection_is_bound_across_catalog_and_profile_changes(tmp_path):
     with make_store(tmp_path) as store:
         task = make_task(store, provider="agy")
         run = SimpleNamespace(task=task, task_id=task.id, store=store, kind=TurnKind.INITIAL)
-        original = Profile(id="agy", auth="oauth", command=("agy",))
+        original = Profile(id="agy", auth="oauth", billing_type="subscription",
+                          command=("agy",))
         catalog = [("gemini-3.8-flash-medium", "Flash"), ("gemini-3.8-pro-high", "Pro")]
         runner._configure_native_agy(run, original, catalog)
         assert run.task.resolved_model == "gemini-3.8-flash-medium"
         assert run.task.resolved_effort == "medium"
         assert run.task.requested_model is None
         run.kind = TurnKind.CONTINUE
-        changed = Profile(id="agy", auth="oauth", command=("agy",), model="gemini-4-flash-high")
+        changed = Profile(id="agy", auth="oauth", billing_type="subscription",
+                          command=("agy",), model="gemini-4-flash-high")
         runner._configure_native_agy(run, changed, [*catalog, (changed.model, "New")])
         assert run.task.resolved_model == "gemini-3.8-flash-medium"
 
@@ -70,7 +72,8 @@ async def test_native_runner_records_real_session_model_selection_and_usage(tmp_
     monkeypatch.setattr(agy_cli_policy, "prepare_launch", lambda **kwargs: ("native-worker",))
     with make_store(tmp_path) as store:
         task = seed_task(store, paths, mode=Mode.CONSULT, provider_family="agy")
-        profile = Profile(id=task.provider, base="agy", auth="oauth", command=("/pinned/agy",))
+        profile = Profile(id=task.provider, base="agy", auth="oauth", billing_type="subscription",
+                          command=("/pinned/agy",))
         await runner.run_worker(store, task.id, profiles={task.provider: profile},
                                 paths=paths, boot=BOOT, signals=False)
         final = store.get_task(task.id)

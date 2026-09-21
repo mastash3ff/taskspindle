@@ -66,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="adapter to install (default: claude)")
     setup.add_argument("--binary", help="explicit raw Muse binary to verify and stage offline")
 
+    enrollment = sub.add_parser("enrollment-check", help="report dormant adapter evidence without activation")
+    enrollment.add_argument("provider", choices=("muse", "opencode-go"))
+    enrollment.add_argument("--evidence", help="optional local JSON evidence references; never credentials")
+
     auth = sub.add_parser("auth", help="check the existing native provider login")
     auth.add_argument("provider", choices=("agy", "muse"))
     auth.add_argument("--runtime-dir", help="use an explicitly installed adapter runtime directory")
@@ -217,6 +221,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 2
+    if args.command == "enrollment-check":
+        from .enrollment import check
+        from .providers import Profile
+
+        try:
+            evidence = json.loads(Path(args.evidence).read_text()) if args.evidence else {}
+            if not isinstance(evidence, dict):
+                raise ValueError("evidence must be a JSON object")
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        profile = Profile(id=args.provider, auth="api_key" if args.provider == "opencode-go"
+                          else "subscription", command=())
+        print(json.dumps(check(profile, evidence), indent=2))
+        return 0
     if args.command == "setup":
         if args.provider == "muse" and not args.binary:
             parser.error("setup --provider muse requires --binary with an explicit raw binary path")
@@ -990,11 +1008,14 @@ def _policy_promote(action: str, request_file: str) -> int:
     }[action]
     try:
         request = json.loads(Path(request_file).read_text(encoding="utf-8"))
-        if not isinstance(request, dict) or set(request) != fields:
+        optional = {"verified_catalogs"} if action == "stage" else set()
+        if not isinstance(request, dict) or not fields <= set(request) or set(request) - fields - optional:
             raise ValueError(f"{action} request must contain exactly: {', '.join(sorted(fields))}")
         if not isinstance(request["record_path"], str) or not request["record_path"]:
             raise ValueError("record_path must be a nonempty string")
         if action == "stage":
+            if "verified_catalogs" in request and not isinstance(request["verified_catalogs"], dict):
+                raise ValueError("verified_catalogs must be an object")
             if type(request["expected_revision"]) is not int or request["expected_revision"] < 0:
                 raise ValueError("expected_revision must be a nonnegative integer")
             if not isinstance(request["binary_digests"], dict) or not isinstance(request["candidates"], dict):

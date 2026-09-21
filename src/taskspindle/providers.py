@@ -53,7 +53,7 @@ __all__ = [
 ]
 
 #: The providers TaskSpindle ships with. Their ids are reserved.
-FIRST_CLASS: tuple[str, ...] = ("claude", "grok", "agy", "muse")
+FIRST_CLASS: tuple[str, ...] = ("claude", "grok", "agy", "muse", "opencode-go")
 
 #: Every task mode. A profile serves all three unless its config narrows the set.
 ALL_MODES = frozenset({"consult", "review", "implement"})
@@ -156,6 +156,29 @@ class Profile:
     base: str | None = None
     #: Host of ``ANTHROPIC_BASE_URL`` / ``OPENAI_BASE_URL`` in :attr:`env`, for attribution only.
     gateway_host: str | None = None
+
+    #: Billing is independent of credential syntax; API keys can back subscriptions.
+    billing_type: Literal["unknown", "subscription", "metered"] = "unknown"
+    account_scope: str | None = None
+    quota_scope: str | None = None
+    model_family: str | None = None
+
+    @property
+    def auth_method(self) -> str:
+        """Normalized credential method; ``auth`` retains its legacy API."""
+        return "native_login" if self.auth == "subscription" else self.auth
+
+    @property
+    def underlying_family(self) -> str:
+        """Model lineage, independent of the CLI/transport family."""
+        if self.model_family:
+            return self.model_family
+        model = (self.model or "").rsplit("/", 1)[-1].lower()
+        for prefix, family in (("grok", "grok"), ("claude", "claude"),
+                               ("gemini", "gemini"), ("muse", "muse"), ("gpt", "openai")):
+            if model.startswith(prefix):
+                return family
+        return self.family
 
     @property
     def family(self) -> str:
@@ -287,7 +310,8 @@ def builtin_profiles(
     }
     return {
         "claude": Profile(
-            id="claude",
+            id="claude", billing_type="subscription", account_scope="claude:personal",
+            quota_scope="claude:personal",
             auth="oauth",
             command=(str(runtime_dir / "node_modules" / ".bin" / "claude-agent-acp"),),
             env=claude_env,
@@ -297,7 +321,8 @@ def builtin_profiles(
             first_class=True,
         ),
         "grok": Profile(
-            id="grok",
+            id="grok", billing_type="subscription", account_scope="grok:personal",
+            quota_scope="grok:personal",
             auth="oauth",
             command=_grok_command(_GROK_DEFAULT_MODEL, _GROK_DEFAULT_EFFORT),
             env=grok_env,
@@ -307,9 +332,14 @@ def builtin_profiles(
             first_class=True,
         ),
         "agy": Profile(
-            id="agy", auth="oauth", command=adapter_command(home, parent_env=resolved_env),
+            id="agy", billing_type="subscription", account_scope="agy:personal",
+            quota_scope="agy:personal", auth="oauth", command=adapter_command(home, parent_env=resolved_env),
             env={},
             first_class=True,
+        ),
+        "opencode-go": Profile(
+            id="opencode-go", auth="api_key", command=("opencode", "acp", "--pure"),
+            billing_type="unknown", first_class=True,
         ),
         "muse": Profile(
             id="muse", auth="subscription", command=muse_command(runtime_dir),
@@ -370,8 +400,11 @@ def _configured_profile(
         raise _invalid(profile_id, f"base must be one of {', '.join(FIRST_CLASS)}")
     if base_id == "agy" and table.get("auth") != "oauth":
         raise _invalid(profile_id, "Antigravity profiles require personal OAuth")
-    if base_id == "muse":
-        raise _invalid(profile_id, "Muse aliases are unavailable until subscription and policy qualification")
+    if base_id in {"muse", "opencode-go"}:
+        raise _invalid(
+            profile_id, f"{'Muse' if base_id == 'muse' else 'OpenCode Go'} aliases are unavailable "
+            "until subscription and policy qualification",
+        )
     base = builtins[base_id] if base_id is not None else None
 
     auth = table.get("auth")
@@ -412,7 +445,22 @@ def _configured_profile(
             profile_id, "Antigravity aliases must retain the pinned native command and environment",
         )
 
+    billing = table.get("billing_type", "unknown")
+    if billing not in {"unknown", "subscription", "metered"}:
+        raise _invalid(profile_id, "billing_type must be unknown, subscription, or metered")
+    if ("billing_type" not in table and base and auth == "oauth"
+            and command == base.command and env == base.env):
+        billing = base.billing_type
+    if billing == "subscription" and not (
+        base and auth == "oauth" and command == base.command and env == base.env
+    ):
+        # Metadata is not enrollment. Unknown/custom routes still require metered opt-in.
+        billing = "unknown"
     return Profile(
+        billing_type=billing,
+        account_scope=_optional_str(profile_id, table, "account_scope"),
+        quota_scope=_optional_str(profile_id, table, "quota_scope"),
+        model_family=_optional_str(profile_id, table, "model_family"),
         id=profile_id,
         auth=auth,
         command=command,
@@ -469,12 +517,19 @@ def profile_for_task(
         from .muse import require_qualified
 
         require_qualified()
+    if profile.family == "opencode-go":
+        from .enrollment import require_enabled
+
+        require_enabled(profile)
     if mode not in profile.modes:
         raise ProfileError("MODE_NOT_ALLOWED", f"provider {provider_id!r} does not serve mode {mode!r}")
-    if profile.auth == "api_key" and not allow_metered:
+    # Credential syntax cannot attest subscription entitlement. No active API-key
+    # subscription route is registered; dormant routes were rejected above.
+    subscription = profile.billing_type == "subscription" and profile.auth != "api_key"
+    if not subscription and not allow_metered:
         raise ProfileError(
             "METERED_NOT_ALLOWED",
-            f"provider {provider_id!r} bills per token; allow_metered was not set",
+            f"provider {provider_id!r} billing is {profile.billing_type}; allow_metered was not set",
         )
     return profile
 
@@ -510,6 +565,10 @@ def launch_command(profile: Profile, mode: str) -> tuple[str, ...]:
     where the kernel refuses its file writes and shell writes (see :data:`GROK_READ_ONLY_FLAGS`).
     Every other case is the profile's own command, unchanged.
     """
+    if profile.family == "opencode-go":
+        from .enrollment import require_enabled
+
+        require_enabled(profile)
     command = profile.command
     if profile.family == "muse":
         # Read-only modes block shell writes as well as the native file-write tools.
@@ -559,7 +618,8 @@ def reviewer_independent(author: Profile, reviewer: Profile) -> bool:
     family cannot review each other, even with different commands or models. Other configured
     authors retain the existing command/model distinction for second-class reviews.
     """
-    if author.id == reviewer.id or author.family == reviewer.family:
+    if (author.id == reviewer.id or author.family == reviewer.family
+            or author.underlying_family == reviewer.underlying_family):
         return False
     if author.first_class:
         return reviewer.first_class
@@ -574,6 +634,8 @@ def adapter_metadata(profile: Profile) -> dict[str, str | None]:
     accepted (see :data:`taskspindle.agy_cli_adapter.AGY_TESTED_MAX`); whether one is in use is
     reported live by ``taskspindle doctor``, not here.
     """
+    if profile.family == "opencode-go":
+        return {"protocol": "acp", "package": "opencode", "version": None, "qualification": "disabled"}
     if profile.family == "muse":
         from .muse import MUSE_BUILD, MUSE_SCHEMA_FINGERPRINT, MUSE_VERSION
 
@@ -654,6 +716,10 @@ def build_child_env(
     env["NO_BROWSER"] = "1"
     env["TMPDIR"] = str(task_tmp)
 
+    if profile.family == "opencode-go":
+        from .opencode_go import isolated_environment
+
+        return {**env, **isolated_environment(task_tmp)}
     env.update(profile.env)
     if profile.family == "agy":
         env.update(AGY_PIN_ENV)

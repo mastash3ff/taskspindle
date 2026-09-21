@@ -132,7 +132,8 @@ async def test_direct_worker_is_gated_before_transport(tmp_path, monkeypatch):
 
     monkeypatch.setattr(muse_msp, "MuseWorker", lambda **kw: pytest.fail("must not spawn"))
     paths = Paths(tmp_path / "config", tmp_path / "state", tmp_path / "data", tmp_path / "runtime")
-    profile = Profile(id="fake", base="muse", auth="subscription", command=("muse",))
+    profile = Profile(id="fake", base="muse", auth="subscription", billing_type="subscription",
+                      command=("muse",))
     with make_store(tmp_path) as store:
         task = seed_task(store, paths, mode=Mode.CONSULT, provider_family="muse")
         state = await runner.run_worker(
@@ -149,7 +150,8 @@ async def test_muse_runner_journals_before_prompt_and_preserves_uncertainty(tmp_
     # Synthetic transport qualification only. Production has no enabling config switch.
     monkeypatch.setattr(muse, "qualification", lambda: {"enabled": True})
     paths = Paths(tmp_path / "config", tmp_path / "state", tmp_path / "data", tmp_path / "runtime")
-    profile = Profile(id="fake", base="muse", auth="subscription", command=("/pinned/muse",))
+    profile = Profile(id="fake", base="muse", auth="subscription", billing_type="subscription",
+                      command=("/pinned/muse",))
     calls = []
     session_id = "01990000-0000-7000-8000-000000000001"
     command_id = "01990000-0000-7000-8000-000000000002"
@@ -211,7 +213,8 @@ def test_muse_selected_model_is_not_reported_as_observed(tmp_path):
     result = TurnResult("end_turn", "answer", TurnCapture(), {
         "input_tokens": 10, "output_tokens": 4, "_muse_msp": True,
     })
-    profile = Profile(id="muse", auth="subscription", command=("muse",), model="requested")
+    profile = Profile(id="muse", auth="subscription", billing_type="subscription",
+                      command=("muse",), model="requested")
     collected = usage.collect(result, profile=profile, cwd=tmp_path, home=tmp_path,
                               session_id=None, duration_ms=1)
     assert collected.model is None
@@ -259,7 +262,8 @@ def test_unresolved_muse_cannot_resume_into_a_fresh_command(tmp_path):
         task = store.update_task(task.id, None, state=TaskState.RECOVERY_AMBIGUOUS)
         store.release_lease(task.provider, task.id)
         store.append_event(task.id, "WARNING", {"code": "MUSE_COMMAND_INTENT", "command_id": "one"})
-        profile = Profile(id="fake", base="muse", auth="subscription", command=("/pinned/muse",))
+        profile = Profile(id="fake", base="muse", auth="subscription", billing_type="subscription",
+                      command=("/pinned/muse",))
         orch = Orchestrator(store=store, paths=paths, profiles={"fake": profile},
                             units=FakeUnitBackend(), boot=BOOT, parent_env={})
         before = store.list_turns(task.id)

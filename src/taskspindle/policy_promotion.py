@@ -13,7 +13,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from . import policy
+from . import enrollment, policy
+from .providers import ProfileError
 from .store import PolicyRevisionConflict
 
 
@@ -22,7 +23,8 @@ class PromotionError(ValueError):
 
 
 def _digest(value: str, name: str) -> str:
-    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+    if (not isinstance(value, str) or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)):
         raise PromotionError(f"{name} must be a lowercase SHA-256 digest")
     return value
 
@@ -34,19 +36,43 @@ def _canonical(value: Any) -> str:
 def _candidate_policy(
     previous: policy.DispatchPolicy, candidates: Mapping[str, Mapping[str, Any]],
     profiles: Mapping[str, Any],
+    verified_catalogs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> policy.DispatchPolicy:
     if not candidates:
         raise PromotionError("at least one candidate selection is required")
     updated = previous.model_copy(deep=True)
+    for provider, catalog in (verified_catalogs or {}).items():
+        if provider not in profiles or provider not in updated.providers:
+            raise PromotionError(f"unknown catalog provider: {provider!r}")
+        try:
+            enrollment.require_promotable(profiles[provider])
+        except ProfileError as exc:
+            raise PromotionError(str(exc)) from exc
+        if not isinstance(catalog, Mapping) or set(catalog) != {
+            "advertised_models", "advertised_efforts", "source", "evidence_sha256",
+        }:
+            raise PromotionError("catalog requires models, efforts, source, and evidence_sha256")
+        if not isinstance(catalog["source"], str) or not catalog["source"].strip():
+            raise PromotionError("catalog source is required")
+        _digest(catalog["evidence_sha256"], "catalog evidence_sha256")
+        payload = updated.providers[provider].model_dump(mode="json")
+        payload.update({key: catalog[key] for key in ("advertised_models", "advertised_efforts")})
+        try:
+            updated.providers[provider] = policy.ProviderPolicy.model_validate(payload)
+        except Exception as exc:
+            raise PromotionError(f"invalid catalog: {exc}") from exc
     for role, selections in candidates.items():
         if role not in updated.roles or not selections:
             raise PromotionError(f"unknown role or empty selections: {role!r}")
         for provider, raw in selections.items():
             profile = profiles.get(provider)
             advertised = updated.providers.get(provider)
-            if profile is None or advertised is None or not getattr(profile, "first_class", False) \
-                    or getattr(profile, "auth", None) not in {"oauth", "subscription"}:
-                raise PromotionError(f"{provider!r} is not a built-in subscription provider")
+            if profile is None or advertised is None:
+                raise PromotionError(f"unknown provider: {provider!r}")
+            try:
+                enrollment.require_promotable(profile)
+            except ProfileError as exc:
+                raise PromotionError(str(exc)) from exc
             try:
                 selection = policy.Selection.model_validate(raw)
             except Exception as exc:
@@ -67,6 +93,7 @@ def stage(
     image_identity: str, binary_digests: Mapping[str, str],
     expected_revision: int, expected_fingerprint: str,
     candidates: Mapping[str, Mapping[str, Any]],
+    verified_catalogs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create an exclusive, read-only staged record; never modify the policy here."""
     if len(source_commit) != 40 or any(c not in "0123456789abcdef" for c in source_commit):
@@ -89,7 +116,7 @@ def stage(
         raise PromotionError("stored policy fingerprint differs from expected fingerprint")
     if policy.fingerprint(loaded.policy) != expected_fingerprint:
         raise PromotionError("stored document does not match its fingerprint")
-    candidate = _candidate_policy(loaded.policy, candidates, profiles)
+    candidate = _candidate_policy(loaded.policy, candidates, profiles, verified_catalogs)
     selections = {
         role: {
             provider: policy.Selection.model_validate(raw).model_dump(mode="json")
@@ -106,6 +133,7 @@ def stage(
         "expected_fingerprint": expected_fingerprint,
         "previous_document": json.loads(policy.canonical_json(loaded.policy)),
         "candidate_selections": selections,
+        "verified_catalogs": dict(verified_catalogs or {}),
         "candidate_fingerprint": policy.fingerprint(candidate),
     }
     content = _canonical(record).encode()
@@ -163,7 +191,9 @@ def apply(
     previous = policy.parse(record["previous_document"])
     if policy.fingerprint(previous) != record["expected_fingerprint"]:
         raise PromotionError("staged prior policy fingerprint mismatch")
-    candidate = _candidate_policy(previous, record["candidate_selections"], profiles)
+    candidate = _candidate_policy(
+        previous, record["candidate_selections"], profiles, record.get("verified_catalogs"),
+    )
     if policy.fingerprint(candidate) != record["candidate_fingerprint"]:
         raise PromotionError("staged candidate fingerprint mismatch")
     return policy.save(

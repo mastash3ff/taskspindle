@@ -296,14 +296,17 @@ def provider_availability(
     call-site symmetry with the rest of the availability surface; the rule itself is per provider.
     """
     del model, parent_env
-    if profile.family == "muse":
-        from .muse import QUALIFICATION_REASON, qualification
+    from .muse import qualification as muse_qualification
 
-        if not qualification()["enabled"]:
-            return {
-                "state": "unqualified", "reset_at": None, "eligible_at": None,
-                "reason": QUALIFICATION_REASON,
-            }
+    if profile.family == "opencode-go" or (
+        profile.family == "muse" and not muse_qualification()["enabled"]
+    ):
+        from .enrollment import check
+
+        return {
+            "state": "unqualified", "reset_at": None, "eligible_at": None,
+            "reason": check(profile)["reason"],
+        }
     key = limits.status_key(profile)
     row = store.get_provider_status(key)
     state = str(row.get("state")) if row and row.get("state") else "ok"

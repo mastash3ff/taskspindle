@@ -345,7 +345,7 @@ def defaults(profiles: Mapping[str, Any]) -> DispatchPolicy:
     for name in sorted(profiles):
         seed = _SEEDS.get(_family(profiles[name]), {})
         providers[name] = ProviderPolicy(**{key: list(values) for key, values in seed.items()})
-        if _family(profiles[name]) == "muse":
+        if _family(profiles[name]) in {"muse", "opencode-go"}:
             providers[name].enabled = False
             providers[name].note = "Disabled pending subscription-route and tool-containment qualification."
     first_class = [name for name in _PREFERENCE_ORDER if name in profiles]
@@ -614,7 +614,10 @@ def _steerable(profile: Any) -> bool:
     Only a built-in subscription profile: ``with_task_selection`` refuses a per-task override on
     anything else, and a metered profile must never be stepped up by a share target.
     """
-    return bool(getattr(profile, "first_class", True)) and getattr(profile, "auth", "oauth") != "api_key"
+    billing = getattr(profile, "billing_type", None)
+    subscription = (billing == "subscription" if billing is not None
+                    else getattr(profile, "auth", "oauth") != "api_key")
+    return bool(getattr(profile, "first_class", True)) and subscription
 
 
 def _check_selection(
@@ -633,7 +636,9 @@ def _check_selection(
             and provider.advertised_models
             and selection.model not in provider.advertised_models
         ):
-            return [_error((*loc, "model"), f"{selection.model!r} is not an advertised model", "unadvertised")]
+            return [_error(
+                (*loc, "model"), f"{selection.model!r} is not an advertised model", "unadvertised",
+            )]
         return []
     if family not in {"claude", "grok"} or provider is None:
         return []

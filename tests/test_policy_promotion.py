@@ -111,3 +111,36 @@ def test_tampered_record_is_rejected(context):
     path.write_text(path.read_text().replace("grok-4.7", "grok-4.6"))
     with pytest.raises(policy_promotion.PromotionError, match="checksum mismatch"):
         _apply(path, store, profiles)
+
+
+def test_new_verified_catalog_is_staged_applied_and_rolled_back(context):
+    path, store, profiles = context
+    before = policy.load(store, profiles)
+    record = policy_promotion.stage(
+        path, store, profiles, source_commit="a" * 40,
+        image_identity="sha256:" + "b" * 64, binary_digests={"grok": "c" * 64},
+        expected_revision=before.revision, expected_fingerprint=before.fingerprint,
+        candidates={"planner": {"grok": {"model": "grok-future", "effort": "medium"}}},
+        verified_catalogs={"grok": {
+            "advertised_models": [*before.policy.providers["grok"].advertised_models, "grok-future"],
+            "advertised_efforts": before.policy.providers["grok"].advertised_efforts,
+            "source": "offline-fixture://catalog", "evidence_sha256": "e" * 64,
+        }},
+    )
+    assert store.get_dispatch_policy() is None
+    assert record["verified_catalogs"]["grok"]["evidence_sha256"] == "e" * 64
+    result = _apply(path, store, profiles)
+    assert "grok-future" in result["document"]["providers"]["grok"]["advertised_models"]
+    restored = policy_promotion.rollback(path, store, profiles, admission_closed=True)
+    assert restored["fingerprint"] == before.fingerprint
+    assert "grok-future" not in restored["document"]["providers"]["grok"]["advertised_models"]
+
+
+def test_boolean_first_class_cannot_promote_unknown_adapter(context):
+    from dataclasses import replace
+
+    path, store, profiles = context
+    profiles["grok"] = replace(profiles["grok"], command=("arbitrary-cli",))
+    with pytest.raises(policy_promotion.PromotionError, match="not qualified"):
+        _stage(path, store, profiles)
+    assert not path.exists()

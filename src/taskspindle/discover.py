@@ -50,7 +50,7 @@ _USER_AGENT = f"taskspindle/{taskspindle.__version__} (+https://github.com/masta
 #: Registry ids that map onto TaskSpindle's own first-class providers.
 _FIRST_CLASS_REGISTRY_IDS: dict[str, str] = {
     "claude-acp": "claude", "grok-build": "grok", "antigravity-acp": "agy",
-    "antigravity-cli": "agy",
+    "antigravity-cli": "agy", "opencode": "opencode-go", "muse": "muse",
 }
 
 #: Suffixes an npm package's bare name commonly drops in its installed bin name. ``-acp`` is not
@@ -297,6 +297,8 @@ def first_class_match(agent: RegistryAgent) -> str | None:
 def proposal(found: DiscoveredAgent) -> str:
     """A ``config.toml`` block for one discovered agent, for a person to read and paste."""
     agent = found.agent
+    if first_class_match(agent) in {"muse", "opencode-go"}:
+        return "# Dormant adapter: run taskspindle enrollment-check; activation is unavailable.\n"
     if first_class_match(agent) == "agy":
         return "# Antigravity is built in as agy; run taskspindle setup --provider agy.\n"
     command = ", ".join(json.dumps(part) for part in found.command)
@@ -322,6 +324,12 @@ async def probe(
 
     results: dict[str, dict[str, Any]] = {}
     for item in found:
+        if first_class_match(item.agent) in {"muse", "opencode-go"}:
+            results[item.agent.id] = {
+                "ok": False, "agent_info": None, "load_session": None, "auth_method_ids": [],
+                "error": {"code": "ADAPTER_NOT_QUALIFIED", "message": "Dormant adapter; probing is disabled"},
+            }
+            continue
         # This transient profile only builds a credential-free child environment.
         profile = Profile(id=profile_id(item.agent), auth="oauth", command=item.command)
         info = None

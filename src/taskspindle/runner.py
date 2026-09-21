@@ -1027,6 +1027,13 @@ def _pre_spawn_evidence(
     checked the same way the built-in is, and an ``api_key`` profile is never asked for an OAuth
     seat it does not have.
     """
+    if profile.family == "opencode-go":
+        from .enrollment import require_enabled
+
+        try:
+            require_enabled(profile)
+        except ProfileError as exc:
+            raise _Failure(exc.code, str(exc)) from exc
     if profile.family == "muse":
         from .muse import require_qualified
 

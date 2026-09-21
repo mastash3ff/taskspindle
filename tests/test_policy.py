@@ -58,7 +58,7 @@ def _turn(store: Store, task_id: str, provider: str, *, age: timedelta, tokens: 
 
 def test_defaults_seed_every_profile_and_the_six_skill_roles(profiles) -> None:
     default = policy.defaults(profiles)
-    assert set(default.providers) == {"claude", "grok", "agy", "muse", "claude-alias"}
+    assert set(default.providers) == {"claude", "grok", "agy", "muse", "opencode-go", "claude-alias"}
     assert default.providers["claude"].advertised_models == ["haiku", "sonnet", "opus[1m]"]
     assert default.providers["claude"].models_without_effort == ["haiku"]
     assert default.providers["claude-alias"].advertised_models == ["haiku", "sonnet", "opus[1m]"]
@@ -303,7 +303,7 @@ def test_new_fields_at_their_defaults_leave_the_stored_document_and_fingerprint_
     assert all("max_concurrent" not in spec for spec in stored["providers"].values())
     assert all("ladders" not in spec and "fanout" not in spec for spec in stored["roles"].values())
     # Pin the current base policy so unrelated tuning fields do not alter its canonical form.
-    assert policy.fingerprint(document) == "49391cd766d096018e067828e6e5b3e7b7ac9523565d65681ffaa9f2dc5be316"
+    assert policy.fingerprint(document) == "9237d9b4a2466c57fb5f72ba4e571d2068c07d31d3ebe7b1f5a06d6e3de2c940"
     # The API still hands readers every key.
     assert document.model_dump(mode="json")["roles"]["mechanic"]["fanout"] == 1
 
