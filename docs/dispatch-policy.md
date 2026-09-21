@@ -23,6 +23,42 @@ takes effect without restarting the MCP server. `[concurrency]` and `[capacity]`
 second is the ceiling over whatever it sets. The dashboard shows both and writes neither. See
 [concurrency.md](concurrency.md).
 
+### Guarded model promotion
+
+Automation can call `taskspindle policy promote stage REQUEST.json`, then `apply REQUEST.json`,
+and, if needed, `rollback REQUEST.json`. Each command accepts one JSON request file and prints
+a JSON result. The commands make no provider or Docker calls. The caller obtains the image and
+binary identities independently, closes admission before a write, and supplies that assertion
+with a nonempty `admission_evidence` string. The string is an operator record, not a check that
+the dispatcher is actually closed.
+
+The stage request has exactly these fields:
+
+```json
+{
+  "record_path": "/path/to/staged-promotion.json",
+  "source_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "image_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "binary_digests": {"grok": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+  "expected_revision": 0,
+  "expected_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "candidates": {"planner": {"grok": {"model": "grok-4.7", "effort": "medium"}}}
+}
+```
+
+`record_path` must not exist. The staged file is created read-only and contains the prior
+policy for rollback. Candidate role and provider keys must already exist; candidate models
+and efforts must be advertised in the policy and pass the policy's selection rules. Metered
+profiles cannot be promoted.
+
+The apply request has `record_path`, `admission_closed: true`, a nonempty
+`admission_evidence`, `runtime_image_identity`, and `runtime_binary_digests`. The runtime values
+must match the staged values exactly. The rollback request has `record_path`,
+`admission_closed: true`, and a nonempty `admission_evidence`. Apply and rollback both use an
+expected policy revision compare-and-swap. A revision conflict exits with code 3; other
+validation failures exit with code 1. Rollback is available only while the staged candidate
+is still the current policy.
+
 ## Turning usage up
 
 The knobs that raise how much of a subscription pool is used, from bluntest to finest:

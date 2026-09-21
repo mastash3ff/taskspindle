@@ -169,6 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--if-revision", type=int, help="only write if this is still the current revision"
     )
 
+    policy_promote = policy_sub.add_parser(
+        "promote", help="stage, apply, or roll back a guarded model-policy refresh"
+    )
+    promote_sub = policy_promote.add_subparsers(dest="promotion_action", metavar="ACTION")
+    for action in ("stage", "apply", "rollback"):
+        promote_sub.add_parser(action, help=f"{action} a guarded promotion").add_argument(
+            "request", help="JSON request file with explicit identity and admission assertions"
+        )
+
     dispatch = sub.add_parser(
         "dispatch", help="start queued tasks whose provider has a free slot, once, and exit"
     )
@@ -643,7 +652,7 @@ def _table(columns: list[str], rows: list[list[str]]) -> None:
 
 def _policy(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.policy_command is None:
-        parser.error("policy requires a subcommand (show, export, import, set, preset, reset)")
+        parser.error("policy requires a subcommand (show, export, import, set, preset, reset, promote)")
     if args.policy_command == "show":
         return _policy_show(status=args.status, as_json=args.json)
     if args.policy_command == "export":
@@ -656,6 +665,10 @@ def _policy(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
         )
     if args.policy_command == "preset":
         return _policy_preset(args.provider, args.level, args.if_revision, dry_run=args.dry_run)
+    if args.policy_command == "promote":
+        if args.promotion_action is None:
+            parser.error("policy promote requires stage, apply, or rollback")
+        return _policy_promote(args.promotion_action, args.request)
     return _policy_reset(args.if_revision)
 
 
@@ -956,6 +969,86 @@ def _policy_reset(if_revision: int | None) -> int:
     except (ConfigError, providers.ProfileError, OSError, ValueError) as exc:
         print(f"taskspindle policy: {exc}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _policy_promote(action: str, request_file: str) -> int:
+    """Execute one local promotion step from a strict JSON request file."""
+    from . import policy_promotion, providers
+    from .store import PolicyRevisionConflict
+
+    fields = {
+        "stage": {
+            "record_path", "source_commit", "image_identity", "binary_digests",
+            "expected_revision", "expected_fingerprint", "candidates",
+        },
+        "apply": {
+            "record_path", "admission_closed", "admission_evidence",
+            "runtime_image_identity", "runtime_binary_digests",
+        },
+        "rollback": {"record_path", "admission_closed", "admission_evidence"},
+    }[action]
+    try:
+        request = json.loads(Path(request_file).read_text(encoding="utf-8"))
+        if not isinstance(request, dict) or set(request) != fields:
+            raise ValueError(f"{action} request must contain exactly: {', '.join(sorted(fields))}")
+        if not isinstance(request["record_path"], str) or not request["record_path"]:
+            raise ValueError("record_path must be a nonempty string")
+        if action == "stage":
+            if type(request["expected_revision"]) is not int or request["expected_revision"] < 0:
+                raise ValueError("expected_revision must be a nonnegative integer")
+            if not isinstance(request["binary_digests"], dict) or not isinstance(request["candidates"], dict):
+                raise ValueError("binary_digests and candidates must be objects")
+            if any(not isinstance(choices, dict) for choices in request["candidates"].values()):
+                raise ValueError("each candidate role must contain a provider object")
+            if any(not isinstance(selection, dict) for choices in request["candidates"].values()
+                   for selection in choices.values()):
+                raise ValueError("each candidate selection must be an object")
+            for name in ("source_commit", "image_identity", "expected_fingerprint"):
+                if not isinstance(request[name], str):
+                    raise ValueError(f"{name} must be a string")
+        else:
+            if request["admission_closed"] is not True:
+                raise ValueError("admission_closed must be true")
+            if (not isinstance(request["admission_evidence"], str)
+                    or not request["admission_evidence"].strip()):
+                raise ValueError("admission_evidence must be a nonempty string")
+            if action == "apply" and not isinstance(request["runtime_binary_digests"], dict):
+                raise ValueError("runtime_binary_digests must be an object")
+            if action == "apply" and not isinstance(request["runtime_image_identity"], str):
+                raise ValueError("runtime_image_identity must be a string")
+        store, profiles = _policy_store_and_profiles()
+        with store:
+            record_path = request.pop("record_path")
+            request.pop("admission_evidence", None)
+            if action == "stage":
+                result = policy_promotion.stage(record_path, store, profiles, **request)
+                report = {
+                    "action": action, "record_path": record_path,
+                    "expected_revision": result["expected_revision"],
+                    "candidate_fingerprint": result["candidate_fingerprint"],
+                }
+            elif action == "apply":
+                result = policy_promotion.apply(record_path, store, profiles, **request)
+                report = {
+                    "action": action, "revision": result["revision"], "fingerprint": result["fingerprint"],
+                }
+            else:
+                result = policy_promotion.rollback(record_path, store, profiles, **request)
+                report = {
+                    "action": action, "revision": result["revision"], "fingerprint": result["fingerprint"],
+                }
+    except PolicyRevisionConflict as exc:
+        print(
+            f"taskspindle policy promote: revision conflict, current revision is {exc.actual}",
+            file=sys.stderr,
+        )
+        return 3
+    except (ConfigError, providers.ProfileError, policy_promotion.PromotionError,
+            OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"taskspindle policy promote: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, sort_keys=True))
     return 0
 
 
