@@ -110,11 +110,26 @@ def test_missing_effort_does_not_downgrade_generation_or_switch_family(effort: s
     assert error.value.code == "AGY_MODEL_UNAVAILABLE"
 
 
-@pytest.mark.parametrize("model", ["claude-sonnet-4", "gemini-latest", "gemini-4-pro/", "", 17])
+@pytest.mark.parametrize("model", ["gemini-latest", "gemini-4-pro/", "", 17])
 def test_unsupported_explicit_model_is_invalid(model: Any) -> None:
     with pytest.raises(ModelSelectionError) as error:
         resolve_model(_advertise("gemini-4-flash-medium"), model=model)
     assert error.value.code == "AGY_MODEL_INVALID"
+
+
+def test_explicit_advertised_third_party_id_is_preserved() -> None:
+    choices = _advertise("gemini-3.1-pro-high", "claude-sonnet-4-6", "gpt-oss-120b-medium")
+    assert resolve_model(choices, model="claude-sonnet-4-6") == ModelSelection("claude-sonnet-4-6")
+    assert resolve_model(choices, model="gpt-oss-120b-medium", effort="medium") == ModelSelection(
+        "gpt-oss-120b-medium", "medium"
+    )
+    assert resolve_model(choices) == ModelSelection("gemini-3.1-pro-high", "high")
+
+
+def test_explicit_third_party_id_must_be_advertised() -> None:
+    with pytest.raises(ModelSelectionError) as error:
+        resolve_model(_advertise("gemini-4-flash-medium"), model="claude-sonnet-4-6")
+    assert error.value.code == "AGY_MODEL_UNAVAILABLE"
 
 
 @pytest.mark.parametrize("effort", ["xhigh", "auto", "Medium", "", 17])
@@ -237,7 +252,6 @@ def test_resume_fails_when_previous_variant_disappears() -> None:
         (ModelSelection("gemini-4-pro-high", "high"), {"effort": "low"}),
         (ModelSelection("gemini-4-pro-high", "high"), {"model": "gemini-4-flash"}),
         (ModelSelection("gemini-4-pro-high", "high"), {"model": "gemini-4-pro-low"}),
-        (ModelSelection("claude-opus-99"), {}),
     ],
 )
 def test_resume_rejects_inconsistent_or_changed_selection(persisted: ModelSelection, kwargs: Any) -> None:
@@ -245,3 +259,16 @@ def test_resume_rejects_inconsistent_or_changed_selection(persisted: ModelSelect
     with pytest.raises(ModelSelectionError) as error:
         resolve_model(choices, persisted=persisted, **kwargs)
     assert error.value.code == "AGY_MODEL_INVALID"
+
+
+def test_resume_preserves_advertised_third_party_selection() -> None:
+    persisted = ModelSelection("claude-sonnet-4-6", "high")
+    choices = _advertise("gemini-3.1-pro-high", "claude-sonnet-4-6")
+    assert resolve_model(choices, persisted=persisted) is persisted
+
+
+def test_resume_rejects_unadvertised_third_party_selection() -> None:
+    choices = _advertise("gemini-4-pro-high")
+    with pytest.raises(ModelSelectionError) as error:
+        resolve_model(choices, persisted=ModelSelection("claude-opus-99"))
+    assert error.value.code == "AGY_MODEL_UNAVAILABLE"

@@ -64,7 +64,11 @@ def test_defaults_seed_every_profile_and_the_six_skill_roles(profiles) -> None:
     assert default.providers["agy"].advertised_efforts == ["low", "medium", "high"]
     assert list(default.roles) == ["mechanic", "explorer", "implementer", "planner", "debugger", "reviewer"]
     planner = default.roles["planner"]
-    assert planner.provider_preference == ["claude", "grok", "agy"]
+    assert planner.provider_preference == ["grok", "agy", "claude"]
+    assert default.roles["mechanic"].provider_preference == ["agy", "grok", "claude"]
+    assert default.roles["reviewer"].selections["agy"].model == "claude-sonnet-4-6"
+    assert default.roles["planner"].selections["agy"].model == "claude-opus-4-6-thinking"
+    assert default.providers["agy"].advertised_models[-1] == "gpt-oss-120b-medium"
     assert planner.selections["claude"].model == "opus[1m]"
     assert planner.selections["claude"].effort == "xhigh"
     assert default.roles["mechanic"].selections["claude"].effort is None
@@ -143,7 +147,7 @@ def test_cross_field_rules(profiles) -> None:
     assert (("roles", "planner", "selections", "grok", "effort"), "unadvertised") in codes
     assert (("roles", "mechanic", "selections", "claude", "effort"), "effort_unsupported") in codes
     assert (("roles", "mechanic", "selections", "agy"), "AGY_MODEL_INVALID") in codes
-    assert (("roles", "explorer", "selections", "agy"), "AGY_MODEL_INVALID") in codes
+    assert (("roles", "explorer", "selections", "agy", "model"), "unadvertised") in codes
     assert (("roles", "explorer", "selections", "ghost"), "unknown_provider") in codes
 
 

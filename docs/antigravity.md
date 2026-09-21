@@ -42,9 +42,11 @@ isolated launch also mounts the resolved binary's real companion directory
 
 ## Models and lifecycle
 
-New tasks select only Gemini entries from the authenticated CLI catalog. Numeric
+New tasks default to Gemini entries from the authenticated CLI catalog. Numeric
 release order determines the newest release; Flash wins release ties and Medium
-effort is preferred when offered. Explicit model/effort overrides must be advertised.
+effort is preferred when offered. An explicit model may be a Gemini ID or any
+other exact advertised ID (Claude Sonnet/Opus and GPT-OSS). Explicit
+model/effort overrides must be advertised.
 The exact resolved model and effort persist across continuations and repairs.
 Requested, resolved and backend-reported identities remain distinct; CLI launch
 configuration is not evidence of a reported backend model.

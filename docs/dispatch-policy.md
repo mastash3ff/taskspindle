@@ -21,7 +21,7 @@ shows it and never writes it.
 | `budgets.<day|week>` | per provider | `turns` and/or `tokens` ceilings over a rolling 24 h / 7 d window of this host's own recorded turns. Advisory unless `enforce`. |
 | `budgets.<window>.enforce` | per budget | An exhausted enforced budget refuses **new** `start_task` admission on that provider with `POLICY_BUDGET_EXHAUSTED` until the window rolls. Already queued or running tasks are untouched. |
 | `allowed_modes` | per provider | Advisory hint narrowing `consult`/`review`/`implement`; must be a subset of what the profile serves. |
-| `advertised_models`, `advertised_efforts`, `models_without_effort` | per provider | The value lists role selections are validated against for Claude and Grok, and the choices the dashboard offers. AGY selections are validated by the Gemini ID grammar instead. |
+| `advertised_models`, `advertised_efforts`, `models_without_effort` | per provider | The value lists role selections are validated against for Claude and Grok, and the choices the dashboard offers. AGY selections must be a numeric Gemini ID or an identifier listed on `providers.agy.advertised_models` (Claude/GPT third-party IDs). |
 | `note` | per provider | Free text for the operator. |
 | `roles.<name>.provider_preference` | per role | Ordered list of provider ids to try first. |
 | `roles.<name>.selections.<provider>` | per role | `model` and `effort` to send on `start_task` for that provider. |
@@ -86,7 +86,9 @@ rules: every provider id must be a loaded profile; `allowed_modes` must be serve
 profile; enabled `target_share` values may not sum above 100; Claude and Grok selections must
 use advertised models and efforts, and no effort for a model in `models_without_effort`; AGY
 selections must be a numeric Gemini ID with an optional `-low|-medium|-high` suffix that does
-not contradict `effort`.
+not contradict `effort`, or an exact third-party ID listed on `providers.agy.advertised_models`.
+A bare AGY start still defaults to Gemini; third-party IDs are only used when explicitly
+selected.
 
 ## Status
 

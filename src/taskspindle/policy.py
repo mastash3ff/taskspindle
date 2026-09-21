@@ -162,7 +162,13 @@ _SEEDS: dict[str, dict[str, list[str]]] = {
         "models_without_effort": [],
     },
     "agy": {
-        "advertised_models": ["gemini-3.8-flash-medium", "gemini-3.1-pro-high"],
+        "advertised_models": [
+            "gemini-3.8-flash-medium",
+            "gemini-3.1-pro-high",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6-thinking",
+            "gpt-oss-120b-medium",
+        ],
         "advertised_efforts": ["low", "medium", "high"],
         "models_without_effort": [],
     },
@@ -177,6 +183,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
             "Perform exact extraction, lookup, prescribed formatting, or a fully specified "
             "mechanical edit with objective checks. Do not introduce design choices."
         ),
+        "provider_preference": ["agy", "grok", "claude"],
         "selections": {
             "claude": {"model": "haiku", "effort": None},
             "grok": {"model": "grok-4.6", "effort": "low"},
@@ -188,6 +195,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
             "Investigate a bounded question, gather relevant evidence, and separate verified "
             "facts, inferences, and unknowns."
         ),
+        "provider_preference": ["agy", "grok", "claude"],
         "selections": {
             "claude": {"model": "sonnet", "effort": "high"},
             "grok": {"model": "grok-4.6", "effort": "medium"},
@@ -199,6 +207,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
             "Implement a settled design within owned paths and satisfy the stated acceptance "
             "criteria and checks."
         ),
+        "provider_preference": ["agy", "grok", "claude"],
         "selections": {
             "claude": {"model": "sonnet", "effort": "high"},
             "grok": {"model": "grok-4.6", "effort": "high"},
@@ -210,10 +219,11 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
             "Produce a decision-ready plan with interfaces, dependencies, risks, verification, "
             "and authority gates."
         ),
+        "provider_preference": ["grok", "agy", "claude"],
         "selections": {
             "claude": {"model": "opus[1m]", "effort": "xhigh"},
             "grok": {"model": "grok-4.6", "effort": "high"},
-            "agy": {"model": "gemini-3.1-pro-high", "effort": "high"},
+            "agy": {"model": "claude-opus-4-6-thinking", "effort": "high"},
         },
     },
     "debugger": {
@@ -221,10 +231,11 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
             "Reproduce and localize unexpected behavior, test hypotheses against evidence, and "
             "identify the smallest justified repair and verification."
         ),
+        "provider_preference": ["grok", "agy", "claude"],
         "selections": {
             "claude": {"model": "opus[1m]", "effort": "xhigh"},
             "grok": {"model": "grok-4.6", "effort": "high"},
-            "agy": {"model": "gemini-3.1-pro-high", "effort": "high"},
+            "agy": {"model": "claude-opus-4-6-thinking", "effort": "high"},
         },
     },
     "reviewer": {
@@ -232,10 +243,11 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
             "Independently inspect the exact target against its requirements and report "
             "prioritized, actionable findings with evidence."
         ),
+        "provider_preference": ["grok", "agy", "claude"],
         "selections": {
             "claude": {"model": "opus[1m]", "effort": "xhigh"},
             "grok": {"model": "grok-4.6", "effort": "high"},
-            "agy": {"model": "gemini-3.1-pro-high", "effort": "high"},
+            "agy": {"model": "claude-sonnet-4-6", "effort": "high"},
         },
     },
 }
@@ -260,8 +272,13 @@ def defaults(profiles: Mapping[str, Any]) -> DispatchPolicy:
         selections = {
             name: Selection(**spec["selections"][name]) for name in first_class if name in spec["selections"]
         }
+        preferred = [
+            name for name in spec.get("provider_preference", first_class) if name in profiles
+        ]
         roles[role] = RolePolicy(
-            brief=spec["brief"], provider_preference=list(first_class), selections=selections
+            brief=spec["brief"],
+            provider_preference=preferred or list(first_class),
+            selections=selections,
         )
     return DispatchPolicy(providers=providers, roles=roles)
 
@@ -345,6 +362,14 @@ def _check_selection(
             agy.validate_selection(selection.model, selection.effort)
         except agy.ModelSelectionError as exc:
             return [_error(loc, str(exc), exc.code)]
+        if (
+            selection.model is not None
+            and not agy.is_gemini_id(selection.model)
+            and provider is not None
+            and provider.advertised_models
+            and selection.model not in provider.advertised_models
+        ):
+            return [_error((*loc, "model"), f"{selection.model!r} is not an advertised model", "unadvertised")]
         return []
     if family not in {"claude", "grok"} or provider is None:
         return []
