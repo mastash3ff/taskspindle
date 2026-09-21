@@ -25,7 +25,7 @@ def test_saved_builtin_choices_reach_launch_without_changing_defaults(tmp_path, 
         task = store.update_task(task.id, None, requested_model=model, requested_effort=effort)
         run = SimpleNamespace(task=task)
         selected = runner._resolve_profile(run, profiles)
-        expected_model = model or ("grok-4.6" if provider == "grok" else None)
+        expected_model = model or ("grok-4.7" if provider == "grok" else None)
         expected_effort = effort or ("medium" if provider == "grok" else None)
         assert (selected.model, selected.effort) == (expected_model, expected_effort)
         assert profiles[provider] == original

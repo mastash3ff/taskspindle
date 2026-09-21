@@ -69,6 +69,11 @@ PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
     # $0.50 cached / $6.00". A request whose prompt reaches 200k tokens is billed at double these
     # rates; a turn's totals cannot tell, so the base tier is used and the estimate is a floor.
     "grok-4.6": {"input": 2.0, "output": 6.0, "cache_read": 0.5, "cache_write": 0.0},
+    # xAI, https://docs.x.ai/developers/release-notes read 2026-09-21: Grok 4.7 has the
+    # same standard rates as 4.6; Build Fast is twice that rate. Long prompts also double.
+    # The longer Fast prefix must win over the standard prefix during price lookup.
+    "grok-4.7-build-fast": {"input": 4.0, "output": 12.0, "cache_read": 1.0, "cache_write": 0.0},
+    "grok-4.7": {"input": 2.0, "output": 6.0, "cache_read": 0.5, "cache_write": 0.0},
     # Google, https://ai.google.dev/gemini-api/docs/pricing read 2026-09-16, paid Standard tier,
     # output "including thinking tokens". Antigravity picker ids add an effort suffix
     # (gemini-3.1-pro-high), which the prefix match absorbs. Pro is the <= 200k-token prompt tier
@@ -80,6 +85,8 @@ PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
 #: When a row that is not Anthropic's was copied, by model-id prefix.
 _PRICE_AS_OF: dict[str, str] = {
     "grok-4.6": "2026-09-16",
+    "grok-4.7-build-fast": "2026-09-21",
+    "grok-4.7": "2026-09-21",
     "gemini-3.1-pro": "2026-09-16",
     "gemini-3.8-flash": "2026-09-16",
 }

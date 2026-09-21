@@ -74,7 +74,7 @@ def test_grok_argv_denies_leaders_and_subagents(tmp_path: Path) -> None:
     assert grok.command[-1] == "stdio"
     assert "--no-leader" in grok.command
     assert "--model" in grok.command
-    assert grok.model == "grok-4.6"
+    assert grok.model == "grok-4.7"
     assert grok.effort == "medium"
 
 

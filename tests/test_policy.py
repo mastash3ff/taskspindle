@@ -63,6 +63,7 @@ def test_defaults_seed_every_profile_and_the_six_skill_roles(profiles) -> None:
     assert default.providers["claude"].models_without_effort == ["haiku"]
     assert default.providers["claude-alias"].advertised_models == ["haiku", "sonnet", "opus[1m]"]
     assert default.providers["agy"].advertised_efforts == ["low", "medium", "high"]
+    assert default.providers["grok"].advertised_models == ["grok-4.7"]
     assert list(default.roles) == ["mechanic", "explorer", "implementer", "planner", "debugger", "reviewer"]
     planner = default.roles["planner"]
     assert planner.provider_preference == ["grok", "agy", "claude"]
@@ -72,6 +73,7 @@ def test_defaults_seed_every_profile_and_the_six_skill_roles(profiles) -> None:
     assert default.providers["agy"].advertised_models[-1] == "gpt-oss-120b-medium"
     assert planner.selections["claude"].model == "opus[1m]"
     assert planner.selections["claude"].effort == "xhigh"
+    assert {role.selections["grok"].model for role in default.roles.values()} == {"grok-4.7"}
     assert default.roles["mechanic"].selections["claude"].effort is None
     assert policy.validate(default, profiles) == []
 
@@ -133,7 +135,7 @@ def test_cross_field_rules(profiles) -> None:
     doc.providers["claude-alias"].models_without_effort = ["ghost"]
     doc.roles["planner"].provider_preference = ["claude", "missing"]
     doc.roles["planner"].selections["claude"] = policy.Selection(model="opus", effort="xhigh")
-    doc.roles["planner"].selections["grok"] = policy.Selection(model="grok-4.6", effort="ultra")
+    doc.roles["planner"].selections["grok"] = policy.Selection(model="grok-4.7", effort="ultra")
     doc.roles["mechanic"].selections["claude"] = policy.Selection(model="haiku", effort="low")
     doc.roles["mechanic"].selections["agy"] = policy.Selection(model="gemini-3.1-pro-high", effort="low")
     doc.roles["explorer"].selections["agy"] = policy.Selection(model="not-gemini", effort=None)
@@ -300,8 +302,8 @@ def test_new_fields_at_their_defaults_leave_the_stored_document_and_fingerprint_
     assert "escalation" not in stored and "max_concurrent_total" not in stored
     assert all("max_concurrent" not in spec for spec in stored["providers"].values())
     assert all("ladders" not in spec and "fanout" not in spec for spec in stored["roles"].values())
-    # Pinned: what ``main`` computed for these same profiles before the tuning fields existed.
-    assert policy.fingerprint(document) == "72b7eb19087028929a55ed1a644cea58259fd4bb96e22f39b85367dc6d9d282d"
+    # Pin the current base policy so unrelated tuning fields do not alter its canonical form.
+    assert policy.fingerprint(document) == "49391cd766d096018e067828e6e5b3e7b7ac9523565d65681ffaa9f2dc5be316"
     # The API still hands readers every key.
     assert document.model_dump(mode="json")["roles"]["mechanic"]["fanout"] == 1
 
@@ -351,7 +353,7 @@ def test_ladder_cross_field_rules(profiles) -> None:
     ladders["claude-alias"] = policy.Ladder(above=[policy.Selection(model="sonnet")])
     ladders["nope"] = policy.Ladder()
     del document.roles["mechanic"].selections["grok"]
-    document.roles["mechanic"].ladders["grok"] = policy.Ladder(above=[policy.Selection(model="grok-4.6")])
+    document.roles["mechanic"].ladders["grok"] = policy.Ladder(above=[policy.Selection(model="grok-4.7")])
 
     found = {(tuple(error["loc"]), error["code"]) for error in policy.validate(document, profiles)}
     assert (("roles", "explorer", "ladders", "claude", "above", 0, "model"), "unadvertised") in found

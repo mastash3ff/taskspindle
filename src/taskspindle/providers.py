@@ -107,7 +107,7 @@ GROK_COMPAT_ENV: dict[str, str] = {
 #: and the sandboxed run.
 AGY_PIN_ENV: dict[str, str] = {"AGY_CLI_DISABLE_AUTO_UPDATE": "true"}
 
-_GROK_DEFAULT_MODEL = "grok-4.6"
+_GROK_DEFAULT_MODEL = "grok-4.7"
 _GROK_DEFAULT_EFFORT = "medium"
 
 #: Top-level Grok flags added for a turn that must not write. Verified against Grok 1.0.13's ACP

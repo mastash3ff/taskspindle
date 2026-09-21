@@ -55,7 +55,7 @@ returning.
                            "target_share": 30, "target_share_normalized": 0.3,
                            "share_state": "under_target", "observed": {"…": "…"},
                            "budgets": {"…": "…"}, "allowed_modes": null, "note": "",
-                           "advertised_models": ["grok-4.6"],
+                           "advertised_models": ["grok-4.7"],
                            "advertised_efforts": ["low", "medium", "high"],
                            "models_without_effort": []},
                 "availability": {"state": "throttled", "reset_at": "2026-09-04T21:00:00Z",

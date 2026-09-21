@@ -239,7 +239,7 @@ _SEEDS: dict[str, dict[str, list[str]]] = {
         "models_without_effort": ["haiku"],
     },
     "grok": {
-        "advertised_models": ["grok-4.6"],
+        "advertised_models": ["grok-4.7"],
         "advertised_efforts": ["low", "medium", "high"],
         "models_without_effort": [],
     },
@@ -268,7 +268,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
         "provider_preference": ["agy", "grok", "claude"],
         "selections": {
             "claude": {"model": "haiku", "effort": None},
-            "grok": {"model": "grok-4.6", "effort": "low"},
+            "grok": {"model": "grok-4.7", "effort": "low"},
             "agy": {"model": "gemini-3.8-flash-medium", "effort": "medium"},
         },
     },
@@ -280,7 +280,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
         "provider_preference": ["agy", "grok", "claude"],
         "selections": {
             "claude": {"model": "sonnet", "effort": "high"},
-            "grok": {"model": "grok-4.6", "effort": "medium"},
+            "grok": {"model": "grok-4.7", "effort": "medium"},
             "agy": {"model": "gemini-3.1-pro-high", "effort": "high"},
         },
     },
@@ -292,7 +292,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
         "provider_preference": ["agy", "grok", "claude"],
         "selections": {
             "claude": {"model": "sonnet", "effort": "high"},
-            "grok": {"model": "grok-4.6", "effort": "high"},
+            "grok": {"model": "grok-4.7", "effort": "high"},
             "agy": {"model": "gemini-3.1-pro-high", "effort": "high"},
         },
     },
@@ -304,7 +304,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
         "provider_preference": ["grok", "agy", "claude"],
         "selections": {
             "claude": {"model": "opus[1m]", "effort": "xhigh"},
-            "grok": {"model": "grok-4.6", "effort": "high"},
+            "grok": {"model": "grok-4.7", "effort": "high"},
             "agy": {"model": "claude-opus-4-6-thinking", "effort": "high"},
         },
     },
@@ -316,7 +316,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
         "provider_preference": ["grok", "agy", "claude"],
         "selections": {
             "claude": {"model": "opus[1m]", "effort": "xhigh"},
-            "grok": {"model": "grok-4.6", "effort": "high"},
+            "grok": {"model": "grok-4.7", "effort": "high"},
             "agy": {"model": "claude-opus-4-6-thinking", "effort": "high"},
         },
     },
@@ -328,7 +328,7 @@ DEFAULT_ROLES: dict[str, dict[str, Any]] = {
         "provider_preference": ["grok", "agy", "claude"],
         "selections": {
             "claude": {"model": "opus[1m]", "effort": "xhigh"},
-            "grok": {"model": "grok-4.6", "effort": "high"},
+            "grok": {"model": "grok-4.7", "effort": "high"},
             "agy": {"model": "claude-sonnet-4-6", "effort": "high"},
         },
     },
@@ -385,7 +385,7 @@ def _rungs(light: Any, middle: Any, heavy: Any) -> dict[str, Any]:
 
 _FLASH = _pick("gemini-3.8-flash-medium", "medium")
 _PRO = _pick("gemini-3.1-pro-high", "high")
-_GROK = "grok-4.6"
+_GROK = "grok-4.7"
 
 #: What each level writes per provider family. ``balanced`` is the shipped role table with a
 #: step either side; ``conserve`` has nothing above it, so escalation can only ease it off; ``max``

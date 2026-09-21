@@ -508,6 +508,18 @@ def test_the_grok_estimate_matches_what_grok_reported_for_the_same_turn(
     assert version == "2026-09-16"
 
 
+def test_grok_47_fast_uses_twice_the_standard_rate() -> None:
+    amounts = {}
+    for model in ("grok-4.7", "grok-4.7-build-fast"):
+        amounts[model], version = usage.estimate_cost(
+            model, input_tokens=1_000_000, output_tokens=1_000_000,
+            cache_read_tokens=200_000, cache_write_tokens=0,
+        )
+        assert version == "2026-09-21"
+    assert amounts["grok-4.7"] == pytest.approx(1.6 + 6.0 + 0.1)
+    assert amounts["grok-4.7-build-fast"] == pytest.approx(2 * amounts["grok-4.7"])
+
+
 def test_antigravity_picker_ids_price_as_their_gemini_model() -> None:
     pro, _ = usage.estimate_cost(
         "gemini-3.1-pro-high", input_tokens=1_000_000, output_tokens=1_000_000,

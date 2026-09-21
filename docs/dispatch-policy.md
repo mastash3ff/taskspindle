@@ -153,7 +153,7 @@ how wide the groups actually were.
       "provider_preference": ["claude", "grok", "agy"],
       "selections": {
         "claude": {"model": "opus[1m]", "effort": "xhigh"},
-        "grok": {"model": "grok-4.6", "effort": "high"},
+        "grok": {"model": "grok-4.7", "effort": "high"},
         "agy": {"model": "gemini-3.1-pro-high", "effort": "high"}
       },
       "timeout_s": null,
@@ -229,7 +229,7 @@ selected.
         }
       },
       "allowed_modes": null, "note": "",
-      "advertised_models": ["grok-4.6"], "advertised_efforts": ["low", "medium", "high"],
+      "advertised_models": ["grok-4.7"], "advertised_efforts": ["low", "medium", "high"],
       "models_without_effort": []
     }
   },
