@@ -11,7 +11,10 @@ codex mcp remove taskspindle
 
 Or comment out the `[mcp_servers.taskspindle]` block in `~/.codex/config.toml`. Either way, new
 Codex sessions stop launching the server. That is the whole of the immediate rollback: no daemon
-survives it, because there was never a daemon — the server only ran while Codex had it open.
+survives it under the systemd backend, because there was never a daemon there — the server only
+ran while Codex had it open, and queued work is drained by the worker that just finished. Under
+the Docker backend the long-lived controller also drains the queue (`[dispatch] drain`), so stop
+the stack, or close the admission fence, to keep queued tasks from starting.
 
 A task whose worker unit is already running keeps running. It will finish, write its outcome to
 the database, and exit. Nothing about de-registering interrupts work in flight.

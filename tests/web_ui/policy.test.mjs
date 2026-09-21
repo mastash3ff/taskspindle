@@ -66,7 +66,7 @@ globalThis.requestAnimationFrame = () => {};
 
 const policyModule = await import("../../src/taskspindle/web/static/views/policy.js");
 const { renderPolicy, __test__ } = policyModule;
-const { applyPath, isDirty, localValidate, orderByUnderTarget, errorsByLoc, normalizeTargets, resetDraft } = __test__;
+const { applyPath, applyPatches, getPath, presetOf, isDirty, localValidate, orderByUnderTarget, errorsByLoc, normalizeTargets, resetDraft } = __test__;
 const aiPolicyModule = await import("../../src/taskspindle/web/static/ai-policy.js");
 const { resetAiPolicyUi, isAiPolicyApplying } = aiPolicyModule;
 
@@ -164,6 +164,69 @@ test("normalizeTargets converts percentages to clamped fractions", () => {
   assert.equal(result.claude, 1);
   assert.equal(result.grok, 0.3);
   assert.equal(result.agy, 0);
+});
+
+// -- utilization tuning helpers -----------------------------------------------------------
+
+const PROFILES = [
+  { id: "claude", family: "claude", first_class: true, auth: "oauth" },
+  { id: "agy", family: "agy", first_class: true, auth: "oauth" },
+  { id: "metered", family: "claude", first_class: false, auth: "api_key" },
+];
+
+test("applyPath walks into a list by index without turning it into a map", () => {
+  const draft = { ladders: { above: [{ model: "a", effort: null }, { model: "b", effort: null }] } };
+  const next = applyPath(draft, ["ladders", "above", 1, "effort"], "high");
+  assert.deepEqual(next.ladders.above, [{ model: "a", effort: null }, { model: "b", effort: "high" }]);
+  assert.ok(Array.isArray(next.ladders.above));
+  assert.equal(draft.ladders.above[1].effort, null);
+});
+
+test("presetOf names the level the draft already equals, custom otherwise, null without presets", () => {
+  const presets = {
+    conserve: [{ path: ["providers", "claude", "max_concurrent"], value: 1 }],
+    max: [{ path: ["providers", "claude", "max_concurrent"], value: 8 }, { path: ["roles", "r", "ladders", "claude"], value: { below: [], above: [] } }],
+  };
+  const draft = { providers: { claude: { max_concurrent: 4 } }, roles: { r: {} } };
+  assert.equal(presetOf(draft, presets), "custom");
+  const applied = applyPatches(draft, presets.max);
+  assert.equal(getPath(applied, ["providers", "claude", "max_concurrent"]), 8);
+  assert.equal(presetOf(applied, presets), "max");
+  assert.equal(draft.providers.claude.max_concurrent, 4, "applyPatches never mutates the draft it was given");
+  assert.equal(presetOf(draft, {}), null);
+  assert.equal(presetOf(draft, undefined), null);
+});
+
+test("localValidate mirrors the server's bounds on slots, fan-out and escalation", () => {
+  const codes = (draft) => localValidate(draft, PROFILES).map((err) => err.code);
+  assert.deepEqual(codes({ providers: { claude: { max_concurrent: 4 } }, max_concurrent_total: 12, roles: { r: { fanout: 3 } } }), []);
+  assert.deepEqual(codes({ providers: { claude: { max_concurrent: 17 } } }), ["CONCURRENCY_OUT_OF_RANGE"]);
+  assert.deepEqual(codes({ providers: { claude: { max_concurrent: 1.5 } } }), ["CONCURRENCY_OUT_OF_RANGE"]);
+  assert.deepEqual(codes({ max_concurrent_total: 49 }), ["CONCURRENCY_OUT_OF_RANGE"]);
+  assert.deepEqual(codes({ roles: { r: { fanout: 4 } } }), ["FANOUT_OUT_OF_RANGE"]);
+  const rules = { step_up_points: [5, 12], release_points: 3, window_hold_percent: 80, window_down_percent: 90, budget_hold_ratio: 0.8, budget_down_ratio: 0.95 };
+  assert.deepEqual(codes({ escalation: rules }), []);
+  assert.deepEqual(codes({ escalation: { ...rules, step_up_points: [12, 5] } }), ["ESCALATION_STEPS"]);
+  assert.deepEqual(codes({ escalation: { ...rules, release_points: 5 } }), ["ESCALATION_RELEASE"]);
+  assert.deepEqual(codes({ escalation: { ...rules, window_down_percent: 70, budget_down_ratio: 0.5 } }), ["ESCALATION_WINDOW", "ESCALATION_BUDGET"]);
+});
+
+test("localValidate checks ladder steps like selections and refuses them on a metered profile", () => {
+  const providers = { claude: { models_without_effort: ["haiku"] }, agy: { advertised_models: ["claude-sonnet-4-6"] }, metered: {} };
+  const role = (extra) => ({ providers, roles: { r: { selections: { claude: { model: "sonnet" }, agy: { model: "claude-sonnet-4-6" }, metered: { model: "x" } }, ...extra } } });
+  const found = (draft) => localValidate(draft, PROFILES).map((err) => `${err.loc.join(".")}:${err.code}`);
+
+  assert.deepEqual(found(role({ ladders: { claude: { below: [{ model: "haiku", effort: null }], above: [{ model: "opus[1m]", effort: "high" }] } } })), []);
+  // An AGY model the operator advertised is accepted, as the server accepts it.
+  assert.deepEqual(found(role({})), []);
+  assert.deepEqual(found(role({ ladders: { claude: { above: [{ model: null, effort: "high" }, { model: "haiku", effort: "low" }] } } })), [
+    "roles.r.ladders.claude.above.0.model:LADDER_STEP_EMPTY", "roles.r.ladders.claude.above.1.effort:EFFORT_NOT_ALLOWED",
+  ]);
+  assert.deepEqual(found(role({ ladders: { metered: { above: [{ model: "y" }] } } })), ["roles.r.ladders.metered:LADDER_METERED"]);
+  assert.deepEqual(found({ providers, roles: { r: { selections: {}, ladders: { claude: { above: [{ model: "sonnet" }] } } } } }), ["roles.r.ladders.claude:LADDER_WITHOUT_SELECTION"]);
+  assert.deepEqual(found(role({ ladders: { claude: { above: Array(4).fill({ model: "sonnet" }) } } })), ["roles.r.ladders.claude.above:LADDER_TOO_LONG"]);
+  // An empty ladder is the default and says nothing.
+  assert.deepEqual(found(role({ ladders: { metered: { below: [], above: [] } } })), []);
 });
 
 // -- rendering --------------------------------------------------------------------------
@@ -305,4 +368,74 @@ test("AI apply holds polling and ignores a stale GET that finishes after apply",
   await applyDone;
   assert.match(textOf(pollNode), /post-apply/);
   assert.doesNotMatch(textOf(pollNode), /stale-poll/);
+});
+
+function tuningFixture() {
+  const base = fixture();
+  base.policy.providers.claude.max_concurrent = null;
+  base.policy.max_concurrent_total = null;
+  base.policy.escalation = { enabled: false, step_up_points: [5, 12], release_points: 3, min_turns: 10, window_hold_percent: 80, window_down_percent: 90, budget_hold_ratio: 0.8, budget_down_ratio: 0.95 };
+  base.policy.roles.planner.ladders = {};
+  base.policy.roles.planner.fanout = 1;
+  base.status.providers.claude.escalation = { level: 1, previous_level: 0, reason: "step +1: 8 points under target", signal: {} };
+  base.status.roles = { planner: { fanout: 1, effective_selections: { claude: { model: "sonnet", effort: "medium", level: 0 } } } };
+  return {
+    ...base,
+    limits: { providers: { claude: { limit: 4, source: "config", ceiling: 8 } }, total: { limit: null, source: null, ceiling: null } },
+    utilization: { day: { claude: { limit: 4, slot_utilization: 0.4, holds: 9, peak_active: 4, saturated_acquires: 2, queued: 3, queue_wait: { p50_s: 12.5 } } } },
+    fanout: {},
+    presets: { claude: { conserve: [{ path: ["providers", "claude", "max_concurrent"], value: 1 }], max: [{ path: ["providers", "claude", "max_concurrent"], value: 8 }] } },
+    file_managed: { config_file: "/x/config.toml", concurrency: { claude: 4 }, capacity: { per_provider_max: 8, total_max: null } },
+  };
+}
+
+test("the provider card shows slots in force and slot use, and a preset fills the draft", async () => {
+  resetDraft();
+  resetAiPolicyUi();
+  globalThis.fetch = async (path) => {
+    if (String(path).startsWith("/api/policy")) return new Response(JSON.stringify(tuningFixture()), { status: 200 });
+    return new Response("{}", { status: 404 });
+  };
+  const node = await renderPolicy({ query: new URLSearchParams() }, { toast: () => {}, refresh: () => {} });
+  const text = textOf(node);
+  assert.match(text, /In force: 4 from config · ceiling 8 from \[capacity\]/);
+  assert.match(text, /Slots 40% used · 9 turns held a slot · peak 4 of 4 · 2 took the last slot/);
+  assert.match(text, /3 queued now · median wait for a slot 12.5s/);
+  assert.match(text, /ladder \+1/);
+  assert.match(text, /step \+1: 8 points under target/);
+  assert.equal(byFocusKey(node, "policy-claude-concurrency").value, "");
+
+  byFocusKey(node, "policy-claude-preset-max").listeners.click();
+  assert.equal(node.dataset.holdPoll, "1");
+  assert.equal(byFocusKey(node, "policy-claude-concurrency").value, "8");
+  assert.equal(byFocusKey(node, "policy-claude-preset-max").attributes["aria-pressed"], "true");
+
+  // A hand edit afterwards is just a draft edit: the dial reads custom again.
+  const slots = byFocusKey(node, "policy-claude-concurrency");
+  slots.value = "5";
+  slots.listeners.change();
+  assert.equal(byFocusKey(node, "policy-claude-preset-max").attributes["aria-pressed"], "false");
+  assert.match(textOf(node), /custom/);
+});
+
+test("a ladder step and a fan-out are edited in the role matrix", async () => {
+  resetDraft();
+  resetAiPolicyUi();
+  globalThis.fetch = async (path) => {
+    if (String(path).startsWith("/api/policy")) return new Response(JSON.stringify(tuningFixture()), { status: 200 });
+    return new Response("{}", { status: 404 });
+  };
+  const node = await renderPolicy({ query: new URLSearchParams() }, { toast: () => {}, refresh: () => {} });
+  byFocusKey(node, "policy-role-planner-claude-above-add").listeners.click();
+  const stepModel = byFocusKey(node, "policy-role-planner-claude-above-0-model");
+  assert.equal(stepModel.value, "sonnet", "a new step starts from the role's own model");
+  stepModel.value = "haiku";
+  stepModel.listeners.change();
+  assert.ok("disabled" in byFocusKey(node, "policy-role-planner-claude-above-0-effort").attributes, "haiku takes no effort");
+
+  const fanout = byFocusKey(node, "policy-role-planner-fanout");
+  fanout.value = "2";
+  fanout.listeners.change();
+  assert.equal(byFocusKey(node, "policy-role-planner-fanout").value, "2");
+  assert.match(textOf(node), /−0 \/ \+1/);
 });

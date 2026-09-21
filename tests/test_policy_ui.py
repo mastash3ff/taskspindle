@@ -79,6 +79,8 @@ def test_style_sheet_carries_the_policy_page_classes(tmp_path: Path) -> None:
     assert css.status_code == 200
     assert ".switch" in css.text
     assert ".save-bar" in css.text
+    assert ".preset-dial" in css.text
+    assert ".ladder-step" in css.text
 
 
 def test_api_module_exposes_put_and_post_json(tmp_path: Path) -> None:

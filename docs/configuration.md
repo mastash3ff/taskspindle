@@ -38,10 +38,24 @@ convenient. There is no replacement key: a refusal is reported and waited out (o
 
 ## Dispatch policy
 
-Target shares, budgets, per-role model and effort, and the rest of the dispatch policy live in the
-state database, not here. Edit them through the dashboard's Policy page or `taskspindle policy` —
-never in `config.toml`. The Policy page shows `[concurrency]` from this file read-only, for context
-alongside the policy they sit next to. See [dispatch-policy.md](dispatch-policy.md).
+Target shares, budgets, concurrent slots, per-role model, effort and ladders, and the rest of the
+dispatch policy live in the state database, not here. Edit them through the dashboard's Policy
+page or `taskspindle policy` — never in `config.toml`. The Policy page shows `[concurrency]` and
+`[capacity]` from this file read-only, for context alongside the policy they sit next to. See
+[dispatch-policy.md](dispatch-policy.md).
+
+## `[concurrency]`, `[capacity]` and `[dispatch]`
+
+| Table | Key | Meaning |
+| --- | --- | --- |
+| `[concurrency]` | `<provider> = N` | Slots for a provider wherever the policy sets no `max_concurrent`; omitted is one. |
+| `[capacity]` | `per_provider_max` (1–16, default 8) | The ceiling over any `max_concurrent` the policy asks for. |
+| `[capacity]` | `total_max` (1–48, default none) | The ceiling on slots held across all providers. |
+| `[dispatch]` | `drain` (default `true`) | Start queued work as soon as a slot frees, without waiting for a tool call. |
+| `[dispatch]` | `interval_s` (1–60, default 2) | How often the Docker controller's drain loop looks. |
+
+A table that is present must be well-formed, and unknown keys are rejected. See
+[concurrency.md](concurrency.md).
 
 ## `[providers.<id>]`
 

@@ -71,6 +71,31 @@ function usageTable(rows) {
   return { keys, node };
 }
 
+// How busy each provider's slots were, and how long queued work waited for one. A number of
+// slot-seconds, not a provider quota: it says where a higher concurrency limit would be used.
+export function slotRows(utilization = []) {
+  return utilization.map((row) => ({
+    provider: row.provider,
+    limit: row.limit ?? "—",
+    used: row.slot_utilization == null ? "—" : `${Math.round(row.slot_utilization * 100)}%`,
+    held: row.holds ?? 0,
+    peak: row.peak_active ?? 0,
+    saturated: row.saturated_acquires ?? 0,
+    queued: row.queued ?? 0,
+    wait: row.queue_wait?.p50_s == null ? "—" : `${row.queue_wait.p50_s}s`,
+  }));
+}
+
+function slotPanel(data) {
+  const rows = slotRows(data.utilization);
+  const fanout = (data.fanout || []).filter((row) => row.groups);
+  const columns = [["provider", "Worker"], ["limit", "Slots"], ["used", "Slot time used"], ["held", "Turns"], ["peak", "Peak active"], ["saturated", "Took the last slot"], ["queued", "Queued now"], ["wait", "Median wait"]];
+  return h("section", { class: "panel" }, sectionHeading("Slot use", "Scheduling on this host, not provider quota"),
+    rows.length ? table(columns.map(([, label]) => label), rows.map((row) => h("tr", {}, columns.map(([key, label]) => h("td", { "data-label": label, text: row[key] })))), "responsive-table") : emptyState("No slot history", "No turn has held a slot in this period."),
+    fanout.length ? h("p", { class: "panel-note", text: `Fan-out: ${fanout.map((row) => `${row.role || "no role"} ${row.groups} groups, mean width ${row.mean_width}`).join(" · ")}` }) : null,
+  );
+}
+
 export async function renderUsage(route, { signal } = {}) {
   const params = new URLSearchParams({ since: route.query.get("since") || "7d", group_by: route.query.get("group_by") || "provider" });
   if (route.query.get("provider")) params.set("provider", route.query.get("provider"));
@@ -91,6 +116,7 @@ export async function renderUsage(route, { signal } = {}) {
       h("section", { class: "panel" }, sectionHeading("Provider distribution", "Observed tokens"), usageChart(providerUsage, ["provider"], "Token distribution by provider")),
       h("section", { class: "panel" }, sectionHeading("Outcome distribution", "Recorded task states"), outcomeChart(data.outcomes)),
     ),
+    slotPanel(data),
     h("section", { class: "panel" }, sectionHeading("Token detail", `Grouped by ${params.get("group_by")}`), usageChart(usage, exact.keys), h("details", { class: "table-alternative", open: true, dataset: { persistKey: "usage-table" } }, h("summary", { text: "Exact values" }), exact.node)),
     h("div", { class: "usage-grid" },
       h("section", { class: "panel" }, sectionHeading("Outcomes", "Task states"), data.outcomes?.length ? table(["Worker", "Mode", "State", "Count"], data.outcomes.map((row) => h("tr", {}, h("td", { text: row.provider }), h("td", { text: row.mode }), h("td", {}, badge(row.state)), h("td", { text: row.count })))) : emptyState("No outcomes", "Nothing was recorded for this period.")),

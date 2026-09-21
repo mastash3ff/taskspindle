@@ -75,6 +75,18 @@ EXAMPLE_CONFIG = """\
 #grok = 4
 #agy = 4
 #
+# The dispatch policy (dashboard Policy page, `taskspindle policy`) can set a provider's slots
+# too, with no restart; [concurrency] is then the fallback and [capacity] the ceiling it cannot
+# exceed. Each worker may use up to 3 GiB, so total_max is what bounds the host's memory.
+#[capacity]
+#per_provider_max = 8
+#total_max = 12
+#
+# Queued work starts as soon as a slot frees, without waiting for the next tool call.
+#[dispatch]
+#drain = true
+#interval_s = 2
+#
 # Files a coordinator may hand to a worker with start_task(context_files=[...]). Absent means
 # the handoff is refused. Every root must be a directory the server can see; under the Docker
 # backend that means inside an [execution] mount. See docs/configuration.md.

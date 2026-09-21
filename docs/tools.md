@@ -73,7 +73,8 @@ returning.
               "adapter_package": "@agentclientprotocol/claude-agent-acp",
               "adapter_version": "0.70.0", "acp": "0.12.0"},
  "limits": {"timeout_s": [60, 14400], "diff_page_bytes": 16384, "diff_page_max_bytes": 262144,
-            "concurrent_turns_per_provider": 1},
+            "concurrent_turns_per_provider": 1,
+            "concurrent_turns_total": {"limit": null, "active": 0}},
  "states": ["PREPARING", "…"], "cleanup_states": ["RETAINED", "…"],
  "isolation": "…what isolation does and does not mean…"}
 ```
@@ -83,16 +84,21 @@ allowlisted environments are containment by construction and not an OS sandbox.
 
 The top-level **`dispatch_policy`** block is the operator's dispatch policy: `revision`,
 `fingerprint`, `updated_at`, `updated_by`, `source` (`store` or `defaults`), `document_error`,
-`share_window`, the `roles` table (`brief`, `provider_preference`, `selections`, `timeout_s` per
-role) and `under_target_order`. `source` is `defaults` when nothing has been saved or the stored
+`share_window`, the `roles` table (`brief`, `provider_preference`, `selections`, `timeout_s`,
+`ladders`, `fanout` and, computed on read, `effective_selections` per role), `under_target_order`,
+`under_target` (the same order with each provider's deficit) and `server_fill`, which is `true`
+on a server that fills a task's `model` and `effort` from its `role`. `source` is `defaults` when nothing has been saved or the stored
 document no longer parses; `document_error` then says why. Each entry in `providers` carries a
 matching per-provider **`policy`** block: `enabled`, `state` (`paused`, `budget_exhausted` or
 `active`), `enforced_exhaustion`, `target_share`, `target_share_normalized`, `share_state`
 (`paused`, `untracked`, `under_target`, `on_target` or `over_target`), `observed` and `budgets` per
-window, `allowed_modes`, `note`, `advertised_models`, `advertised_efforts` and
-`models_without_effort`. It is read fresh on every call — an edit made in the dashboard or with
+window, `allowed_modes`, `note`, `advertised_models`, `advertised_efforts`,
+`models_without_effort`, `max_concurrent`, `share_deficit` and `escalation` (`level`,
+`previous_level`, `reason`, `signal`). Each provider's **`capacity`** is `limit`, `active`,
+`available` (already reduced by the pool total), `source` (`policy` or `config`), `ceiling` and
+`queued`; **`utilization`** is `slot_utilization_day` and `queue_wait_p50_s`. It is read fresh on every call — an edit made in the dashboard or with
 `taskspindle policy` takes effect without restarting the MCP server. None of this selects a
-provider or changes admission by itself; see [dispatch-policy.md](dispatch-policy.md) for the full
+provider; an enforced budget, `max_concurrent` and the role fill are its only server-side effects; see [dispatch-policy.md](dispatch-policy.md) for the full
 shape and [`dispatch_policy`](#dispatch_policy--read-only) below for the dedicated tool.
 
 `availability` is the one part of this answer that changes, and it is deliberately small: `state`
@@ -138,9 +144,13 @@ checks. Same checks as the `taskspindle doctor` command.
 
 `get` returns `{"policy", "revision", "fingerprint", "updated_at", "updated_by", "source",
 "document_error"}` — the same document `capabilities()` reads. `status` adds `status` (observed
-usage against the policy, per [dispatch-policy.md](dispatch-policy.md#status)) and
-`file_managed: {"config_file", "concurrency"}`, the `config.toml` tables the dashboard shows
-read-only alongside the policy.
+usage against the policy, per [dispatch-policy.md](dispatch-policy.md#status)),
+`file_managed: {"config_file", "concurrency", "capacity"}` (the `config.toml` tables the
+dashboard shows read-only alongside the policy), `limits` (the slot limits this server
+dispatches by), `utilization` (per provider for the rolling `day` and `week`: `limit`,
+`slot_seconds_used`, `slot_utilization`, `holds`, `peak_active`, `saturated_acquires`, `queued`
+and `queue_wait`) and `fanout` (per role: `configured`, `groups`, `mean_width`,
+`full_width_groups`).
 
 There is no `set` through MCP: the caller being steered does not rewrite its own steering. The
 policy is edited only through the dashboard's Policy page or `taskspindle policy`; see
@@ -206,7 +216,8 @@ Takes one object parameter, `request`; the fields below go inside it.
 | `candidate_message` | string\|null | `null` | **implement only, required**; one line, ≤ 72 characters |
 | `review_target` | object\|null | `null` | **review only, required** |
 | `review_kind` | `"standard"`\|`"adversarial"` | `"standard"` | review only; the reviewer's stance, recorded on the task and its review — see [the review contract](#the-review-contract) |
-| `role` | string\|null | `null` | matches `^[a-z][a-z0-9_-]*$`, at most 32 characters; recorded on the task for reporting only, does not select a provider or change admission |
+| `role` | string\|null | `null` | matches `^[a-z][a-z0-9_-]*$`, at most 32 characters; recorded on the task, and whichever of `model` and `effort` is left out is filled from the role's current selection — see [server-side fill](dispatch-policy.md#server-side-fill). Never selects a provider or changes a value you sent |
+| `fanout_group` | string\|null | `null` | matches `^[a-z0-9][a-z0-9_-]{0,63}$`; **consult and review only**. Names a set of tasks asking the same question of different provider families; a second live member from one family is refused with `FANOUT_NOT_INDEPENDENT` |
 | `context_files` | string[]\|null | `null` | absolute paths under the operator's `[context_files]` roots whose contents are copied into the worker's first turn — see [handing over context](#handing-over-context) |
 
 `review_target` is either
@@ -254,8 +265,12 @@ One call, in full:
 }
 ```
 
-Returns `{"task_id", "state", "state_version"}`. The task is created, its worktree is made, its
-first turn is composed and it is queued; a worker unit starts if the provider's lease is free.
+Returns `{"task_id", "state", "state_version", "selection"}`. The task is created, its worktree
+is made, its first turn is composed and it is queued; a worker unit starts if the provider has
+a free slot, and otherwise the task waits and is started as soon as one frees, without a further
+call. `selection` is `{"model", "effort", "source", "role", "ladder_level", "policy_revision",
+"reason"}`: what the task will run with and whether it came from the `caller`, the `policy`,
+both (`mixed`) or the `profile`'s own defaults.
 
 Errors: `INVALID_REQUEST` (validation, unknown provider, mode not served, a repository with
 uncommitted changes inside the task's own path prefixes — `details.code = DIRTY_OVERLAP`),
@@ -691,5 +706,6 @@ invalidates the review: get a new one.
 | `PROVIDER_ACCESS_DENIED` | on a FAILED task: the provider denied account access without claiming the login itself is invalid |
 | `PROVIDER_MODEL_UNAVAILABLE` | on a FAILED task: the requested model, rather than the account, is unavailable |
 | `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and it is not eligible again yet; pass `ignore_provider_status` for an explicit coordinator override |
+| `FANOUT_NOT_INDEPENDENT` | `start_task` refused: `fanout_group` already has a live member from this provider's family; `details` carries `fanout_group`, `family`, `task_id` |
 | `POLICY_BUDGET_EXHAUSTED` | `start_task` refused (retryable): the named provider has an exhausted, enforced dispatch-policy budget; `details` carries `provider`, `window`, `kind`, `limit`, `used`, `window_start`, `policy_revision` |
 | `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |

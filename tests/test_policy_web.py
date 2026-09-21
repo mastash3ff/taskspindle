@@ -973,3 +973,58 @@ async def test_stop_adapter_falls_back_when_killpg_is_missing(
     with pytest.raises(AdapterError) as caught:
         await invoke_configured_adapter((sys.executable, str(script)), {"action": "status"}, timeout=0.05)
     assert caught.value.code == "ADAPTER_UNAVAILABLE"
+
+
+# -- utilization tuning -------------------------------------------------------------------------
+
+
+def test_policy_payload_carries_limits_presets_and_slot_use(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _seed_schema_11(paths)
+    paths.config_file.parent.mkdir(parents=True, exist_ok=True)
+    paths.config_file.write_text(
+        "[concurrency]\nclaude = 3\n\n[capacity]\nper_provider_max = 6\ntotal_max = 10\n", encoding="utf-8"
+    )
+    body = _client(paths).get("/api/policy").json()
+
+    assert body["limits"]["providers"]["claude"] == {"limit": 3, "source": "config", "ceiling": 6}
+    assert body["limits"]["total"] == {"limit": 10, "source": "config", "ceiling": 10}
+    assert body["file_managed"]["capacity"] == {"per_provider_max": 6, "total_max": 10}
+    assert set(body["presets"]["claude"]) == {"conserve", "balanced", "max"}
+    assert body["preset_matches"] == {"claude": "custom", "grok": "custom"}
+    assert body["bounds"] == {
+        "max_concurrent": 16, "max_concurrent_total": 48, "ladder_steps": 3, "fanout": 3,
+    }
+    assert body["utilization"]["day"]["claude"]["limit"] == 3
+    assert body["fanout"]["reviewer"]["configured"] == 1
+    assert body["policy"]["escalation"]["enabled"] is False
+
+
+def test_put_saves_tuning_knobs_under_the_file_ceiling(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _seed_schema_11(paths)
+    client = _client(paths)
+    token = client.get("/api/policy").json()["csrf_token"]
+    document = json.loads(json.dumps(DEFAULTS_JSON))
+    document["providers"]["claude"]["max_concurrent"] = 12
+    document["roles"]["reviewer"]["fanout"] = 2
+    document["roles"]["explorer"]["ladders"] = {
+        "claude": {"below": [], "above": [{"model": "opus[1m]", "effort": "high"}]}
+    }
+    document["escalation"]["enabled"] = True
+
+    saved = client.put("/api/policy", headers=_headers(token), json={"if_revision": 0, "policy": document})
+    assert saved.status_code == 200
+    body = client.get("/api/policy").json()
+    assert body["policy"]["providers"]["claude"]["max_concurrent"] == 12
+    # Asked for twelve; the file's ceiling is what is in force.
+    assert body["limits"]["providers"]["claude"] == {"limit": 8, "source": "policy", "ceiling": 8}
+    assert body["status"]["providers"]["claude"]["escalation"]["level"] == 0
+
+    document["providers"]["claude"]["max_concurrent"] = 17
+    refused = client.put(
+        "/api/policy", headers=_headers(token), json={"if_revision": 1, "policy": document}
+    )
+    assert refused.status_code == 400
+    located = [error["loc"] for error in refused.json()["details"]["errors"]]
+    assert ["providers", "claude", "max_concurrent"] in located

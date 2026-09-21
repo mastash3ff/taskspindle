@@ -106,7 +106,12 @@ input[type="range"].slider { width: 100%; accent-color: var(--teal); }
 .chip-remove:hover { color: var(--red); }
 .chip-add { display: flex; gap: .4rem; margin-top: .4rem; }
 .chip-add input { min-width: 0; flex: 1 1 auto; height: 36px; padding: .4rem .6rem; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); }
+.preset-dial .chip-add { flex-wrap: wrap; align-items: center; margin-top: 0; }
+.preset-dial .button { text-transform: capitalize; }
 .role-matrix th, .role-matrix td { min-width: 150px; vertical-align: top; }
+.role-matrix .ladder { margin-top: .4rem; }
+.ladder-step { display: grid; grid-template-columns: auto 1fr 1fr auto; gap: .3rem; align-items: center; margin: .3rem 0; padding: 0; border: 0; background: none; }
+.ladder-step .field-error { grid-column: 1 / -1; margin: 0; }
 .role-matrix textarea { width: 100%; min-height: 52px; padding: .4rem .55rem; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); resize: vertical; }
 .role-matrix select, .role-matrix input[type="text"], .role-matrix input[type="number"] { width: 100%; min-width: 110px; height: 36px; padding: .35rem .55rem; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text); }
 .pref-order { display: grid; gap: .3rem; margin: 0; padding: 0; list-style: none; }

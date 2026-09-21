@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+- **Usage you can turn up.** The dispatch policy gains the knobs that decide how much of each
+  subscription pool gets used, all editable on the dashboard's Policy page or with
+  `taskspindle policy`, none needing a restart: `providers.<id>.max_concurrent` and
+  `max_concurrent_total` (slots, read at every dispatch), per-role `ladders` of model and effort
+  steps with an `escalation` rule that steps a provider up while it is under its target share
+  and down when it is over, throttled, near a reported usage window or near a budget, and
+  per-role `fanout`. Intensity presets (`conserve`, `balanced`, `max`; `taskspindle policy
+  preset`) fill a provider's slots, selections and ladders in one step and stay hand-editable.
+  See [dispatch-policy.md](docs/dispatch-policy.md#turning-usage-up).
+- **The server fills model and effort from the role.** A `start_task` that names a `role` and
+  leaves `model` or `effort` out has them filled from that role's current ladder step on the
+  named provider, and returns what it chose as `selection`. A value the caller sends is never
+  changed, the provider is still always the caller's, and the fill is skipped rather than
+  refused on anything but a built-in subscription profile.
+  `capabilities.dispatch_policy.server_fill` says a server does this.
+- **`[capacity]` bounds what the policy can ask for.** `per_provider_max` (default 8) and
+  `total_max` in `config.toml` are the ceiling over the policy's concurrency, because the policy
+  can be edited from a dashboard that may be on the LAN and the file cannot. `[concurrency]`
+  keeps its meaning as the fallback, so an upgrade changes no limit until a knob is set.
+- **Queued work starts when a slot frees.** Dispatch only ever ran inside a tool call, so a freed
+  slot sat empty until the coordinator next spoke to the server. The Docker controller now
+  drains the queue every `[dispatch] interval_s`, and under systemd the exiting worker does; a
+  pass is the ordinary dispatch, an idle pool costs one read-only query, and a drain failure can
+  never fail the turn that triggered it. `taskspindle dispatch` runs one pass by hand. Queued
+  tasks therefore now start unattended, including when the admission fence reopens.
+- **Slot use is measured.** Schema 15 adds `lease_history` (one row per slot hold) and
+  `task_dispatch` (how each task's selection was chosen); neither adds a `tasks` column, so an
+  older image still reads every task. `dispatch_policy(action="status")`, `usage_report`,
+  `policy show --status`, the dashboard and `doctor` report slot time used, peak active, how
+  often the last slot was taken, queue depth and queue wait, plus the share deficit itself
+  (`under_target`) rather than only its order. `doctor` gains advisory `capacity_<provider>`,
+  `capacity_shared_<family>` and `capacity_memory` checks.
+- **Fan-out groups.** `start_task` takes `fanout_group` on a consult or review; a group takes
+  one live member per provider family (`FANOUT_NOT_INDEPENDENT` otherwise) and is refused on
+  `implement`. Realized fan-out is reported beside the configured `fanout`.
+- **A stored policy that uses none of the new knobs is unchanged**, byte for byte, so its
+  fingerprint does not move and an older image still parses it. Setting any of them makes the
+  document newer: an older image then runs on the defaults and reports `document_error`, so run
+  `taskspindle policy export` before a rollback.
+- Fixed: the Policy page restored each control's previous value after a repaint, so Discard
+  could leave stale numbers on screen; a draft-driven repaint now renders from the draft. A
+  dotted path through a list no longer turns it into a map. The page also accepts an AGY model
+  the operator advertised, as the server already did, and `docs/concurrency.md` no longer
+  describes the retired `QUOTA_RETRY_PENDING` claim.
+
 ## v0.6.2
 
 - **`task_result` and `task_status` hand over the worker's session.** Both now carry

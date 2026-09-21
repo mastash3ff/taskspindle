@@ -167,14 +167,19 @@ above.
   the dispatch-policy draft; a successful apply names the mode and tells you to start a new Codex
   conversation. Routine integrity checks stay collapsed; failures stay visible. Below that, the
   dispatch policy document and its
-  observed status: per-provider shares, budgets and enable state; per-role briefs, provider
-  preference, model/effort selections and timeouts; and the read-only `[concurrency]` table from
-  `config.toml` for context. The dispatch editor holds a draft while you edit — polling pauses —
+  observed status: per-provider shares, budgets, enable state, an intensity preset dial,
+  concurrent slots (with the limit in force and where it comes from), slot use and the current
+  ladder level with its reason; pool total and escalation rules; per-role briefs, provider
+  preference, model/effort selections with their ladders, fan-out and timeouts; and the
+  read-only `[concurrency]` and `[capacity]` tables from `config.toml` for context. The dispatch editor holds a draft while you edit — polling pauses —
   validates locally, and saves the whole document against the revision it was loaded from; every
   save is kept in history. See [dispatch-policy.md](dispatch-policy.md#editing).
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
   choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
-  counts, window telemetry notes, and the cost-estimate disclaimer.
+  counts, window telemetry notes, and the cost-estimate disclaimer. A **Slot use** panel shows,
+  per provider, the slot time used against what its limit offered, peak active turns, how often
+  the last slot was taken, tasks queued now and the median wait for a slot: scheduling on this
+  host, not provider quota.
 The navigation order is **Overview**, **Tasks**, **Workers**, **Policy**, and **Usage**.
 `Ctrl+K` or `Cmd+K` opens navigation destinations and a GET-only finder over as many as 200
 recent tasks. Typing filters task ID, summary, repository, and state; arrow keys select a result,
