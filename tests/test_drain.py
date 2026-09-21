@@ -159,3 +159,42 @@ def test_capacity_and_dispatch_tables_are_validated() -> None:
                   {"dispatch": {"nope": 1}}, {"dispatch": 1}):
         with pytest.raises(ConfigError):
             dispatch_config(table)
+
+
+def test_a_real_pass_starts_a_queued_task_when_its_slot_frees(paths: Paths, monkeypatch) -> None:
+    """The whole path with only systemd faked: real config, store, orchestrator and leases."""
+    from tests.fakes.units import ACTIVE, FakeUnitBackend
+
+    backend = FakeUnitBackend()
+    monkeypatch.setattr("taskspindle.execution.unit_backend", lambda *_, **__: backend)
+    env = {"HOME": str(paths.state_dir), "PATH": "/usr/bin"}
+    from taskspindle import auth_context, providers
+    from taskspindle.models import TurnKind
+
+    claude = providers.load_profiles(
+        {}, runtime_dir=paths.runtime_dir, home=paths.state_dir, state_dir=paths.state_dir,
+        data_dir=paths.data_dir, parent_env=env,
+    )["claude"]
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        running, waiting = _queued(store, "ts_000000000001"), _queued(store, "ts_000000000002")
+        # What ``start_task`` leaves behind for a queued task: its first turn and its seat.
+        store.insert_turn(waiting.id, 1, TurnKind.INITIAL, prompt="q")
+        store.set_task_auth_context(waiting.id, auth_context.fingerprint(claude, env))
+        store.acquire_lease("claude", running.id, "taskspindle-worker-ts_000000000001", None, "boot")
+        store.update_task(running.id, None, bump_version=False, state=TaskState.RUNNING,
+                          unit_name="taskspindle-worker-ts_000000000001")
+    backend.states["taskspindle-worker-ts_000000000001"] = ACTIVE
+
+    # One slot, and it is taken: nothing to do, and nothing is even built.
+    assert drain.drain_once(paths=paths, parent_env=env) == drain.DrainResult()
+
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        store.release_lease("claude", running.id)
+    result = drain.drain_once(paths=paths, parent_env=env)
+    assert result.ran and result.error is None
+    assert result.started == [waiting.id]
+    assert [unit for unit, _ in backend.started] == [f"taskspindle-worker-{waiting.id}"]
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        assert [row["task_id"] for row in store.list_leases("claude")] == [waiting.id]
+        held = store.list_lease_history(since="0")[-1]
+        assert held["task_id"] == waiting.id and held["limit_at_acquire"] == 1
