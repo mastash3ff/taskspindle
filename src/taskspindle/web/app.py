@@ -38,9 +38,10 @@ from starlette.staticfiles import StaticFiles
 
 import taskspindle
 
-from .. import access_checks, limits, policy, usage
+from .. import access_checks, limits, policy, usage, utilization
 from ..config import Paths
 from ..doctor import run_doctor_async
+from ..models import TaskState
 from ..providers import Profile
 from ..service import provider_availability, task_view
 from ..store import PolicyRevisionConflict
@@ -67,6 +68,9 @@ _MAX_AI_POLICY_BODY_BYTES = 65536
 
 Handler = Callable[[Request], Response | Awaitable[Response]]
 
+
+#: States a task waits for a slot in (mirrors ``orchestrator.DISPATCHABLE_STATES``).
+_DISPATCHABLE = (TaskState.QUEUED, TaskState.REPAIRING, TaskState.RESUMING)
 
 def _guard(handler: Handler) -> Handler:
     """Turn a stray sqlite/OS error into a 500 JSON body instead of a traceback."""
@@ -478,6 +482,7 @@ def build_app(
                     group_by=group_by,
                     profiles=profiles,
                     now=clock(),
+                    limits=policy.slot_limits_for(store, paths.config_file, profiles),
                 )
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
@@ -486,11 +491,22 @@ def build_app(
     # -- dispatch policy --------------------------------------------------------------
 
     def _policy_payload(now: datetime) -> dict[str, Any]:
+        file_managed = policy.file_managed(paths.config_file, profiles)
         with _store() as ro_store:
             loaded = policy.load(ro_store, profiles)
             status_report = policy.status(ro_store, loaded, profiles, now)
+            # The limits a process reading this same file dispatches by, and how they were used.
+            slot_limits = policy.file_managed(paths.config_file, profiles, loaded.policy).get("limits")
+            pool = utilization.pool(
+                ro_store, now=now,
+                limits={n: info["limit"] for n, info in (slot_limits or {}).get("providers", {}).items()},
+                queued_states=[state.value for state in _DISPATCHABLE],
+            )
+            fanout = utilization.fanout_report(
+                ro_store.fanout_groups(since=utilization.stamp(now - utilization.SPANS["week"])),
+                {name: spec.fanout for name, spec in loaded.policy.roles.items()},
+            )
         default_policy = policy.defaults(profiles)
-        file_managed = policy.file_managed(paths.config_file, profiles)
         with policy_store_factory() as pstore:
             writable = pstore.available
         profiles_out = [
@@ -510,6 +526,22 @@ def build_app(
             "defaults": default_policy.model_dump(mode="json"),
             "profiles": profiles_out,
             "file_managed": file_managed,
+            "limits": slot_limits,
+            "utilization": pool,
+            "fanout": fanout,
+            # A preset is a macro over the draft: these are the patches each level writes, so
+            # the page applies exactly what the CLI's ``policy preset`` would.
+            "presets": policy.preset_table(loaded.policy, profiles),
+            "preset_matches": {
+                name: policy.preset_matches(loaded.policy, profiles, name)
+                for name in loaded.policy.providers
+            },
+            "bounds": {
+                "max_concurrent": policy.MAX_CONCURRENT,
+                "max_concurrent_total": policy.MAX_CONCURRENT_TOTAL,
+                "ladder_steps": policy.MAX_LADDER_STEPS,
+                "fanout": policy.MAX_FANOUT,
+            },
             "writable": writable,
             "csrf_token": csrf_token,
         }

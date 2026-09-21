@@ -341,8 +341,32 @@ def _doctor(*, live_probes: bool, as_json: bool) -> int:
             else _provider_status(paths)
         ),
         settings=settings,
+        capacity=(
+            None if os.environ.get("TASKSPINDLE_WORKER_CONTAINER") == "1"
+            else _capacity_summary(paths, profiles, settings)
+        ),
     )
     return _report(report, as_json=as_json)
+
+
+def _capacity_summary(
+    paths: Paths, profiles: dict[str, Any], settings: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Slot limits and their use, when a store exists; never a reason for doctor to fail."""
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from . import doctor as doctor_module
+    from .web.db import ReadOnlyStore
+
+    database = paths.state_dir / "taskspindle.sqlite3"
+    if not database.exists():
+        return None
+    try:
+        with ReadOnlyStore(database) as store:
+            return doctor_module.capacity_summary(store, profiles, settings, datetime.now(UTC))
+    except (sqlite3.Error, OSError, ConfigError):
+        return None
 
 
 def _provider_status(paths: Paths) -> list[dict[str, Any]]:
@@ -462,6 +486,7 @@ def _report(report: dict[str, Any], *, as_json: bool) -> int:
 
 
 def _usage(since: str | None, provider: str | None, group_by: str, *, as_json: bool) -> int:
+    from . import policy as policy_module
     from . import providers, usage
     from .store import Store
 
@@ -475,6 +500,7 @@ def _usage(since: str | None, provider: str | None, group_by: str, *, as_json: b
                 provider=provider,
                 group_by=group_by,
                 profiles=profiles,
+                limits=policy_module.slot_limits_for(store, paths.config_file, profiles),
             )
     except (ConfigError, providers.ProfileError, OSError, ValueError) as exc:
         print(f"taskspindle usage: {exc}", file=sys.stderr)

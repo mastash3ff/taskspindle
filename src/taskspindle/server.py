@@ -233,6 +233,10 @@ def build_server(orchestrator: Orchestrator) -> FastMCP:
                 provider_status=orchestrator.store.list_provider_status(),
                 now=orchestrator.clock(),
                 settings=load_config(orchestrator.paths.config_file),
+                capacity=doctor_module.capacity_summary(
+                    orchestrator.store, orchestrator.profiles,
+                    load_config(orchestrator.paths.config_file), orchestrator.clock(),
+                ),
             ),
         )
 

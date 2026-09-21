@@ -493,8 +493,13 @@ def report(
     group_by: str = "provider",
     profiles: Mapping[str, Profile] | None = None,
     now: datetime | None = None,
+    limits: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Tokens, estimated cost, outcomes, timings, violations and windows, rolled up on read."""
+    """Tokens, estimated cost, outcomes, timings, violations and windows, rolled up on read.
+
+    ``limits`` is each provider's slot limit; with it ``utilization`` can say what share of the
+    offered slot time was used, and without it only how much was held.
+    """
     moment = now or datetime.now(UTC)
     rows = store.list_turn_usage(since=since, provider=provider)
     mode_by_task: dict[str, str] = {}
@@ -581,6 +586,41 @@ def report(
         },
         "violations": violations,
         "windows": windows_report(store, profiles or {}, moment),
+        **_pool_sections(store, since=since, provider=provider, now=moment, limits=limits or {}),
+    }
+
+
+def _pool_sections(
+    store: Any, *, since: str | None, provider: str | None, now: datetime, limits: Mapping[str, int],
+) -> dict[str, Any]:
+    """Slot use, queue wait and realized fan-out over the report's window (a week when open-ended)."""
+    from . import utilization
+    from .models import TaskState
+
+    history = getattr(store, "list_lease_history", None)
+    if history is None:
+        return {}
+    start = now - utilization.SPANS["week"]
+    if since is not None:
+        with_zone = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        start = with_zone if with_zone.tzinfo else with_zone.replace(tzinfo=UTC)
+    stamp = utilization.stamp(start)
+    busy = utilization.report(
+        history(since=stamp), since=start, now=now, limits=limits,
+        queued=store.queued_counts(
+            [TaskState.QUEUED.value, TaskState.REPAIRING.value, TaskState.RESUMING.value]
+        ),
+    )
+    members = [
+        row for row in store.fanout_groups(since=stamp) if provider is None or row["provider"] == provider
+    ]
+    return {
+        "utilization": [
+            {"provider": name, **info} for name, info in busy.items() if provider in (None, name)
+        ],
+        "fanout": [
+            {"role": role, **info} for role, info in utilization.fanout_report(members, {}).items()
+        ],
     }
 
 

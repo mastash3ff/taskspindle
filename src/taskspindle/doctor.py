@@ -83,6 +83,106 @@ class Check:
         return {"name": self.name, "ok": self.ok, "detail": self.detail, "advisory": self.advisory}
 
 
+#: What one worker may hold: ``MemoryMax`` under systemd, ``mem_limit`` under Docker.
+WORKER_MEMORY_BYTES = 3 * 1024**3
+
+
+def capacity_summary(
+    store: Any, profiles: Mapping[str, Any], settings: Mapping[str, Any], now: datetime
+) -> dict[str, Any]:
+    """The slot limits in force and how the last day used them, for :func:`capacity_checks`.
+
+    Read by the caller on its own thread, like ``provider_status``: the blocking checks run on
+    a worker thread that must never touch the store's connection.
+    """
+    from . import policy, utilization
+    from .config import capacity_limits, concurrency_limits
+    from .models import TaskState
+
+    capacity = capacity_limits(settings)
+    loaded = policy.load(store, profiles)
+    limits_now = policy.effective_limits(
+        loaded.policy, concurrency_limits(settings, profiles),
+        per_provider_max=capacity.per_provider_max, total_max=capacity.total_max,
+    )
+    active: dict[str, int] = {}
+    for lease in store.list_leases():
+        active[lease["provider"]] = active.get(lease["provider"], 0) + 1
+    day = utilization.pool(
+        store, now=now, limits={name: info["limit"] for name, info in limits_now["providers"].items()},
+        queued_states=[TaskState.QUEUED.value, TaskState.REPAIRING.value, TaskState.RESUMING.value],
+    ).get("day", {})
+    families: dict[str, list[str]] = {}
+    for name, profile in profiles.items():
+        spec = loaded.policy.providers.get(name)
+        if getattr(profile, "auth", None) == "oauth" and (spec is None or spec.enabled):
+            families.setdefault(profile.family, []).append(name)
+    return {
+        "providers": {
+            name: {
+                **info,
+                "active": active.get(name, 0),
+                "queued": day.get(name, {}).get("queued", 0),
+                "slot_utilization": day.get(name, {}).get("slot_utilization"),
+            }
+            for name, info in limits_now["providers"].items() if name in profiles
+        },
+        "total": limits_now["total"],
+        "shared_seats": {family: sorted(names) for family, names in families.items() if len(names) > 1},
+    }
+
+
+def _memory_total_bytes() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def capacity_checks(summary: Mapping[str, Any], *, memory_total: int | None = None) -> list[Check]:
+    """Advisory answers about slot limits: a full provider with a queue, and memory exposure.
+
+    Neither is a fault. A saturated provider is where raising ``max_concurrent`` would help, and
+    limits that add up to more memory than the host has only matter if every slot fills at once.
+    """
+    checks: list[Check] = []
+    for name, info in sorted(summary.get("providers", {}).items()):
+        busy = info.get("slot_utilization")
+        used = f"{busy:.0%}" if isinstance(busy, int | float) else "unknown"
+        detail = (
+            f"limit {info['limit']} from {info['source']}, {info['active']} active, "
+            f"{info['queued']} queued, slots {used} used over the last day"
+        )
+        saturated = info["queued"] > 0 and info["active"] >= info["limit"]
+        if saturated:
+            detail += "; every slot is taken while work waits, so a higher max_concurrent would be used"
+        checks.append(Check(f"capacity_{name}", not saturated, detail, advisory=True))
+    for family, names in sorted(summary.get("shared_seats", {}).items()):
+        checks.append(Check(
+            f"capacity_shared_{family}", False,
+            f"{', '.join(names)} share one {family} seat, so their slot limits add up on it",
+            advisory=True,
+        ))
+    total = summary.get("total", {}).get("limit")
+    slots = sum(info["limit"] for info in summary.get("providers", {}).values())
+    slots = min(slots, total) if total is not None else slots
+    memory_total = memory_total if memory_total is not None else _memory_total_bytes()
+    if memory_total and slots:
+        exposure = slots * WORKER_MEMORY_BYTES
+        gib = 1024**3
+        detail = (
+            f"{slots} slots at up to {WORKER_MEMORY_BYTES // gib} GiB each is {exposure / gib:.0f} GiB "
+            f"against {memory_total / gib:.0f} GiB of memory"
+        )
+        if exposure > memory_total:
+            detail += "; set [capacity] total_max to bound it"
+        checks.append(Check("capacity_memory", exposure <= memory_total, detail, advisory=True))
+    return checks
+
+
 def _newer_than_tested(name: str, reported: str, tested_up_to: str) -> str:
     """One consistent wording for a build past the newest one TaskSpindle has been tested with.
 
@@ -672,8 +772,31 @@ async def run_doctor_async(
     provider_status: Sequence[Mapping[str, Any]] = (),
     now: datetime | None = None,
     settings: Mapping[str, Any] | None = None,
+    capacity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Ask every question and report the answers; advisory failures never fail the run."""
+    report = await _run_checks(
+        profiles=profiles, paths=paths, parent_env=parent_env, live_probes=live_probes,
+        runner=runner, provider_status=provider_status, now=now, settings=settings,
+    )
+    if capacity is not None and parent_env.get("TASKSPINDLE_WORKER_CONTAINER") != "1":
+        # Slots are scheduled here, not in a worker, so these are answered on this side even
+        # when every other question was put to the worker image.
+        report["checks"] = [*report["checks"], *(check.as_dict() for check in capacity_checks(capacity))]
+    return report
+
+
+async def _run_checks(
+    *,
+    profiles: Mapping[str, Profile],
+    paths: Paths,
+    parent_env: Mapping[str, str],
+    live_probes: bool,
+    runner: Runner,
+    provider_status: Sequence[Mapping[str, Any]],
+    now: datetime | None,
+    settings: Mapping[str, Any] | None,
+) -> dict[str, Any]:
     if parent_env.get("TASKSPINDLE_WORKER_CONTAINER") != "1":
         configured = settings if settings is not None else load_config(paths.config_file)
         execution = configured.get("execution", {})
@@ -726,6 +849,7 @@ def run_doctor(
     runner: Runner = subprocess.run,
     provider_status: Sequence[Mapping[str, Any]] = (),
     settings: Mapping[str, Any] | None = None,
+    capacity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """:func:`run_doctor_async` for a caller that owns no event loop, such as the CLI."""
     return asyncio.run(
@@ -737,5 +861,6 @@ def run_doctor(
             runner=runner,
             provider_status=provider_status,
             settings=settings,
+            capacity=capacity,
         )
     )

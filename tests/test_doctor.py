@@ -706,3 +706,60 @@ def test_a_profile_whose_secret_is_missing_is_not_probed(
         "detail": "secret not set: SOME_API_KEY",
         "advisory": True,
     }
+
+
+# -- capacity advisories -------------------------------------------------------------------------
+
+
+def _capacity(**claude: object) -> dict:
+    info = {"limit": 2, "source": "policy", "ceiling": 8, "active": 0, "queued": 0,
+            "slot_utilization": 0.25} | claude
+    return {"providers": {"claude": info}, "total": {"limit": None}, "shared_seats": {}}
+
+
+def test_capacity_checks_are_advisory_and_flag_a_full_provider_with_a_queue() -> None:
+    from taskspindle import doctor
+
+    quiet = {c.name: c for c in doctor.capacity_checks(_capacity(), memory_total=64 * 1024**3)}
+    assert quiet["capacity_claude"].ok and quiet["capacity_claude"].advisory
+    assert "limit 2 from policy, 0 active, 0 queued, slots 25% used" in quiet["capacity_claude"].detail
+    assert quiet["capacity_memory"].ok
+    assert "2 slots at up to 3 GiB each is 6 GiB" in quiet["capacity_memory"].detail
+
+    busy = _capacity(active=2, queued=3)
+    full = {c.name: c for c in doctor.capacity_checks(busy, memory_total=4 * 1024**3)}
+    assert full["capacity_claude"].ok is False and full["capacity_claude"].advisory
+    assert "a higher max_concurrent would be used" in full["capacity_claude"].detail
+    assert full["capacity_memory"].ok is False and "[capacity] total_max" in full["capacity_memory"].detail
+
+    # A pool total bounds the exposure; two profiles on one seat are called out.
+    summary = _capacity(limit=16) | {
+        "total": {"limit": 1}, "shared_seats": {"claude": ["claude", "claude-b"]},
+    }
+    bounded = {c.name: c for c in doctor.capacity_checks(summary, memory_total=4 * 1024**3)}
+    assert bounded["capacity_memory"].ok
+    assert "claude, claude-b share one claude seat" in bounded["capacity_shared_claude"].detail
+
+
+def test_capacity_summary_reads_limits_use_and_queue_from_the_store(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    from taskspindle import doctor, policy, providers
+    from taskspindle.store import Store
+
+    profiles = providers.load_profiles(
+        {}, runtime_dir=tmp_path / "rt", home=tmp_path, state_dir=tmp_path / "state",
+    )
+    with Store.open(tmp_path / "state" / "taskspindle.sqlite3") as store:
+        document = policy.defaults(profiles)
+        document.providers["grok"].max_concurrent = 12
+        policy.save(store, document, updated_by="test", if_revision=None)
+        summary = doctor.capacity_summary(
+            store, profiles, {"concurrency": {"claude": 4}, "capacity": {"total_max": 9}},
+            datetime.now(UTC),
+        )
+    assert summary["providers"]["claude"] | {"slot_utilization": None} == {
+        "limit": 4, "source": "config", "ceiling": 8, "active": 0, "queued": 0, "slot_utilization": None,
+    }
+    assert summary["providers"]["grok"]["limit"] == 8 and summary["providers"]["grok"]["source"] == "policy"
+    assert summary["total"]["limit"] == 9 and summary["shared_seats"] == {}

@@ -54,6 +54,7 @@ __all__ = [
     "preset_matches",
     "preset_table",
     "resolve_selection",
+    "slot_limits_for",
     "status",
     "step_selection",
     "validate",
@@ -795,6 +796,12 @@ def file_managed(
             policy, concurrency, per_provider_max=capacity.per_provider_max, total_max=capacity.total_max
         )
     return managed
+
+
+def slot_limits_for(store: Any, config_file: Any, profiles: Mapping[str, Any]) -> dict[str, int]:
+    """Each provider's slot limit as a reader outside the server sees it; empty when the file is broken."""
+    limits = file_managed(config_file, profiles, load(store, profiles).policy).get("limits")
+    return {name: info["limit"] for name, info in (limits or {}).get("providers", {}).items()}
 
 
 # -- concurrency: what the policy asks for, under the file's ceiling -----------------------------

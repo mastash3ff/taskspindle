@@ -1339,6 +1339,7 @@ class Orchestrator:
                 group_by=group_by,
                 profiles=self.profiles,
                 now=now,
+                limits={name: info["limit"] for name, info in self._slot_limits()["providers"].items()},
             )
         return result
 
