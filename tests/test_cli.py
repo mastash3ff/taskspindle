@@ -627,3 +627,72 @@ def test_policy_without_a_subcommand_prints_usage_and_exits_two(
         cli.main(["policy"])
     assert raised.value.code == 2
     assert "policy requires a subcommand" in capsys.readouterr().err
+
+
+# -- utilization tuning ---------------------------------------------------------------------------
+
+
+def test_policy_preset_previews_then_writes_and_is_recognised(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "preset", "grok", "max", "--dry-run"]) == 0
+    preview = capsys.readouterr().out
+    assert "providers.grok.max_concurrent: null -> 8" in preview
+    assert cli.main(["policy", "show", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["revision"] == 0
+
+    assert cli.main(["policy", "preset", "grok", "max", "--if-revision", "0"]) == 0
+    capsys.readouterr()
+    assert cli.main(["policy", "show", "--status", "--json"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["revision"] == 1
+    assert shown["presets"]["grok"] == "max" and shown["presets"]["claude"] == "custom"
+    assert shown["limits"]["providers"]["grok"] == {"limit": 8, "source": "policy", "ceiling": 8}
+    assert shown["policy"]["roles"]["mechanic"]["selections"]["grok"]["effort"] == "medium"
+    assert shown["utilization"]["day"]["grok"]["limit"] == 8
+
+    assert cli.main(["policy", "preset", "grok", "max", "--if-revision", "0"]) == 3
+    assert cli.main(["policy", "preset", "muse", "max"]) == 1
+    assert "no intensity presets" in capsys.readouterr().err
+
+
+def test_policy_show_status_prints_the_tuning_columns(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "preset", "claude", "balanced"]) == 0
+    capsys.readouterr()
+    assert cli.main(["policy", "show", "--status"]) == 0
+    text = capsys.readouterr().out
+    assert "slots" in text and "preset" in text and "ladder" in text
+    assert "4 (policy)" in text and "balanced" in text
+
+
+def test_policy_set_guards_the_revision_and_can_create_a_ladder(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["policy", "set", "providers.claude.max_concurrent", "6", "--if-revision", "0"]) == 0
+    assert cli.main(["policy", "set", "providers.claude.max_concurrent", "7", "--if-revision", "0"]) == 3
+    capsys.readouterr()
+
+    step = '[{"model": "opus[1m]", "effort": "high"}]'
+    assert cli.main(["policy", "set", "roles.explorer.ladders.claude.above", step]) == 1
+    assert "no such path" in capsys.readouterr().err
+    assert cli.main(
+        ["policy", "set", "roles.explorer.ladders.claude.above", step, "--create-parents"]
+    ) == 0
+    assert cli.main(["policy", "set", "providers.claude.max_concurrent", "99"]) == 1
+    capsys.readouterr()
+
+    assert cli.main(["policy", "export"]) == 0
+    stored = json.loads(capsys.readouterr().out)
+    assert stored["providers"]["claude"]["max_concurrent"] == 6
+    assert stored["roles"]["explorer"]["ladders"]["claude"]["above"][0]["model"] == "opus[1m]"
+    # Knobs left alone stay out of the stored document.
+    assert "max_concurrent" not in stored["providers"]["grok"]
+
+
+def test_dispatch_reports_an_idle_pool(home: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["dispatch"]) == 0
+    assert capsys.readouterr().out.strip() == "nothing to start"
+    assert cli.main(["dispatch", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ran": False, "started": [], "error": None}

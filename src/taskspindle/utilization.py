@@ -14,12 +14,13 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-__all__ = ["SPANS", "fanout_report", "pool", "report"]
+__all__ = ["SPANS", "fanout_report", "pool", "report", "stamp"]
 
 SPANS: dict[str, timedelta] = {"day": timedelta(hours=24), "week": timedelta(days=7)}
 
 
-def _stamp(moment: datetime) -> str:
+def stamp(moment: datetime) -> str:
+    """A store timestamp: UTC, microseconds, ``Z``."""
     return moment.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
@@ -116,7 +117,7 @@ def pool(
     queued = store.queued_counts(queued_states)
     return {
         window: report(
-            history(since=_stamp(now - span)), since=now - span, now=now, limits=limits, queued=queued,
+            history(since=stamp(now - span)), since=now - span, now=now, limits=limits, queued=queued,
         )
         for window, span in SPANS.items()
     }

@@ -142,13 +142,37 @@ def build_parser() -> argparse.ArgumentParser:
     policy_set = policy_sub.add_parser(
         "set", help="set one dotted path in the policy document to a JSON value"
     )
-    policy_set.add_argument("path", help="dotted path, e.g. providers.claude.target_share")
+    policy_set.add_argument("path", help="dotted path, e.g. providers.claude.max_concurrent")
     policy_set.add_argument("value", help="a JSON value; a raw string when it does not parse as JSON")
+    policy_set.add_argument(
+        "--if-revision", type=int, help="only write if this is still the current revision"
+    )
+    policy_set.add_argument(
+        "--create-parents", action="store_true",
+        help="create missing tables along the path, e.g. roles.explorer.ladders.claude.above",
+    )
+
+    policy_preset = policy_sub.add_parser(
+        "preset", help="set one provider's concurrency, role selections and ladders to an intensity level"
+    )
+    policy_preset.add_argument("provider", help="a provider id, e.g. claude")
+    policy_preset.add_argument("level", choices=["conserve", "balanced", "max"])
+    policy_preset.add_argument(
+        "--if-revision", type=int, help="only write if this is still the current revision"
+    )
+    policy_preset.add_argument(
+        "--dry-run", action="store_true", help="print what would change and write nothing"
+    )
 
     policy_reset = policy_sub.add_parser("reset", help="reset the policy document to its defaults")
     policy_reset.add_argument(
         "--if-revision", type=int, help="only write if this is still the current revision"
     )
+
+    dispatch = sub.add_parser(
+        "dispatch", help="start queued tasks whose provider has a free slot, once, and exit"
+    )
+    dispatch.add_argument("--json", action="store_true", help="print the result as JSON")
 
     discover = sub.add_parser(
         "discover", help="list installed ACP agents from the community registry as config proposals"
@@ -214,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "policy":
         return _policy(parser, args)
+    if args.command == "dispatch":
+        return _dispatch(as_json=args.json)
     if args.command == "discover":
         return _discover(args.registry, refresh=args.refresh, show_all=args.all, as_json=args.json,
                          probe=args.probe)
@@ -591,7 +617,7 @@ def _table(columns: list[str], rows: list[list[str]]) -> None:
 
 def _policy(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.policy_command is None:
-        parser.error("policy requires a subcommand (show, export, import, set, reset)")
+        parser.error("policy requires a subcommand (show, export, import, set, preset, reset)")
     if args.policy_command == "show":
         return _policy_show(status=args.status, as_json=args.json)
     if args.policy_command == "export":
@@ -599,7 +625,11 @@ def _policy(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
     if args.policy_command == "import":
         return _policy_import(args.file, args.if_revision)
     if args.policy_command == "set":
-        return _policy_set(args.path, args.value)
+        return _policy_set(
+            args.path, args.value, if_revision=args.if_revision, create_parents=args.create_parents,
+        )
+    if args.policy_command == "preset":
+        return _policy_preset(args.provider, args.level, args.if_revision, dry_run=args.dry_run)
     return _policy_reset(args.if_revision)
 
 
@@ -637,8 +667,28 @@ def _policy_show(*, status: bool, as_json: bool) -> int:
                 **loaded.describe(),
             }
             if status:
-                result["status"] = policy_module.status(store, loaded, profiles, datetime.now(UTC))
-                result["file_managed"] = policy_module.file_managed(resolve_paths().config_file, profiles)
+                from . import utilization
+                from .models import TaskState
+
+                moment = datetime.now(UTC)
+                managed = policy_module.file_managed(resolve_paths().config_file, profiles, loaded.policy)
+                result["status"] = policy_module.status(store, loaded, profiles, moment)
+                result["limits"] = managed.pop("limits", None)
+                result["file_managed"] = managed
+                result["presets"] = {
+                    name: policy_module.preset_matches(loaded.policy, profiles, name)
+                    for name in loaded.policy.providers
+                }
+                limits = (result["limits"] or {}).get("providers", {})
+                result["utilization"] = utilization.pool(
+                    store, now=moment, limits={name: info["limit"] for name, info in limits.items()},
+                    queued_states=[TaskState.QUEUED.value, TaskState.REPAIRING.value,
+                                   TaskState.RESUMING.value],
+                )
+                result["fanout"] = utilization.fanout_report(
+                    store.fanout_groups(since=utilization.stamp(moment - utilization.SPANS["week"])),
+                    {name: spec.fanout for name, spec in loaded.policy.roles.items()},
+                )
     except (ConfigError, providers.ProfileError, OSError, ValueError) as exc:
         print(f"taskspindle policy: {exc}", file=sys.stderr)
         return 1
@@ -670,16 +720,36 @@ def _print_policy(result: dict[str, Any]) -> None:
             for window, budget in (spec.get("budgets") or {}).items()
         )
         default_state = "active" if spec.get("enabled") else "paused"
-        rows.append([
+        row = [
             name,
             str(info.get("state", "-")) if status is not None else default_state,
             str(spec.get("target_share")) if spec.get("target_share") is not None else "-",
             f"{share:.2f}" if isinstance(share, int | float) else "-",
             budgets or "-",
-        ])
+        ]
+        if status is not None:
+            limit = ((result.get("limits") or {}).get("providers") or {}).get(name)
+            used = (result.get("utilization") or {}).get("day", {}).get(name, {})
+            busy = used.get("slot_utilization")
+            level = info.get("escalation", {}).get("level")
+            row += [
+                f"{limit['limit']} ({limit['source']})" if limit else "-",
+                (result.get("presets") or {}).get(name) or "-",
+                f"{level:+d}" if level else "0",
+                f"{busy:.0%}" if isinstance(busy, int | float) else "-",
+                str(used.get("queued", 0)),
+            ]
+        rows.append(row)
     print()
     print("providers")
-    _table(["provider", "state", "target_share", f"observed_share ({share_window})", "budgets"], rows)
+    headers = ["provider", "state", "target_share", f"observed_share ({share_window})", "budgets"]
+    if status is not None:
+        headers += ["slots", "preset", "ladder", "slot_use (day)", "queued"]
+    _table(headers, rows)
+    if status is not None:
+        for name, info in sorted(provider_status.items()):
+            if info.get("escalation", {}).get("level"):
+                print(f"  {name}: {info['escalation']['reason']}")
 
     role_rows = []
     for role, spec in sorted(document.get("roles", {}).items()):
@@ -751,7 +821,9 @@ def _policy_import(file: str, if_revision: int | None) -> int:
     return 0
 
 
-def _policy_set(path: str, raw_value: str) -> int:
+def _policy_set(
+    path: str, raw_value: str, *, if_revision: int | None = None, create_parents: bool = False,
+) -> int:
     from . import policy as policy_module
     from . import providers
     from .store import PolicyRevisionConflict
@@ -768,6 +840,8 @@ def _policy_set(path: str, raw_value: str) -> int:
             document = loaded.policy.model_dump(mode="json")
             target: Any = document
             for key in keys[:-1]:
+                if isinstance(target, dict) and key not in target and create_parents:
+                    target[key] = {}
                 if not isinstance(target, dict) or key not in target:
                     print(f"taskspindle policy: no such path: {path}", file=sys.stderr)
                     return 1
@@ -785,7 +859,50 @@ def _policy_set(path: str, raw_value: str) -> int:
             if errors:
                 _print_policy_errors(errors)
                 return 1
-            policy_module.save(store, parsed, updated_by="cli", if_revision=None, reason="cli set")
+            policy_module.save(
+                store, parsed, updated_by="cli", if_revision=if_revision, reason="cli set"
+            )
+    except PolicyRevisionConflict as exc:
+        print(f"taskspindle policy: revision conflict, current revision is {exc.actual}", file=sys.stderr)
+        return 3
+    except (ConfigError, providers.ProfileError, OSError, ValueError) as exc:
+        print(f"taskspindle policy: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _policy_preset(provider: str, level: str, if_revision: int | None, *, dry_run: bool) -> int:
+    from . import policy as policy_module
+    from . import providers
+    from .store import PolicyRevisionConflict
+
+    try:
+        store, profiles = _policy_store_and_profiles()
+        with store:
+            loaded = policy_module.load(store, profiles)
+            try:
+                updated = policy_module.apply_preset(loaded.policy, profiles, provider, level)
+            except policy_module.PolicyError as exc:
+                _print_policy_errors(exc.errors)
+                return 1
+            errors = policy_module.validate(updated, profiles)
+            if errors:
+                _print_policy_errors(errors)
+                return 1
+            before = loaded.policy.model_dump(mode="json")
+            for patch in policy_module.preset_table(loaded.policy, profiles)[provider][level]:
+                old: Any = before
+                for key in patch["path"]:
+                    old = old.get(key) if isinstance(old, dict) else None
+                if old != patch["value"]:
+                    where = ".".join(patch["path"])
+                    print(f"{where}: {json.dumps(old)} -> {json.dumps(patch['value'])}")
+            if dry_run:
+                return 0
+            policy_module.save(
+                store, updated, updated_by="cli", if_revision=if_revision,
+                reason=f"preset {provider} {level}",
+            )
     except PolicyRevisionConflict as exc:
         print(f"taskspindle policy: revision conflict, current revision is {exc.actual}", file=sys.stderr)
         return 3
@@ -814,6 +931,25 @@ def _policy_reset(if_revision: int | None) -> int:
         print(f"taskspindle policy: {exc}", file=sys.stderr)
         return 1
     return 0
+
+
+# -- dispatch ------------------------------------------------------------------------
+
+
+def _dispatch(*, as_json: bool) -> int:
+    """One drain pass: what the controller's loop, or an exiting worker, does on its own."""
+    from .drain import drain_once
+
+    result = drain_once()
+    if as_json:
+        print(json.dumps({"ran": result.ran, "started": result.started, "error": result.error}))
+    elif result.error:
+        print(f"taskspindle dispatch: {result.error}", file=sys.stderr)
+    elif result.started:
+        print("started " + " ".join(result.started))
+    else:
+        print("nothing to start")
+    return 1 if result.error else 0
 
 
 # -- discover ------------------------------------------------------------------------

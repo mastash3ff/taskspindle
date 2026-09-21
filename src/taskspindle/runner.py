@@ -1766,7 +1766,23 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if store is not None:
             store.close()
-    return 0 if state in TERMINAL_STATES or state is TaskState.RESULT_READY else 1
+    code = 0 if state in TERMINAL_STATES or state is TaskState.RESULT_READY else 1
+    _drain_after_turn()
+    return code
+
+
+def _drain_after_turn() -> None:
+    """Hand the slot this turn just gave back to the next queued task, if there is one.
+
+    The turn's outcome is already decided and recorded, so nothing here can change it. A
+    worker container cannot start units and is skipped: there the controller drains.
+    """
+    if os.environ.get("TASKSPINDLE_WORKER_CONTAINER") == "1":
+        return
+    with contextlib.suppress(Exception):
+        from .drain import drain_once
+
+        drain_once()
 
 
 if __name__ == "__main__":  # pragma: no cover - process entry point

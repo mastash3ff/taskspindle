@@ -173,6 +173,30 @@ class ControlServer(socketserver.ThreadingUnixStreamServer):
             self._slots.release()
 
 
+def _drain_loop(controller: Controller, stopped: threading.Event) -> None:
+    """Start queued work whenever a slot frees, as an ordinary client of the jobs socket.
+
+    The pass goes through the same socket, fence and mutation lock as a server's dispatch, so
+    this thread holds no authority the controller does not already grant. A pass that ran and
+    started nothing (a throttled provider, a closed fence) backs the loop off, so a stuck queue
+    is polled gently; the next start resets it.
+    """
+    from .config import dispatch_config
+    from .drain import drain_once
+
+    try:
+        config = dispatch_config(controller.settings)
+    except ConfigError:
+        return
+    if not config.drain:
+        return
+    wait = float(config.interval_s)
+    while not stopped.wait(wait):
+        result = drain_once(paths=controller.paths)
+        idle = result.error is not None or (result.ran and not result.started)
+        wait = min(wait * 2, 60.0) if idle else float(config.interval_s)
+
+
 def serve(controller: Controller, jobs: Path, diagnostics: Path) -> None:
     if jobs == diagnostics or not jobs.is_absolute() or not diagnostics.is_absolute():
         raise ConfigError("Controller sockets must be distinct absolute paths")
@@ -193,6 +217,7 @@ def serve(controller: Controller, jobs: Path, diagnostics: Path) -> None:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 previous[sig] = signal.signal(sig, lambda *_: stopped.set())
             threads = [threading.Thread(target=server.serve_forever, daemon=True) for server in servers]
+            threads.append(threading.Thread(target=_drain_loop, args=(controller, stopped), daemon=True))
             try:
                 for thread in threads:
                     thread.start()
