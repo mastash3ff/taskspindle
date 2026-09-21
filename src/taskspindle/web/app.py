@@ -615,7 +615,7 @@ def build_app(
         return JSONResponse(
             {
                 "revision": row["revision"],
-                "policy": row["document"],
+                "policy": policy.full_document(row["document"]),
                 "updated_at": row["updated_at"],
                 "updated_by": row["updated_by"],
                 "reason": row["reason"],

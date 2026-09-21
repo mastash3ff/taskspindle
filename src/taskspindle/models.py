@@ -260,8 +260,12 @@ class StartTaskRequest(BaseModel):
     #: An explicit coordinator override: admit this task even while the provider's status says
     #: it is not eligible yet. There is no other bypass; a caller that sets this owns the decision.
     ignore_provider_status: bool = False
-    #: The dispatch-policy role this task was assigned for; recorded for usage reporting only.
+    #: The dispatch-policy role this task was assigned for. It is recorded for usage reporting,
+    #: and whichever of ``model`` and ``effort`` is left out is filled from the role's selection.
     role: str | None = Field(default=None, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
+    #: Names the set of consults or reviews asking the same question of different provider
+    #: families; the caller makes it up, and one family may hold one live member of a group.
+    fanout_group: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     # implement only
     acceptance_criteria: str | None = None
     path_prefixes: list[str] | None = None
@@ -337,6 +341,8 @@ class StartTaskRequest(BaseModel):
             raise ValueError("review mode requires review_target")
         if self.mode is not Mode.REVIEW and self.review_kind != "standard":
             raise ValueError("review_kind is review only")
+        if self.mode is Mode.IMPLEMENT and self.fanout_group is not None:
+            raise ValueError("fanout_group is for consult and review; a writer is never fanned out")
         return self
 
 

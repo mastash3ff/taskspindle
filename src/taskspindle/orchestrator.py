@@ -18,7 +18,7 @@ import sys
 import traceback
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +34,11 @@ from . import (
     repos,
     units,
     usage,
+    utilization,
     worktrees,
 )
 from .config import (
+    CapacityConfig,
     ContextFilesConfig,
     Paths,
     concurrency_limits,
@@ -67,6 +69,7 @@ from .service import (
     CANDIDATE_MISMATCH,
     CHECKS_FAILED,
     DIRTY_OVERLAP,
+    FANOUT_NOT_INDEPENDENT,
     GRANT_MISSING,
     ILLEGAL_TRANSITION,
     INVALID_REQUEST,
@@ -171,6 +174,11 @@ _RESUME_DEFAULT_PROMPT = "Continue where you left off."
 _AWAITING_DISPATCH: dict[str, Any] = {"unit_name": None, "worker_pid": None, "boot_id": None}
 
 
+def _iso(moment: datetime) -> str:
+    """A store timestamp: UTC, microseconds, ``Z`` -- the form :func:`taskspindle.store.now` writes."""
+    return moment.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def utcnow() -> datetime:
     """The clock the orchestrator reconciles against; injectable so tests can move time."""
     return datetime.now(UTC)
@@ -219,19 +227,37 @@ class Orchestrator:
         clock: Callable[[], datetime] = utcnow,
         concurrency: Mapping[str, int] | None = None,
         context_files: ContextFilesConfig | None = None,
+        capacity: CapacityConfig | None = None,
     ) -> None:
         self.store = store
         self.paths = paths
         #: The ``[context_files]`` allowlist; None means ``start_task(context_files=...)`` is refused.
         self.context_files = context_files
         self.profiles = dict(profiles)
+        #: ``[concurrency]``: the limits in force wherever the dispatch policy sets none.
         self.concurrency = concurrency_limits({"concurrency": dict(concurrency or {})}, profiles)
+        #: ``[capacity]``: the ceiling over whatever the dispatch policy asks for.
+        self.capacity = capacity or CapacityConfig()
         self.units = units
         self.boot = boot
         self.parent_env = dict(parent_env)
         auth_context.validate_contexts(self.profiles, self.parent_env)
         self.clock = clock
         _mkdir(paths.state_dir)
+
+    def _slot_limits(self, loaded: policy.LoadedPolicy | None = None) -> dict[str, Any]:
+        """The slot limits in force right now, read from the stored policy on every call.
+
+        A limit saved from the dashboard or the CLI therefore applies to the next dispatch in
+        every process sharing the database, with no restart.
+        """
+        loaded = loaded or policy.load(self.store, self.profiles)
+        return policy.effective_limits(
+            loaded.policy,
+            self.concurrency,
+            per_provider_max=self.capacity.per_provider_max,
+            total_max=self.capacity.total_max,
+        )
 
     def _unit_env(self) -> dict[str, str]:
         """The environment a worker or accept unit is started with.
@@ -389,6 +415,31 @@ class Orchestrator:
             active[lease["provider"]] = active.get(lease["provider"], 0) + 1
         loaded_policy = policy.load(self.store, self.profiles)
         policy_status = policy.status(self.store, loaded_policy, self.profiles, now)
+        slots = self._slot_limits(loaded_policy)
+        total_limit = slots["total"]["limit"]
+        total_active = sum(active.values())
+        queued = self.store.queued_counts([state.value for state in DISPATCHABLE_STATES])
+        busy = utilization.report(
+            self.store.list_lease_history(since=_iso(now - timedelta(hours=24))),
+            since=now - timedelta(hours=24), now=now,
+            limits={name: info["limit"] for name, info in slots["providers"].items()},
+            queued=queued,
+        )
+
+        def capacity(provider_id: str) -> dict[str, Any]:
+            info = slots["providers"].get(provider_id, {"limit": 1, "source": "config", "ceiling": None})
+            free = info["limit"] - active.get(provider_id, 0)
+            if total_limit is not None:
+                free = min(free, total_limit - total_active)
+            return {
+                "limit": info["limit"],
+                "active": active.get(provider_id, 0),
+                "available": max(0, free),
+                "source": info["source"],
+                "ceiling": info["ceiling"],
+                "queued": queued.get(provider_id, 0),
+            }
+
         return {
             "execution": {
                 "platform": "linux",
@@ -400,8 +451,14 @@ class Orchestrator:
             "dispatch_policy": {
                 **loaded_policy.describe(),
                 "share_window": loaded_policy.policy.share_window,
-                "roles": loaded_policy.policy.model_dump(mode="json")["roles"],
+                "roles": {
+                    name: {**spec, **policy_status["roles"].get(name, {})}
+                    for name, spec in loaded_policy.policy.model_dump(mode="json")["roles"].items()
+                },
                 "under_target_order": policy_status["under_target_order"],
+                "under_target": policy_status["under_target"],
+                # A task that names a role and leaves model or effort out has them filled here.
+                "server_fill": True,
             },
             "providers": [
                 {
@@ -423,10 +480,10 @@ class Orchestrator:
                         model=profile.model,
                         parent_env=self.parent_env,
                     ),
-                    "capacity": {
-                        "limit": self.concurrency.get(profile.id, 1),
-                        "active": active.get(profile.id, 0),
-                        "available": max(0, self.concurrency.get(profile.id, 1) - active.get(profile.id, 0)),
+                    "capacity": capacity(profile.id),
+                    "utilization": {
+                        "slot_utilization_day": busy.get(profile.id, {}).get("slot_utilization"),
+                        "queue_wait_p50_s": busy.get(profile.id, {}).get("queue_wait", {}).get("p50_s"),
                     },
                     "windows": self.store.latest_provider_windows(limits_key(profile)),
                     "policy": policy_status["providers"].get(profile.id),
@@ -446,7 +503,10 @@ class Orchestrator:
                 "timeout_s": list(TIMEOUT_BOUNDS),
                 "diff_page_bytes": DIFF_PAGE_BYTES,
                 "diff_page_max_bytes": DIFF_PAGE_MAX_BYTES,
-                "concurrent_turns_per_provider": min(self.concurrency.values(), default=1),
+                "concurrent_turns_per_provider": min(
+                    (info["limit"] for info in slots["providers"].values()), default=1
+                ),
+                "concurrent_turns_total": {"limit": total_limit, "active": total_active},
             },
             "states": [state.value for state in TaskState],
             "cleanup_states": [state.value for state in CleanupState],
@@ -633,15 +693,20 @@ class Orchestrator:
 
     # -- starting work ---------------------------------------------------------------
 
-    def _require_policy_admission(self, profile: Profile) -> None:
+    def _policy_snapshot(self) -> tuple[policy.LoadedPolicy, dict[str, Any]]:
+        loaded = policy.load(self.store, self.profiles)
+        return loaded, policy.status(self.store, loaded, self.profiles, self.clock())
+
+    def _require_policy_admission(
+        self, profile: Profile, snapshot: tuple[policy.LoadedPolicy, dict[str, Any]] | None = None,
+    ) -> None:
         """Refuse admission when the dispatch policy has an exhausted, enforced budget.
 
         Pause (``enabled=false``) is advisory only and never refuses here; only an *enforced*
         exhausted budget does. The policy is reloaded on every call so an edit saved between the
         two admission checks of one ``start_task`` takes effect immediately.
         """
-        loaded = policy.load(self.store, self.profiles)
-        status_report = policy.status(self.store, loaded, self.profiles, self.clock())
+        loaded, status_report = snapshot or self._policy_snapshot()
         refusal = policy.admission_refusal(loaded, status_report, profile.id)
         if refusal is None:
             return
@@ -663,7 +728,14 @@ class Orchestrator:
         """
         with self._cycle():
             profile = self._profile_for(request)
-            self._require_policy_admission(profile)
+            snapshot = self._policy_snapshot()
+            self._require_policy_admission(profile, snapshot)
+            # The caller names the provider and may name the model and effort; whichever of the
+            # two it left out is filled from its role's current ladder step. Nothing it sent moves.
+            selection = policy.resolve_selection(
+                *snapshot, profile, role=request.role, model=request.model, effort=request.effort,
+            )
+            request = request.model_copy(update={"model": selection.model, "effort": selection.effort})
             model = request.model or profile.model
             require_provider_available(
                 self.store, profile, now=self.clock(), ignore=request.ignore_provider_status,
@@ -688,6 +760,7 @@ class Orchestrator:
                     model=model, parent_env=self.parent_env,
                 )
                 self._require_policy_admission(profile)
+                self._require_fanout_independent(request, profile)
                 record = create_task(
                     self.store,
                     request,
@@ -698,10 +771,46 @@ class Orchestrator:
                 self.store.set_task_auth_context(
                     record.id, auth_context.fingerprint(profile, self.parent_env),
                 )
+                self.store.set_task_dispatch(
+                    record.id,
+                    profile.id,
+                    selection_source=selection.source,
+                    caller_model=selection.caller_model,
+                    caller_effort=selection.caller_effort,
+                    policy_revision=selection.policy_revision,
+                    ladder_level=selection.ladder_level,
+                    ladder_reason=selection.reason,
+                    fanout_group=request.fanout_group,
+                )
             self._prepare(record, request, placement, context=context)
             self.dispatch_queued()
             final = require_task(self.store, record.id)
-        return _acknowledge(final)
+        return {**_acknowledge(final), "selection": selection.describe()}
+
+    def _require_fanout_independent(self, request: StartTaskRequest, profile: Profile) -> None:
+        """A fan-out group is second opinions: one live member per provider family.
+
+        Two models behind one seat are not independent of each other, which is the same rule a
+        review of a candidate already follows against its author.
+        """
+        if request.fanout_group is None:
+            return
+        gave_up = {TaskState.FAILED.value, TaskState.CANCELLING.value, TaskState.CANCELLED.value}
+        for member in self.store.fanout_members(request.fanout_group):
+            if member["state"] in gave_up:
+                # It will give no opinion, so it no longer holds its family's place.
+                continue
+            other = self.profiles.get(member["provider"])
+            if other is not None and other.family == profile.family:
+                raise TaskSpindleError(
+                    FANOUT_NOT_INDEPENDENT,
+                    f"Fan-out group {request.fanout_group!r} already has a {profile.family} member.",
+                    details={
+                        "fanout_group": request.fanout_group,
+                        "family": profile.family,
+                        "task_id": member["task_id"],
+                    },
+                )
 
     def _profile_for(self, request: StartTaskRequest) -> Profile:
         try:
@@ -984,8 +1093,9 @@ class Orchestrator:
         runnable: list[TaskRecord] = []
         for state in DISPATCHABLE_STATES:
             runnable.extend(self.store.list_tasks(state=state.value, limit=_SCAN_LIMIT))
+        limits = self._slot_limits() if runnable else None
         for task in sorted(runnable, key=lambda item: (item.created_at, item.id)):
-            if self._start_worker(task):
+            if self._start_worker(task, limits):
                 started.append(task.id)
         return started
 
@@ -1026,7 +1136,7 @@ class Orchestrator:
         if state.kind not in ("active", "not_found"):
             self.units.reset_failed(unit)
 
-    def _start_worker(self, task: TaskRecord) -> bool:
+    def _start_worker(self, task: TaskRecord, limits: Mapping[str, Any] | None = None) -> bool:
         """Claim capacity and publish task identity before starting its unit outside the lock."""
         if not self._admission_open():
             return False
@@ -1080,9 +1190,11 @@ class Orchestrator:
                     # runner may have left its signed lease. Observed exit makes release safe;
                     # unsigned reservations can belong to an in-flight launch and stay held.
                     self.store.release_lease(task.provider, task.id)
+                limits = limits or self._slot_limits()
                 if not self.store.acquire_lease(
                     task.provider, task.id, unit, None, self.boot,
-                    limit=self.concurrency.get(task.provider, 1),
+                    limit=limits["providers"].get(task.provider, {}).get("limit", 1),
+                    total_limit=limits["total"]["limit"],
                 ):
                     return False
                 self.store.update_task(
@@ -1246,8 +1358,21 @@ class Orchestrator:
             **loaded.describe(),
         }
         if action == "status":
-            result["status"] = policy.status(self.store, loaded, self.profiles, self.clock())
+            now = self.clock()
+            slots = self._slot_limits(loaded)
+            result["status"] = policy.status(self.store, loaded, self.profiles, now)
             result["file_managed"] = policy.file_managed(self.paths.config_file, self.profiles)
+            # What this process dispatches by, which is its own ``[concurrency]`` and ``[capacity]``.
+            result["limits"] = slots
+            result["utilization"] = utilization.pool(
+                self.store, now=now,
+                limits={name: info["limit"] for name, info in slots["providers"].items()},
+                queued_states=[state.value for state in DISPATCHABLE_STATES],
+            )
+            result["fanout"] = utilization.fanout_report(
+                self.store.fanout_groups(since=_iso(now - utilization.SPANS["week"])),
+                {name: spec.fanout for name, spec in loaded.policy.roles.items()},
+            )
         return result
 
     def task_diff(

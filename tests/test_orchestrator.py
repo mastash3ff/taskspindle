@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from taskspindle import policy, repos, runner, service
-from taskspindle.config import ContextFilesConfig, Paths
+from taskspindle.config import CapacityConfig, ContextFilesConfig, Paths
 from taskspindle.models import (
     AcceptTaskRequest,
     AuthMode,
@@ -1053,6 +1053,7 @@ def test_capabilities_describes_the_providers_and_the_limits(harness: Harness) -
         "diff_page_bytes": 16384,
         "diff_page_max_bytes": 262144,
         "concurrent_turns_per_provider": 1,
+        "concurrent_turns_total": {"limit": None, "active": 0},
     }
     assert "not an OS sandbox" in capabilities["isolation"]
     availability = capabilities["providers"][0]["availability"]
@@ -1660,7 +1661,9 @@ def test_capacity_dispatches_four_then_refills_only_one(harness, make_repo):
     ids = [harness.orchestrator.start_task(implement_request(repo))["task_id"] for _ in range(6)]
     assert harness.pending == ids[:4]
     capacity = harness.orchestrator.capabilities()["providers"][0]["capacity"]
-    assert capacity == {"limit": 4, "active": 4, "available": 0}
+    assert capacity == {
+        "limit": 4, "active": 4, "available": 0, "source": "config", "ceiling": 8, "queued": 2,
+    }
     harness._run(harness.pending.pop(1))
     assert harness.orchestrator.dispatch_queued() == [ids[4]]
     assert len(harness.orchestrator.store.list_leases(AUTHOR)) == 4
@@ -2121,3 +2124,182 @@ def test_dispatch_policy_status_reports_a_broken_config_as_a_file_managed_error(
     assert status["file_managed"]["config_file"] == str(config_file)
     assert "error" in status["file_managed"]
     assert "concurrency" not in status["file_managed"]
+
+
+# -- utilization tuning: live limits, server fill, fan-out ---------------------------------------
+
+
+def _save(paths: Paths, document: policy.DispatchPolicy) -> None:
+    """Save from a second connection, as the dashboard or the CLI would."""
+    other = Store.open(paths.state_dir / "taskspindle.sqlite3")
+    try:
+        policy.save(other, document, updated_by="test", if_revision=None, reason="tuning")
+    finally:
+        other.close()
+
+
+def test_a_saved_concurrency_limit_applies_to_the_next_dispatch_without_a_rebuild(
+    harness: Harness, paths: Paths, make_repo
+) -> None:
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    ids = [harness.orchestrator.start_task(implement_request(repo))["task_id"] for _ in range(4)]
+    assert harness.pending == ids[:1]  # the file says nothing, so one slot
+
+    document = policy.defaults(harness.orchestrator.profiles)
+    document.providers[AUTHOR].max_concurrent = 3
+    _save(paths, document)
+    assert harness.orchestrator.dispatch_queued() == ids[1:3]
+    capacity = harness.orchestrator.capabilities()["providers"][0]["capacity"]
+    assert capacity == {
+        "limit": 3, "active": 3, "available": 0, "source": "policy", "ceiling": 8, "queued": 1,
+    }
+
+    # Lowering the limit evicts nobody; it only stops further acquisitions.
+    document.providers[AUTHOR].max_concurrent = 1
+    _save(paths, document)
+    assert harness.orchestrator.dispatch_queued() == []
+    assert len(harness.orchestrator.store.list_leases(AUTHOR)) == 3
+
+
+def test_the_file_ceiling_bounds_a_policy_limit_and_the_pool_total(
+    harness: Harness, paths: Paths, make_repo
+) -> None:
+    harness.orchestrator.capacity = CapacityConfig(per_provider_max=2, total_max=3)
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    document = policy.defaults(harness.orchestrator.profiles)
+    document.providers[AUTHOR].max_concurrent = 16
+    document.providers[REVIEWER].max_concurrent = 16
+    _save(paths, document)
+
+    for _ in range(3):
+        harness.orchestrator.start_task(implement_request(repo))
+    assert len(harness.orchestrator.store.list_leases(AUTHOR)) == 2
+    for _ in range(3):
+        harness.orchestrator.start_task(StartTaskRequest(
+            provider=REVIEWER, mode=Mode.CONSULT, prompt="think", timeout_s=60,
+        ))
+    # Two author slots plus one reviewer slot: the pool total, not the reviewer's own limit.
+    assert len(harness.orchestrator.store.list_leases(REVIEWER)) == 1
+    capabilities = harness.orchestrator.capabilities()
+    assert capabilities["limits"]["concurrent_turns_total"] == {"limit": 3, "active": 3}
+    assert [p["capacity"]["available"] for p in capabilities["providers"]] == [0, 0]
+
+
+def test_a_policy_that_no_longer_parses_falls_back_to_the_file_limits(
+    harness: Harness, make_repo
+) -> None:
+    harness.orchestrator.concurrency = {AUTHOR: 2, REVIEWER: 1}
+    harness.orchestrator.store.save_dispatch_policy(
+        '{"version": 99}', "f", updated_by="test", if_revision=None, reason="from the future",
+    )
+    harness.defer()
+    repo = make_repo()
+    authorize(harness, repo)
+    for _ in range(3):
+        harness.orchestrator.start_task(implement_request(repo))
+    assert len(harness.orchestrator.store.list_leases(AUTHOR)) == 2
+
+
+def _first_class(harness: Harness, provider_id: str) -> None:
+    harness.orchestrator.profiles[provider_id] = Profile(
+        id=provider_id, auth="oauth", command=("adapter",), first_class=True
+    )
+
+
+def test_start_task_fills_model_and_effort_from_the_role_and_says_so(
+    harness: Harness, paths: Paths
+) -> None:
+    _first_class(harness, "claude")
+    harness.defer()
+    started = harness.orchestrator.start_task(StartTaskRequest(
+        provider="claude", mode=Mode.CONSULT, prompt="think", timeout_s=60, role="explorer",
+    ))
+
+    assert started["selection"] == {
+        "model": "sonnet", "effort": "high", "source": "policy", "role": "explorer",
+        "ladder_level": 0, "policy_revision": 0, "reason": "escalation is off",
+    }
+    record = harness.orchestrator.store.get_task(started["task_id"])
+    assert (record.requested_model, record.requested_effort) == ("sonnet", "high")
+    row = harness.orchestrator.store.get_task_dispatch(started["task_id"])
+    assert (row["selection_source"], row["caller_model"], row["ladder_level"]) == ("policy", None, 0)
+    assert harness.orchestrator.capabilities()["dispatch_policy"]["server_fill"] is True
+
+
+def test_a_model_the_caller_sent_is_never_changed(harness: Harness) -> None:
+    _first_class(harness, "claude")
+    harness.defer()
+    started = harness.orchestrator.start_task(StartTaskRequest(
+        provider="claude", mode=Mode.CONSULT, prompt="think", timeout_s=60, role="explorer",
+        model="haiku",
+    ))
+    assert (started["selection"]["model"], started["selection"]["effort"]) == ("haiku", None)
+    assert started["selection"]["source"] == "caller"
+    record = harness.orchestrator.store.get_task(started["task_id"])
+    assert (record.requested_model, record.requested_effort) == ("haiku", None)
+
+
+def test_a_second_class_profile_is_never_filled_so_its_worker_still_starts(
+    harness: Harness, make_repo
+) -> None:
+    """``with_task_selection`` refuses an override there; a fill would fail every such task."""
+    repo = make_repo()
+    authorize(harness, repo)
+    started = harness.orchestrator.start_task(implement_request(repo, role="implementer"))
+    assert started["state"] == TaskState.RESULT_READY.value
+    assert started["selection"]["source"] == "profile"
+    assert harness.orchestrator.store.get_task(started["task_id"]).requested_model is None
+
+
+def test_a_fanout_group_takes_one_live_member_per_provider_family(harness: Harness) -> None:
+    for provider_id in ("claude", "grok"):
+        _first_class(harness, provider_id)
+    harness.orchestrator.profiles["claude-two"] = Profile(
+        id="claude-two", auth="oauth", command=("adapter",), base="claude"
+    )
+    harness.defer()
+
+    def consult(provider: str) -> dict:
+        return harness.orchestrator.start_task(StartTaskRequest(
+            provider=provider, mode=Mode.CONSULT, prompt="think", timeout_s=60,
+            role="reviewer", fanout_group="q-42",
+        ))
+
+    first = consult("claude")
+    consult("grok")
+    with pytest.raises(TaskSpindleError) as excinfo:
+        consult("claude-two")
+    assert excinfo.value.code == "FANOUT_NOT_INDEPENDENT"
+    assert excinfo.value.details["task_id"] == first["task_id"]
+
+    fanout = harness.orchestrator.dispatch_policy("status")["fanout"]
+    assert fanout["reviewer"] == {
+        "configured": 1, "groups": 1, "mean_width": 2.0, "full_width_groups": 1,
+    }
+    # A member that ended badly no longer holds its family's place.
+    status = harness.orchestrator.task_status(first["task_id"])
+    harness.orchestrator.cancel_task(first["task_id"], status["state_version"])
+    assert consult("claude-two")["state"]
+
+
+def test_a_writer_is_never_fanned_out(make_repo) -> None:
+    with pytest.raises(ValueError, match="a writer is never fanned out"):
+        implement_request(make_repo(), fanout_group="q-1")
+
+
+def test_dispatch_policy_status_reports_limits_and_slot_use(harness: Harness, make_repo) -> None:
+    harness.orchestrator.concurrency = {AUTHOR: 2, REVIEWER: 1}
+    repo = make_repo()
+    authorize(harness, repo)
+    harness.orchestrator.start_task(implement_request(repo))
+
+    report = harness.orchestrator.dispatch_policy("status")
+    assert report["limits"]["providers"][AUTHOR] == {"limit": 2, "source": "config", "ceiling": 8}
+    author = report["utilization"]["day"][AUTHOR]
+    assert (author["limit"], author["holds"], author["peak_active"], author["queued"]) == (2, 1, 1, 0)
+    assert author["queue_wait"]["count"] == 1
+    assert "utilization" not in harness.orchestrator.dispatch_policy("get")

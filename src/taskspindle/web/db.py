@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -407,6 +408,74 @@ class ReadOnlyStore:
             "COALESCE(SUM(u.output_tokens), 0) AS output_tokens "
             "FROM turns t JOIN tasks k ON k.id = t.task_id LEFT JOIN turn_usage u ON u.turn_id = t.id "
             "WHERE t.started_at >= ? GROUP BY k.provider ORDER BY k.provider",
+            (since,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- utilization (schema 15) ----------------------------------------------------------
+
+    def list_lease_history(self, *, since: str) -> list[dict[str, Any]]:
+        if not self._table_exists("lease_history"):
+            return []
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT h.*, (l.task_id IS NOT NULL) AS live FROM lease_history h "
+            "LEFT JOIN leases l ON l.provider = h.provider AND l.task_id = h.task_id "
+            "WHERE h.released_at IS NULL OR h.released_at >= ? ORDER BY h.id",
+            (since,),
+        ).fetchall()
+        return [dict(row) | {"live": bool(row["live"])} for row in rows]
+
+    def list_leases(self, provider: str | None = None) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        where, args = (" WHERE provider = ?", (provider,)) if provider else ("", ())
+        return [dict(row) for row in self._conn.execute(
+            "SELECT * FROM leases" + where + " ORDER BY acquired_at, task_id", args
+        )]
+
+    def queued_counts(self, states: Sequence[str]) -> dict[str, int]:
+        if self._conn is None or not states:
+            return {}
+        marks = ",".join("?" * len(states))
+        rows = self._conn.execute(
+            f"SELECT t.provider, COUNT(*) FROM tasks t WHERE t.state IN ({marks}) "
+            "AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.task_id = t.id) GROUP BY t.provider",
+            tuple(states),
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def get_task_dispatch(self, task_id: str) -> dict[str, Any] | None:
+        if not self._table_exists("task_dispatch"):
+            return None
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT * FROM task_dispatch WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def latest_ladder_levels(self, *, since: str) -> dict[str, int]:
+        if not self._table_exists("task_dispatch"):
+            return {}
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT d.provider, d.ladder_level FROM task_dispatch d JOIN ("
+            "SELECT provider, MAX(created_at) AS at FROM task_dispatch "
+            "WHERE created_at >= ? AND ladder_level IS NOT NULL GROUP BY provider"
+            ") m ON m.provider = d.provider AND m.at = d.created_at "
+            "WHERE d.ladder_level IS NOT NULL",
+            (since,),
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def fanout_groups(self, *, since: str) -> list[dict[str, Any]]:
+        if not self._table_exists("task_dispatch"):
+            return []
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT d.fanout_group, d.provider, t.role, t.mode FROM task_dispatch d "
+            "JOIN tasks t ON t.id = d.task_id "
+            "WHERE d.fanout_group IS NOT NULL AND d.created_at >= ? ORDER BY d.created_at",
             (since,),
         ).fetchall()
         return [dict(row) for row in rows]

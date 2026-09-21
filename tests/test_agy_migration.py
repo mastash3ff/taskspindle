@@ -75,7 +75,7 @@ def test_schema_two_upgrade_preserves_records_and_adds_nullable_selection(tmp_pa
             before = {table: _rows(store, table) for table in tables}
 
     with Store.open(path) as store:
-        assert store.schema_version() == 14
+        assert store.schema_version() == 15
         assert store.migrate() == []
         for table in tables:
             after = _rows(store, table)

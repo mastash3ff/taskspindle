@@ -68,7 +68,7 @@ def test_schema_three_upgrade_preserves_leases_and_history(tmp_path, monkeypatch
                 for table in ("tasks", "leases", "events", "repository_grants")
             }
     with Store.open(path) as store:
-        assert store.schema_version() == 14
+        assert store.schema_version() == 15
         for table, rows in before.items():
             after = [dict(row) for row in store._conn.execute(f"SELECT * FROM {table}")]
             if table == "tasks":

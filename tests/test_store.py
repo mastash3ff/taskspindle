@@ -56,7 +56,7 @@ def test_open_creates_a_private_file_and_applies_every_migration(tmp_path: Path)
     mode = stat.S_IMODE(store.path.stat().st_mode)
     assert mode == 0o600
     assert stat.S_IMODE(store.path.parent.stat().st_mode) == 0o700
-    assert store.schema_version() == 14
+    assert store.schema_version() == 15
     store.close()
 
 
@@ -138,7 +138,7 @@ def test_schema_12_migration_drops_the_collapsed_tables_and_keeps_the_rest(
                 assert store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
 
     with Store.open(path) as reopened:
-        assert reopened.schema_version() == 14
+        assert reopened.schema_version() == 15
         for table in dropped_tables:
             with pytest.raises(sqlite3.OperationalError, match="no such table"):
                 reopened._conn.execute(f"SELECT * FROM {table}")
@@ -170,7 +170,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store.close()
     reopened = Store.open(tmp_path / "state" / "taskspindle.sqlite3")
     assert reopened.migrate() == []
-    assert reopened.schema_version() == 14
+    assert reopened.schema_version() == 15
     reopened.close()
 
 
@@ -244,6 +244,79 @@ def test_acquire_lease_is_single_flight(tmp_path: Path) -> None:
     assert store.release_lease("claude", first.id) is True
     assert store.get_lease("claude") is None
     assert store.acquire_lease("claude", second.id, "unit-b", 222, "boot") is True
+    store.close()
+
+
+def test_lease_history_records_each_hold_and_closes_it_once(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    first = make_task(store, "ts_000000000001")
+    second = make_task(store, "ts_000000000002")
+
+    assert store.acquire_lease("claude", first.id, "unit-a", 1, "boot", limit=2)
+    assert store.acquire_lease("claude", second.id, "unit-b", 2, "boot", limit=2)
+    # A refused acquisition holds nothing, so it leaves no history.
+    assert store.acquire_lease("claude", second.id, "unit-b", 2, "boot", limit=2) is False
+
+    rows = store.list_lease_history(since="0")
+    assert [(r["task_id"], r["limit_at_acquire"], r["active_at_acquire"], r["live"]) for r in rows] == [
+        (first.id, 2, 1, True), (second.id, 2, 2, True),
+    ]
+    assert all(r["released_at"] is None for r in rows)
+
+    assert store.release_lease("claude", first.id) is True
+    assert store.release_lease("claude", first.id) is False
+    closed, still_open = store.list_lease_history(since="0")
+    assert closed["released_at"] is not None and closed["live"] is False
+    assert still_open["released_at"] is None and still_open["live"] is True
+    # A hold released before the window is not part of it.
+    assert [r["task_id"] for r in store.list_lease_history(since="9999")] == [second.id]
+    store.close()
+
+
+def test_queued_counts_ignore_tasks_that_already_hold_a_slot(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    running = make_task(store, "ts_000000000001")
+    waiting = make_task(store, "ts_000000000002")
+    make_task(store, "ts_000000000003", provider="grok")
+    store.acquire_lease("claude", running.id, "unit-a", 1, "boot", limit=4)
+
+    assert store.queued_counts([TaskState.PREPARING.value]) == {"claude": 1, "grok": 1}
+    assert store.queued_counts([TaskState.QUEUED.value]) == {}
+    assert store.queued_counts([]) == {}
+    assert waiting.id  # the claude task still counted above
+    store.close()
+
+
+def test_task_dispatch_round_trips_and_reports_the_newest_level_per_provider(tmp_path: Path) -> None:
+    store = make_store(tmp_path)
+    first = make_task(store, "ts_000000000001")
+    second = make_task(store, "ts_000000000002")
+    third = make_task(store, "ts_000000000003", provider="grok")
+
+    store.set_task_dispatch(first.id, "claude", selection_source="policy", policy_revision=3,
+                            ladder_level=1, ladder_reason="under target", fanout_group="g1")
+    store.set_task_dispatch(second.id, "claude", selection_source="caller",
+                            caller_model="opus[1m]", caller_effort="xhigh", ladder_level=-1)
+    store.set_task_dispatch(third.id, "grok", selection_source="policy", fanout_group="g1")
+
+    assert store.get_task_dispatch(first.id)["ladder_reason"] == "under target"
+    assert store.get_task_dispatch("ts_missing") is None
+    # grok recorded no level, so it has no "previous" one to hold.
+    assert store.latest_ladder_levels(since="0") == {"claude": -1}
+    assert store.latest_ladder_levels(since="9999") == {}
+    assert [m["provider"] for m in store.fanout_members("g1")] == ["claude", "grok"]
+    assert len(store.fanout_groups(since="0")) == 2
+    store.close()
+
+
+def test_side_tables_leave_the_task_row_readable_by_the_record_model(tmp_path: Path) -> None:
+    """Schema 15 adds tables, never ``tasks`` columns: ``TaskRecord`` forbids unknown fields."""
+    store = make_store(tmp_path)
+    task = make_task(store)
+    store.set_task_dispatch(task.id, "claude", selection_source="policy")
+    columns = {row[1] for row in store._conn.execute("PRAGMA table_info(tasks)")}
+    assert columns <= set(TaskRecord.model_fields)
+    assert store.get_task(task.id).id == task.id
     store.close()
 
 

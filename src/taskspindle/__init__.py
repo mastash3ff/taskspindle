@@ -2,6 +2,6 @@
 
 __version__ = "0.6.2"
 API_VERSION = 1
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 ADAPTER_PACKAGE = "@agentclientprotocol/claude-agent-acp"
 ADAPTER_VERSION = "0.70.0"

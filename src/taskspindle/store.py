@@ -760,6 +760,43 @@ _MIGRATION_14 = """
 ALTER TABLE tasks ADD COLUMN context_files TEXT;
 """
 
+# What the pool actually did, kept after a lease is gone. ``lease_history`` is one row per slot
+# hold, so occupancy, queue wait and saturation can be read back over a window; ``task_dispatch``
+# records how a task's model and effort were chosen. Both are side tables rather than ``tasks``
+# columns, so an older image that reads ``tasks`` with ``SELECT *`` still loads every row.
+_MIGRATION_15 = """
+CREATE TABLE lease_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    ready_at TEXT,
+    acquired_at TEXT NOT NULL,
+    released_at TEXT,
+    limit_at_acquire INTEGER NOT NULL,
+    active_at_acquire INTEGER NOT NULL
+);
+
+CREATE INDEX lease_history_provider_idx ON lease_history(provider, acquired_at);
+CREATE INDEX lease_history_open_idx ON lease_history(task_id) WHERE released_at IS NULL;
+
+CREATE TABLE task_dispatch (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL,
+    selection_source TEXT NOT NULL,
+    caller_model TEXT,
+    caller_effort TEXT,
+    policy_revision INTEGER,
+    ladder_level INTEGER,
+    ladder_reason TEXT,
+    fanout_group TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX task_dispatch_provider_idx ON task_dispatch(provider, created_at);
+CREATE INDEX task_dispatch_fanout_idx ON task_dispatch(fanout_group)
+    WHERE fanout_group IS NOT NULL;
+"""
+
 MIGRATIONS: list[tuple[int, str]] = [
     (1, _MIGRATION_1),
     (2, _MIGRATION_2),
@@ -775,6 +812,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (12, _MIGRATION_12),
     (13, _MIGRATION_13),
     (14, _MIGRATION_14),
+    (15, _MIGRATION_15),
 ]
 
 #: The ``turn_usage`` columns a caller may set; everything else is bookkeeping.
@@ -1331,20 +1369,27 @@ class Store:
 
     def acquire_lease(
         self, provider: str, task_id: str, unit_name: str, pid: int | None, boot_id: str,
-        *, limit: int = 1,
+        *, limit: int = 1, total_limit: int | None = None,
     ) -> bool:
         """Atomically claim one provider slot, with at most one lease per task.
 
         The capacity read and insert share a SQLite write transaction across all processes.
         Lowering a limit does not evict existing workers; it prevents further acquisitions.
+        ``total_limit`` bounds the leases held across every provider, counted in the same read.
         """
         if type(limit) is not int or limit < 1:
             raise StoreError("lease limit must be a positive integer")
+        if total_limit is not None and (type(total_limit) is not int or total_limit < 1):
+            raise StoreError("total lease limit must be a positive integer")
         stamp = now()
         with self._guard(), self.transaction() as conn:
             count = conn.execute(
                 "SELECT COUNT(*) FROM leases WHERE provider = ?", (provider,)
             ).fetchone()[0]
+            if total_limit is not None and conn.execute(
+                "SELECT COUNT(*) FROM leases"
+            ).fetchone()[0] >= total_limit:
+                return False
             if count >= limit or conn.execute(
                 "SELECT 1 FROM leases WHERE task_id = ?", (task_id,)
             ).fetchone():
@@ -1355,14 +1400,122 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (provider, task_id, unit_name, pid, boot_id, stamp, stamp),
             )
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                return False
+            if self.schema_version() < 15:
+                return True
+            # When the task last became dispatchable: its newest state change, not
+            # ``updated_at``, which an admission-fence restore bumps without a transition.
+            ready = conn.execute(
+                "SELECT at FROM events WHERE task_id = ? AND kind = ? ORDER BY id DESC LIMIT 1",
+                (task_id, EventKind.STATE_CHANGED.value),
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO lease_history"
+                "(provider, task_id, ready_at, acquired_at, limit_at_acquire, active_at_acquire) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (provider, task_id, ready[0] if ready else None, stamp, limit, count + 1),
+            )
+            return True
 
     def release_lease(self, provider: str, task_id: str) -> bool:
         with self._guard(), self.transaction() as conn:
             cur = conn.execute(
                 "DELETE FROM leases WHERE provider = ? AND task_id = ?", (provider, task_id)
             )
-            return cur.rowcount == 1
+            if cur.rowcount != 1:
+                return False
+            if self.schema_version() < 15:
+                return True
+            conn.execute(
+                "UPDATE lease_history SET released_at = ? "
+                "WHERE provider = ? AND task_id = ? AND released_at IS NULL",
+                (now(), provider, task_id),
+            )
+            return True
+
+    def list_lease_history(self, *, since: str) -> list[dict[str, Any]]:
+        """Slot holds still open or released at or after ``since``, oldest first."""
+        rows = self._conn.execute(
+            "SELECT h.*, (l.task_id IS NOT NULL) AS live FROM lease_history h "
+            "LEFT JOIN leases l ON l.provider = h.provider AND l.task_id = h.task_id "
+            "WHERE h.released_at IS NULL OR h.released_at >= ? ORDER BY h.id",
+            (since,),
+        ).fetchall()
+        return [dict(row) | {"live": bool(row["live"])} for row in rows]
+
+    def queued_counts(self, states: Sequence[str]) -> dict[str, int]:
+        """Tasks per provider in one of ``states`` that hold no lease: what is waiting for a slot."""
+        if not states:
+            return {}
+        marks = ",".join("?" * len(states))
+        rows = self._conn.execute(
+            f"SELECT t.provider, COUNT(*) FROM tasks t WHERE t.state IN ({marks}) "
+            "AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.task_id = t.id) GROUP BY t.provider",
+            tuple(states),
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    # -- how a task's selection was chosen ------------------------------------------------
+
+    def set_task_dispatch(
+        self,
+        task_id: str,
+        provider: str,
+        *,
+        selection_source: str,
+        caller_model: str | None = None,
+        caller_effort: str | None = None,
+        policy_revision: int | None = None,
+        ladder_level: int | None = None,
+        ladder_reason: str | None = None,
+        fanout_group: str | None = None,
+    ) -> None:
+        with self._guard(), self.transaction() as conn:
+            conn.execute(
+                "INSERT INTO task_dispatch(task_id, provider, selection_source, caller_model, "
+                "caller_effort, policy_revision, ladder_level, ladder_reason, fanout_group, "
+                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, provider, selection_source, caller_model, caller_effort,
+                 policy_revision, ladder_level, ladder_reason, fanout_group, now()),
+            )
+
+    def get_task_dispatch(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM task_dispatch WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def latest_ladder_levels(self, *, since: str) -> dict[str, int]:
+        """Each provider's most recently recorded ladder level at or after ``since``."""
+        rows = self._conn.execute(
+            "SELECT d.provider, d.ladder_level FROM task_dispatch d JOIN ("
+            "SELECT provider, MAX(created_at) AS at FROM task_dispatch "
+            "WHERE created_at >= ? AND ladder_level IS NOT NULL GROUP BY provider"
+            ") m ON m.provider = d.provider AND m.at = d.created_at "
+            "WHERE d.ladder_level IS NOT NULL",
+            (since,),
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
+    def fanout_members(self, fanout_group: str) -> list[dict[str, Any]]:
+        """Every task recorded under one fan-out group, with its current state."""
+        rows = self._conn.execute(
+            "SELECT d.task_id, d.provider, t.state, t.mode, t.role FROM task_dispatch d "
+            "JOIN tasks t ON t.id = d.task_id WHERE d.fanout_group = ? ORDER BY d.created_at",
+            (fanout_group,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def fanout_groups(self, *, since: str) -> list[dict[str, Any]]:
+        """One row per fan-out group member created at or after ``since``."""
+        rows = self._conn.execute(
+            "SELECT d.fanout_group, d.provider, t.role, t.mode FROM task_dispatch d "
+            "JOIN tasks t ON t.id = d.task_id "
+            "WHERE d.fanout_group IS NOT NULL AND d.created_at >= ? ORDER BY d.created_at",
+            (since,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_lease(self, provider: str, task_id: str | None = None) -> dict[str, Any] | None:
         """Read the exact task lease, or the oldest lease for legacy single-flight callers."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -286,3 +287,296 @@ def test_status_with_no_turns_marks_targets_under_target(store, profiles) -> Non
     assert report["providers"]["claude"]["share_state"] == "under_target"
     assert report["providers"]["grok"]["share_state"] == "untracked"
     assert report["under_target_order"] == ["claude"]
+
+
+# -- utilization tuning: additive fields, presets, limits, escalation, fill ------------------------
+
+
+def test_new_fields_at_their_defaults_leave_the_stored_document_and_fingerprint_alone(profiles) -> None:
+    """A document that uses no tuning knob is what the first release wrote, byte for byte."""
+    document = policy.defaults(profiles)
+    stored = json.loads(policy.canonical_json(document))
+
+    assert "escalation" not in stored and "max_concurrent_total" not in stored
+    assert all("max_concurrent" not in spec for spec in stored["providers"].values())
+    assert all("ladders" not in spec and "fanout" not in spec for spec in stored["roles"].values())
+    # Pinned: what ``main`` computed for these same profiles before the tuning fields existed.
+    assert policy.fingerprint(document) == "72b7eb19087028929a55ed1a644cea58259fd4bb96e22f39b85367dc6d9d282d"
+    # The API still hands readers every key.
+    assert document.model_dump(mode="json")["roles"]["mechanic"]["fanout"] == 1
+
+
+def test_a_set_knob_is_stored_and_changes_the_fingerprint(profiles) -> None:
+    document = policy.defaults(profiles)
+    before = policy.fingerprint(document)
+    document.providers["claude"].max_concurrent = 6
+    document.roles["reviewer"].fanout = 2
+    document.escalation.enabled = True
+
+    stored = json.loads(policy.canonical_json(document))
+    assert stored["providers"]["claude"]["max_concurrent"] == 6
+    assert stored["roles"]["reviewer"]["fanout"] == 2
+    assert stored["escalation"]["enabled"] is True
+    assert policy.fingerprint(document) != before
+    assert policy.parse(stored) == document
+
+
+@pytest.mark.parametrize(
+    ("document", "loc"),
+    [
+        ({"providers": {"claude": {"max_concurrent": 0}}}, ["providers", "claude", "max_concurrent"]),
+        ({"providers": {"claude": {"max_concurrent": 17}}}, ["providers", "claude", "max_concurrent"]),
+        ({"max_concurrent_total": 49}, ["max_concurrent_total"]),
+        ({"roles": {"r": {"fanout": 4}}}, ["roles", "r", "fanout"]),
+        (
+            {"roles": {"r": {"ladders": {"claude": {"above": [{}] * 4}}}}},
+            ["roles", "r", "ladders", "claude", "above"],
+        ),
+        ({"escalation": {"step_up_points": [12, 5]}}, ["escalation"]),
+        ({"escalation": {"release_points": 5}}, ["escalation"]),
+        ({"escalation": {"window_hold_percent": 95}}, ["escalation"]),
+    ],
+)
+def test_tuning_shape_errors_are_located(document, loc) -> None:
+    with pytest.raises(policy.PolicyError) as caught:
+        policy.parse(document)
+    assert loc in [error["loc"] for error in caught.value.errors]
+
+
+def test_ladder_cross_field_rules(profiles) -> None:
+    document = policy.defaults(profiles)
+    ladders = document.roles["explorer"].ladders
+    ladders["claude"] = policy.Ladder(above=[policy.Selection(model="gpt-9", effort="high")],
+                                      below=[policy.Selection(effort="low")])
+    ladders["claude-alias"] = policy.Ladder(above=[policy.Selection(model="sonnet")])
+    ladders["nope"] = policy.Ladder()
+    del document.roles["mechanic"].selections["grok"]
+    document.roles["mechanic"].ladders["grok"] = policy.Ladder(above=[policy.Selection(model="grok-4.6")])
+
+    found = {(tuple(error["loc"]), error["code"]) for error in policy.validate(document, profiles)}
+    assert (("roles", "explorer", "ladders", "claude", "above", 0, "model"), "unadvertised") in found
+    assert (("roles", "explorer", "ladders", "claude", "below", 0, "model"), "ladder_step_empty") in found
+    assert (("roles", "explorer", "ladders", "claude-alias"), "ladder_metered") in found
+    assert (("roles", "explorer", "ladders", "nope"), "unknown_provider") in found
+    assert (("roles", "mechanic", "ladders", "grok"), "ladder_without_selection") in found
+
+
+def test_presets_are_valid_idempotent_and_recognised(profiles) -> None:
+    document = policy.defaults(profiles)
+    assert policy.preset_matches(document, profiles, "claude") == "custom"
+    assert policy.preset_matches(document, profiles, "muse") is None
+
+    for provider in ("claude", "grok", "agy"):
+        for level in policy.PRESET_LEVELS:
+            once = policy.apply_preset(document, profiles, provider, level)
+            assert policy.validate(once, profiles) == []
+            assert policy.apply_preset(once, profiles, provider, level) == once
+            assert policy.preset_matches(once, profiles, provider) == level
+            # A preset for one provider leaves every other provider's fields alone.
+            for other in ("claude", "grok", "agy"):
+                if other != provider:
+                    assert once.providers[other] == document.providers[other]
+                    assert all(
+                        once.roles[r].selections.get(other) == document.roles[r].selections.get(other)
+                        for r in document.roles
+                    )
+
+    balanced = policy.apply_preset(document, profiles, "claude", "balanced")
+    assert all(balanced.roles[r].selections["claude"] == document.roles[r].selections["claude"]
+               for r in document.roles)
+    assert balanced.providers["claude"].max_concurrent == 4
+    conserve = policy.apply_preset(document, profiles, "grok", "conserve")
+    assert all(not ladder.above for role in conserve.roles.values()
+               for name, ladder in role.ladders.items() if name == "grok")
+    hand_edited = balanced.model_copy(deep=True)
+    hand_edited.providers["claude"].max_concurrent = 5
+    assert policy.preset_matches(hand_edited, profiles, "claude") == "custom"
+
+
+def test_presets_refuse_what_they_cannot_tune(profiles) -> None:
+    document = policy.defaults(profiles)
+    for provider, level, code in (
+        ("claude", "turbo", "unknown_preset"), ("nope", "max", "unknown_provider"),
+        ("muse", "max", "no_preset"), ("claude-alias", "max", "no_preset"),
+    ):
+        with pytest.raises(policy.PolicyError) as caught:
+            policy.apply_preset(document, profiles, provider, level)
+        assert caught.value.errors[0]["code"] == code
+    patches = policy.preset_table(document, profiles)
+    assert set(patches["claude"]) == set(policy.PRESET_LEVELS)
+    assert patches["claude-alias"] == {} and patches["muse"] == {}
+    assert patches["grok"]["max"][0] == {"path": ["providers", "grok", "max_concurrent"], "value": 8}
+
+
+def test_effective_limits_cap_the_policy_but_not_the_file(profiles) -> None:
+    document = policy.defaults(profiles)
+    document.providers["claude"].max_concurrent = 12
+    document.providers["grok"].max_concurrent = 2
+    document.max_concurrent_total = 20
+
+    limits = policy.effective_limits(
+        document, {"claude": 4, "grok": 4, "agy": 10}, per_provider_max=8, total_max=12,
+    )
+    assert limits["providers"]["claude"] == {"limit": 8, "source": "policy", "ceiling": 8}
+    assert limits["providers"]["grok"] == {"limit": 2, "source": "policy", "ceiling": 8}
+    # The file's own value is the operator's and is used as written.
+    assert limits["providers"]["agy"] == {"limit": 10, "source": "config", "ceiling": 8}
+    assert limits["total"] == {"limit": 12, "source": "config", "ceiling": 12}
+    document.max_concurrent_total = 6
+    assert policy.effective_limits(document, {}, per_provider_max=8, total_max=12)["total"]["limit"] == 6
+    unset = policy.effective_limits(policy.defaults(profiles), {}, per_provider_max=8)
+    assert unset["total"]["limit"] is None
+
+
+def _shares(store: Store, *, claude: int, grok: int) -> None:
+    for index in range(claude):
+        task_id = f"ts_c{index:011d}"
+        _task(store, task_id, "claude")
+        _turn(store, task_id, "claude", age=timedelta(hours=1), tokens=10)
+    for index in range(grok):
+        task_id = f"ts_g{index:011d}"
+        _task(store, task_id, "grok")
+        _turn(store, task_id, "grok", age=timedelta(hours=1), tokens=10)
+
+
+def _escalating(profiles, *, claude: int = 50, grok: int = 50) -> policy.LoadedPolicy:
+    document = policy.defaults(profiles)
+    for name in document.providers:
+        document.providers[name].enabled = name in {"claude", "grok"}
+    document.providers["claude"].target_share = claude
+    document.providers["grok"].target_share = grok
+    document.escalation.enabled = True
+    document = policy.apply_preset(document, profiles, "claude", "balanced")
+    return policy.LoadedPolicy(document, 7, policy.fingerprint(document), None, None, "store")
+
+
+def _level(store: Store, loaded: policy.LoadedPolicy, profiles, provider: str) -> dict:
+    return policy.status(store, loaded, profiles, NOW)["providers"][provider]["escalation"]
+
+
+def test_escalation_is_off_by_default_and_needs_a_sample(store, profiles) -> None:
+    _shares(store, claude=1, grok=19)
+    plain = policy.LoadedPolicy(policy.defaults(profiles), 0, "f", None, None, "defaults")
+    assert _level(store, plain, profiles, "claude") | {"signal": None} == {
+        "level": 0, "previous_level": 0, "reason": "escalation is off", "signal": None,
+    }
+    loaded = _escalating(profiles)
+    loaded.policy.escalation.min_turns = 50
+    assert _level(store, loaded, profiles, "claude")["level"] == 0
+    assert "below the 50 needed" in _level(store, loaded, profiles, "claude")["reason"]
+
+
+def test_escalation_steps_with_the_share_deficit_and_explains_itself(store, profiles) -> None:
+    _shares(store, claude=4, grok=16)  # claude at 20% of a 50% target: 30 points under
+    loaded = _escalating(profiles)
+
+    claude = _level(store, loaded, profiles, "claude")
+    assert claude["level"] == 2 and claude["reason"] == "step +2: 30 points under target"
+    assert claude["signal"]["deficit_points"] == 30 and claude["signal"]["sample_turns"] == 20
+    grok = _level(store, loaded, profiles, "grok")
+    assert grok["level"] == -2 and grok["reason"] == "step -2: 30 points over target"
+
+    report = policy.status(store, loaded, profiles, NOW)
+    assert report["under_target"] == [
+        {"provider": "claude", "deficit": 0.3}, {"provider": "grok", "deficit": -0.3},
+    ]
+    assert report["providers"]["claude"]["share_deficit"] == 0.3
+    # A ladder shorter than the level stops at its last step.
+    assert report["roles"]["explorer"]["effective_selections"]["claude"] == {
+        "model": "opus[1m]", "effort": "high", "level": 1,
+    }
+    assert report["roles"]["planner"]["effective_selections"]["claude"]["level"] == 0
+
+
+def test_escalation_holds_its_level_inside_the_release_margin(store, profiles) -> None:
+    """At 4 points under, the level is 0 coming up and 1 going down: it cannot flap at 5."""
+    _shares(store, claude=46, grok=54)
+    loaded = _escalating(profiles)
+    assert _level(store, loaded, profiles, "claude")["level"] == 0
+
+    holder = _task(store, "ts_h00000000001", "claude")
+    store.set_task_dispatch(holder.id, "claude", selection_source="policy", ladder_level=1)
+    store._conn.execute("UPDATE task_dispatch SET created_at = ?", (_stamp(NOW - timedelta(hours=2)),))
+    held = _level(store, loaded, profiles, "claude")
+    assert (held["level"], held["previous_level"]) == (1, 1)
+
+    loaded.policy.escalation.release_points = 0
+    assert _level(store, loaded, profiles, "claude")["level"] == 0
+
+
+def test_escalation_brakes_only_ever_lower_the_level(store, profiles) -> None:
+    _shares(store, claude=4, grok=16)
+    loaded = _escalating(profiles)
+    loaded.policy.providers["claude"].budgets = {"week": policy.Budget(turns=5)}
+    held = _level(store, loaded, profiles, "claude")
+    assert held["level"] == 0 and held["reason"] == "held at 0: a budget is 80% used"
+
+    loaded.policy.providers["claude"].budgets = {"week": policy.Budget(turns=4)}
+    down = _level(store, loaded, profiles, "claude")
+    assert down["level"] == -1 and "a budget is 100% used" in down["reason"]
+
+    loaded.policy.providers["claude"].budgets = {}
+    store.set_provider_status("claude", state="throttled", code="PROVIDER_THROTTLED", source="test",
+                              observed_at=_stamp(NOW))
+    throttled = _level(store, loaded, profiles, "claude")
+    assert throttled["level"] == 0 and throttled["reason"] == "held at 0: provider is throttled"
+    # A brake never raises a level that was already below it.
+    assert _level(store, loaded, profiles, "grok")["level"] == -2
+
+
+def test_escalation_never_steps_a_second_class_profile(store, profiles) -> None:
+    _shares(store, claude=4, grok=16)
+    loaded = _escalating(profiles)
+    loaded.policy.providers["claude-alias"].enabled = True
+    loaded.policy.providers["claude-alias"].target_share = 0
+    alias = _level(store, loaded, profiles, "claude-alias")
+    assert alias["level"] == 0 and "built-in subscription profile" in alias["reason"]
+
+
+@pytest.mark.parametrize(
+    ("role", "model", "effort", "expected"),
+    [
+        # nothing sent: the role's current step, as a pair
+        ("explorer", None, None, ("opus[1m]", "high", "policy", 1)),
+        ("planner", None, None, ("opus[1m]", "xhigh", "policy", 0)),
+        # both sent: untouched
+        ("explorer", "haiku", "low", ("haiku", "low", "caller", None)),
+        # model only: the step's effort belongs to the step's model
+        ("explorer", "opus[1m]", None, ("opus[1m]", "high", "mixed", 1)),
+        ("explorer", "sonnet", None, ("sonnet", None, "caller", None)),
+        # effort only: the step's model, unless it takes no effort
+        ("explorer", None, "medium", ("opus[1m]", "medium", "mixed", 1)),
+        ("explorer", None, "turbo", (None, "turbo", "caller", None)),
+        # no role, or one the policy does not have
+        (None, None, None, (None, None, "profile", None)),
+        ("stranger", None, None, (None, None, "profile", None)),
+    ],
+)
+def test_resolve_selection_fills_only_what_the_caller_left_out(
+    store, profiles, role, model, effort, expected
+) -> None:
+    _shares(store, claude=4, grok=16)
+    loaded = _escalating(profiles)
+    report = policy.status(store, loaded, profiles, NOW)
+
+    out = policy.resolve_selection(loaded, report, profiles["claude"], role=role, model=model, effort=effort)
+    assert (out.model, out.effort, out.source, out.ladder_level) == expected
+    assert (out.caller_model, out.caller_effort, out.policy_revision) == (model, effort, 7)
+
+
+def test_resolve_selection_skips_models_without_effort_and_unsteerable_profiles(store, profiles) -> None:
+    loaded = _escalating(profiles)
+    report = policy.status(store, loaded, profiles, NOW)
+
+    claude = profiles["claude"]
+    mechanic = policy.resolve_selection(loaded, report, claude, role="mechanic", model=None, effort=None)
+    assert (mechanic.model, mechanic.effort, mechanic.source) == ("haiku", None, "policy")
+    # haiku takes no effort, so an effort sent alone is not paired with it.
+    alone = policy.resolve_selection(loaded, report, claude, role="mechanic", model=None, effort="low")
+    assert (alone.model, alone.effort, alone.source) == (None, "low", "caller")
+
+    alias = policy.resolve_selection(
+        loaded, report, profiles["claude-alias"], role="explorer", model=None, effort=None
+    )
+    assert alias.source == "profile" and "built-in subscription profile" in alias.reason
+    assert alias.describe()["ladder_level"] is None
