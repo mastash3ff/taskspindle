@@ -20,6 +20,8 @@ import json
 import os
 import pwd
 import shutil
+import sys
+import sysconfig
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -117,6 +119,14 @@ def prepare_launch(
         raise ValueError("workspace and native authentication home must exist")
     if task_dir == workspace or task_dir.is_relative_to(workspace):
         raise ValueError("private launch state must be outside the model workspace")
+    from .agy_namespace import mount_table, runtime_sources, validate_source
+
+    broad_roots = {Path(p) for p in ("/", "/etc", "/var", "/opt", "/mnt", "/run",
+                                         "/proc", "/sys", "/dev", "/tmp", "/usr", "/home")}
+    if workspace in broad_roots or home.is_relative_to(workspace):
+        raise ValueError("workspace must not expose a broad home or system runtime")
+    inventory = mount_table()
+    validate_source(workspace, inventory)
     scopes = _scopes(workspace, mode, allowed_prefixes)
     bwrap = shutil.which("bwrap")
     if bwrap is None:
@@ -182,16 +192,66 @@ def prepare_launch(
 
     # The transport creates the process group; a second session here would hide
     # native descendants from its SIGINT/SIGTERM cancellation sequence.
-    argv = [bwrap, "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+    argv = [bwrap, "--proc", "/proc", "--dev", "/dev",
             "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--die-with-parent",
             "--cap-drop", "ALL", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp"]
+    retained = []
 
     def mount(option: str, source: Path, destination: Path) -> None:
+        validate_source(source, inventory)
+        stat = source.stat()
+        retained.append({"destination": str(destination), "identity": [stat.st_dev, stat.st_ino],
+                         "readonly": option == "--ro-bind", "directory": source.is_dir()})
         argv.extend((option, str(source), str(destination)))
 
-    # Explicit binds keep test/ephemeral paths usable even when hosted below /tmp.
-    for path in (home, task_dir, workspace):
-        mount("--ro-bind", path, path)
+    # Split system runtime directories around ALL nested mounts. A small mount
+    # count is a resource bound, never permission to inherit a host mount.
+    runtime_roots = [Path(value) for value in (
+        "/usr/bin", "/usr/sbin", "/usr/lib64", "/usr/local", "/usr/share",
+        "/usr/lib/locale", "/usr/lib/ssl", "/usr/libexec",
+        f"/usr/lib/{sysconfig.get_config_var('MULTIARCH')}", sysconfig.get_path("stdlib"),
+    )]
+    runtime_roots = sorted({path.resolve() for path in runtime_roots if path.exists()})
+    runtime_roots = [path for path in runtime_roots
+                     if not any(path != other and path.is_relative_to(other) for other in runtime_roots)]
+    runtime = [source for root in runtime_roots for source in runtime_sources(root, inventory)]
+    if len(runtime) > 64:
+        raise ValueError("runtime requires more than 64 explicit mounts")
+    for path in runtime:
+        if path.is_symlink():
+            argv.extend(("--symlink", os.readlink(path), str(path)))
+        else:
+            mount("--ro-bind", path, path)
+    for name in ("bin", "sbin", "lib", "lib64"):
+        path = Path("/") / name
+        if path.is_symlink():
+            argv.extend(("--symlink", os.readlink(path), str(path)))
+        elif path.is_dir():
+            for source in runtime_sources(path, inventory):
+                if source.is_symlink():
+                    argv.extend(("--symlink", os.readlink(source), str(source)))
+                else:
+                    mount("--ro-bind", source, source)
+    interpreter = Path(sys.executable).resolve()
+    if not interpreter.is_relative_to(Path("/usr")):
+        prefix = Path(sys.base_prefix).resolve()
+        if (home.is_relative_to(prefix) or task_dir.is_relative_to(prefix)
+                or not interpreter.is_relative_to(prefix)):
+            raise ValueError("namespace verifier requires an isolated Python runtime prefix")
+        mount("--ro-bind", prefix, prefix)
+    # Pin the selected executable inode even when its parent runtime is mounted.
+    mount("--ro-bind", binary, binary)
+    for name in ("resolv.conf", "hosts", "ld.so.cache", "localtime",
+                 "ssl/certs/ca-certificates.crt"):
+        path = Path("/etc") / name
+        if path.is_file():
+            mount("--ro-bind", path.resolve(), path)
+    nss = _file(policy / "nsswitch.conf", "hosts: files dns\npasswd: files\ngroup: files\n")
+    mount("--ro-bind", nss, Path("/etc/nsswitch.conf"))
+    # HOME and task ancestors are synthetic. Only explicitly required leaves
+    # are exposed, even when the user's installation lives under HOME.
+    argv.extend(("--dir", str(home)))
+    mount("--ro-bind", workspace, workspace)
     for path in scopes:
         mount("--bind", path, path)
     for path in _controls(workspace):
@@ -225,17 +285,27 @@ def prepare_launch(
         mount("--ro-bind", companion_bin, native_home / "antigravity-cli" / "bin")
     argv.extend(("--clearenv", "--setenv", "HOME", str(home), "--setenv", "USER",
                  pwd.getpwuid(os.getuid()).pw_name, "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
-                 "--setenv", "LANG", "C.UTF-8"))
+                 "--setenv", "LANG", "C.UTF-8", "--setenv", "SSL_CERT_FILE",
+                 "/etc/ssl/certs/ca-certificates.crt"))
     for name, value in AGY_PIN_ENV.items():
         argv.extend(("--setenv", name, value))
-    for name in ("DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"):
-        if os.environ.get(name):
-            argv.extend(("--setenv", name, os.environ[name]))
-    argv.extend(("--chdir", str(workspace), "--", str(binary), "--agent", agent,
-                 "--mode", "accept-edits" if mode == "implement" else "plan",
+    guard = Path(__file__).with_name("agy_namespace.py").resolve()
+    mount("--ro-bind", guard, Path("/taskspindle-namespace.py"))
+    manifest = _file(policy / "mounts.json")
+    # The manifest cannot contain its own inode entry until it exists.
+    mount("--ro-bind", manifest, Path("/taskspindle-mounts.json"))
+    manifest.write_text(json.dumps({"mounts": retained, "writable_scopes": [str(p) for p in scopes]}),
+                        encoding="utf-8")
+    argv.extend(("--remount-ro", "/", "--chdir", str(workspace), "--", str(interpreter),
+                 "-I", "/taskspindle-namespace.py", "/taskspindle-mounts.json", str(binary),
+                 "--agent", agent, "--mode", "accept-edits" if mode == "implement" else "plan",
                  "--sandbox", "--disable-slash-commands", "--add-dir", str(workspace)))
     _file(task_dir / "agy-cli-launch.json", json.dumps({
         "mode": mode, "binary": str(binary), "workspace": str(workspace),
+        "host_mount_count": len(inventory), "retained_mount_count": len(retained),
+        "runtime_nested_mounts_excluded": [str(p) for p in inventory
+                                           if str(p).startswith("/usr/")],
+        "namespace_validation": "required before exec", "synthetic_home": True,
         "writable_scopes": [str(path) for path in scopes], "private_state": str(state),
         "credential_refresh": "read-only; reauthenticate with native CLI if expired",
         "verification_commands_external": len(verification_commands), "shell_tools": False,
@@ -245,3 +315,42 @@ def prepare_launch(
         "companion_bin": str(companion_bin) if companion_bin.is_dir() else None,
     }, indent=2) + "\n")
     return tuple(argv)
+
+
+def smoke_launch(argv: Sequence[str]) -> dict:
+    """Run the prepared namespace's verifier and stdlib only, with a 10s limit.
+
+    Never invokes the provider, reads tokens, or opens a network connection.
+    Timeout cleanup targets only this probe's process group.
+    """
+    import signal
+    import subprocess
+    import time
+    from contextlib import suppress
+
+    boundary = argv.index("--")
+    end = argv.index("/taskspindle-mounts.json", boundary) + 1
+    interpreter = argv[boundary + 1]
+    code = (
+        "import json,pathlib,socket,ssl; "
+        "print(json.dumps({'status':'ok','mount_count':"
+        "len(pathlib.Path('/proc/self/mountinfo').read_text().splitlines()),"
+        "'ca_certificates':len(ssl.create_default_context().get_ca_certs()),"
+        "'localhost':bool(socket.getaddrinfo('localhost',443))}))"
+    )
+    started = time.monotonic()
+    process = subprocess.Popen([*argv[:end], interpreter, "-I", "-c", code],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired as exc:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise ValueError("AGY namespace smoke exceeded 10 seconds before provider execution") from exc
+    if process.returncode:
+        raise ValueError(f"AGY namespace smoke failed ({process.returncode}): {stderr.strip()}")
+    result = json.loads(stdout)
+    result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+    return result

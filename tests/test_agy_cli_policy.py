@@ -48,6 +48,9 @@ def launch(layout: tuple[Path, Path, Path], mode: str = "consult", prefixes: tup
 def test_policy_is_private_and_does_not_copy_auth(layout) -> None:
     home, _, task = layout
     argv = launch(layout)
+    assert ("--ro-bind", str(Path(sys.executable).resolve()), str(Path(sys.executable).resolve())) in (
+        list(zip(argv, argv[1:], argv[2:], strict=False))
+    )
     assert "--clearenv" in argv
     assert "--unshare-pid" in argv
     assert "--die-with-parent" in argv
@@ -130,9 +133,9 @@ def test_implement_rejects_hardlinks_into_protected_files(layout) -> None:
 def _run_inside(argv: tuple[str, ...], code: str) -> dict:
     if not shutil.which("bwrap"):
         pytest.skip("bubblewrap unavailable")
-    boundary = argv.index("--")
+    boundary = argv.index("/taskspindle-mounts.json", argv.index("--"))
     proc = subprocess.run(
-        [*argv[:boundary + 1], sys.executable, "-c", code],
+        [*argv[:boundary + 1], str(Path(sys.executable).resolve()), "-c", code],
         capture_output=True, text=True, timeout=10, check=False,
         env={**os.environ, "GEMINI_API_KEY": "must-not-reach-child"},
     )
@@ -250,7 +253,8 @@ def test_native_child_stays_in_transport_process_group(layout) -> None:
     if not shutil.which("bwrap"):
         pytest.skip("bubblewrap unavailable")
     argv = launch(layout)
-    command = [*argv[:argv.index("--") + 1], sys.executable, "-u", "-c",
+    command = [*argv[:argv.index("/taskspindle-mounts.json", argv.index("--")) + 1],
+               str(Path(sys.executable).resolve()), "-u", "-c",
                "import time; print('ready', flush=True); time.sleep(30)"]
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
@@ -282,3 +286,123 @@ def test_native_child_stays_in_transport_process_group(layout) -> None:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
         process.communicate(timeout=3)
+
+
+def test_smoke_uses_only_explicit_runtime_and_synthetic_home(layout, monkeypatch):
+    from taskspindle.agy_cli_policy import smoke_launch
+
+    home, _, task = layout
+    (home / 'private-secret').write_text('never expose')
+    (task / 'private-secret').write_text('never expose')
+    monkeypatch.setenv('DBUS_SESSION_BUS_ADDRESS', 'unix:path=/run/user/private')
+    monkeypatch.setenv('XDG_RUNTIME_DIR', '/run/user/private')
+    argv = launch(layout)
+    triples = list(zip(argv, argv[1:], argv[2:], strict=False))
+    for source in ('/', str(home), str(task)):
+        assert ('--ro-bind', source, source) not in triples
+    assert 'DBUS_SESSION_BUS_ADDRESS' not in argv
+    assert 'XDG_RUNTIME_DIR' not in argv
+    result = smoke_launch(argv)
+    assert result['status'] == 'ok'
+    assert result['elapsed_seconds'] < 10
+    assert result['ca_certificates'] > 0 and result['localhost']
+    assert result['mount_count'] < 100
+    result = _run_inside(argv, f"import json; from pathlib import Path; print(json.dumps("
+                         f"{{'hidden':not Path({str(home / 'private-secret')!r}).exists() "
+                         f"and not Path({str(task / 'private-secret')!r}).exists() "
+                         "and not Path('/mnt/wsl').exists() and not Path('/run/user').exists()}))")
+    assert result['hidden']
+
+
+@pytest.mark.parametrize('location', ['workspace', 'runtime', 'state', 'companions'])
+def test_rejects_nested_mounts_in_every_retained_directory(layout, monkeypatch, location):
+    from taskspindle import agy_namespace
+
+    home, workspace, task = layout
+    roots = {'workspace': workspace, 'runtime': Path('/usr/bin'),
+             'state': task / 'agy-cli-state' / 'cli',
+             'companions': home / '.gemini' / 'antigravity-cli' / 'bin'}
+    roots['companions'].mkdir()
+    original = agy_namespace.mount_table()
+    original[roots[location] / 'injected'] = {'rw'}
+    # A plain map deliberately exercises a fresh inventory, not the cached index.
+    monkeypatch.setattr(agy_namespace, 'mount_table', lambda: dict(original))
+    match = '64 explicit mounts' if location == 'runtime' else 'nested mounts'
+    with pytest.raises(ValueError, match=match):
+        launch(layout)
+
+
+def test_runtime_descendant_count_is_not_authorization(tmp_path):
+    from taskspindle.agy_namespace import runtime_sources
+
+    root = tmp_path / 'runtime'
+    root.mkdir()
+    (root / 'ordinary').mkdir()
+    (root / 'unapproved').mkdir()
+    assert runtime_sources(root, {root / 'unapproved': {'ro'}}) == [root / 'ordinary']
+    with pytest.raises(ValueError, match='64 descendants'):
+        runtime_sources(root, {root / str(i): {'ro'} for i in range(65)})
+
+
+def test_final_namespace_validation_rejects_a_mount_added_after_planning(layout):
+    from taskspindle.agy_cli_policy import smoke_launch
+
+    _, workspace, task = layout
+    argv = list(launch(layout))
+    index = argv.index('--clearenv')
+    # Emulate a source gaining a nested mount after host preflight, before exec.
+    argv[index:index] = ['--ro-bind', str(task / 'agy-cli-policy' / 'empty'), str(workspace / 'src')]
+    with pytest.raises(ValueError, match='unapproved mount'):
+        smoke_launch(argv)
+
+
+def test_final_namespace_validation_rejects_replaced_source(layout):
+    from taskspindle.agy_cli_policy import smoke_launch
+
+    _, workspace, _ = layout
+    argv = launch(layout)
+    workspace.rename(workspace.with_name('old-workspace'))
+    workspace.mkdir()
+    (workspace / '.git').mkdir()
+    (workspace / '.agents').mkdir()
+    with pytest.raises(ValueError, match='identity changed'):
+        smoke_launch(argv)
+
+
+def test_final_namespace_validation_rejects_writable_controls(layout):
+    from taskspindle.agy_cli_policy import smoke_launch
+
+    _, _, task = layout
+    argv = list(launch(layout))
+    index = argv.index(str(task / 'agy-cli-policy' / 'settings.json'))
+    assert argv[index - 1] == '--ro-bind'
+    argv[index - 1] = '--bind'
+    with pytest.raises(ValueError, match='mount is writable'):
+        smoke_launch(argv)
+
+
+@pytest.mark.parametrize('destination,message', [
+    ('/unapproved', 'unapproved mount'), ('/dev/null', 'private device changed'),
+])
+def test_final_namespace_validation_rejects_unapproved_root_mount(layout, destination, message):
+    from taskspindle.agy_cli_policy import smoke_launch
+
+    _, _, task = layout
+    secret = task / 'synthetic-secret'
+    secret.write_text('must stay hidden')
+    argv = list(launch(layout))
+    index = argv.index('--clearenv')
+    argv[index:index] = ['--ro-bind', str(secret), destination]
+    with pytest.raises(ValueError, match=message):
+        smoke_launch(argv)
+
+
+def test_final_namespace_validation_rejects_late_hardlink(layout):
+    from taskspindle.agy_cli_policy import smoke_launch
+
+    _, workspace, _ = layout
+    argv = launch(layout, 'implement', ('src',))
+    (workspace / 'src' / 'late-link').hardlink_to(workspace / 'outside.txt')
+    with pytest.raises(ValueError, match='gained a hardlink'):
+        smoke_launch(argv)
+    assert (workspace / 'outside.txt').read_text() == 'before'

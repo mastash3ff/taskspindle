@@ -36,8 +36,8 @@ cache is unavailable, run interactive `agy` in the same WSL account to sign in.
 Credentials remain at their original native path and are mounted read-only into
 private worker state. No tokens are copied into TaskSpindle, no API key is
 forwarded, and no account or provider is substituted after an auth/quota error.
-The ordinary user D-Bus environment is included in the environment allowlist. A worker's
-isolated launch also mounts the resolved binary's real companion directory
+D-Bus and runtime socket environment variables are excluded. A worker's
+isolated launch mounts the resolved binary's real companion directory
 (`~/.gemini/antigravity-cli/bin`) read-only, exactly as it mounts the binary itself.
 
 ## Models and lifecycle
@@ -111,3 +111,44 @@ temporary rollout grants.
 Upstream references: [headless CLI](https://antigravity.google/docs/cli/headless/),
 [permissions](https://antigravity.google/docs/cli/permissions/),
 [authentication](https://antigravity.google/docs/cli/install/).
+
+### Explicit namespace runtime
+
+The sandbox starts with an empty root and a synthetic HOME. It mounts only system
+executable directories, architecture libraries, the current Python standard library,
+shared data and locale paths, the selected executable, approved companion directory,
+and task policy/state leaves. DNS configuration is flattened from its resolved file
+(including WSL's symlink target); hosts, the CA bundle and loader cache are explicit
+read-only files. Network access remains available. Host home, task root, `/mnt`,
+Docker mount trees and host sockets are not inherited. Private `/tmp` and `/var/tmp`
+remain writable. The original token remains the same read-only inode.
+
+Every retained directory is checked for nested mounts before launch. Runtime trees
+are split around and exclude mounted descendants; 64 descendants is a planning
+limit, never authorization for an otherwise unapproved mount. Workspace, state and
+companion sources with nested mounts fail closed. A Python verifier inside the
+completed private namespace checks source identities, read-only flags and unexpected
+descendant mounts before replacing itself with the selected executable. Root stays
+read-only and the executable keeps the transport process group for cancellation.
+
+`agy_cli_policy.smoke_launch(prepare_launch(...))` runs that verifier and synthetic
+Python checks with a ten-second deadline, without executing AGY, reading credentials
+or contacting a server. It reports elapsed time, namespace mount count, CA loading
+and localhost resolution. Launch metadata records host/retained mount counts and
+excluded runtime mounts. These checks prove namespace startup, not provider login,
+inference or every optional companion's loader compatibility. An executable needing
+nonstandard libraries outside the explicit runtime requires a reviewed runtime
+extension; the launcher never falls back to exposing the host root.
+
+A large Docker Desktop mount inventory can make recursive root binds expensive.
+The launcher avoids those binds; it does not delete mounts or change host namespace
+settings. Mount count alone does not establish stale mounts or their owner. Any host
+cleanup requires a separate inventory and authorization.
+
+The final verifier also rejects mounts anywhere outside the complete mount allowlist
+and rechecks writable scopes for hardlinks immediately before execution. Scope data
+remains a live bind of a coordinator-owned worktree: the coordinator must not mutate
+its filesystem topology concurrently with a worker. These checks reject changes made
+between planning and verification; they do not claim to defend against a hostile host
+process continuously modifying the worktree after verification. That stronger boundary
+would require private writable staging and controlled writeback.
