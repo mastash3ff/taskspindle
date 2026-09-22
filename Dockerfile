@@ -2,9 +2,9 @@
 # Supply a build context named provider-binaries containing the required
 # executables claude, grok and agy, plus the optional pinned raw Muse binary as
 # muse. OAuth and session state are mounted or created only at runtime.
-FROM node:24.14.0-bookworm-slim@sha256:d8e448a56fc63242f70026718378bd4b00f8c82e78d20eefb199224a4d8e33d8 AS node
+FROM node:24-bookworm-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS node
 FROM ghcr.io/astral-sh/uv:0.10.12@sha256:72ab0aeb448090480ccabb99fb5f52b0dc3c71923bffb5e2e26517a1c27b7fec AS uv
-FROM python:3.13-slim-trixie@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285
+FROM python:3.13-slim-trixie@sha256:8d9d0b8bcf6506481eae4907c18f5e3e7902e629f5f6d684f9e7c32e85e3ddf0
 ARG TASKSPINDLE_HOME=/home/taskspindle
 ARG TASKSPINDLE_GIT_USER_NAME
 ARG TASKSPINDLE_GIT_USER_EMAIL
