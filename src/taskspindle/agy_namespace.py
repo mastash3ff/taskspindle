@@ -42,6 +42,8 @@ def runtime_sources(root: Path, mounts: dict[Path, set[str]]) -> list[Path]:
             return [path]
         result = []
         for child in sorted(path.iterdir()):
+            if child in descendants:
+                continue
             if child.is_symlink():
                 # Symlinks are reconstructed separately by the planner.
                 result.append(child)

@@ -206,8 +206,10 @@ def prepare_launch(
 
     # Split system runtime directories around ALL nested mounts. A small mount
     # count is a resource bound, never permission to inherit a host mount.
+    # Administrative binaries are not needed. Docker --init adds a mounted
+    # /usr/sbin/docker-init; retaining that tree would expand into many binds.
     runtime_roots = [Path(value) for value in (
-        "/usr/bin", "/usr/sbin", "/usr/lib64", "/usr/local", "/usr/share",
+        "/usr/bin", "/usr/lib64", "/usr/local", "/usr/share",
         "/usr/lib/locale", "/usr/lib/ssl", "/usr/libexec",
         f"/usr/lib/{sysconfig.get_config_var('MULTIARCH')}", sysconfig.get_path("stdlib"),
     )]
@@ -226,7 +228,7 @@ def prepare_launch(
         path = Path("/") / name
         if path.is_symlink():
             argv.extend(("--symlink", os.readlink(path), str(path)))
-        elif path.is_dir():
+        elif path.is_dir() and name != "sbin":
             for source in runtime_sources(path, inventory):
                 if source.is_symlink():
                     argv.extend(("--symlink", os.readlink(source), str(source)))

@@ -332,13 +332,17 @@ def test_rejects_nested_mounts_in_every_retained_directory(layout, monkeypatch, 
         launch(layout)
 
 
-def test_runtime_descendant_count_is_not_authorization(tmp_path):
+@pytest.mark.parametrize("mounted_file", [False, True])
+def test_runtime_descendant_count_is_not_authorization(tmp_path, mounted_file):
     from taskspindle.agy_namespace import runtime_sources
 
     root = tmp_path / 'runtime'
     root.mkdir()
     (root / 'ordinary').mkdir()
-    (root / 'unapproved').mkdir()
+    if mounted_file:
+        (root / 'unapproved').write_text('unapproved mount')
+    else:
+        (root / 'unapproved').mkdir()
     assert runtime_sources(root, {root / 'unapproved': {'ro'}}) == [root / 'ordinary']
     with pytest.raises(ValueError, match='64 descendants'):
         runtime_sources(root, {root / str(i): {'ro'} for i in range(65)})
@@ -406,3 +410,17 @@ def test_final_namespace_validation_rejects_late_hardlink(layout):
     with pytest.raises(ValueError, match='gained a hardlink'):
         smoke_launch(argv)
     assert (workspace / 'outside.txt').read_text() == 'before'
+
+
+def test_docker_init_mount_does_not_expand_administrative_runtime(layout, monkeypatch):
+    from taskspindle import agy_namespace
+
+    mounts = dict(agy_namespace.mount_table())
+    mounts[Path('/usr/sbin/docker-init')] = {'ro'}
+    monkeypatch.setattr(agy_namespace, 'mount_table', lambda: mounts)
+    argv = launch(layout)
+    sources = [argv[index + 1] for index, value in enumerate(argv) if value in {'--bind', '--ro-bind'}]
+    assert not any(Path(source).is_relative_to(Path('/usr/sbin')) for source in sources)
+    assert not any(source == '/sbin' for source in sources)
+    metadata = json.loads((layout[2] / 'agy-cli-launch.json').read_text())
+    assert metadata['retained_mount_count'] < 64

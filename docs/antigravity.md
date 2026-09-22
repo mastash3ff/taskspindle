@@ -152,3 +152,10 @@ its filesystem topology concurrently with a worker. These checks reject changes 
 between planning and verification; they do not claim to defend against a hostile host
 process continuously modifying the worktree after verification. That stronger boundary
 would require private writable staging and controlled writeback.
+
+
+Administrative executable directories (`/usr/sbin` and a real `/sbin`) are omitted
+from the worker runtime. Docker's `--init` injects `/usr/sbin/docker-init` into the
+outer container; the worker neither needs that executable nor inherits its mount.
+Runtime splitting excludes mounted files as well as mounted directories, while
+retaining the existing 64-mount planning limit.
