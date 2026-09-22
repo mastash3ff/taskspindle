@@ -89,6 +89,7 @@ def claude_like(script_path: Path) -> Profile:
     return Profile(
         id="fake",
         auth="oauth",
+        billing_type="subscription",  # Synthetic agent; this test exercises mode enforcement.
         command=AGENT_ARGV,
         env={"PYTHONPATH": str(REPO_ROOT), "TASKSPINDLE_FAKE_SCRIPT": str(script_path)},
         base="claude",

@@ -23,9 +23,12 @@ from taskspindle.store import Store
 from taskspindle.web.app import build_app
 from taskspindle.web.policy_store import PolicyStore
 
+# Synthetic subscription seats for dashboard policy tests; no provider is launched.
 PROFILES: dict[str, Profile] = {
-    "claude": Profile(id="claude", auth="oauth", command=("claude",), first_class=True),
-    "grok": Profile(id="grok", auth="oauth", command=("grok",), first_class=True),
+    "claude": Profile(id="claude", auth="oauth", billing_type="subscription",
+                      command=("claude",), first_class=True),
+    "grok": Profile(id="grok", auth="oauth", billing_type="subscription",
+                      command=("grok",), first_class=True),
 }
 TRUSTED_ORIGIN = "http://127.0.0.1:8765"
 DEFAULTS_JSON = policy.defaults(PROFILES).model_dump(mode="json")

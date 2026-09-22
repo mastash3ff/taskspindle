@@ -80,7 +80,7 @@ def test_doctor_json_prints_the_report_and_an_advisory_failure_still_passes(
     assert [check["name"] for check in printed["checks"]] == ["git", "codex_registration"]
     assert printed["ok"] is True
     assert seen["live_probes"] is False
-    assert sorted(seen["profiles"]) == ["agy", "claude", "grok", "muse"]
+    assert sorted(seen["profiles"]) == ["agy", "claude", "grok", "muse", "opencode-go"]
 
 
 def test_doctor_marks_each_check_and_fails_on_a_real_failure(
@@ -132,9 +132,11 @@ def test_providers_reads_cached_status_without_creating_task_database(
     monkeypatch.setattr(subprocess, "run", forbidden)
     assert cli.main(["providers", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
-    assert {row["id"] for row in report["providers"]} == {"claude", "grok", "agy", "muse"}
-    assert all(row["availability"]["state"] == ("unqualified" if row["id"] == "muse" else "ok")
-               for row in report["providers"])
+    assert {row["id"] for row in report["providers"]} == {"claude", "grok", "agy", "muse", "opencode-go"}
+    assert all(
+        row["availability"]["state"] == ("unqualified" if row["id"] in {"muse", "opencode-go"} else "ok")
+        for row in report["providers"]
+    )
     assert all("native_check" in row for row in report["providers"])
     assert all(row["native_check"]["eligible_hint"] is None for row in report["providers"])
     assert not (home / "state/taskspindle/taskspindle.sqlite3").exists()
@@ -176,7 +178,9 @@ def test_usage_prints_the_report_as_json_or_as_tables(
     assert printed["group_by"] == "day"
     assert printed["usage"] == []
     assert printed["turns"]["count"] == 0
-    assert {entry["provider"] for entry in printed["windows"]} == {"agy", "claude", "grok", "muse"}
+    assert {entry["provider"] for entry in printed["windows"]} == {
+        "agy", "claude", "grok", "muse", "opencode-go",
+    }
 
     assert cli.main(["usage"]) == 0
     text = capsys.readouterr().out
@@ -404,7 +408,7 @@ def test_web_parses_defaults_and_calls_serve(home: Path, monkeypatch: pytest.Mon
     assert seen["host"] == "127.0.0.1"
     assert seen["port"] == 8765
     assert seen["open_browser"] is False
-    assert seen["profiles"] == ["agy", "claude", "grok", "muse"]
+    assert seen["profiles"] == ["agy", "claude", "grok", "muse", "opencode-go"]
 
 
 

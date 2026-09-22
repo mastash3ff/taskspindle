@@ -192,6 +192,7 @@ def test_a_config_directory_that_already_exists_keeps_its_permissions(tmp_path: 
     """TASKSPINDLE_CONFIG can point anywhere, so setup must not re-permission somebody's home."""
     elsewhere = tmp_path / "somebodys-home"
     elsewhere.mkdir(mode=0o755)
+    elsewhere.chmod(0o755)  # Establish the intended fixture mode even under service UMask=0077.
     paths = Paths(
         config_file=elsewhere / "taskspindle.toml",
         state_dir=tmp_path / "state",

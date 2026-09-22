@@ -70,8 +70,10 @@ def test_continuation_uses_saved_explicit_choices_after_profile_defaults_change(
 
 @pytest.mark.parametrize("family", ["claude", "grok", "agy", "custom"])
 def test_configured_profiles_keep_their_command_and_selection(tmp_path, family):
+    # Synthetic billing is explicit so this fixture reaches the selection contract.
     profile = providers.Profile(
-        id="alias", base=family, auth="oauth", command=("custom",), model="configured", effort="high"
+        id="alias", base=family, auth="oauth", billing_type="subscription",
+        command=("custom",), model="configured", effort="high"
     )
     with make_store(tmp_path) as store:
         task = make_task(store, provider="alias")
@@ -82,7 +84,10 @@ def test_configured_profiles_keep_their_command_and_selection(tmp_path, family):
 
 @pytest.mark.parametrize("family", ["claude", "grok"])
 def test_custom_profile_task_overrides_fail_instead_of_being_ignored(tmp_path, family):
-    profile = providers.Profile(id="alias", base=family, auth="oauth", command=("custom",))
+    # Synthetic billing is explicit so admission does not mask override refusal.
+    profile = providers.Profile(
+        id="alias", base=family, auth="oauth", billing_type="subscription", command=("custom",),
+    )
     with make_store(tmp_path) as store:
         task = make_task(store, provider="alias")
         task = task.model_copy(update={"provider_family": family, "requested_effort": "high"})
