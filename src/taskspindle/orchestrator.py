@@ -725,6 +725,34 @@ class Orchestrator:
             details=refusal,
         )
 
+    @contextmanager
+    def _submission(self):
+        begin = getattr(self.units, "submission_begin", None)
+        if begin is None:
+            yield
+            return
+        import secrets
+        token = secrets.token_hex(32)
+        try:
+            begin(token)
+        except UnitError as exc:
+            raise TaskSpindleError(
+                exc.code, str(exc), retryable=exc.code != "UNIT_SUBMISSION_UNCERTAIN",
+            ) from exc
+        try:
+            yield
+        finally:
+            # Failed/lost end replies retain a durable reservation. Never infer that
+            # a disconnected submitter finished or retry its task creation.
+            try:
+                self.units.submission_end(token)
+            except UnitError as exc:
+                raise TaskSpindleError(
+                    "UNIT_SUBMISSION_UNCERTAIN",
+                    "Submission completion was not acknowledged; reconcile before retrying.",
+                    retryable=False,
+                ) from exc
+
     def start_task(self, request: StartTaskRequest) -> dict[str, Any]:
         """Create, prepare and queue one task.
 
@@ -733,7 +761,7 @@ class Orchestrator:
         bypass -- a provider that is eligible again after its ``reset_at`` (or, absent one, fifteen
         minutes after the refusal was observed) is simply eligible, no override needed.
         """
-        with self._cycle():
+        with self._submission(), self._cycle():
             profile = self._profile_for(request)
             snapshot = self._policy_snapshot()
             self._require_policy_admission(profile, snapshot)
@@ -1144,6 +1172,17 @@ class Orchestrator:
             self.units.reset_failed(unit)
 
     def _start_worker(self, task: TaskRecord, limits: Mapping[str, Any] | None = None) -> bool:
+        # Reserve admission through the controller before publishing a DB lease. This
+        # closes the check/claim race against maintenance, even before Docker start.
+        try:
+            with self._submission():
+                return self._start_worker_admitted(task, limits)
+        except TaskSpindleError as exc:
+            if exc.code == "UNIT_ADMISSION_CLOSED":
+                return False
+            raise
+
+    def _start_worker_admitted(self, task: TaskRecord, limits: Mapping[str, Any] | None = None) -> bool:
         """Claim capacity and publish task identity before starting its unit outside the lock."""
         if not self._admission_open():
             return False
@@ -1456,7 +1495,7 @@ class Orchestrator:
         ``provider_status`` and cleared by ``start_task``'s own admission once the provider is
         eligible again, not by resuming the failed task's own session.
         """
-        with self._cycle():
+        with self._submission(), self._cycle():
             record = require_task(self.store, task_id)
             _require_version(record, expected_state_version)
             if muse.unresolved_commands(self.store, record):
@@ -1541,7 +1580,7 @@ class Orchestrator:
 
     def accept_task(self, request: AcceptTaskRequest) -> dict[str, Any]:
         """Gate an acceptance, journal it, and hand the root commit to the accept unit."""
-        with self._cycle():
+        with self._submission(), self._cycle():
             if not self._admission_open():
                 raise TaskSpindleError(
                     "UNIT_ADMISSION_CLOSED", "Worker admission is closed.", retryable=True,

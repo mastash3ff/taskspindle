@@ -131,20 +131,102 @@ class DockerBackend:
     def _save(self, record: dict[str, Any]) -> None:
         _atomic(self._record_path(record["unit"]), record)
 
+    def _maintenance(self) -> dict[str, Any] | None:
+        record = _read(self.directory / "maintenance.json")
+        if record is not None and (record.get("version") != 1
+                or type(record.get("active")) is not bool
+                or not re.fullmatch(r"[0-9a-f]{64}", str(record.get("owner_sha256", "")))):
+            raise UnitError("UNIT_RECORD_INVALID", "Maintenance record is invalid")
+        return record
+
+    @staticmethod
+    def _token(token: str) -> str:
+        if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+            raise UnitError("UNIT_INVALID", "Maintenance/submission token must be 32 random bytes in hex")
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def _admission(self) -> bool:
+        maintenance = self._maintenance()
+        if maintenance and maintenance["active"]:
+            return False
+        value = _read(self.directory / "admission.json")
+        if value is None:
+            return True
+        if type(value.get("open")) is not bool:
+            raise UnitError("UNIT_RECORD_INVALID", "Admission record is invalid")
+        return value["open"]
+
     def admission_open(self) -> bool:
         with self._locked():
-            value = _read(self.directory / "admission.json")
-            if value is None:
-                return True
-            if type(value.get("open")) is not bool:
-                raise UnitError("UNIT_RECORD_INVALID", "Admission record is invalid")
-            return value["open"]
+            return self._admission()
 
     def set_admission(self, value: bool) -> None:
         if type(value) is not bool:
             raise UnitError("UNIT_INVALID", "Admission value must be boolean")
         with self._locked():
+            maintenance = self._maintenance()
+            if value and maintenance and maintenance["active"]:
+                raise UnitError("UNIT_MAINTENANCE_ACTIVE", "Only the maintenance owner can reopen admission")
             _atomic(self.directory / "admission.json", {"open": value})
+
+    def maintenance_acquire(self, token: str) -> None:
+        owner = self._token(token)
+        with self._locked():
+            previous = self._maintenance()
+            if previous and previous["active"] and previous["owner_sha256"] != owner:
+                raise UnitError("UNIT_MAINTENANCE_ACTIVE", "Maintenance belongs to another operation")
+            if not (previous and previous["active"]) and not self._admission():
+                raise UnitError("UNIT_ADMISSION_CLOSED", "Admission was closed by another operation")
+            # The independent token closes all new-controller paths before touching the
+            # legacy boolean. A crash between these writes cannot reopen admission.
+            _atomic(self.directory / "maintenance.json", {
+                "version": 1, "active": True, "owner_sha256": owner,
+            })
+            _atomic(self.directory / "admission.json", {"open": False})
+
+    def maintenance_release(self, token: str, reopen: bool) -> None:
+        owner = self._token(token)
+        if type(reopen) is not bool:
+            raise UnitError("UNIT_INVALID", "Admission value must be boolean")
+        with self._locked():
+            previous = self._maintenance()
+            if not previous or previous["owner_sha256"] != owner:
+                raise UnitError("UNIT_MAINTENANCE_OWNER", "Maintenance owner does not match")
+            if not previous["active"]:
+                # A lost successful reply is resumable; never override a later operator fence.
+                if self._admission() != reopen:
+                    raise UnitError("UNIT_ADMISSION_CLOSED", "Admission changed after maintenance release")
+                return
+            if self._submissions():
+                raise UnitError("UNIT_SUBMISSION_ACTIVE", "Submissions remain in flight or unresolved")
+            _atomic(self.directory / "admission.json", {"open": reopen})
+            _atomic(self.directory / "maintenance.json", dict(previous, active=False))
+
+    def _submissions(self) -> list[Path]:
+        return list(self.directory.glob("submission-*.json"))
+
+    def submission_begin(self, token: str) -> None:
+        owner = self._token(token)
+        with self._locked():
+            if not self._admission():
+                raise UnitError("UNIT_ADMISSION_CLOSED", "Submissions are closed for maintenance")
+            target = self.directory / f"submission-{owner}.json"
+            if target.exists():
+                raise UnitError("UNIT_SUBMISSION_ACTIVE", "Submission already exists; do not replay it")
+            # This reservation never expires. A lost client requires explicit recovery.
+            _atomic(target, {"version": 1, "owner_sha256": owner})
+
+    def submission_end(self, token: str) -> None:
+        owner = self._token(token)
+        with self._locked():
+            target = self.directory / f"submission-{owner}.json"
+            if target.exists():
+                target.unlink()
+                fd = os.open(self.directory, os.O_DIRECTORY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
 
     @contextlib.contextmanager
     def _database(self):
@@ -294,8 +376,7 @@ class DockerBackend:
         self._record_path(unit)
         with self._locked():
             # Read fence within the same cross-process lock as the launch reservation.
-            admission = _read(self.directory / "admission.json")
-            if admission is not None and admission.get("open") is not True:
+            if not self._admission():
                 raise UnitError("UNIT_ADMISSION_CLOSED", "Worker admission is closed")
             kind, task_id, identity, provider = self._identity(unit)
             record = self._record(unit)
@@ -460,7 +541,6 @@ class DockerBackend:
                 if state in {"active", "unknown"}:
                     jobs.append({"unit": record["unit"], "kind": record["kind"],
                                  "task_id": record["task_id"], "state": state})
-            admission = _read(self.directory / "admission.json")
             try:
                 with self._database() as connection:
                     unsettled = connection.execute(
@@ -473,7 +553,10 @@ class DockerBackend:
                     ).fetchone()[0]
             except UnitError:
                 unsettled = reservations = nonterminal = None
-            return {"backend": "docker", "admission_open": admission is None or admission.get("open") is True,
+            maintenance = self._maintenance()
+            return {"backend": "docker", "admission_open": self._admission(),
+                    "maintenance_protocol": 1, "maintenance": maintenance,
+                    "active_submissions": len(self._submissions()),
                     "engine_reachable": reachable, "jobs": jobs, "unsettled_integrations": unsettled,
                     "active_reservations": reservations, "nonterminal_worker_tasks": nonterminal}
 

@@ -27,6 +27,10 @@ class ControllerClient:
                 "CONTROL_UNAVAILABLE", "CONTROL_PROTOCOL_ERROR", "CONTROL_FAILED",
             }:
                 code = "UNIT_START_UNCERTAIN"
+            if operation == "submission_begin" and code in {
+                "CONTROL_UNAVAILABLE", "CONTROL_PROTOCOL_ERROR", "CONTROL_FAILED",
+            }:
+                code = "UNIT_SUBMISSION_UNCERTAIN"
             raise UnitError(code, str(exc)) from exc
 
     def start(self, unit: str, argv: Sequence[str], *, working_dir: Path,
@@ -57,6 +61,18 @@ class ControllerClient:
 
     def set_admission(self, value: bool) -> None:
         self._call("set_admission", {"open": value})
+
+    def maintenance_acquire(self, token: str) -> dict[str, Any]:
+        return self._call("maintenance_acquire", {"token": token})
+
+    def maintenance_release(self, token: str, reopen: bool) -> dict[str, Any]:
+        return self._call("maintenance_release", {"token": token, "open": reopen})
+
+    def submission_begin(self, token: str) -> None:
+        self._call("submission_begin", {"token": token})
+
+    def submission_end(self, token: str) -> None:
+        self._call("submission_end", {"token": token})
 
     def status(self) -> dict[str, Any]:
         return self._call("status")

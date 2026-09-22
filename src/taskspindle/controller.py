@@ -36,7 +36,9 @@ class Controller:
 
     def dispatch(self, operation: Any, arguments: Any, *, diagnostics: bool = False) -> Any:
         # Keep the fence closed across a whole stop/recovery sweep, including against `open`.
-        if not diagnostics and operation in {"start", "set_admission", "interrupt_workers", "reconcile"}:
+        if not diagnostics and operation in {"start", "set_admission", "interrupt_workers", "reconcile",
+                                               "maintenance_acquire", "maintenance_release",
+                                               "submission_begin", "submission_end"}:
             with self._mutation_lock:
                 return self._dispatch(operation, arguments, diagnostics=diagnostics)
         return self._dispatch(operation, arguments, diagnostics=diagnostics)
@@ -77,6 +79,14 @@ class Controller:
             from .worker_diagnostics import reconcile_interrupted_workers
             reconcile_interrupted_workers(self.backend, self.paths, self.settings)
             return self.backend.status()
+        if operation in {"maintenance_acquire", "maintenance_release", "submission_begin", "submission_end"}:
+            fields = {"token", "open"} if operation == "maintenance_release" else {"token"}
+            args = _arguments(arguments, fields)
+            if operation == "maintenance_release":
+                self.backend.maintenance_release(args["token"], args["open"])
+            else:
+                getattr(self.backend, operation)(args["token"])
+            return self.backend.status() if operation.startswith("maintenance_") else {"accepted": True}
         if operation == "set_admission":
             args = _arguments(arguments, {"open"})
             if type(args["open"]) is not bool:
@@ -235,8 +245,11 @@ def serve(controller: Controller, jobs: Path, diagnostics: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="taskspindle-controller")
     parser.add_argument(
-        "command", choices=["serve", "status", "fence", "open", "interrupt-workers", "reconcile"],
+        "command", choices=["serve", "status", "fence", "open", "interrupt-workers", "reconcile",
+                            "maintenance-acquire", "maintenance-release"],
     )
+    parser.add_argument("--token")
+    parser.add_argument("--reopen", action="store_true")
     parser.add_argument("--jobs-socket", type=Path)
     parser.add_argument("--diagnostics-socket", type=Path)
     args = parser.parse_args(argv)
@@ -257,7 +270,11 @@ def main(argv: list[str] | None = None) -> int:
         client = ControllerClient(jobs)
         if args.command in {"fence", "open"}:
             client.set_admission(args.command == "open")
-        if args.command == "interrupt-workers":
+        if args.command == "maintenance-acquire":
+            result = client.maintenance_acquire(args.token)
+        elif args.command == "maintenance-release":
+            result = client.maintenance_release(args.token, args.reopen)
+        elif args.command == "interrupt-workers":
             result = client.interrupt_workers()
         elif args.command in {"fence", "reconcile"}:
             result = client.reconcile()

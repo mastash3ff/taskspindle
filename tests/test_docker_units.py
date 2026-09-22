@@ -420,3 +420,120 @@ def test_accepting_task_without_journal_still_blocks_worker_interruption(setup):
         backend.interrupt_workers()
     assert caught.value.code == "ACCEPT_IN_FLIGHT"
     assert backend.status()["unsettled_integrations"] == 1
+
+
+def test_maintenance_survives_restart_and_legacy_boolean_overwrite(setup):
+    backend, client = setup
+    token = 'a' * 64
+    backend.maintenance_acquire(token)
+    (backend.directory / 'admission.json').write_text('{"open":true}')
+    restarted = DockerBackend(backend.paths, backend.settings, client=client)
+    assert restarted.admission_open() is False
+    assert restarted.status()['maintenance_protocol'] == 1
+    with pytest.raises(UnitError, match='owner'):
+        restarted.set_admission(True)
+    with pytest.raises(UnitError):
+        launch(restarted)
+    with pytest.raises(UnitError):
+        restarted.submission_begin('b' * 64)
+    with pytest.raises(UnitError):
+        restarted.maintenance_release('c' * 64, True)
+    restarted.maintenance_release(token, True)
+    restarted.maintenance_release(token, True)  # lost reply is idempotent
+    assert restarted.admission_open()
+
+
+def test_submission_is_durable_and_blocks_maintenance_release(setup):
+    backend, client = setup
+    backend.submission_begin('b' * 64)
+    backend.maintenance_acquire('a' * 64)
+    restarted = DockerBackend(backend.paths, backend.settings, client=client)
+    assert restarted.status()['active_submissions'] == 1
+    with pytest.raises(UnitError, match='Submissions remain'):
+        restarted.maintenance_release('a' * 64, True)
+    restarted.submission_end('b' * 64)
+    assert restarted.status()['active_submissions'] == 0
+    restarted.maintenance_release('a' * 64, True)
+
+
+def test_maintenance_cannot_steal_operator_fence_or_other_owner(setup):
+    backend, _ = setup
+    backend.set_admission(False)
+    with pytest.raises(UnitError):
+        backend.maintenance_acquire('a' * 64)
+    backend.set_admission(True)
+    backend.maintenance_acquire('a' * 64)
+    with pytest.raises(UnitError):
+        backend.maintenance_acquire('b' * 64)
+    backend.maintenance_acquire('a' * 64)
+
+
+def test_concurrent_submission_open_and_start_cannot_cross_owned_fence(setup):
+    from concurrent.futures import ThreadPoolExecutor
+    backend, _ = setup
+    backend.maintenance_acquire('a' * 64)
+    actions = [lambda: backend.set_admission(True), lambda: launch(backend),
+               lambda: backend.submission_begin('b' * 64)]
+    def refused(action):
+        with pytest.raises(UnitError):
+            action()
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(refused, actions))
+    assert backend.status()['active_submissions'] == 0
+    assert backend.status()['jobs'] == []
+
+
+def test_crash_during_release_keeps_independent_token_closed(setup, monkeypatch):
+    import taskspindle.docker_units as module
+    backend, _ = setup
+    token = 'a' * 64
+    backend.maintenance_acquire(token)
+    atomic = module._atomic
+    def fail(path, value):
+        if path.name == 'maintenance.json' and value['active'] is False:
+            raise OSError('crash')
+        atomic(path, value)
+    monkeypatch.setattr(module, '_atomic', fail)
+    with pytest.raises(OSError):
+        backend.maintenance_release(token, True)
+    assert json.loads((backend.directory / 'admission.json').read_text())['open'] is True
+    assert backend.admission_open() is False
+
+
+def test_maintenance_acquisition_serializes_with_a_launch_already_in_progress(setup):
+    backend, client = setup
+    client.containers.entered = threading.Event()
+    client.containers.proceed = threading.Event()
+    launching = threading.Thread(target=launch, args=(backend,))
+    launching.start()
+    assert client.containers.entered.wait(2)
+    done = threading.Event()
+    def acquire():
+        backend.maintenance_acquire('a' * 64)
+        done.set()
+    acquiring = threading.Thread(target=acquire)
+    acquiring.start()
+    assert not done.wait(0.05)
+    client.containers.proceed.set()
+    launching.join(3)
+    acquiring.join(3)
+    assert done.is_set()
+    assert backend.status()['admission_open'] is False
+    assert len(backend.status()['jobs']) == 1
+
+
+def test_maintenance_acquire_crash_before_legacy_write_is_still_closed(setup, monkeypatch):
+    import taskspindle.docker_units as module
+    backend, client = setup
+    atomic = module._atomic
+    def fail(path, value):
+        if path.name == 'admission.json':
+            raise OSError('crash before legacy flag')
+        atomic(path, value)
+    monkeypatch.setattr(module, '_atomic', fail)
+    with pytest.raises(OSError):
+        backend.maintenance_acquire('a' * 64)
+    restarted = DockerBackend(backend.paths, backend.settings, client=client)
+    assert restarted.admission_open() is False
+    with pytest.raises(UnitError):
+        restarted.submission_begin('b' * 64)
