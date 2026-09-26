@@ -492,7 +492,7 @@ class Orchestrator:
                         "slot_utilization_day": busy.get(profile.id, {}).get("slot_utilization"),
                         "queue_wait_p50_s": busy.get(profile.id, {}).get("queue_wait", {}).get("p50_s"),
                     },
-                    "windows": self.store.latest_provider_windows(limits_key(profile)),
+                    "windows": self.store.current_provider_windows(limits_key(profile)),
                     "policy": policy_status["providers"].get(profile.id),
                 }
                 for profile in sorted(self.profiles.values(), key=lambda item: item.id)

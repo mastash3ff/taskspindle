@@ -38,7 +38,7 @@ from starlette.staticfiles import StaticFiles
 
 import taskspindle
 
-from .. import access_checks, limits, policy, usage, utilization
+from .. import access_checks, limits, metrics, policy, usage, utilization
 from ..config import Paths
 from ..doctor import run_doctor_async
 from ..models import TaskState
@@ -429,7 +429,7 @@ def build_app(
                         "native_check": access_checks.cached_native_check(
                             store, profile, now=observed_now
                         ),
-                        "windows": store.latest_provider_windows(limits.status_key(profile)),
+                        "windows": store.current_provider_windows(limits.status_key(profile)),
                     }
                 )
             status = [
@@ -487,6 +487,20 @@ def build_app(
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(report)
+
+    # -- metrics --------------------------------------------------------------------
+
+    @_guard
+    def metrics_endpoint(request: Request) -> Response:
+        # Read-only like every task read: the same ``mode=ro`` view, rendered fresh per scrape.
+        with _store() as store:
+            body = metrics.render(
+                store,
+                profiles=profiles,
+                limits=policy.slot_limits_for(store, paths.config_file, profiles),
+                now=clock(),
+            )
+        return Response(body, media_type=metrics.CONTENT_TYPE, headers={"Cache-Control": "no-store"})
 
     # -- dispatch policy --------------------------------------------------------------
 
@@ -752,6 +766,7 @@ def build_app(
         Route("/api/providers", providers_endpoint, methods=["GET"]),
         Route("/api/doctor", doctor_endpoint, methods=["GET"]),
         Route("/api/usage", usage_endpoint, methods=["GET"]),
+        Route("/metrics", metrics_endpoint, methods=["GET"]),
         Route("/api/policy", policy_get_endpoint, methods=["GET"]),
         Route("/api/policy", policy_put_endpoint, methods=["PUT"]),
         Route("/api/policy/reset", policy_reset_endpoint, methods=["POST"]),

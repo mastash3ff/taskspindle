@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Usage says why tasks failed, and how complete it is.** `usage_report`, `taskspindle usage`
+  and `/api/usage` add `failures` (failed tasks by provider, mode and error code, never the
+  message), `daily` (one row per UTC day: tasks created and their outcomes, failures, turns,
+  tokens, estimated cost, checks run and passed), `metering` (per provider, turns with and
+  without token usage, and metered turns no price covers) and `p95_ms` in every timing summary.
+  Every existing key keeps its shape. The CLI prints a failures table, p95, a 14-day trend and a
+  metering line; the dashboard's Usage page gains a Failures table, a Daily trend chart (tasks,
+  failures, check pass rate) and the metering note.
+- **Usage windows are listed once.** A window seen across many reset periods was listed once
+  per period (fourteen `five_hour` entries, mostly without a percentage). `usage_report`,
+  `capabilities` and `/api/providers` now give each window's newest observation, carrying the
+  period's last reported `used_percent` with `used_percent_observed_at` when the newest event
+  has none. The dispatch policy's headroom read is unchanged.
+- **Prometheus metrics.** `GET /metrics` on the dashboard and `taskspindle metrics` print the
+  text exposition format read from the task database: tasks by state, failures by code, turn
+  duration quantiles, tokens, estimated cost, checks, slots, leases, queue depth, provider
+  availability and build info. Labels carry identifiers only. See
+  [dashboard.md](docs/dashboard.md#metrics).
+- **Fix: the dashboard counts every violation kind.** Its read-only view omitted
+  `MODE_SWITCH_ATTEMPT` from the usage report's violations; it now shares the store's list.
 - **Usage you can turn up.** The dispatch policy gains the knobs that decide how much of each
   subscription pool gets used, all editable on the dashboard's Policy page or with
   `taskspindle policy`, none needing a restart: `providers.<id>.max_concurrent` and

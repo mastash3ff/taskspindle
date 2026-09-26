@@ -568,6 +568,8 @@ def test_usage_endpoint_matches_usage_report(tmp_path: Path, group_by: str) -> N
 
     assert body["usage"] == expected["usage"]
     assert body["outcomes"] == expected["outcomes"]
+    for key in ("failures", "daily", "metering", "turns", "checks", "windows"):
+        assert body[key] == expected[key]
 
 
 def test_usage_endpoint_rejects_a_bad_since_or_group_by(tmp_path: Path) -> None:
@@ -577,6 +579,50 @@ def test_usage_endpoint_rejects_a_bad_since_or_group_by(tmp_path: Path) -> None:
 
     assert client.get("/api/usage", params={"since": "yesterday"}).status_code == 400
     assert client.get("/api/usage", params={"group_by": "colour"}).status_code == 400
+
+
+# -- metrics --------------------------------------------------------------------------
+
+
+def test_metrics_endpoint_serves_the_text_exposition_read_only(tmp_path: Path) -> None:
+    from taskspindle import metrics, policy
+
+    paths = _paths(tmp_path)
+    _seed(paths)
+    db_path = paths.state_dir / "taskspindle.sqlite3"
+    before = db_path.read_bytes()
+    client = _client(paths)
+
+    resp = client.get("/metrics")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "text/plain; version=0.0.4; charset=utf-8"
+    assert resp.headers["cache-control"] == "no-store"
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    with ReadOnlyStore(db_path) as store:
+        limits = policy.slot_limits_for(store, paths.config_file, PROFILES)
+        assert limits == {"claude": 1, "grok": 1}
+        assert resp.text == metrics.render(store, profiles=PROFILES, limits=limits, now=NOW)
+    assert 'taskspindle_tasks{mode="implement",provider="claude",state="RESULT_READY"}' in resp.text
+    assert "do the thing" not in resp.text
+    assert db_path.read_bytes() == before
+    assert client.post("/metrics").status_code == 405
+
+
+def test_metrics_endpoint_refuses_a_foreign_host_like_every_route(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    _seed(paths)
+    app = build_app(paths, PROFILES, clock=lambda: NOW)
+    client = TestClient(app, base_url="http://evil.example", client=("127.0.0.1", 50000))
+    assert client.get("/metrics").status_code == 403
+
+
+def test_metrics_endpoint_renders_without_a_database(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    resp = _client(paths).get("/metrics")
+    assert resp.status_code == 200
+    assert "taskspindle_build_info{" in resp.text
+    assert not (paths.state_dir / "taskspindle.sqlite3").exists()
 
 
 # -- method and write guards -------------------------------------------------------------
