@@ -56,6 +56,15 @@ class ControllerClient:
     def reset_failed(self, unit: str) -> None:
         self._call("reset_failed", {"unit": unit})
 
+    def recover_failed_create(self, unit: str) -> UnitState:
+        result = self._call("recover_failed_create", {"unit": unit})
+        try:
+            if not isinstance(result, dict) or set(result) != set(asdict(UnitState("", "", "", ""))):
+                raise ValueError
+            return UnitState(**result)
+        except (TypeError, ValueError) as exc:
+            raise UnitError("UNIT_QUERY_FAILED", "Invalid controller recovery result") from exc
+
     def admission_open(self) -> bool:
         return self._call("admission") is True
 

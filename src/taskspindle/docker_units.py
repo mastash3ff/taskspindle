@@ -10,6 +10,7 @@ import re
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
@@ -26,6 +27,28 @@ from .units import UnitError, UnitState
 _UNIT = re.compile(r"taskspindle-(worker|accept)-([A-Za-z0-9_-]{1,160})\Z")
 _IMAGE = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s]+@sha256:[0-9a-f]{64})\Z")
 _TERMINAL = {"exited", "dead"}
+_SAFE_DAEMON_FAILURES = {
+    "no space left on device": "no space left on device",
+}
+_RECOVERY_EVENTS_TIMEOUT_S = 30.0
+
+
+def _api_diagnostic(exc: APIError) -> str:
+    """Return bounded, non-verbatim facts from a Docker error response.
+
+    Docker explanations can contain request arguments, paths, registry URLs, or credentials. Keep
+    only the response status and exact failure phrases that are safe and useful to an operator.
+    The caller still decides whether the failed request has a certain or uncertain outcome.
+    """
+    facts: list[str] = []
+    if isinstance(exc.status_code, int) and 100 <= exc.status_code <= 599:
+        facts.append(f"HTTP {exc.status_code}")
+    explanation = exc.explanation if isinstance(exc.explanation, str) else ""
+    lowered = explanation.lower()
+    for needle, diagnostic in _SAFE_DAEMON_FAILURES.items():
+        if needle in lowered:
+            facts.append(diagnostic)
+    return f" ({'; '.join(facts)})" if facts else ""
 
 
 def _atomic(path: Path, value: Any) -> None:
@@ -113,6 +136,10 @@ class DockerBackend:
                 raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid turn identity")
             if "container_id" in record and not isinstance(record["container_id"], str):
                 raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid container ID")
+            if "reserved_at_ns" in record and (
+                type(record["reserved_at_ns"]) is not int or record["reserved_at_ns"] <= 0
+            ):
+                raise UnitError("UNIT_RECORD_INVALID", "Execution record has invalid reservation time")
             evidence = record.get("evidence")
             if evidence is not None:
                 template = asdict(UnitState("", "", "", ""))
@@ -408,7 +435,7 @@ class DockerBackend:
             generation = uuid.uuid4().hex
             record = {"unit": unit, "kind": kind, "task_id": task_id, "identity": identity,
                       "generation": generation, "name": f"taskspindle-{self.owner}-{generation}",
-                      "phase": "creating"}
+                      "phase": "creating", "reserved_at_ns": time.time_ns()}
             self._save(record)
             labels = {"taskspindle.owner": self.owner, "taskspindle.generation": generation,
                       "taskspindle.unit": unit, "taskspindle.kind": kind, "taskspindle.task": task_id}
@@ -421,6 +448,7 @@ class DockerBackend:
                                  "XDG_DATA_HOME": "/opt/taskspindle/data"}, **options,
                 )
             except Exception as exc:
+                diagnostic = _api_diagnostic(exc) if isinstance(exc, APIError) else ""
                 try:
                     container = self._container(record)
                 except UnitError:
@@ -429,8 +457,12 @@ class DockerBackend:
                     if isinstance(exc, APIError) and exc.status_code in {400, 401, 403, 404, 422}:
                         record["phase"] = "failed"
                         self._save(record)
-                        raise UnitError("UNIT_START_FAILED", "Docker rejected the job before launch") from exc
-                    raise UnitError("UNIT_START_UNCERTAIN", "Docker create outcome is unsettled") from exc
+                        raise UnitError(
+                            "UNIT_START_FAILED", f"Docker rejected the job before launch{diagnostic}",
+                        ) from exc
+                    raise UnitError(
+                        "UNIT_START_UNCERTAIN", f"Docker create outcome is unsettled{diagnostic}",
+                    ) from exc
             record["container_id"] = container.id
             record["phase"] = "starting"
             self._save(record)
@@ -448,6 +480,126 @@ class DockerBackend:
                 raise UnitError("UNIT_START_UNCERTAIN", "Docker start outcome is unsettled") from exc
             record["phase"] = "started"
             self._save(record)
+
+    def recover_failed_create(self, unit: str) -> UnitState:
+        """Retire one absent create only when Docker proves that exact generation was destroyed."""
+        self._record_path(unit)
+        with self._locked():
+            # Fence in the same cross-process critical section as the first evidence read. Keep it
+            # closed on success and every failure; a second controller cannot reopen in the gap.
+            _atomic(self.directory / "admission.json", {"open": False})
+            record = self._record(unit)
+            if record is None or record["phase"] != "creating":
+                raise UnitError(
+                    "UNIT_RECOVERY_INVALID", "Only an unsettled Docker create can be recovered",
+                )
+            try:
+                self.client.ping()
+                if self._container(record) is not None:
+                    raise UnitError(
+                        "UNIT_RECOVERY_UNPROVEN", "The recorded Docker generation still exists",
+                    )
+                path = self._record_path(unit)
+                reserved_at_ns = record.get("reserved_at_ns") or path.stat().st_mtime_ns
+                filters = {
+                    "type": "container",
+                    "event": "destroy",
+                    "label": [
+                        f"taskspindle.owner={self.owner}",
+                        f"taskspindle.generation={record['generation']}",
+                    ],
+                }
+                api = getattr(self.client, "api", None)
+                if api is None:  # Test doubles and deliberately small compatible clients.
+                    events = self.client.events(
+                        decode=True, since=max(0, reserved_at_ns // 1_000_000_000 - 1),
+                        until=int(time.time()) + 1, filters=filters,
+                    )
+                else:
+                    # DockerClient.events hard-codes timeout=None. Use the same SDK stream helpers
+                    # with a finite connect/read timeout so recovery cannot hold both locks forever.
+                    response = api._get(
+                        api._url("/events"),
+                        params={
+                            "since": max(0, reserved_at_ns // 1_000_000_000 - 1),
+                            "until": int(time.time()) + 1,
+                            "filters": docker.utils.convert_filters(filters),
+                        },
+                        stream=True,
+                        timeout=30,
+                    )
+                    events = docker.types.CancellableStream(
+                        api._stream_helper(response, decode=True), response,
+                    )
+                destroyed = None
+                event_deadline = threading.Event()
+
+                def expire_events() -> None:
+                    event_deadline.set()
+                    with contextlib.suppress(Exception):
+                        close = getattr(events, "close", None)
+                        if close is not None:
+                            close()
+
+                deadline = threading.Timer(_RECOVERY_EVENTS_TIMEOUT_S, expire_events)
+                deadline.daemon = True
+                deadline.start()
+                try:
+                    for index, event in enumerate(events):
+                        if event_deadline.is_set():
+                            raise UnitError(
+                                "UNIT_QUERY_FAILED", "Docker recovery event query timed out",
+                            )
+                        if index >= 64:
+                            raise UnitError(
+                                "UNIT_RECOVERY_UNPROVEN", "Docker returned too many recovery events",
+                            )
+                        actor = event.get("Actor", {}) if isinstance(event, Mapping) else {}
+                        attributes = actor.get("Attributes", {}) if isinstance(actor, Mapping) else {}
+                        event_ns = event.get("timeNano") if isinstance(event, Mapping) else None
+                        expected = {
+                            "taskspindle.owner": self.owner,
+                            "taskspindle.generation": record["generation"],
+                            "taskspindle.unit": unit,
+                            "taskspindle.kind": record["kind"],
+                            "taskspindle.task": record["task_id"],
+                            "name": record["name"],
+                        }
+                        if (
+                            event.get("Action") == "destroy"
+                            and isinstance(event_ns, int) and event_ns >= reserved_at_ns
+                            and isinstance(attributes, Mapping)
+                            and all(attributes.get(key) == value for key, value in expected.items())
+                            and isinstance(actor.get("ID"), str) and actor["ID"]
+                        ):
+                            destroyed = {"time_nano": event_ns, "container_id": actor["ID"]}
+                            break
+                    if event_deadline.is_set():
+                        raise UnitError("UNIT_QUERY_FAILED", "Docker recovery event query timed out")
+                finally:
+                    deadline.cancel()
+                    with contextlib.suppress(Exception):
+                        close = getattr(events, "close", None)
+                        if close is not None:
+                            close()
+                if destroyed is None:
+                    raise UnitError(
+                        "UNIT_RECOVERY_UNPROVEN", "No exact Docker destroy evidence follows the reservation",
+                    )
+                if self._container(record) is not None:
+                    raise UnitError(
+                        "UNIT_RECOVERY_UNPROVEN", "The recorded Docker generation reappeared",
+                    )
+            except UnitError:
+                raise
+            except Exception as exc:
+                raise UnitError(
+                    "UNIT_QUERY_FAILED", "Docker recovery evidence is unavailable",
+                ) from exc
+            record["phase"] = "failed"
+            record["recovery"] = {"kind": "destroy", **destroyed}
+            self._save(record)
+            return UnitState("not-found", "inactive", "dead", "unknown")
 
     def show(self, unit: str) -> UnitState:
         with self._locked():

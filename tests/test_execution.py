@@ -44,6 +44,21 @@ def test_remote_error_code_preserved(monkeypatch):
     assert caught.value.code == "UNIT_ADMISSION_CLOSED"
 
 
+def test_failed_create_recovery_round_trip(monkeypatch):
+    monkeypatch.setattr(
+        execution,
+        "request",
+        lambda _socket, operation, arguments, **_: {
+            "load_state": "not-found", "active_state": "inactive", "sub_state": "dead",
+            "result": "unknown", "exec_main_status": None, "main_pid": None,
+        } if operation == "recover_failed_create" and arguments == {"unit": "worker"} else None,
+    )
+
+    state = execution.ControllerClient("/private/jobs.sock").recover_failed_create("worker")
+
+    assert state.kind == "not_found"
+
+
 def test_lost_submission_reply_is_not_safe_to_retry(monkeypatch):
     def unavailable(*args, **kwargs):
         raise RemoteError('CONTROL_UNAVAILABLE', 'Unavailable')

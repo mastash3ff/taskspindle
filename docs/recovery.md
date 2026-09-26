@@ -12,6 +12,40 @@ Two rules shape every decision:
 - **Ambiguity is never resolved by guessing.** A task systemd has forgotten but whose heartbeat is
   recent becomes `RECOVERY_AMBIGUOUS` and waits for a person.
 
+## Docker create failures
+
+An Engine error during container creation can leave an execution record in
+`creating` even when the container is absent. `UNIT_START_UNCERTAIN` deliberately
+retains the reservation: absence alone does not prove that the request cannot
+complete. Cancellation may remain `CANCELLING` until launch uncertainty is resolved.
+
+After repairing the Engine, use the private controller command for the exact
+logical unit (in Compose, run these commands inside the runtime service):
+
+```sh
+taskspindle-controller recover-failed-create taskspindle-worker-<task_id>
+taskspindle-controller reconcile
+taskspindle-controller status
+```
+
+Recovery closes admission and requires a reachable Engine, an absent container,
+and a Docker `destroy` event matching the recorded owner, generation, task, unit,
+and container name after the reservation was written. It checks absence again
+before saving the evidence. Missing, expired, or mismatched events leave the
+record unresolved; do not replace this check with manual database edits or a
+blind retry. Back up the database and execution records before operational repair.
+Normal reconciliation then settles an already-cancelling task and releases its
+reservation, retaining its worktree. Inspect the queue before explicitly reopening
+admission with `taskspindle-controller open`.
+
+Docker's overlay mount error `no space left on device` can also mean an exhausted
+Linux mount namespace. Check free bytes, free inodes, the Engine's mount count,
+and `fs.mount-max` before deleting storage. In Docker Desktop, inspect the
+daemon's mount namespace, not just a worker container's `/proc/self/mountinfo`.
+A reversible limit increase can restore launches but does not clear leaked
+mounts. Coordinate Docker Desktop maintenance with all running services; avoid
+global pruning or blindly unmounting shared WSL bind mounts.
+
 ## `INTERRUPTED`
 
 Something stopped the turn, and TaskSpindle knows it. The worktree, the ACP session id and any

@@ -38,7 +38,8 @@ class Controller:
         # Keep the fence closed across a whole stop/recovery sweep, including against `open`.
         if not diagnostics and operation in {"start", "set_admission", "interrupt_workers", "reconcile",
                                                "maintenance_acquire", "maintenance_release",
-                                               "submission_begin", "submission_end"}:
+                                               "submission_begin", "submission_end",
+                                               "recover_failed_create"}:
             with self._mutation_lock:
                 return self._dispatch(operation, arguments, diagnostics=diagnostics)
         return self._dispatch(operation, arguments, diagnostics=diagnostics)
@@ -92,7 +93,7 @@ class Controller:
             if type(args["open"]) is not bool:
                 raise RemoteError("CONTROL_INVALID_ARGUMENT", "Admission flag must be boolean")
             return self.backend.set_admission(args["open"])
-        if operation in {"show", "stop", "reset_failed", "kill", "start"}:
+        if operation in {"show", "stop", "reset_failed", "kill", "start", "recover_failed_create"}:
             fields = {"unit"}
             if operation == "kill":
                 fields.add("signal")
@@ -120,7 +121,7 @@ class Controller:
                     raise RemoteError("CONTROL_INVALID_ARGUMENT", "Invalid signal")
                 return self.backend.kill(args["unit"], args["signal"])
             result = getattr(self.backend, operation)(args["unit"])
-            return asdict(result) if operation == "show" else result
+            return asdict(result) if operation in {"show", "recover_failed_create"} else result
         raise RemoteError("CONTROL_FORBIDDEN", "Unknown control operation")
 
 
@@ -246,8 +247,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="taskspindle-controller")
     parser.add_argument(
         "command", choices=["serve", "status", "fence", "open", "interrupt-workers", "reconcile",
-                            "maintenance-acquire", "maintenance-release"],
+                            "maintenance-acquire", "maintenance-release", "recover-failed-create"],
     )
+    parser.add_argument("unit", nargs="?")
     parser.add_argument("--token")
     parser.add_argument("--reopen", action="store_true")
     parser.add_argument("--jobs-socket", type=Path)
@@ -276,6 +278,10 @@ def main(argv: list[str] | None = None) -> int:
             result = client.maintenance_release(args.token, args.reopen)
         elif args.command == "interrupt-workers":
             result = client.interrupt_workers()
+        elif args.command == "recover-failed-create":
+            if args.unit is None:
+                raise ConfigError("recover-failed-create requires a logical unit name")
+            result = asdict(client.recover_failed_create(args.unit))
         elif args.command in {"fence", "reconcile"}:
             result = client.reconcile()
         else:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +79,18 @@ class Containers:
             raise OSError("lost create request")
         if self.create_failure == "rejected":
             raise APIError("private secret", response=SimpleNamespace(status_code=400))
+        if self.create_failure == "no_space":
+            raise APIError(
+                "private secret TOKEN=never-public",
+                response=SimpleNamespace(status_code=500),
+                explanation="failed to mount /private/path: no space left on device TOKEN=never-public",
+            )
+        if self.create_failure == "private_500":
+            raise APIError(
+                "private secret TOKEN=never-public",
+                response=SimpleNamespace(status_code=500),
+                explanation="daemon detail includes /private/path and TOKEN=never-public",
+            )
         assert options["name"] not in self.values
         container = Container(self, options["name"], options)
         self.created.append((image, command, options, container))
@@ -111,7 +124,8 @@ def setup(tmp_path):
                                                                "read_only": True}]}}}
     containers = Containers()
     client = SimpleNamespace(containers=containers, images=SimpleNamespace(get=lambda image: object()),
-                             ping=lambda: True)
+                             ping=lambda: True, event_values=[], event_calls=[])
+    client.events = lambda **kwargs: client.event_calls.append(kwargs) or iter(client.event_values)
     return DockerBackend(paths, settings, client=client), client
 
 
@@ -119,6 +133,23 @@ def launch(backend, unit="taskspindle-worker-ts_one"):
     module = "accept" if "-accept-" in unit else "runner"
     backend.start(unit, ["/host/python", "-m", f"taskspindle.{module}", "--task", "ts_one"],
                   working_dir=backend.paths.state_dir, env={"TOKEN": "never-public"}, properties={})
+
+
+def destroyed_event(backend, record, *, time_nano=None, **attributes):
+    labels = {
+        "taskspindle.owner": backend.owner,
+        "taskspindle.generation": record["generation"],
+        "taskspindle.unit": record["unit"],
+        "taskspindle.kind": record["kind"],
+        "taskspindle.task": record["task_id"],
+        "name": record["name"],
+        **attributes,
+    }
+    return {
+        "Action": "destroy",
+        "timeNano": time_nano or record.get("reserved_at_ns", 0) + 1,
+        "Actor": {"ID": "a" * 64, "Attributes": labels},
+    }
 
 
 def test_one_launch_survives_lost_create_and_start_ack_and_controller_restart(setup):
@@ -151,6 +182,161 @@ def test_create_known_failure_vs_uncertain(setup, failure):
             launch(backend)
         assert retry.value.code == "UNIT_START_UNCERTAIN"
     assert not client.containers.created
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_detail"),
+    [("no_space", "HTTP 500; no space left on device"), ("private_500", "HTTP 500")],
+)
+def test_uncertain_create_preserves_only_safe_bounded_diagnostics(setup, failure, expected_detail):
+    backend, client = setup
+    client.containers.create_failure = failure
+
+    with pytest.raises(UnitError) as caught:
+        launch(backend)
+
+    assert caught.value.code == "UNIT_START_UNCERTAIN"
+    assert expected_detail in str(caught.value)
+    assert "private" not in str(caught.value)
+    assert "TOKEN" not in str(caught.value)
+    assert not client.containers.created
+
+
+def test_failed_create_recovery_requires_exact_destroy_and_keeps_fence_closed(setup):
+    backend, client = setup
+    client.containers.create_failure = "before"
+    with pytest.raises(UnitError):
+        launch(backend)
+    path = backend.directory / "taskspindle-worker-ts_one.json"
+    record = json.loads(path.read_text())
+
+    with pytest.raises(UnitError) as unproven:
+        backend.recover_failed_create(record["unit"])
+    assert unproven.value.code == "UNIT_RECOVERY_UNPROVEN"
+    assert backend.admission_open() is False
+    assert json.loads(path.read_text())["phase"] == "creating"
+
+    client.event_values = [destroyed_event(backend, record, **{"taskspindle.generation": "wrong"})]
+    with pytest.raises(UnitError) as wrong_generation:
+        backend.recover_failed_create(record["unit"])
+    assert wrong_generation.value.code == "UNIT_RECOVERY_UNPROVEN"
+
+    client.event_values = [
+        destroyed_event(backend, record, time_nano=record["reserved_at_ns"] - 1),
+    ]
+    with pytest.raises(UnitError) as before_reservation:
+        backend.recover_failed_create(record["unit"])
+    assert before_reservation.value.code == "UNIT_RECOVERY_UNPROVEN"
+
+    client.event_values = [destroyed_event(backend, record)]
+    recovered = backend.recover_failed_create(record["unit"])
+    assert recovered.kind == "not_found"
+    persisted = json.loads(path.read_text())
+    assert persisted["phase"] == "failed"
+    assert persisted["recovery"] == {
+        "kind": "destroy", "time_nano": record["reserved_at_ns"] + 1,
+        "container_id": "a" * 64,
+    }
+    assert backend.show(record["unit"]).kind == "not_found"
+    assert client.event_calls[-1]["filters"]["label"] == [
+        f"taskspindle.owner={backend.owner}",
+        f"taskspindle.generation={record['generation']}",
+    ]
+
+
+def test_failed_create_recovery_accepts_legacy_record_mtime_as_lower_bound(setup):
+    backend, client = setup
+    client.containers.create_failure = "before"
+    with pytest.raises(UnitError):
+        launch(backend)
+    path = backend.directory / "taskspindle-worker-ts_one.json"
+    record = json.loads(path.read_text())
+    del record["reserved_at_ns"]
+    path.write_text(json.dumps(record))
+    lower_bound = path.stat().st_mtime_ns
+    client.event_values = [destroyed_event(backend, record, time_nano=lower_bound + 1)]
+
+    assert backend.recover_failed_create(record["unit"]).kind == "not_found"
+    assert json.loads(path.read_text())["recovery"]["time_nano"] == lower_bound + 1
+
+
+def test_failed_create_recovery_never_uses_500_or_absence_without_destroy(setup):
+    backend, client = setup
+    client.containers.create_failure = "private_500"
+    with pytest.raises(UnitError) as create:
+        launch(backend)
+    assert create.value.code == "UNIT_START_UNCERTAIN"
+    client.ping = lambda: (_ for _ in ()).throw(OSError("private engine endpoint"))
+
+    with pytest.raises(UnitError) as unavailable:
+        backend.recover_failed_create("taskspindle-worker-ts_one")
+
+    assert unavailable.value.code == "UNIT_QUERY_FAILED"
+    assert "private" not in str(unavailable.value)
+    assert json.loads(next(backend.directory.glob("taskspindle-*.json")).read_text())["phase"] == "creating"
+
+
+def test_failed_create_recovery_refuses_a_present_or_reappearing_generation(setup, monkeypatch):
+    backend, client = setup
+    client.containers.create_failure = "before"
+    with pytest.raises(UnitError):
+        launch(backend)
+    path = backend.directory / "taskspindle-worker-ts_one.json"
+    record = json.loads(path.read_text())
+    options = {"labels": {
+        "taskspindle.owner": backend.owner, "taskspindle.generation": record["generation"],
+    }}
+    present = Container(client.containers, record["name"], options)
+    client.containers.values[record["name"]] = present
+
+    with pytest.raises(UnitError) as still_present:
+        backend.recover_failed_create(record["unit"])
+    assert still_present.value.code == "UNIT_RECOVERY_UNPROVEN"
+
+    client.containers.values.clear()
+    client.event_values = [destroyed_event(backend, record)]
+    observations = iter([None, present])
+    monkeypatch.setattr(backend, "_container", lambda _record: next(observations))
+    with pytest.raises(UnitError) as reappeared:
+        backend.recover_failed_create(record["unit"])
+    assert reappeared.value.code == "UNIT_RECOVERY_UNPROVEN"
+    assert json.loads(path.read_text())["phase"] == "creating"
+
+
+def test_failed_create_recovery_has_an_absolute_event_deadline(setup, monkeypatch):
+    backend, client = setup
+    client.containers.create_failure = "before"
+    with pytest.raises(UnitError):
+        launch(backend)
+    record = json.loads(next(backend.directory.glob("taskspindle-*.json")).read_text())
+
+    class SlowEvents:
+        def __init__(self):
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.closed:
+                raise StopIteration
+            time.sleep(0.01)
+            return {"Action": "partial"}
+
+        def close(self):
+            self.closed = True
+
+    stream = SlowEvents()
+    client.events = lambda **_kwargs: stream
+    monkeypatch.setattr("taskspindle.docker_units._RECOVERY_EVENTS_TIMEOUT_S", 0.05)
+
+    with pytest.raises(UnitError) as timed_out:
+        backend.recover_failed_create(record["unit"])
+
+    assert timed_out.value.code == "UNIT_QUERY_FAILED"
+    assert "timed out" in str(timed_out.value)
+    assert stream.closed is True
+    assert json.loads(next(backend.directory.glob("taskspindle-*.json")).read_text())["phase"] == "creating"
 
 
 def test_unsettled_start_never_retries_or_reports_absence(setup):
