@@ -192,6 +192,16 @@ def test_a_cancelling_task_whose_unit_is_gone_is_cancelled(store: Store) -> None
     assert store.get_task(task.id).finished_at is not None
 
 
+def test_a_cancelling_failed_create_settles_after_backend_proves_absence(store: Store) -> None:
+    task = make_task(store, state=TaskState.CANCELLING)
+    backend = FakeUnitBackend({worker_unit_name(task.id): NOT_FOUND})
+
+    actions = run(store, backend)
+
+    assert_settled(store, task, actions, TaskState.CANCELLED, "unit_missing_fresh_heartbeat")
+    assert store.get_lease(PROVIDER, task.id) is None
+
+
 def test_a_queued_task_that_was_never_started_fails_after_the_grace_period(
     store: Store,
 ) -> None:
