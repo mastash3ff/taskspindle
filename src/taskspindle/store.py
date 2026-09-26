@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import Enum
@@ -51,7 +52,21 @@ class UsageReader(ProviderStatusReader, Protocol):
 
     def latest_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]: ...
 
+    def current_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]: ...
+
     def task_counts(self, *, since: str | None = None) -> list[dict[str, Any]]: ...
+
+    def failure_counts(
+        self, *, since: str | None = None, provider: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    def daily_counts(
+        self, *, since: str, provider: str | None = None,
+    ) -> dict[str, list[dict[str, Any]]]: ...
+
+    def metering_counts(
+        self, *, since: str | None = None, provider: str | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     def turn_durations_ms(
         self, *, since: str | None = None, provider: str | None = None,
@@ -63,6 +78,191 @@ class UsageReader(ProviderStatusReader, Protocol):
 
 
 BUSY_TIMEOUT_MS = 10_000
+
+# -- rollup reads shared with the dashboard's read-only view -----------------------------------
+#
+# ``web.db.ReadOnlyStore`` mirrors the store's reads; the rollups below take a bare connection so
+# both run the same SQL instead of two copies drifting apart.
+
+#: What a stored error code must look like to be reported; anything else is ``OTHER``, so a
+#: malformed row can never carry prose (or a path) into a report or a metric label.
+_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+
+
+def failure_code(error: Any) -> str:
+    """The machine code of a stored task error: ``UNKNOWN`` when absent, never its message."""
+    if isinstance(error, str):
+        try:
+            error = json.loads(error)
+        except ValueError:
+            return "UNKNOWN"
+    code = error.get("code") if isinstance(error, Mapping) else None
+    if code is None:
+        return "UNKNOWN"
+    return code if isinstance(code, str) and _ERROR_CODE.fullmatch(code) else "OTHER"
+
+
+def _where(clauses: Sequence[str]) -> str:
+    return f" WHERE {' AND '.join(clauses)}" if clauses else ""
+
+
+def rollup_failure_counts(
+    conn: sqlite3.Connection, *, since: str | None = None, provider: str | None = None
+) -> list[dict[str, Any]]:
+    """``FAILED`` tasks created at or after ``since``, per provider, mode and error code."""
+    clauses, params = ["state = ?"], [TaskState.FAILED.value]
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(since)
+    if provider is not None:
+        clauses.append("provider = ?")
+        params.append(provider)
+    tally: dict[tuple[str, str, str], int] = {}
+    for row in conn.execute(f"SELECT provider, mode, error FROM tasks{_where(clauses)}", params):
+        key = (str(row[0]), str(row[1]), failure_code(row[2]))
+        tally[key] = tally.get(key, 0) + 1
+    return [
+        {"provider": prov, "mode": mode, "code": code, "count": count}
+        for (prov, mode, code), count in sorted(tally.items())
+    ]
+
+
+def rollup_daily_counts(
+    conn: sqlite3.Connection, *, since: str, provider: str | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Per UTC day from ``since``: tasks by state (creation day), turns (start day) and checks.
+
+    A turn that never started is counted on its task's creation day.
+    """
+    by_provider = " AND k.provider = ?" if provider is not None else ""
+    params: list[Any] = [since, *([provider] if provider is not None else [])]
+    tasks = conn.execute(
+        "SELECT substr(k.created_at, 1, 10) AS day, k.state AS state, COUNT(*) AS count "
+        f"FROM tasks k WHERE k.created_at >= ?{by_provider} GROUP BY day, state ORDER BY day, state",
+        params,
+    ).fetchall()
+    turns = conn.execute(
+        "SELECT substr(COALESCE(t.started_at, k.created_at), 1, 10) AS day, COUNT(*) AS count "
+        "FROM turns t JOIN tasks k ON k.id = t.task_id "
+        f"WHERE COALESCE(t.started_at, k.created_at) >= ?{by_provider} GROUP BY day ORDER BY day",
+        params,
+    ).fetchall()
+    checks = conn.execute(
+        "SELECT substr(c.created_at, 1, 10) AS day, COUNT(*) AS run, "
+        "COALESCE(SUM(c.ok != 0), 0) AS passed FROM checks c JOIN tasks k ON k.id = c.task_id "
+        f"WHERE c.created_at >= ?{by_provider} GROUP BY day ORDER BY day",
+        params,
+    ).fetchall()
+    return {
+        "tasks": [dict(row) for row in tasks],
+        "turns": [dict(row) for row in turns],
+        "checks": [dict(row) for row in checks],
+    }
+
+
+def rollup_metering_counts(
+    conn: sqlite3.Connection, *, since: str | None = None, provider: str | None = None
+) -> list[dict[str, Any]]:
+    """Per provider: every turn, and how many carry a ``turn_usage`` row and a priced one.
+
+    ``since`` is compared with the turn's start, or its task's creation for a turn that never
+    started, so a turn that died before starting is still counted as unmetered.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    if since is not None:
+        clauses.append("COALESCE(t.started_at, k.created_at) >= ?")
+        params.append(since)
+    if provider is not None:
+        clauses.append("k.provider = ?")
+        params.append(provider)
+    rows = conn.execute(
+        "SELECT k.provider AS provider, COUNT(t.id) AS turns, COUNT(u.id) AS turns_with_usage, "
+        "COALESCE(SUM(u.id IS NULL), 0) AS unmetered_turns, "
+        "COALESCE(SUM(u.id IS NULL AND t.stop_reason = 'end_turn'), 0) AS unmetered_successful_turns, "
+        "COALESCE(SUM(u.id IS NOT NULL AND u.cost_estimate_usd IS NULL), 0) AS unpriced_turns "
+        "FROM turns t JOIN tasks k ON k.id = t.task_id LEFT JOIN turn_usage u ON u.turn_id = t.id"
+        f"{_where(clauses)} GROUP BY k.provider ORDER BY k.provider",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def rollup_usage_totals(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every recorded ``turn_usage`` row summed per provider: tokens by kind and estimated cost."""
+    rows = conn.execute(
+        "SELECT provider, COUNT(*) AS turns, "
+        "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+        "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+        "COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, "
+        "COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, "
+        "COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens, "
+        "COALESCE(SUM(cost_estimate_usd), 0.0) AS cost_estimate_usd, "
+        "COUNT(cost_estimate_usd) AS priced_turns "
+        "FROM turn_usage GROUP BY provider ORDER BY provider"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def current_windows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """The newest observation of each usage window, from ``provider_windows`` rows in id order.
+
+    A window is one name under one provider key, scope and model; the reset periods it has been
+    observed in are history, not separate windows. When the newest observation carries no
+    percentage (an ``allowed`` event reports none) the most recent percentage recorded for the
+    same period is carried onto it. ``used_percent_observed_at`` says when the percentage shown
+    was observed, and is ``None`` when the period has none.
+    """
+    newest: dict[tuple[Any, ...], dict[str, Any]] = {}
+    percent: dict[tuple[Any, ...], tuple[float, str]] = {}
+
+    def period(row: Mapping[str, Any]) -> str:
+        return str(row.get("period_key") or f"{row['window']}|{row.get('resets_at') or 'unknown'}")
+
+    for raw in rows:
+        row = dict(raw)
+        key = (row.get("status_key") or row["provider"], row.get("scope") or "account",
+               row.get("model"), row["window"])
+        newest[key] = row
+        if row.get("used_percent") is not None:
+            percent[(*key, period(row))] = (float(row["used_percent"]), str(row["observed_at"]))
+    result: list[dict[str, Any]] = []
+    for key, row in newest.items():
+        known = percent.get((*key, period(row)))
+        if known is not None and row.get("used_percent") is None:
+            row["used_percent"] = known[0]
+        row["used_percent_observed_at"] = known[1] if known is not None else None
+        result.append(row)
+    return sorted(result, key=lambda row: (
+        str(row["provider"]), str(row["window"]), str(row.get("scope") or ""), str(row.get("model") or ""),
+    ))
+
+
+def rollup_current_windows(
+    conn: sqlite3.Connection, provider: str | None = None, *, scoped: bool = True
+) -> list[dict[str, Any]]:
+    """Read just the rows :func:`current_windows` needs.
+
+    That is each window's newest observation and, per period, its newest one with a
+    percentage. ``scoped`` is false below schema 8, which has no scope or period columns; every
+    row is read then.
+    """
+    where, params = (" WHERE provider = ?", [provider]) if provider is not None else ("", [])
+    if not scoped:
+        rows = conn.execute(f"SELECT * FROM provider_windows{where} ORDER BY id", params).fetchall()
+        return current_windows(rows)
+    with_percent = f"{where} AND" if where else " WHERE"
+    rows = conn.execute(
+        "SELECT * FROM provider_windows WHERE id IN ("
+        f"SELECT MAX(id) FROM provider_windows{where} "
+        "GROUP BY COALESCE(status_key, provider), scope, model, window"
+        ") OR id IN ("
+        f"SELECT MAX(id) FROM provider_windows{with_percent} used_percent IS NOT NULL "
+        "GROUP BY COALESCE(status_key, provider), scope, model, window, period_key"
+        ") ORDER BY id",
+        [*params, *params],
+    ).fetchall()
+    return current_windows(rows)
 
 
 def now() -> str:
@@ -2097,7 +2297,37 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def current_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]:
+        """The newest observation of each usage window (see :func:`current_windows`).
+
+        :meth:`latest_provider_windows` keeps one row per reset period, which is what the
+        dispatch policy's headroom check reads; a report wants one row per window.
+        """
+        return rollup_current_windows(self._conn, provider)
+
     # -- rollup reads -----------------------------------------------------------------
+
+    def failure_counts(
+        self, *, since: str | None = None, provider: str | None = None
+    ) -> list[dict[str, Any]]:
+        """``FAILED`` tasks per provider, mode and error code."""
+        return rollup_failure_counts(self._conn, since=since, provider=provider)
+
+    def daily_counts(
+        self, *, since: str, provider: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Tasks by state, turns and checks per UTC day from ``since``."""
+        return rollup_daily_counts(self._conn, since=since, provider=provider)
+
+    def metering_counts(
+        self, *, since: str | None = None, provider: str | None = None
+    ) -> list[dict[str, Any]]:
+        """How many turns per provider carry usage, and how many of those carry a price."""
+        return rollup_metering_counts(self._conn, since=since, provider=provider)
+
+    def usage_totals(self) -> list[dict[str, Any]]:
+        """All recorded tokens and estimated cost, per provider."""
+        return rollup_usage_totals(self._conn)
 
     def task_counts(self, *, since: str | None = None) -> list[dict[str, Any]]:
         """How many tasks ended up in each state, per provider and mode."""
@@ -2170,5 +2400,7 @@ __all__: Sequence[str] = (
     "Store",
     "StoreError",
     "UsageReader",
+    "current_windows",
+    "failure_code",
     "now",
 )

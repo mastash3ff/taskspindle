@@ -25,6 +25,7 @@ from typing import Any
 
 from . import limits
 from .acp_client import TurnResult
+from .models import TERMINAL_STATES, TaskState
 from .providers import Profile
 from .store import Store, UsageReader
 
@@ -43,6 +44,7 @@ __all__ = [
     "from_turn_completed",
     "parse_since",
     "priced_as",
+    "quantile",
     "report",
     "reprice",
     "windows_report",
@@ -102,6 +104,12 @@ SOURCE_SESSION_FILE = "session_file"
 
 _SINCE_SHORTHAND = re.compile(r"^(\d+)([smhd])$")
 _SINCE_UNITS = {"s": "seconds", "m": "minutes", "h": "hours", "d": "days"}
+
+#: How many UTC days ``daily`` covers when the report has no ``since``.
+DAILY_DEFAULT_DAYS = 30
+#: The most days ``daily`` lists; a longer window keeps its most recent days.
+DAILY_MAX_DAYS = 366
+_TERMINAL = frozenset(state.value for state in TERMINAL_STATES)
 
 
 @dataclass(frozen=True)
@@ -481,15 +489,106 @@ def _group_key(row: Mapping[str, Any], mode_by_task: Mapping[str, str], group_by
     raise ValueError(f"unknown group_by: {group_by!r}")
 
 
+def quantile(values: list[int] | list[float], fraction: float) -> float:
+    """The ``fraction`` quantile, linearly interpolated (the method :func:`statistics.median` uses)."""
+    if len(values) == 1:
+        return float(values[0])
+    ordered = sorted(values)
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
 def _stats(values: list[int]) -> dict[str, Any]:
     if not values:
-        return {"count": 0, "mean_ms": None, "p50_ms": None, "max_ms": None}
+        return {"count": 0, "mean_ms": None, "p50_ms": None, "p95_ms": None, "max_ms": None}
     return {
         "count": len(values),
         "mean_ms": int(statistics.fmean(values)),
         "p50_ms": int(statistics.median(values)),
+        "p95_ms": int(quantile(values, 0.95)),
         "max_ms": max(values),
     }
+
+
+def _parse_stamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _daily(
+    store: UsageReader,
+    usage_rows: list[dict[str, Any]],
+    *,
+    since: str | None,
+    provider: str | None,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """One row per UTC day of the report's window, oldest first, days with nothing included.
+
+    Tasks, their terminal outcomes and failures are counted on the day the task was created,
+    turns on the day they started, tokens and cost on the day they were captured, checks on the
+    day they ran. Without ``since`` the window is the last :data:`DAILY_DEFAULT_DAYS` days.
+    """
+    end = now.astimezone(UTC).date()
+    if since is None:
+        start = end - timedelta(days=DAILY_DEFAULT_DAYS - 1)
+        query_since = f"{start.isoformat()}T00:00:00.000000Z"
+    else:
+        start = _parse_stamp(since).astimezone(UTC).date()
+        query_since = since
+    start = max(start, end - timedelta(days=DAILY_MAX_DAYS - 1))
+    days: dict[str, dict[str, Any]] = {}
+    day = start
+    while day <= end:
+        days[day.isoformat()] = {
+            "day": day.isoformat(),
+            "tasks_created": 0,
+            "outcomes": {},
+            "failures": 0,
+            "turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_estimate_usd": 0.0,
+            "checks_run": 0,
+            "checks_passed": 0,
+        }
+        day += timedelta(days=1)
+    if not days:
+        return []
+    counts = store.daily_counts(since=query_since, provider=provider)
+    for row in counts["tasks"]:
+        bucket = days.get(str(row["day"]))
+        if bucket is None:
+            continue
+        state, count = str(row["state"]), int(row["count"])
+        bucket["tasks_created"] += count
+        if state in _TERMINAL:
+            bucket["outcomes"][state] = bucket["outcomes"].get(state, 0) + count
+        if state == TaskState.FAILED.value:
+            bucket["failures"] += count
+    for row in counts["turns"]:
+        if (bucket := days.get(str(row["day"]))) is not None:
+            bucket["turns"] += int(row["count"])
+    for row in counts["checks"]:
+        if (bucket := days.get(str(row["day"]))) is not None:
+            bucket["checks_run"] += int(row["run"])
+            bucket["checks_passed"] += int(row["passed"])
+    for row in usage_rows:
+        bucket = days.get(str(row.get("captured_at") or "")[:10])
+        if bucket is None:
+            continue
+        for column in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+            bucket[column] += int(row.get(column) or 0)
+        cost = row.get("cost_estimate_usd")
+        if cost is not None:
+            bucket["cost_estimate_usd"] = round(bucket["cost_estimate_usd"] + float(cost), 6)
+    for bucket in days.values():
+        bucket["outcomes"] = dict(sorted(bucket["outcomes"].items()))
+    return list(days.values())
 
 
 def report(
@@ -502,7 +601,8 @@ def report(
     now: datetime | None = None,
     limits: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
-    """Tokens, estimated cost, outcomes, timings, violations and windows, rolled up on read.
+    """Tokens, estimated cost, outcomes, failures, timings, a daily series, metering coverage,
+    violations and windows, rolled up on read.
 
     ``limits`` is each provider's slot limit; with it ``utilization`` can say what share of the
     offered slot time was used, and without it only how much was held.
@@ -584,6 +684,9 @@ def report(
         ),
         "usage": list(groups.values()),
         "outcomes": outcomes,
+        "failures": store.failure_counts(since=since, provider=provider),
+        "daily": _daily(store, rows, since=since, provider=provider, now=moment),
+        "metering": store.metering_counts(since=since, provider=provider),
         "turns": {**_stats([ms for _, _, ms in durations]), "by_provider": {
             prov: _stats(values) for prov, values in sorted(by_provider.items())
         }},
@@ -765,7 +868,7 @@ def windows_report(
                 "observable": family == "claude",
                 "note": _WINDOW_NOTES.get(family, "no window telemetry is documented for this agent"),
                 "status": limits.safe_status_row(status),
-                "windows": store.latest_provider_windows(key),
+                "windows": store.current_provider_windows(key),
             }
         )
     return entries

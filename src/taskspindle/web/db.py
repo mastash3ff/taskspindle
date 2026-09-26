@@ -19,16 +19,20 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ACTIVE_STATES, CheckRecord, CleanupState, TaskRecord, TaskState
+from ..store import (
+    VIOLATION_EVENT_KINDS,
+    rollup_current_windows,
+    rollup_daily_counts,
+    rollup_failure_counts,
+    rollup_metering_counts,
+    rollup_usage_totals,
+)
 
 __all__ = ["ReadOnlyStore"]
 
-#: The event kinds that count as violations in a usage report (mirrors ``store.VIOLATION_EVENT_KINDS``).
-_VIOLATION_EVENT_KINDS: tuple[str, ...] = (
-    "SCOPE_VIOLATION",
-    "ROOT_MUTATION",
-    "READ_ONLY_VIOLATION",
-    "DELEGATION_ATTEMPT",
-)
+#: The event kinds that count as violations in a usage report: the store's own list, so the
+#: dashboard and ``taskspindle usage`` count the same kinds.
+_VIOLATION_EVENT_KINDS: tuple[str, ...] = VIOLATION_EVENT_KINDS
 
 
 def _loads(value: Any) -> Any:
@@ -533,7 +537,38 @@ class ReadOnlyStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def current_provider_windows(self, provider: str | None = None) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        return rollup_current_windows(self._conn, provider, scoped=(self.schema_version() or 0) >= 8)
+
     # -- rollup reads -----------------------------------------------------------------
+
+    def failure_counts(
+        self, *, since: str | None = None, provider: str | None = None
+    ) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        return rollup_failure_counts(self._conn, since=since, provider=provider)
+
+    def daily_counts(
+        self, *, since: str, provider: str | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        if self._conn is None:
+            return {"tasks": [], "turns": [], "checks": []}
+        return rollup_daily_counts(self._conn, since=since, provider=provider)
+
+    def metering_counts(
+        self, *, since: str | None = None, provider: str | None = None
+    ) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        return rollup_metering_counts(self._conn, since=since, provider=provider)
+
+    def usage_totals(self) -> list[dict[str, Any]]:
+        if self._conn is None:
+            return []
+        return rollup_usage_totals(self._conn)
 
     def task_counts(self, *, since: str | None = None) -> list[dict[str, Any]]:
         if self._conn is None:
