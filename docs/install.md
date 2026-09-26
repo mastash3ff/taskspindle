@@ -75,13 +75,16 @@ Everything follows the XDG variables, and honours them if you set them.
 | What | Default | Contents |
 | --- | --- | --- |
 | Configuration | `$XDG_CONFIG_HOME/taskspindle/config.toml` (`~/.config/...`) | the one file you may write |
-| State | `$XDG_STATE_HOME/taskspindle/` (`~/.local/state/...`) | `taskspindle.sqlite3`, `server.log`, `grok-overlay.toml`, `tasks/<task_id>/` worktrees, transcripts and diffs |
+| State | `$XDG_STATE_HOME/taskspindle/` (`~/.local/state/...`) | `taskspindle.sqlite3`, `logs/taskspindle.jsonl`, `server.log`, `dispatch-errors.log`, `grok-overlay.toml`, `tasks/<task_id>/` worktrees, transcripts, diffs and worker `tmp` |
 | Data | `$XDG_DATA_HOME/taskspindle/` (`~/.local/share/...`) | installed runtimes |
 | Runtime | `$XDG_DATA_HOME/taskspindle/runtimes/<version>/` | the pinned adapter's `node_modules` |
 
 The runtime directory is versioned, so upgrading installs the new adapter beside the old one
 rather than pulling it out from under a task that is still running. Every directory is created
 mode `0700`.
+
+The logs rotate on their own. `taskspindle gc` reports the scratch that finished tasks left
+behind, and `taskspindle gc --apply` removes it. See [logging.md](logging.md).
 
 `TASKSPINDLE_CONFIG` overrides the configuration file path for every subcommand, the MCP server
 and the detached units alike.

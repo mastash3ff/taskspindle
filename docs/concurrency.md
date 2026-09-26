@@ -50,8 +50,10 @@ interval_s = 2   # 1-60, the controller's loop
 A pass is the ordinary dispatch: the same leases, limits, provider availability and admission
 fence. It starts only tasks the coordinator already queued. An idle pool costs one read-only
 query per interval; a pass that starts nothing backs the loop off to at most a minute. A drain
-failure is logged to `dispatch-errors.log` in the state directory and can never fail the turn
-that triggered it. `taskspindle dispatch` runs one pass by hand. Note the consequence: queued
+failure can never fail the turn that triggered it. Its traceback goes to `dispatch-errors.log` in
+the state directory and a record goes to `logs/taskspindle.jsonl`. A failure that repeats on
+every pass is written once and then counted (see [logging.md](logging.md)). `taskspindle
+dispatch` runs one pass by hand. Note the consequence: queued
 work now starts unattended, including as soon as the admission fence reopens.
 
 ## What was used

@@ -105,6 +105,7 @@ moved underneath you is refused rather than clobbered.
 | [architecture.md](docs/architecture.md) | components, the state machine, acceptance, violations |
 | [muse.md](docs/muse.md) | experimental Muse MSP adapter, offline setup, and unresolved enablement gates |
 | [recovery.md](docs/recovery.md) | `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, and the restart drill |
+| [logging.md](docs/logging.md) | the operational log, traceback files, rotation, and `taskspindle gc` |
 | [dashboard.md](docs/dashboard.md) | `taskspindle web`: task and worker inspection and its JSON API |
 | [rollback.md](docs/rollback.md) | backing it out without losing anything |
 
