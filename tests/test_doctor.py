@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -196,6 +197,8 @@ def test_live_worker_agy_sandbox_uses_real_launch_policy_and_synthetic_token(pat
             return subprocess.CompletedProcess(argv, 0, "bubblewrap 0.10", "")
         assert "--unshare-pid" in argv and "--clearenv" in argv and "--cap-drop" in argv
         assert kwargs["timeout"] == doctor._UNIT_TIMEOUT
+        inner = argv[argv.index("--") + 1:]
+        assert inner[:3] == [str(Path(sys.executable).resolve()), "-I", "-c"]
         targets = {name: Path(path) for name, path in json.loads(argv[-1]).items()}
         task_dir = targets["policy"].parent.parent
         metadata = json.loads((task_dir / "agy-cli-launch.json").read_text())

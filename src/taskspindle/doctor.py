@@ -805,8 +805,10 @@ print(json.dumps(result))
                     ("src",) if mode == "implement" else (), (),
                 )
                 protected = {**targets, "policy": task_dir / "agy-cli-policy" / "settings.json"}
+                # The sandbox mounts only explicit runtime paths, which do not include a venv, so
+                # the scope script runs on the real interpreter the venv points at, isolated.
                 result = self.run([
-                    *argv[:argv.index("--") + 1], sys.executable, "-c", code,
+                    *argv[:argv.index("--") + 1], str(Path(sys.executable).resolve()), "-I", "-c", code,
                     json.dumps({name: str(path) for name, path in protected.items()}),
                 ], timeout=_UNIT_TIMEOUT)
                 if result.returncode != 0:

@@ -92,6 +92,30 @@ def test_worker_report_preserves_failed_checks_and_launches_each_provider(paths,
     assert "private" not in json.dumps(report)
 
 
+def test_worker_probe_skips_a_family_the_image_cannot_run(paths, monkeypatch):
+    profiles = {
+        "a": Profile(id="a", auth="oauth", command=("/bin/true",)),
+        "opencode-go": Profile(id="opencode-go", auth="api_key", command=("/bin/true",)),
+    }
+    monkeypatch.setattr(worker_diagnostics.providers, "load_profiles", lambda *args, **kwargs: profiles)
+    probed = []
+
+    class Backend:
+        worker_families = frozenset({"a"})
+
+        def run_probe(self, provider, argv, *, env, timeout):
+            probed.append(provider)
+            check = {"name": "git", "ok": True, "detail": "fine", "advisory": False}
+            return {"exit_code": 0, "stdout": json.dumps({"ok": True, "checks": [check]}), "stderr": ""}
+
+    report = worker_diagnostics.doctor_report(Backend(), paths, {}, live=False)
+    assert probed == ["a"]
+    assert report["ok"] is True
+    skipped = next(row for row in report["checks"] if row["name"] == "opencode-go:worker_probe")
+    assert skipped["ok"] is True and skipped["advisory"] is True
+    assert skipped["detail"].startswith("not probed")
+
+
 def test_worker_probe_failure_is_failure_even_when_controller_is_available(paths, monkeypatch):
     profiles = {"a": Profile(id="a", auth="oauth", command=("/bin/true",))}
     monkeypatch.setattr(worker_diagnostics.providers, "load_profiles", lambda *args, **kwargs: profiles)

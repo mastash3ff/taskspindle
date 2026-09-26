@@ -49,7 +49,16 @@ def doctor_report(
         state_dir=paths.state_dir, data_dir=paths.data_dir,
     )
     checks: list[dict[str, Any]] = []
+    supported = getattr(backend, "worker_families", None)
     for provider in sorted(profiles):
+        if supported is not None and profiles[provider].family not in supported:
+            # A configured family the worker image cannot run (for example a disabled built-in)
+            # has nothing an isolated probe could observe; say so rather than report a failure.
+            checks.append(Check(
+                f"{provider}:worker_probe", True,
+                "not probed: the worker image has no runtime for this provider family", advisory=True,
+            ).as_dict())
+            continue
         argv = ["taskspindle", "doctor", "--json"]
         if not live:
             argv.append("--no-live")

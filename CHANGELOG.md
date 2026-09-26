@@ -115,6 +115,7 @@
   verification commands find that Python ahead of TaskSpindle's runtime venv, which still has no
   test tools. The systemd backend is unchanged. See
   [docker-image.md](docs/docker-image.md#python-and-pytest-for-verification-commands).
+- Fixed: the live `agy_sandbox` doctor check ran its scope script on the runtime venv interpreter, which the Antigravity sandbox does not mount, so it always failed; it now runs the resolved system interpreter isolated. Worker diagnostics no longer fail for a configured family the worker image cannot run, such as the disabled `opencode-go` built-in; it is reported as not probed.
 
 ## v0.6.2
 

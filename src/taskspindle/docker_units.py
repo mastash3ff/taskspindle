@@ -101,8 +101,14 @@ def _read(path: Path) -> dict[str, Any] | None:
         raise UnitError("UNIT_RECORD_INVALID", "Execution record cannot be safely read") from exc
 
 
+#: Provider families the worker image can run, launch and probe; any other family is refused.
+WORKER_FAMILIES = frozenset({"claude", "grok", "agy", "muse"})
+
+
 class DockerBackend:
     """Persist intent before Engine calls; never interpret transport failure as absence."""
+
+    worker_families = WORKER_FAMILIES
     requires_inactive_previous_turn = True
 
     def __init__(self, paths: Paths, settings: Mapping[str, Any], *, client: Any = None) -> None:
@@ -313,10 +319,10 @@ class DockerBackend:
                 row = connection.execute("SELECT MAX(id) FROM turns WHERE task_id=?", (task_id,)).fetchone()
                 identity = str(row[0])
                 family = task["provider_family"] or task["provider"]
-                if family not in {"claude", "grok", "agy", "muse"}:
+                if family not in WORKER_FAMILIES:
                     profile = self._profiles().get(task["provider"])
                     family = profile.family if profile else None
-                if family not in {"claude", "grok", "agy", "muse"}:
+                if family not in WORKER_FAMILIES:
                     raise UnitError("UNIT_START_FAILED", "Task provider family is not configured")
         return kind, task_id, identity, family
 
@@ -914,10 +920,10 @@ class DockerBackend:
     def run_probe(self, provider: str, argv: Sequence[str], *, env: Mapping[str, str] | None = None,
                   timeout: float = 90) -> dict[str, Any]:
         family = provider
-        if family not in {"claude", "grok", "agy", "muse"}:
+        if family not in WORKER_FAMILIES:
             profile = self._profiles().get(provider)
             family = profile.family if profile else None
-        if family not in {"claude", "grok", "agy", "muse"} or not 0 < timeout <= 90:
+        if family not in WORKER_FAMILIES or not 0 < timeout <= 90:
             raise UnitError("UNIT_INVALID", "Invalid diagnostic provider or timeout")
         options = self._options(family, probe=True)
         # Config is needed to reconstruct provider profiles. Runtime tools are image-baked.
