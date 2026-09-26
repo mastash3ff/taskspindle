@@ -516,6 +516,8 @@ class DockerBackend:
             # Fence in the same cross-process critical section as the first evidence read. Keep it
             # closed on success and every failure; a second controller cannot reopen in the gap.
             _atomic(self.directory / "admission.json", {"open": False})
+            oplog.emit(self.paths.state_dir, "controller", "admission_set", admission_open=False,
+                       unit=unit, reason="recover_failed_create")
             record = self._record(unit)
             if record is None or record["phase"] != "creating":
                 raise UnitError(
@@ -706,6 +708,8 @@ class DockerBackend:
         path = self._record_path(unit)
         with self._locked():
             _atomic(self.directory / "admission.json", {"open": False})
+            oplog.emit(self.paths.state_dir, "controller", "admission_set", admission_open=False,
+                       unit=unit, reason="recover_absent_launch")
             record = self._record(unit)
             if record is None or record["phase"] != "creating" or record["kind"] != "worker":
                 raise UnitError(

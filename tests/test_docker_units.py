@@ -858,6 +858,19 @@ def test_absent_launch_recovery_retires_a_cancelled_create_that_never_ran(setup)
     assert again.value.code == "UNIT_RECOVERY_INVALID"
 
 
+def test_absent_launch_recovery_logs_the_fence_it_closes(setup):
+    backend, client = setup
+    _, record = absent_launch(backend, client)
+
+    backend.recover_absent_launch(record["unit"])
+
+    text = (backend.paths.state_dir / "logs" / "taskspindle.jsonl").read_text()
+    fences = [r for r in map(json.loads, text.splitlines()) if r["event"] == "admission_set"]
+    assert [(r["admission_open"], r["unit"], r["reason"]) for r in fences] == [
+        (False, record["unit"], "recover_absent_launch"),
+    ]
+
+
 def test_absent_launch_recovery_accepts_a_legacy_record_by_its_mtime(setup):
     backend, client = setup
     path, record = absent_launch(backend, client)
