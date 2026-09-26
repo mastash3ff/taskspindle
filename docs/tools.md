@@ -110,7 +110,10 @@ no recorded refusal is simply `"state": "ok"`. Nothing else is in this object, a
 for you: see [`start_task`](#start_task) for what a refused provider does to a request, and
 [architecture.md](architecture.md#provider-availability) for the one rule behind it. `windows` is
 the newest observation of each usage window, as far as the agent reports them — informational only;
-nothing gates admission on it.
+nothing gates admission on it. There is one entry per window (name, scope and model), not one per
+reset period it has been seen in. An `allowed` event carries no percentage, so when the newest
+observation lacks one, `used_percent` is the most recent percentage recorded for the same period and
+`used_percent_observed_at` says when that was; it is `null` when the period has none.
 
 Every provider includes a normalized `native_check`. Stable fields include `state`, `source`,
 `version`, `checked_at`, `last_attempt_at`, `last_success_at`, `used_percent`, `window`,
@@ -574,13 +577,40 @@ Returns:
             "cache_read_tokens": 194157, "cache_write_tokens": 34570, "reasoning_tokens": 0,
             "cost_estimate_usd": 0.35, "priced_turns": 4}],
  "outcomes": [{"provider": "claude", "mode": "implement", "state": "ACCEPTED", "count": 1}],
- "turns": {"count": 5, "mean_ms": 24000, "p50_ms": 12000, "max_ms": 63000,
+ "failures": [{"provider": "grok", "mode": "review", "code": "TURN_TIMEOUT", "count": 2}],
+ "daily": [{"day": "2026-09-04", "tasks_created": 3, "outcomes": {"COMPLETED": 2, "FAILED": 1},
+            "failures": 1, "turns": 4, "input_tokens": 20, "output_tokens": 1695,
+            "cache_read_tokens": 194157, "cache_write_tokens": 34570, "cost_estimate_usd": 0.35,
+            "checks_run": 2, "checks_passed": 2}],
+ "metering": [{"provider": "claude", "turns": 5, "turns_with_usage": 4, "unmetered_turns": 1,
+               "unmetered_successful_turns": 1, "unpriced_turns": 0}],
+ "turns": {"count": 5, "mean_ms": 24000, "p50_ms": 12000, "p95_ms": 58000, "max_ms": 63000,
            "by_provider": {"claude": {"count": 3, "…": "…"}}},
- "checks": {"count": 2, "passed": 2, "mean_ms": 49, "p50_ms": 49, "max_ms": 50},
+ "checks": {"count": 2, "passed": 2, "mean_ms": 49, "p50_ms": 49, "p95_ms": 50, "max_ms": 50},
  "violations": [{"provider": "grok", "kind": "READ_ONLY_VIOLATION", "count": 1}],
  "windows": [{"provider": "claude", "state": "ok", "observable": true, "note": "…",
-              "status": {"…": "…"}, "windows": [{"window": "five_hour", "…": "…"}]}]}
+              "status": {"…": "…"},
+              "windows": [{"window": "five_hour", "status": "allowed", "used_percent": 81.0,
+                           "used_percent_observed_at": "…Z", "observed_at": "…Z", "…": "…"}]}],
+ "utilization": [{"provider": "claude", "…": "…"}], "fanout": []}
 ```
+
+The later keys were added without changing any earlier one:
+
+- **`failures`** counts the `FAILED` tasks created in the window by provider, mode and the `code`
+  of the task's recorded error — `UNKNOWN` when the task has none and `OTHER` when the stored code
+  is not an identifier. The error's message is never included. The counts add up to the `FAILED`
+  rows of `outcomes`.
+- **`daily`** is one row per UTC day of the window, oldest first, days with nothing recorded
+  included. Tasks, their terminal `outcomes` and `failures` count on the day the task was created,
+  `turns` on the day they started, tokens and cost on the day they were captured, and checks on
+  the day they ran. Without `since` it covers the last 30 days; it never lists more than 366.
+- **`metering`** says how complete the token and cost totals are, per provider: every turn in the
+  window, the ones with a usage record, the ones without (`unmetered_successful_turns` of those
+  ended normally with `end_turn`), and the metered ones no price covers (`unpriced_turns`, a model
+  the price table does not know). When either is non-zero the totals above are a floor.
+- **`p95_ms`** joins `mean_ms`, `p50_ms` and `max_ms` in every timing summary, linearly
+  interpolated like the median.
 
 Where the numbers come from, and what they are not:
 
@@ -606,7 +636,8 @@ Where the numbers come from, and what they are not:
 - **Windows** are observed, never polled. For Claude, the adapter forwards the SDK's rate-limit
   events while a turn runs, and a refusal records the window as rejected at 100%; there is no
   local way to ask for the seat's headroom between turns. Grok 1.0.13 reports no window at all, so
-  its entry says `observable: false` and only a refusal is ever recorded.
+  its entry says `observable: false` and only a refusal is ever recorded. Each window is listed
+  once, as described under [`capabilities`](#capabilities).
 
 The same report is `taskspindle usage` on the command line, and the usage panel of the
 [dashboard](dashboard.md).

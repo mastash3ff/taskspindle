@@ -48,7 +48,7 @@ is the network path to this port — a LAN, or a private VPN an operator has alr
 exactly as the loopback bind always trusted the local machine's own network stack; this dashboard
 adds no login or TLS of its own on top of that. Every response also carries
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`;
-`/api/*` responses add `Cache-Control: no-store`; and the HTML page carries a
+`/api/*` and `/metrics` responses add `Cache-Control: no-store`; and the HTML page carries a
 `Content-Security-Policy` that allows its one inline bootstrap script only via a fresh per-response
 nonce.
 
@@ -175,8 +175,13 @@ above.
   validates locally, and saves the whole document against the revision it was loaded from; every
   save is kept in history. See [dispatch-policy.md](dispatch-policy.md#editing).
 - **Usage** — the same rollup as `taskspindle usage`: tokens and estimated cost by the filters you
-  choose (since, provider, group-by including repository_id), task outcomes, turn and check timing summaries, violation
-  counts, window telemetry notes, and the cost-estimate disclaimer. A **Slot use** panel shows,
+  choose (since, provider, group-by including repository_id), task outcomes, a **Failures** table
+  (failed tasks by worker, mode and error code), turn and check timing summaries (mean, p50, p95),
+  violation counts, each worker's current usage windows with their notes, and the cost-estimate
+  disclaimer. A metering note says how many turns carry token usage and, when some do not or are
+  unpriced, that the token and cost totals are partial. A **Daily trend** chart shows the last 14
+  UTC days: tasks created and failed as bars, and the share of verification checks that passed
+  as a line on the days any ran, with the exact values in a table beneath. A **Slot use** panel shows,
   per provider, the slot time used against what its limit offered, peak active turns, how often
   the last slot was taken, tasks queued now and the median wait for a slot: scheduling on this
   host, not provider quota.
@@ -216,6 +221,7 @@ route are `405`. Errors are JSON, never a traceback.
 | `/api/providers` | per-profile availability (`state`, `reset_at`, `eligible_at`, `reason`), windows, cached `native_check`, sanitized provider status, cached doctor report; no probes |
 | `/api/doctor?live=1` | run the doctor report with explicit live probes |
 | `/api/usage?since&provider&group_by` | the same shape as `taskspindle usage --json`; `400` on a bad `since` or `group_by` |
+| `/metrics` | Prometheus text exposition (`text/plain; version=0.0.4`), the same text as `taskspindle metrics`; see [Metrics](#metrics) |
 | `/api/policy` | GET: `{policy, revision, fingerprint, updated_at, updated_by, source, document_error, status, defaults, profiles, file_managed, writable, csrf_token}` |
 | `/api/policy` | PUT `{if_revision, policy}`: the GET payload after saving; `400 POLICY_INVALID` with `details.errors`, `409 POLICY_REVISION_CONFLICT` with `current_revision` |
 | `/api/policy/reset` | POST `{if_revision}`: the GET payload after saving the defaults |
@@ -252,6 +258,36 @@ Each `/api/providers` availability projection is deliberately small: `state` (`o
 the same shape `capabilities.providers[].availability` returns over MCP. A model-scoped refusal
 names the model in `reason`; there is no separate per-model projection. Nothing here starts a
 process or mutates provider state; Workers is entirely read-only.
+
+## Metrics
+
+`GET /metrics` renders what the task database records in the Prometheus text format, read fresh
+from the same `mode=ro` connection on every scrape; `taskspindle metrics` prints the identical
+text without starting a server (and without creating a database that is not there yet). The route
+sits behind the same `Host` check as every other route, so a Prometheus scraping it must use a
+loopback address, or a netloc named in `[web] allowed_hosts`.
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `taskspindle_build_info` | gauge | `version`, `schema` (the schema this build migrates to) |
+| `taskspindle_database_schema_version` | gauge | — (absent when there is no database) |
+| `taskspindle_tasks` | gauge | `provider`, `mode`, `state` |
+| `taskspindle_task_failures_total` | counter | `provider`, `code` |
+| `taskspindle_turns_total`, `taskspindle_turns_unmetered_total` | counter | `provider` |
+| `taskspindle_turn_duration_seconds` | summary | `provider`, `quantile` (0.5, 0.95, 0.99 over the trailing 7 days; `_sum`/`_count` over every turn) |
+| `taskspindle_tokens_total` | counter | `provider`, `kind` (`input`, `output`, `cache_read`, `cache_write`, `reasoning`) |
+| `taskspindle_estimated_cost_usd_total` | counter | `provider` (an estimate at published rates, never a charge) |
+| `taskspindle_checks_total` | counter | `provider`, `result` (`passed`, `failed`) |
+| `taskspindle_slot_limit`, `taskspindle_active_leases`, `taskspindle_queue_depth` | gauge | `provider` |
+| `taskspindle_slot_utilization_ratio` | gauge | `provider` (slot time held over slot time offered, trailing 24 hours) |
+| `taskspindle_provider_available` | gauge | `provider` (1 when a turn would be admitted now) |
+| `taskspindle_provider_state` | gauge | `provider`, `state` (1 for the current availability state) |
+
+Label values are identifiers and enums only; anything else, including a stored error code that
+is not an identifier, is reported as `other`. No path, prompt, command, model string or message
+ever becomes a label. The `_total` series and the summary's `_sum` and `_count` are sums over the
+rows on file, so they grow as work is recorded; if old rows are ever pruned they fall, which
+Prometheus treats as a counter reset.
 
 Repository usage groups display the registered repository path when available. The JSON keeps
 `repository_id` as its stable grouping key and adds `repository_path`; missing paths fall back
