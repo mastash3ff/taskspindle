@@ -15,7 +15,6 @@ import json
 import secrets
 import shutil
 import sys
-import traceback
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -29,6 +28,7 @@ from . import (
     enrollment,
     integration,
     muse,
+    oplog,
     policy,
     providers,
     recovery,
@@ -63,6 +63,7 @@ from .models import (
 )
 from .providers import Profile, ProfileError
 from .repos import GitError, RepositoryIdentity, RootSnapshot
+from .retention import remove_tree as _remove_tree
 from .runner import compose_prompt, context_section
 from .service import (
     ACCEPT_BLOCKED,
@@ -323,9 +324,21 @@ class Orchestrator:
                 self.dispatch_queued()
             except Exception as dispatch_exc:
                 self._log_dispatch_failure(dispatch_exc)
+            else:
+                oplog.clear(self.paths.state_dir, "dispatch", "dispatch")
             raise
         else:
-            self.dispatch_queued()
+            try:
+                self.dispatch_queued()
+            except Exception as dispatch_exc:
+                # The caller hears about this one; a non-TaskSpindle error also leaves its
+                # traceback in server.log through the tool's own failure path.
+                oplog.exception(
+                    self.paths.state_dir, "dispatch", "dispatch_failed", dispatch_exc,
+                    dedup_scope="dispatch",
+                )
+                raise
+            oplog.clear(self.paths.state_dir, "dispatch", "dispatch")
 
     @contextmanager
     def _observe(self) -> Any:
@@ -345,25 +358,30 @@ class Orchestrator:
         This runs only when ``dispatch_queued`` raised while masking would have hidden the tool's
         own error, so it is best effort by design: the operator can read ``server.log``, but a
         failure to write to it must not raise in place of the exception ``_cycle`` is re-raising.
+        The same failure repeating on every tool call is logged once per window, then counted.
         """
-        log_path = self.paths.state_dir / "server.log"
-        try:
-            log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write(f"--- _cycle dispatch_queued: {type(exc).__name__}\n")
-                handle.write("".join(traceback.format_exception(exc)))
-        except OSError:  # pragma: no cover - the log is best effort by design
-            pass
+        oplog.exception(
+            self.paths.state_dir, "dispatch", "dispatch_failed", exc,
+            traceback_file="server.log", dedup_scope="dispatch",
+        )
 
     def reconcile(self) -> list[recovery.ReconcileAction]:
         """Settle every task that claims to be active but may no longer be."""
-        return recovery.reconcile(
-            self.store,
-            self.units,
-            boot=self.boot,
-            now=self.clock(),
-            accept_recover=self._recover_accept,
-        )
+        try:
+            actions = recovery.reconcile(
+                self.store,
+                self.units,
+                boot=self.boot,
+                now=self.clock(),
+                accept_recover=self._recover_accept,
+            )
+        except Exception as exc:
+            oplog.exception(
+                self.paths.state_dir, "recovery", "reconcile_failed", exc, dedup_scope="reconcile",
+            )
+            raise
+        oplog.clear(self.paths.state_dir, "recovery", "reconcile")
+        return actions
 
     def _recover_accept(self, task: TaskRecord) -> recovery.AcceptOutcome:
         """What an interrupted accept actually did to the root repository.
@@ -1247,6 +1265,10 @@ class Orchestrator:
                     task.id, None, bump_version=False, unit_name=unit, boot_id=self.boot
                 )
         except TaskSpindleError as exc:
+            oplog.emit(
+                self.paths.state_dir, "dispatch", "task_dispatch_failed", level="warning",
+                task_id=task.id, provider=task.provider, code=exc.code,
+            )
             self._fail(task.id, exc.code, exc.message, exc.details, reason="dispatch failed")
             return False
         self._reset_stale_unit(unit)
@@ -1259,6 +1281,10 @@ class Orchestrator:
                 properties=units.WORKER_PROPERTIES,
             )
         except UnitError as exc:
+            oplog.emit(
+                self.paths.state_dir, "dispatch", "worker_start_failed", level="warning",
+                task_id=task.id, provider=task.provider, unit=unit, code=exc.code,
+            )
             if exc.code in ("UNIT_START_UNCERTAIN", "UNIT_TIMEOUT"):
                 raise self._uncertain_start(task.id, unit, exc) from exc
             if exc.code in ("UNIT_ADMISSION_CLOSED", "UNIT_PREVIOUS_TURN_ACTIVE"):
@@ -1280,6 +1306,10 @@ class Orchestrator:
                 reason="dispatch failed",
             )
             return False
+        oplog.emit(
+            self.paths.state_dir, "dispatch", "worker_dispatched",
+            task_id=task.id, provider=task.provider, unit=unit,
+        )
         return True
 
     # -- reading ----------------------------------------------------------------------
@@ -1836,6 +1866,16 @@ class Orchestrator:
             except TaskSpindleError:
                 identity = None
 
+        # The worker's TMPDIR is TaskSpindle's own scratch and can hold hundreds of megabytes.
+        # It goes first, so a cleanup that has to stop at the worktree still gives it back.
+        # Nothing else in the task directory (transcripts, diffs, worker.log) is touched.
+        task_tmp = self.paths.state_dir / "tasks" / record.id / "tmp"
+        if task_tmp.exists() or task_tmp.is_symlink():
+            _remove_tree(task_tmp)
+            (removed if not (task_tmp.exists() or task_tmp.is_symlink()) else retained).append(
+                str(task_tmp)
+            )
+
         if record.worktree_path and Path(record.worktree_path).exists():
             if identity is None and force and self._owns(Path(record.worktree_path)):
                 # The repository is gone, so ``git worktree remove`` has nothing to talk to. With
@@ -1874,9 +1914,9 @@ class Orchestrator:
         if identity is not None:
             removed.extend(worktrees.delete_task_refs(identity, record.id))
 
-        for path in (self.paths.state_dir / "tasks" / record.id / "tmp", record.scratch_repo):
-            target = Path(path) if path else None
-            if target is not None and target.exists():
+        if record.scratch_repo:
+            target = Path(record.scratch_repo)
+            if target.exists():
                 shutil.rmtree(target, ignore_errors=True)
                 (removed if not target.exists() else retained).append(str(target))
 

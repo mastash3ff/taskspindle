@@ -1085,6 +1085,7 @@ class Store:
         self._conn = sqlite3.connect(str(self.path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._depth = 0
+        self._after_commit: list[tuple[str, dict[str, Any]]] = []
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -1132,10 +1133,31 @@ class Store:
             yield self._conn
         except BaseException:
             self._depth = 0
+            self._after_commit.clear()
             self._conn.execute("ROLLBACK")
             raise
         self._depth = 0
-        self._conn.execute("COMMIT")
+        try:
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._after_commit.clear()
+            raise
+        self._flush_log()
+
+    def _log_after_commit(self, event: str, **fields: Any) -> None:
+        """Queue an operational-log record that only a committed transaction may write."""
+        self._after_commit.append((event, fields))
+        if not self._depth:
+            self._flush_log()
+
+    def _flush_log(self) -> None:
+        pending, self._after_commit = self._after_commit, []
+        if not pending or not self.path.is_absolute():
+            return
+        from . import oplog
+
+        for event, fields in pending:
+            oplog.emit(self.path.parent, "lease", event, **fields)
 
     @contextmanager
     def _guard(self) -> Iterator[None]:
@@ -1602,6 +1624,10 @@ class Store:
             )
             if cur.rowcount != 1:
                 return False
+            self._log_after_commit(
+                "lease_acquired", task_id=task_id, provider=provider, unit=unit_name,
+                limit=limit, active=count + 1,
+            )
             if self.schema_version() < 15:
                 return True
             # When the task last became dispatchable: its newest state change, not
@@ -1625,6 +1651,7 @@ class Store:
             )
             if cur.rowcount != 1:
                 return False
+            self._log_after_commit("lease_released", task_id=task_id, provider=provider)
             if self.schema_version() < 15:
                 return True
             conn.execute(

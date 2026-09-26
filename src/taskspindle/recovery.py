@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import service
+from . import oplog, service
 from .models import ACTIVE_STATES, TERMINAL_STATES, EventKind, TaskRecord, TaskState
 from .service import TaskSpindleError
 from .store import Store
@@ -175,8 +175,23 @@ def reconcile(
                 action = _strand(store, task, f"{_RECONCILE_FAILED}:{exc.code}")
             if action is not None:
                 actions.append(action)
+                _log_action(store, task, action)
     _release_finished_leases(store, backend, boot=boot, moment=moment, stale_after_s=stale_after_s)
     return actions
+
+
+def _log_action(store: Store, task: TaskRecord, action: ReconcileAction) -> None:
+    """One record per reconcile decision; the same stuck decision repeats only once a window."""
+    state_dir = store.path.parent if store.path.is_absolute() else None
+    key = f"{action.from_state}|{action.to_state}|{action.reason}"
+    if not oplog.dedup(state_dir, "recovery", f"reconcile:{action.task_id}", key, event="reconcile_action"):
+        return
+    oplog.emit(
+        state_dir, "recovery", "reconcile_action",
+        level="info" if action.to_state is not None else "warning",
+        task_id=action.task_id, provider=task.provider, unit=task.unit_name,
+        from_state=action.from_state, to_state=action.to_state, reason=action.reason,
+    )
 
 
 def _release_finished_leases(

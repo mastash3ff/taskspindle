@@ -18,7 +18,11 @@ exception from a result:
 `code` is stable and is what you should branch on; `message` is for a human. An error TaskSpindle
 did not anticipate comes back as `INTERNAL` with nothing but the exception's class name in
 `details`; its traceback goes to `state_dir/server.log`, not into the conversation, where it would
-leak paths and arguments.
+leak paths and arguments. Each traceback there opens with a timestamped
+`--- <ts> server tool_failed: <ExcType>` header. A tool that keeps failing the same way is written
+once and then counted, and the file rotates at 5 MiB. Every tool failure, and every coded
+refusal, also leaves a record in `state_dir/logs/taskspindle.jsonl`. See
+[logging.md](logging.md).
 
 Read-only tools are annotated `readOnlyHint: true`. Seven are: `doctor`,
 `list_repository_policies`, `list_tasks`, `task_status`, `task_result`, `usage_report`, and
@@ -539,8 +543,10 @@ now. Errors: `TASK_NOT_FOUND`, `STALE_STATE_VERSION`, `ILLEGAL_TRANSITION`.
 ### `cleanup_task`
 
 `task_id`, `force` (default `false`). Gives back the worktree, the task's refs under
-`refs/taskspindle/<task_id>/`, and its scratch space. The task must be in a terminal state
-(`COMPLETED`, `ACCEPTED`, `REJECTED`, `CANCELLED`, `FAILED`) or the answer is
+`refs/taskspindle/<task_id>/`, and its scratch space. The scratch space includes the worker's
+`TMPDIR` (`state_dir/tasks/<task_id>/tmp`), which goes first, so a cleanup that stops at a dirty
+worktree still returns it. The task's transcripts, diffs and `worker.log` stay. The task must be
+in a terminal state (`COMPLETED`, `ACCEPTED`, `REJECTED`, `CANCELLED`, `FAILED`) or the answer is
 `ILLEGAL_TRANSITION`. A worktree with uncommitted changes is **retained**, not removed, unless
 `force` is set. Returns `{"task_id", "cleanup_state", "removed": [...], "retained": [...]}` and, on
 a git failure, `cleanup_state: "FAILED"` with an `error` object rather than a raised error.
@@ -739,4 +745,4 @@ invalidates the review: get a new one.
 | `PROVIDER_UNAVAILABLE` | `start_task` refused: the provider's last turn hit one of the above and it is not eligible again yet; pass `ignore_provider_status` for an explicit coordinator override |
 | `FANOUT_NOT_INDEPENDENT` | `start_task` refused: `fanout_group` already has a live member from this provider's family; `details` carries `fanout_group`, `family`, `task_id` |
 | `POLICY_BUDGET_EXHAUSTED` | `start_task` refused (retryable): the named provider has an exhausted, enforced dispatch-policy budget; `details` carries `provider`, `window`, `kind`, `limit`, `used`, `window_start`, `policy_revision` |
-| `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` |
+| `INTERNAL` | an unanticipated error; the traceback is in `state_dir/server.log` (see [logging.md](logging.md)) |

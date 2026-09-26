@@ -36,6 +36,8 @@
   limits.py      what a refused turn means for its provider; never what to do about it
   usage.py       token counts per turn, the price table, the rolled-up report
   policy.py      dispatch policy: document, defaults, validation, status against observed usage
+  oplog.py       the operational log (logs/taskspindle.jsonl): records, rotation, dedup
+  retention.py   taskspindle gc: finished tasks' tmp dirs and oversized logs
   web/           operator console: read-only task, worker, overview and usage projections, plus
                  security.py (the Policy write path's guards) and policy_store.py (its authorizer-
                  limited SQLite connection)

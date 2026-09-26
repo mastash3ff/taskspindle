@@ -206,6 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     discover.add_argument("--json", action="store_true", help="print the findings as JSON")
 
+    gc = sub.add_parser(
+        "gc", help="reclaim finished tasks' scratch (tmp) dirs and rotate logs; a dry run by default"
+    )
+    gc.add_argument("--apply", action="store_true", help="remove and rotate instead of reporting")
+    gc.add_argument("--json", action="store_true", help="print the report as JSON")
+
     web = sub.add_parser("web", help="serve the local task dashboard")
     web.add_argument("--host", default="127.0.0.1", help="address to bind (default: 127.0.0.1)")
     web.add_argument("--port", type=int, default=8765, help="port to bind (default: 8765)")
@@ -280,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         return _web(args.host, args.port, open_browser=args.open)
     if args.command == "accept":
         return _accept(args.task)
+    if args.command == "gc":
+        return _gc(apply=args.apply, as_json=args.json)
     parser.error(f"unrecognized command: {args.command}")
     return 2
 
@@ -1307,6 +1315,47 @@ def _accept(task_id: str) -> int:
     from . import accept
 
     return accept.main(["--task", task_id])
+
+
+def _gc(*, apply: bool, as_json: bool) -> int:
+    """Report (or with ``--apply`` reclaim) finished tasks' scratch and oversized logs."""
+    from . import oplog, retention
+    from .store import Store
+
+    oplog.configure(process="cli")
+    resolved = resolve_paths()
+    database = resolved.state_dir / "taskspindle.sqlite3"
+    if not database.exists():
+        print(f"taskspindle gc: no database at {database}", file=sys.stderr)
+        return 1
+    with Store.open(database) as store:
+        report = retention.collect(resolved.state_dir, store, apply=apply)
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 0
+    verb = "removed" if apply else "would remove"
+    for item in report["tmp"]:
+        print(f"{verb} {item['path']} ({_bytes(item['bytes'])})")
+    for item in report["logs"]:
+        action = item["action"] if apply else f"would {item['action']}"
+        print(f"{action} {item['path']} ({_bytes(item['bytes'])} freed)")
+    for item in report["refused"]:
+        print(f"kept {item['path']} ({_bytes(item['bytes'])}): {item['reason']}")
+    total = _bytes(report["reclaimed_bytes"])
+    if apply:
+        print(f"reclaimed: {total}")
+    else:
+        print(f"reclaimable: {total} (dry run; pass --apply)")
+    return 0
+
+
+def _bytes(count: int) -> str:
+    size = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{count} B"  # pragma: no cover - the loop always returns
 
 
 if __name__ == "__main__":  # pragma: no cover - process entry point

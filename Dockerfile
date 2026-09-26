@@ -30,6 +30,20 @@ WORKDIR /opt/taskspindle
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
+# Verification commands run by workers resolve python3 and pytest to this system Python ahead of
+# the runtime venv, which never gets test tools. Versions and hashes match uv.lock.
+COPY <<EOF /tmp/verification-requirements.txt
+pytest==9.1.1 --hash=sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c
+iniconfig==2.3.0 --hash=sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12
+packaging==26.3 --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+pluggy==1.6.0 --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
+pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+EOF
+RUN uv pip install --system --python /usr/local/bin/python3 --no-cache --require-hashes --no-deps \
+      -r /tmp/verification-requirements.txt \
+    && rm /tmp/verification-requirements.txt \
+    && /usr/local/bin/python3 -m pytest --version \
+    && ! /opt/taskspindle/.venv/bin/python -c 'import pytest' 2>/dev/null
 RUN --mount=type=bind,from=provider-binaries,source=/,target=/tmp/provider-binaries \
     install -m 0755 /tmp/provider-binaries/claude /usr/local/bin/claude \
     && install -m 0755 /tmp/provider-binaries/grok /usr/local/bin/grok \

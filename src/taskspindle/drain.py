@@ -17,13 +17,12 @@ import contextlib
 import json
 import os
 import sqlite3
-import traceback
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import policy
+from . import oplog, policy
 from .config import (
     ConfigError,
     Paths,
@@ -110,15 +109,15 @@ def startable(database: Path, settings: Mapping[str, Any]) -> bool:
     return any(active.get(name, 0) < limits["providers"][name]["limit"] for name in queued)
 
 
-def _log(state_dir: Path, exc: BaseException) -> None:
-    """The class name and traceback, to the state directory; a log failure is never raised."""
-    try:
-        state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with (state_dir / "dispatch-errors.log").open("a", encoding="utf-8") as handle:
-            handle.write(f"--- drain: {type(exc).__name__}\n")
-            handle.write("".join(traceback.format_exception(exc)))
-    except OSError:  # pragma: no cover - the log is best effort by design
-        pass
+def _log(state_dir: Path, exc: BaseException, *, event: str = "drain_failed") -> None:
+    """The traceback to ``dispatch-errors.log``, a record to the operational log. Never raises.
+
+    The controller drains every few seconds, so a failure that persists would otherwise be
+    appended on every pass: it is logged once per window and then counted.
+    """
+    oplog.exception(
+        state_dir, "drain", event, exc, traceback_file="dispatch-errors.log", dedup_scope="drain",
+    )
 
 
 def drain_once(
@@ -148,10 +147,18 @@ def drain_once(
         _log(resolved.state_dir, exc)
         return DrainResult(error=type(exc).__name__)
     try:
+        stage = "reconcile_failed"
         orchestrator.reconcile()
-        return DrainResult(ran=True, started=orchestrator.dispatch_queued())
+        stage = "dispatch_failed"
+        started = orchestrator.dispatch_queued()
     except Exception as exc:
-        _log(resolved.state_dir, exc)
+        _log(resolved.state_dir, exc, event=stage)
         return DrainResult(ran=True, error=type(exc).__name__)
     finally:
         store.close()
+    oplog.clear(resolved.state_dir, "drain", "drain")
+    oplog.emit(
+        resolved.state_dir, "drain", "drain_pass", level="info" if started else "debug",
+        started=len(started),
+    )
+    return DrainResult(ran=True, started=started)

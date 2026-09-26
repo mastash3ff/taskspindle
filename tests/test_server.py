@@ -218,6 +218,36 @@ async def test_the_server_log_captures_a_traceback(server, paths: Paths, monkeyp
     assert "RuntimeError: the store fell over" in log
 
 
+async def test_a_tool_failing_the_same_way_logs_one_traceback_then_counts(
+    server, paths: Paths, monkeypatch,
+) -> None:
+    def explode(*_: object, **__: object) -> dict[str, object]:
+        raise RuntimeError("the store fell over")
+
+    original = Store.list_repositories
+    monkeypatch.setattr(Store, "list_repositories", explode)
+    async with Client(server) as client:
+        for _ in range(3):
+            await client.call_tool("list_repository_policies", {})
+        refused = await client.call_tool("task_status", {"task_id": "ts_nope"})
+        monkeypatch.setattr(Store, "list_repositories", original)
+        assert (await client.call_tool("list_repository_policies", {})).data["ok"] is True
+
+    assert refused.data["ok"] is False
+    log = (paths.state_dir / "server.log").read_text(encoding="utf-8")
+    assert log.count("server tool_failed: RuntimeError") == 1
+    records = [json.loads(line) for line in
+               (paths.state_dir / "logs" / "taskspindle.jsonl").read_text().splitlines()]
+    events = [(r["event"], r.get("tool"), r.get("code"), r.get("suppressed")) for r in records
+              if r["component"] == "server"]
+    assert events == [
+        ("tool_failed", "list_repository_policies", None, None),
+        ("tool_refused", "task_status", refused.data["error"]["code"], None),
+        ("failure_cleared", None, None, 2),
+    ]
+    assert "fell over" not in json.dumps(records)
+
+
 @pytest.mark.parametrize("choice", ["retry", "cancel"])
 async def test_ambiguous_recovery_elicits_without_changing_the_callers_version(
     server, monkeypatch, choice: str,

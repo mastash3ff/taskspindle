@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from taskspindle import policy, repos, runner, service
+from taskspindle import policy, recovery, repos, runner, service
 from taskspindle.config import CapacityConfig, ContextFilesConfig, Paths
 from taskspindle.models import (
     AcceptTaskRequest,
@@ -997,6 +997,29 @@ def test_cleanup_refuses_a_dirty_worktree_without_force(harness: Harness, make_r
     ).stdout == b""
 
 
+def test_cleanup_gives_back_the_worker_tmp_even_when_the_worktree_stays(
+    harness: Harness, make_repo
+) -> None:
+    repo = make_repo()
+    task_id = build_candidate(harness, repo)
+    status = harness.orchestrator.task_status(task_id)
+    harness.orchestrator.reject_task(task_id, status["state_version"], "not what I meant")
+    task_dir = harness.orchestrator.paths.state_dir / "tasks" / task_id
+    scratch = task_dir / "tmp"
+    (scratch / "cache").mkdir(parents=True, exist_ok=True)
+    (scratch / "cache" / "blob").write_bytes(b"x" * 4096)
+    evidence = sorted(path.name for path in task_dir.iterdir() if path.name != "tmp")
+    assert "worker.log" in evidence
+    (Path(status["worktree_path"]) / "leftover.txt").write_text("still here\n")
+
+    refused = harness.orchestrator.cleanup_task(task_id)
+
+    assert refused["cleanup_state"] == CleanupState.FAILED.value
+    assert str(scratch) in refused["removed"]
+    assert not scratch.exists()
+    assert sorted(path.name for path in task_dir.iterdir()) == evidence
+
+
 def test_cleanup_of_a_task_whose_repository_is_gone_fails_loudly(
     harness: Harness, make_repo
 ) -> None:
@@ -1777,6 +1800,77 @@ def test_cycle_never_masks_the_bodys_error_with_a_dispatch_failure(harness):
     log_path = harness.orchestrator.paths.state_dir / "server.log"
     assert log_path.exists()
     assert "RuntimeError" in log_path.read_text(encoding="utf-8")
+
+
+def _records(state_dir: Path, event: str | None = None) -> list[dict]:
+    path = state_dir / "logs" / "taskspindle.jsonl"
+    if not path.exists():
+        return []
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    return [record for record in records if event is None or record["event"] == event]
+
+
+def test_a_repeating_dispatch_failure_is_logged_once_and_counted_when_it_clears(harness):
+    """The same recovery-dispatch failure on every tool call used to append a traceback each time."""
+    state_dir = harness.orchestrator.paths.state_dir
+    original = harness.orchestrator.dispatch_queued
+
+    def explode() -> list[str]:
+        raise RuntimeError("dispatch blew up")
+
+    harness.orchestrator.dispatch_queued = explode  # type: ignore[method-assign]
+    for _ in range(4):
+        with pytest.raises(TaskSpindleError):
+            harness.orchestrator.cancel_task("does-not-exist", 1)
+
+    text = (state_dir / "server.log").read_text(encoding="utf-8")
+    assert text.count("dispatch dispatch_failed: RuntimeError") == 1
+    [failure] = _records(state_dir, "dispatch_failed")
+    assert (failure["component"], failure["exc_type"]) == ("dispatch", "RuntimeError")
+    assert "blew up" not in json.dumps(failure)
+
+    harness.orchestrator.dispatch_queued = original  # type: ignore[method-assign]
+    with pytest.raises(TaskSpindleError):
+        harness.orchestrator.cancel_task("does-not-exist", 1)
+    [cleared] = _records(state_dir, "failure_cleared")
+    assert (cleared["scope"], cleared["suppressed"]) == ("dispatch", 3)
+
+
+def test_a_reconcile_failure_is_logged_and_still_raised(harness, monkeypatch):
+    state_dir = harness.orchestrator.paths.state_dir
+    saved = recovery.reconcile
+
+    def explode(*_: object, **__: object) -> list[object]:
+        raise RuntimeError("the unit backend is gone")
+
+    monkeypatch.setattr(recovery, "reconcile", explode)
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            harness.orchestrator.reconcile()
+    monkeypatch.setattr(recovery, "reconcile", saved)
+    [failure] = _records(state_dir, "reconcile_failed")
+    assert (failure["component"], failure["level"]) == ("recovery", "error")
+    harness.orchestrator.reconcile()
+    [cleared] = _records(state_dir, "failure_cleared")
+    assert (cleared["scope"], cleared["suppressed"]) == ("reconcile", 1)
+
+
+def test_dispatch_and_the_worker_leave_a_trail_in_the_operational_log(harness, make_repo):
+    repo = make_repo()
+    authorize(harness, repo)
+    task_id = harness.orchestrator.start_task(implement_request(repo))["task_id"]
+    state_dir = harness.orchestrator.paths.state_dir
+
+    events = [record["event"] for record in _records(state_dir) if record.get("task_id") == task_id]
+    for expected in ("lease_acquired", "worker_dispatched", "worker_started", "worker_settled",
+                     "lease_released"):
+        assert expected in events
+    assert events.index("lease_acquired") < events.index("worker_dispatched")
+    [settled] = [r for r in _records(state_dir, "worker_settled") if r["task_id"] == task_id]
+    assert settled["component"] == "worker"
+    assert settled["state"] == harness.orchestrator.store.get_task(task_id).state.value
+    everything = (state_dir / "logs" / "taskspindle.jsonl").read_text(encoding="utf-8")
+    assert implement_request(repo).prompt not in everything
 
 
 def test_dispatch_bookkeeping_does_not_bump_state_version(harness, make_repo):

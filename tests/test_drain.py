@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 from pathlib import Path
 
@@ -79,7 +81,29 @@ def test_drain_once_never_raises_and_logs_the_failure(paths: Paths, monkeypatch)
     monkeypatch.setattr("taskspindle.server.build_orchestrator", broken)
     result = drain.drain_once(paths=paths, parent_env={"HOME": str(paths.state_dir)})
     assert (result.ran, result.error) == (False, "RuntimeError")
-    assert "--- drain: RuntimeError" in (paths.state_dir / "dispatch-errors.log").read_text()
+    text = (paths.state_dir / "dispatch-errors.log").read_text()
+    assert re.match(r"--- \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z drain drain_failed: RuntimeError\n", text)
+    log = (paths.state_dir / "logs" / "taskspindle.jsonl").read_text()
+    records = [json.loads(line) for line in log.splitlines()]
+    failure = next(record for record in records if record["event"] == "drain_failed")
+    assert (failure["component"], failure["exc_type"], failure["level"]) == ("drain", "RuntimeError", "error")
+    assert "secret" not in json.dumps(failure)
+
+
+def test_a_persistent_drain_failure_is_logged_once_and_then_counted(paths: Paths, monkeypatch) -> None:
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        _queued(store, "ts_000000000001")
+
+    def broken(**_: object) -> None:
+        raise RuntimeError("the same failure")
+
+    monkeypatch.setattr("taskspindle.server.build_orchestrator", broken)
+    for _ in range(6):
+        drain.drain_once(paths=paths, parent_env={"HOME": str(paths.state_dir)})
+    text = (paths.state_dir / "dispatch-errors.log").read_text()
+    assert text.count("drain drain_failed: RuntimeError") == 1
+    dedup = json.loads((paths.state_dir / "logs" / "dedup.json").read_text())
+    assert dedup["drain"]["suppressed"] == 5
 
 
 def test_drain_once_reconciles_then_dispatches_with_the_configured_backend(paths: Paths, monkeypatch) -> None:

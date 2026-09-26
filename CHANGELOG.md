@@ -88,6 +88,33 @@
 - Fixed: `docs/recovery.md` told Docker-backend operators to run `systemctl --user status`; it
   now has a Docker section covering `taskspindle-controller status`, the recoveries, and
   reopening admission.
+- **An operational log.** Every process now appends JSON records to
+  `state_dir/logs/taskspindle.jsonl`. Each record has a UTC timestamp, a level, a component and
+  an event. The log covers tool failures and coded refusals, dispatches and dispatch failures,
+  lease acquire and release (written only after the transaction commits), every reconcile
+  decision, drain passes, each Docker controller operation with its outcome and duration,
+  admission-fence and maintenance changes, and worker start and settle. Records never carry
+  prompts, agent output, environments, provider argv or credentials. A crash is recorded with its
+  class name and stack frames, not its text. `taskspindle-controller serve` mirrors the records
+  to stderr, so `docker logs` on the runtime container is no longer empty. The stdio MCP server
+  stays file-only. See [logging.md](docs/logging.md).
+- **Tracebacks carry a timestamp, repeats are counted, and logs rotate.** `server.log` and
+  `dispatch-errors.log` keep their full tracebacks. Each block now opens with
+  `--- <ts> <component> <event>: <ExcType>`. The same failure repeating on every tool call or
+  drain pass is written once per 15 minutes and then counted, and the count is logged when the
+  failure changes, recurs or clears. All three logs rotate at 5 MiB with three generations,
+  under a lock that several processes share safely.
+- **Scratch space is given back.** `cleanup_task` now removes the worker's `tmp` directory before
+  it touches the worktree, so a cleanup refused for a dirty worktree still frees it. New
+  `taskspindle gc` reports the `tmp` directories of tasks in terminal states that hold no lease,
+  and with `--apply` removes them and rotates oversized logs. It is a dry run by default. It
+  never touches an active or unknown task, a task's transcripts, diffs or `worker.log`,
+  worktrees, or containers, and it behaves the same inside the runtime container.
+- **Verification commands can run pytest in the container image.** The image installs pytest,
+  pinned with hashes to `uv.lock`, into its system Python. Inside worker and accept containers,
+  verification commands find that Python ahead of TaskSpindle's runtime venv, which still has no
+  test tools. The systemd backend is unchanged. See
+  [docker-image.md](docs/docker-image.md#python-and-pytest-for-verification-commands).
 
 ## v0.6.2
 

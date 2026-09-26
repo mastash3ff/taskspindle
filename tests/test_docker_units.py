@@ -1079,3 +1079,19 @@ def test_execution_diagnostics_ignore_running_and_recent_launches(setup):
     with pytest.raises(UnitError):
         launch(backend)
     assert backend.execution_diagnostics()["unsettled"] == []
+
+def test_fence_and_maintenance_changes_are_logged_without_their_tokens(setup):
+    backend, _ = setup
+    token = "a" * 64
+    backend.set_admission(False)
+    backend.set_admission(True)
+    backend.maintenance_acquire(token)
+    backend.maintenance_release(token, True)
+    text = (backend.paths.state_dir / "logs" / "taskspindle.jsonl").read_text()
+    records = [json.loads(line) for line in text.splitlines()]
+    assert [(r["event"], r["admission_open"]) for r in records] == [
+        ("admission_set", False), ("admission_set", True),
+        ("maintenance_acquired", False), ("maintenance_released", True),
+    ]
+    assert {r["component"] for r in records} == {"controller"}
+    assert token not in text

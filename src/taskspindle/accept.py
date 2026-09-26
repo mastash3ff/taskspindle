@@ -42,11 +42,17 @@ MAX_VERIFICATION_S = 1800
 
 
 def check_env(parent: Mapping[str, str]) -> dict[str, str]:
-    """The minimal environment the root verification commands see."""
+    """The minimal environment the root verification commands see.
+
+    In an accept container the image's system Python (with its pinned pytest) is found before
+    TaskSpindle's own runtime venv, exactly as for a worker's checks.
+    """
     env = {name: parent[name] for name in _CHECK_ENV_NAMES if name in parent}
     env["TERM"] = "dumb"
     env["CI"] = "1"
-    return env
+    return integration.verification_env(
+        env, container=parent.get(integration.WORKER_CONTAINER_ENV) == "1",
+    )
 
 
 def run_accept(

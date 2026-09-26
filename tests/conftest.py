@@ -7,7 +7,16 @@ from pathlib import Path
 
 import pytest
 
+from taskspindle import oplog
 from taskspindle.repos import run_git
+
+
+@pytest.fixture(autouse=True)
+def _fresh_oplog():
+    """No test inherits another test's process role or stderr mirroring."""
+    oplog.reset()
+    yield
+    oplog.reset()
 
 
 @pytest.fixture
