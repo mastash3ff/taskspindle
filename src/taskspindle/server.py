@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import traceback
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -23,7 +22,7 @@ from fastmcp import Context, FastMCP
 from pydantic import BaseModel, ValidationError
 
 from . import doctor as doctor_module
-from . import providers, units
+from . import oplog, providers, units
 from .config import (
     Paths,
     capacity_limits,
@@ -93,14 +92,15 @@ def _failure(body: ErrorBody) -> dict[str, Any]:
 
 
 def _log_traceback(log_path: Path, name: str, exc: BaseException) -> None:
-    """Write what went wrong where the operator can read it, and nowhere else."""
-    try:
-        log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"--- {name}: {type(exc).__name__}\n")
-            handle.write("".join(traceback.format_exception(exc)))
-    except OSError:  # pragma: no cover - the log is best effort by design
-        pass
+    """Write what went wrong where the operator can read it, and nowhere else.
+
+    The traceback goes to ``log_path`` under a timestamped header and a record to the
+    operational log. A tool failing the same way on every call is logged once, then counted.
+    """
+    oplog.exception(
+        log_path.parent, "server", "tool_failed", exc, traceback_file=log_path.name,
+        dedup_scope=f"tool:{name}", tool=name,
+    )
 
 
 def _type_name(spec: Mapping[str, Any], defs: Mapping[str, Any]) -> str:
@@ -138,8 +138,10 @@ def _describe(summary: str, model: type[BaseModel]) -> str:
 def _failure_for(name: str, log_path: Path, exc: Exception) -> dict[str, Any]:
     """Turn whatever a tool body raised into the envelope's error body."""
     if isinstance(exc, TaskSpindleError):
+        oplog.emit(log_path.parent, "server", "tool_refused", code=exc.code, tool=name)
         return _failure(exc.to_error_body())
     if isinstance(exc, ValidationError):
+        oplog.emit(log_path.parent, "server", "tool_refused", code=INVALID_REQUEST, tool=name)
         return _failure(
             ErrorBody(
                 code=INVALID_REQUEST,
@@ -162,9 +164,11 @@ def _failure_for(name: str, log_path: Path, exc: Exception) -> dict[str, Any]:
 def _guard(name: str, log_path: Path, call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """Run one tool body and turn whatever happens into an envelope."""
     try:
-        return _envelope(call())
+        result = _envelope(call())
     except Exception as exc:
         return _failure_for(name, log_path, exc)
+    oplog.clear(log_path.parent, "server", f"tool:{name}")
+    return result
 
 
 async def _guard_async(
@@ -172,9 +176,11 @@ async def _guard_async(
 ) -> dict[str, Any]:
     """The same, for a tool body that has to be awaited on the server's own loop."""
     try:
-        return _envelope(await call())
+        result = _envelope(await call())
     except Exception as exc:
         return _failure_for(name, log_path, exc)
+    oplog.clear(log_path.parent, "server", f"tool:{name}")
+    return result
 
 
 def build_server(orchestrator: Orchestrator) -> FastMCP:
@@ -501,6 +507,8 @@ def build_orchestrator(
 
 def main() -> None:
     """``python -m taskspindle.server``: the stdio MCP server."""
+    # stdout and stderr belong to the MCP transport and the client: records go to the file only.
+    oplog.configure(process="server", stderr=False)
     orchestrator, store = build_orchestrator()
     try:
         build_server(orchestrator).run(transport="stdio", show_banner=False)

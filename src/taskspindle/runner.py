@@ -30,6 +30,7 @@ from typing import Any, Protocol
 from . import (
     auth_context,
     limits,
+    oplog,
     providers,
     repos,
     units,
@@ -533,6 +534,11 @@ async def run_worker(
             heartbeat_at=stamp,
         )
         running = True
+        oplog.emit(
+            paths.state_dir, "worker", "worker_started", task_id=task_id,
+            provider=task.provider, unit=units.worker_unit_name(task_id),
+            kind=kind.value, revision=run.revision,
+        )
 
         cancel_event = asyncio.Event()
         heartbeat = asyncio.create_task(_heartbeat(run))
@@ -559,6 +565,10 @@ async def run_worker(
             raise
         failure = _Failure("WORKER_ERROR", type(exc).__name__)
         run.log.write(f"failed {failure.code} ({type(exc).__name__})")
+        oplog.exception(
+            paths.state_dir, "worker", "worker_crashed", exc, frames=True,
+            task_id=task_id, provider=task.provider,
+        )
         return _settle(run, TaskState.FAILED, failure.code, error=failure.body)
     finally:
         if handler_installed:
@@ -1671,6 +1681,13 @@ def _settle(run: _Run, state: TaskState, reason: str, **fields: Any) -> TaskStat
         fields["finished_at"] = now()
     run.task = transition(run.store, run.task_id, state, reason=reason, **fields)
     run.log.write(f"settled {state.value} ({reason})")
+    error = fields.get("error")
+    oplog.emit(
+        run.paths.state_dir, "worker", "worker_settled",
+        level="warning" if state in (TaskState.FAILED, TaskState.RECOVERY_AMBIGUOUS) else "info",
+        task_id=run.task_id, provider=run.task.provider, state=state.value, reason=reason,
+        code=error.get("code") if isinstance(error, Mapping) else None, revision=run.revision,
+    )
     return state
 
 
@@ -1747,6 +1764,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", required=True, help="the task id to run one turn of")
     args = parser.parse_args(argv)
 
+    oplog.configure(process="worker")
     resolved = default_paths()
     raw_config = os.environ.get("TASKSPINDLE_CONFIG")
     config_file = Path(raw_config) if raw_config else resolved.config_file
@@ -1769,6 +1787,10 @@ def main(argv: list[str] | None = None) -> int:
         # crash, with none of the message text, which can carry paths or credentials.
         code = f" {exc.code}" if isinstance(exc, TaskSpindleError) else ""
         print(f"taskspindle-runner: {type(exc).__name__}{code}", file=sys.stderr)
+        oplog.exception(
+            resolved.state_dir, "worker", "worker_exited", exc, frames=True, task_id=args.task,
+            message="the worker could not run its turn",
+        )
         return 1
     finally:
         if store is not None:

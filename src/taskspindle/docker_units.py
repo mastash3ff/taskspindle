@@ -21,6 +21,7 @@ import docker
 from docker.errors import APIError, NotFound
 from docker.types import LogConfig, Mount
 
+from . import oplog
 from .config import ConfigError, Paths
 from .units import UnitError, UnitState
 
@@ -195,6 +196,7 @@ class DockerBackend:
             if value and maintenance and maintenance["active"]:
                 raise UnitError("UNIT_MAINTENANCE_ACTIVE", "Only the maintenance owner can reopen admission")
             _atomic(self.directory / "admission.json", {"open": value})
+        oplog.emit(self.paths.state_dir, "controller", "admission_set", admission_open=value)
 
     def maintenance_acquire(self, token: str) -> None:
         owner = self._token(token)
@@ -210,6 +212,7 @@ class DockerBackend:
                 "version": 1, "active": True, "owner_sha256": owner,
             })
             _atomic(self.directory / "admission.json", {"open": False})
+        oplog.emit(self.paths.state_dir, "controller", "maintenance_acquired", admission_open=False)
 
     def maintenance_release(self, token: str, reopen: bool) -> None:
         owner = self._token(token)
@@ -228,6 +231,7 @@ class DockerBackend:
                 raise UnitError("UNIT_SUBMISSION_ACTIVE", "Submissions remain in flight or unresolved")
             _atomic(self.directory / "admission.json", {"open": reopen})
             _atomic(self.directory / "maintenance.json", dict(previous, active=False))
+        oplog.emit(self.paths.state_dir, "controller", "maintenance_released", admission_open=reopen)
 
     def _submissions(self) -> list[Path]:
         return list(self.directory.glob("submission-*.json"))

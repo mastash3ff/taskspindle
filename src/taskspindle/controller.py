@@ -12,11 +12,13 @@ import socketserver
 import stat
 import struct
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
+from . import oplog
 from .config import ConfigError, load_config, paths
 from .execution import ControllerClient
 from .rpc import RemoteError, receive, send
@@ -128,6 +130,7 @@ class Controller:
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         self.connection.settimeout(300 if self.server.diagnostics else 90)
+        started, operation, unit = time.monotonic(), None, None
         try:
             # Socket mode protects access; peer credentials additionally reject another UID.
             credentials = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
@@ -137,18 +140,59 @@ class _Handler(socketserver.StreamRequestHandler):
             message = receive(self.rfile)
             if set(message) != {"operation", "arguments"}:
                 raise RemoteError("CONTROL_PROTOCOL_ERROR", "Invalid control request")
+            operation, unit = _operation_labels(message)
             result = self.server.controller.dispatch(message["operation"], message["arguments"],
                                                      diagnostics=self.server.diagnostics)
             response = {"ok": True, "result": result}
         except (RemoteError, UnitError) as exc:
             response = {"ok": False, "error": {"code": exc.code, "message": str(exc)}}
-        except Exception:
-            # SDK and provider exceptions may carry credentials or full request arguments.
+        except Exception as exc:
+            # SDK and provider exceptions may carry credentials or full request arguments: the
+            # record gets the class name and stack frames, never the exception's text.
             response = {"ok": False, "error": {
                 "code": "CONTROL_FAILED", "message": "Control operation failed",
             }}
+            oplog.exception(
+                _state_dir(self.server), "controller", "operation_crashed", exc,
+                frames=True, unit=unit, operation=operation,
+            )
+        _log_operation(self.server, operation, unit, response, time.monotonic() - started)
         with contextlib.suppress(OSError, RemoteError):
             send(self.wfile, response)
+
+
+#: Read-only polls that run on every dispatch; a successful one is a debug record.
+_POLLS = frozenset({"admission", "status", "show"})
+
+
+def _state_dir(server: Any) -> Path | None:
+    state_dir = getattr(getattr(server.controller, "paths", None), "state_dir", None)
+    return state_dir if isinstance(state_dir, Path) else None
+
+
+def _operation_labels(message: Any) -> tuple[str | None, str | None]:
+    """The operation name and logical unit, as bounded labels; never the other arguments."""
+    operation = message.get("operation") if isinstance(message, dict) else None
+    arguments = message.get("arguments") if isinstance(message, dict) else None
+    unit = arguments.get("unit") if isinstance(arguments, dict) else None
+    return (
+        operation[:64] if isinstance(operation, str) else None,
+        unit[:200] if isinstance(unit, str) else None,
+    )
+
+
+def _log_operation(
+    server: Any, operation: str | None, unit: str | None, response: dict[str, Any], elapsed: float,
+) -> None:
+    """One record per control request: its name, ok or error code, and how long it took."""
+    ok = bool(response.get("ok"))
+    code = None if ok else response.get("error", {}).get("code")
+    level = ("debug" if operation in _POLLS else "info") if ok else "warning"
+    oplog.emit(
+        _state_dir(server), "controller", "operation", level=level,
+        unit=unit, code=code, operation=operation, ok=ok,
+        duration_ms=int(elapsed * 1000), socket="diagnostics" if server.diagnostics else "jobs",
+    )
 
 
 class ControlServer(socketserver.ThreadingUnixStreamServer):
@@ -232,8 +276,10 @@ def serve(controller: Controller, jobs: Path, diagnostics: Path) -> None:
             try:
                 for thread in threads:
                     thread.start()
+                oplog.emit(controller.paths.state_dir, "controller", "controller_started")
                 stopped.wait()
             finally:
+                oplog.emit(controller.paths.state_dir, "controller", "controller_stopping")
                 for server in servers:
                     server.shutdown()
                 for sig, handler in previous.items():
@@ -267,6 +313,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError("execution.jobs_socket must be absolute")
         if args.command == "serve":
             from .docker_units import DockerBackend
+
+            # The long-running controller mirrors every record to stderr so `docker logs` on the
+            # runtime container shows what it decided; the file under state_dir/logs is durable.
+            oplog.configure(process="controller", stderr=True)
             serve(Controller(DockerBackend(resolved, settings), resolved, settings), jobs, diagnostics)
             return 0
         client = ControllerClient(jobs)

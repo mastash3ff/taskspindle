@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -249,6 +250,33 @@ def test_one_task_that_systemd_cannot_answer_for_does_not_end_the_sweep(store: S
     # A sweep that keeps finding the same broken unit reports it again but only logs it once.
     assert run(store, backend)[0].task_id == broken.id
     assert recovery_reasons(store, broken.id) == ["reconcile_failed:UNIT_QUERY_FAILED"]
+
+
+def test_every_reconcile_decision_is_logged_and_a_stuck_one_only_once(store: Store) -> None:
+    broken = make_task(store, state=TaskState.RUNNING)
+    other = make_task(store, state=TaskState.RUNNING, lease=False)
+    broken_unit = worker_unit_name(broken.id)
+
+    def explode(unit: str) -> None:
+        if unit == broken_unit:
+            raise UnitError("UNIT_QUERY_FAILED", "systemctl show exited 1")
+
+    backend = FakeUnitBackend({worker_unit_name(other.id): SUCCESS}, on_show=explode)
+    for _ in range(3):
+        run(store, backend)
+
+    log = store.path.parent / "logs" / "taskspindle.jsonl"
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    decisions = [record for record in records if record["event"] == "reconcile_action"]
+    by_task = {record["task_id"]: record for record in decisions}
+    assert len(decisions) == 2
+    assert by_task[other.id]["from_state"] == "RUNNING"
+    assert by_task[other.id]["to_state"] == TaskState.INTERRUPTED.value
+    assert by_task[other.id]["level"] == "info"
+    assert by_task[broken.id]["to_state"] is None
+    assert by_task[broken.id]["reason"] == "reconcile_failed:UNIT_QUERY_FAILED"
+    assert by_task[broken.id]["level"] == "warning"
+    assert by_task[broken.id]["component"] == "recovery"
 
 
 def test_a_task_that_finishes_underneath_the_sweep_is_skipped(store: Store) -> None:

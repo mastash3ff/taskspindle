@@ -723,3 +723,20 @@ def test_maintenance_acquire_crash_before_legacy_write_is_still_closed(setup, mo
     assert restarted.admission_open() is False
     with pytest.raises(UnitError):
         restarted.submission_begin('b' * 64)
+
+
+def test_fence_and_maintenance_changes_are_logged_without_their_tokens(setup):
+    backend, _ = setup
+    token = "a" * 64
+    backend.set_admission(False)
+    backend.set_admission(True)
+    backend.maintenance_acquire(token)
+    backend.maintenance_release(token, True)
+    text = (backend.paths.state_dir / "logs" / "taskspindle.jsonl").read_text()
+    records = [json.loads(line) for line in text.splitlines()]
+    assert [(r["event"], r["admission_open"]) for r in records] == [
+        ("admission_set", False), ("admission_set", True),
+        ("maintenance_acquired", False), ("maintenance_released", True),
+    ]
+    assert {r["component"] for r in records} == {"controller"}
+    assert token not in text
