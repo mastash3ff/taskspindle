@@ -42,7 +42,7 @@ from .agy_cli import AgyCliWorker
 from .agy_cli import model_catalog as cli_model_catalog
 from .config import Paths, load_config
 from .config import paths as default_paths
-from .integration import run_verification
+from .integration import WORKER_CONTAINER_ENV, run_verification, verification_env
 from .models import (
     TERMINAL_STATES,
     CheckRecord,
@@ -1543,7 +1543,9 @@ async def _run_checks(run: _Run, workspace: Path, revision: int) -> dict[str, An
         workspace,
         commands,
         timeout_s=min(run.task.timeout_s, MAX_VERIFICATION_S),
-        env=run.child_env,
+        env=verification_env(
+            run.child_env, container=os.environ.get(WORKER_CONTAINER_ENV) == "1",
+        ),
     )
     for check in results:
         run.store.insert_check(

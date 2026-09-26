@@ -63,3 +63,25 @@ check alone does not establish that containment works.
 The Python image uses Debian Trixie so Git supports `merge-tree --merge-base`,
 which candidate acceptance requires. The build verifies this feature in a
 disposable repository before installing TaskSpindle.
+
+## Python and pytest for verification commands
+
+A task's verification commands run in the worker container, and an
+acceptance's rerun runs in the accept container. The image's `PATH` starts
+with `/opt/taskspindle/.venv/bin`, TaskSpindle's own runtime venv. That venv is
+installed `--no-dev` and must not gain test tools. For verification commands
+only, and only inside a container (`TASKSPINDLE_WORKER_CONTAINER=1`), the
+runner and the accept job move that directory to the end of `PATH`. `python3`
+and `pytest` then resolve to the image's system Python, `/usr/local/bin`.
+Anything that exists only in the runtime venv still resolves. The agent's own
+environment and the systemd backend are unchanged.
+
+The build installs pytest into that system Python with
+`uv pip install --system --require-hashes --no-deps`. The versions and hashes
+of `pytest`, `iniconfig`, `packaging`, `pluggy` and `pygments` are copied from
+`uv.lock`, and `tests/test_verification_env.py` fails if the two drift apart.
+The same build step checks that `python3 -m pytest --version` works and that
+the runtime venv still cannot import pytest. A project whose checks need its
+own dependencies, or pytest plugins such as `pytest-asyncio`, should keep
+running them through its own environment, for example
+`uv run --frozen pytest`. Only the image's bare `python3` gained pytest.

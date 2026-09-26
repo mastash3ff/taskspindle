@@ -7,7 +7,9 @@ by the journal so an interrupted apply can be recognised and undone.
 
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -26,6 +28,7 @@ __all__ = [
     "recover_journal",
     "run_verification",
     "stage_candidate",
+    "verification_env",
 ]
 
 #: Phases a journal can be in, in the order they are entered. ``committing`` is written before
@@ -34,6 +37,42 @@ PHASES = ("probing", "staged", "verified", "committing", "committed")
 
 #: How much of a check's output is retained.
 TAIL_CHARS = 4096
+
+#: Set by the Docker backend on every worker and accept container.
+WORKER_CONTAINER_ENV = "TASKSPINDLE_WORKER_CONTAINER"
+
+
+def _own_venv_bin() -> Path | None:
+    """The bin directory of the virtualenv TaskSpindle itself runs from, if it runs from one."""
+    if sys.prefix == sys.base_prefix:
+        return None
+    return Path(sys.prefix) / "bin"
+
+
+def verification_env(
+    env: Mapping[str, str], *, container: bool, own_bin: Path | None = None,
+) -> dict[str, str]:
+    """The environment verification commands run under, from the one the caller built.
+
+    Inside a worker or accept container, ``PATH`` starts with ``/opt/taskspindle/.venv/bin``, so
+    ``python3`` and ``pytest`` would resolve to TaskSpindle's own runtime venv, which has no test
+    tools and must not grow any. There, that directory moves to the end of ``PATH``: the image's
+    system Python, which carries a pinned pytest, is found first, and anything that only exists
+    in the runtime venv still resolves. Outside a container -- the systemd backend, where an
+    operator may deliberately run from a venv that has their tools -- nothing changes.
+    """
+    result = dict(env)
+    if not container:
+        return result
+    own = own_bin if own_bin is not None else _own_venv_bin()
+    if own is None or "PATH" not in result:
+        return result
+    own_text = os.path.normpath(str(own))
+    entries = result["PATH"].split(os.pathsep)
+    kept = [entry for entry in entries if entry and os.path.normpath(entry) != own_text]
+    demoted = [entry for entry in entries if entry and os.path.normpath(entry) == own_text]
+    result["PATH"] = os.pathsep.join(kept + demoted[:1])
+    return result
 
 
 @dataclass(frozen=True)
