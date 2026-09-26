@@ -46,6 +46,28 @@
   dotted path through a list no longer turns it into a map. The page also accepts an AGY model
   the operator advertised, as the server already did, and `docs/concurrency.md` no longer
   describes the retired `QUOTA_RETRY_PENDING` claim.
+- **A failed Docker launch can be retired without guessing.** When a container create fails
+  with an uncertain outcome, the task and its lease were held forever: every reconcile answered
+  `UNIT_START_UNCERTAIN`. `taskspindle-controller recover-failed-create <unit>` retires the
+  record on an exact Docker `destroy` event, and, once that event has left the Engine's history,
+  `recover-absent-launch <unit> --attest-never-ran` retires it for a task the operator already
+  cancelled whose worker provably never started: record at least an hour old, no container of
+  that name, generation or unit in any state, and no start, heartbeat, pid or ended turn in the
+  task database. Both close admission and keep it closed; ordinary reconciliation then cancels
+  the task and releases its lease. See [recovery.md](docs/recovery.md#the-docker-backend).
+- **`doctor` shows stuck execution state.** Under Docker, the controller adds non-advisory
+  `worker_admission` (with the command that reopens it), `stuck_launches` (records unsettled for
+  over ten minutes, by unit) and `orphan_leases` checks; under systemd `orphan_leases` comes from
+  the task database. `capacity_<provider>` no longer counts an orphaned lease as active work.
+  Worker probe failures keep a controller error's code and fixed message instead of only
+  `UnitError`, and Docker create, start, image and probe failures name a transport exception's
+  class (for example `ReadTimeout`).
+- **The dashboard flags stuck active tasks.** An active task that carries an error, such as a
+  `CANCELLING` task whose launch is `UNIT_START_UNCERTAIN`, is listed under Needs attention with
+  its error code as well as under Active work.
+- Fixed: `docs/recovery.md` told Docker-backend operators to run `systemctl --user status`; it
+  now has a Docker section covering `taskspindle-controller status`, the recoveries, and
+  reopening admission.
 
 ## v0.6.2
 

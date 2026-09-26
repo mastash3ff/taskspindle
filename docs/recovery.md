@@ -12,15 +12,64 @@ Two rules shape every decision:
 - **Ambiguity is never resolved by guessing.** A task systemd has forgotten but whose heartbeat is
   recent becomes `RECOVERY_AMBIGUOUS` and waits for a person.
 
-## Docker create failures
+Everything below applies to both execution backends. Under the systemd backend the unit is a
+transient `systemctl --user` unit; under the [Docker backend](docker-backend.md) it is a
+container the private controller launched, and the `systemctl` commands in this page do not
+apply — use the controller commands in the next section instead.
+
+## The Docker backend
+
+The controller keeps one private execution record per logical unit under
+`state_dir/execution/taskspindle-worker-<task_id>.json` (or `taskspindle-accept-<task_id>.json`).
+The record's `phase` is where the launch got to: `creating`, `starting`, `started`, then
+`finished` or `retired` with exit evidence, or `failed` when Docker refused the job or an
+administrative recovery retired it. Records never contain argv or environment values. In Compose,
+run every command below inside the runtime service.
+
+### Looking at the state
+
+```sh
+taskspindle-controller status
+taskspindle doctor
+```
+
+`status` prints one JSON object. The fields that matter for recovery:
+
+- `admission_open` — `false` means the fence is closed and queued work will not start.
+  `maintenance.active` is `true` while a maintenance operation owns the fence.
+- `engine_reachable` — whether the Docker Engine answered. An unreachable Engine is never read as
+  "the container is gone".
+- `jobs` — every launch that is active or whose state is `unknown`. `unknown` means the record
+  is unsettled: the container is missing without exit evidence, cannot be inspected, or was
+  created but never confirmed running.
+- `active_reservations` — provider leases (slots) held in the task database, and
+  `nonterminal_worker_tasks` — tasks in `RUNNING`, `PREPARING` or `CANCELLING`. A reservation
+  with no matching `active` job is a slot held by nothing that runs.
+
+`taskspindle doctor` asks the controller for the same picture and fails, with the unit names, on:
+
+| Check | Fails when |
+| --- | --- |
+| `worker_admission` | admission is closed; the detail names the command that reopens it |
+| `stuck_launches` | a launch record has stayed unsettled (for example in `creating`) for more than ten minutes |
+| `orphan_leases` | a lease belongs to a task that is gone or not running, to a task whose launch is unsettled, or has had no worker heartbeat for ten minutes |
+| `execution_state` | the controller could not read its records at all |
+
+A `capacity_<provider>` line counts an orphaned lease separately ("0 active, 1 held by orphaned
+lease") so it is not mistaken for running work. Under the systemd backend, `orphan_leases` is
+answered from the task database alone.
+
+### Docker create failures
 
 An Engine error during container creation can leave an execution record in
 `creating` even when the container is absent. `UNIT_START_UNCERTAIN` deliberately
 retains the reservation: absence alone does not prove that the request cannot
 complete. Cancellation may remain `CANCELLING` until launch uncertainty is resolved.
+The error message keeps only safe facts: the HTTP status and a known failure phrase for an
+Engine API error, or the exception class (such as `ReadTimeout`) for a transport failure.
 
 After repairing the Engine, use the private controller command for the exact
-logical unit (in Compose, run these commands inside the runtime service):
+logical unit:
 
 ```sh
 taskspindle-controller recover-failed-create taskspindle-worker-<task_id>
@@ -32,11 +81,67 @@ Recovery closes admission and requires a reachable Engine, an absent container,
 and a Docker `destroy` event matching the recorded owner, generation, task, unit,
 and container name after the reservation was written. It checks absence again
 before saving the evidence. Missing, expired, or mismatched events leave the
-record unresolved; do not replace this check with manual database edits or a
-blind retry. Back up the database and execution records before operational repair.
+record unresolved (`UNIT_RECOVERY_UNPROVEN`); do not replace this check with manual database
+edits or a blind retry. Back up the database and execution records before operational repair.
 Normal reconciliation then settles an already-cancelling task and releases its
-reservation, retaining its worktree. Inspect the queue before explicitly reopening
-admission with `taskspindle-controller open`.
+reservation, retaining its worktree.
+
+### A launch that provably never ran
+
+The Engine keeps only a bounded event history, and a daemon restart loses it, so the `destroy`
+event `recover-failed-create` needs can be gone for good. For a task you have **already
+cancelled**, a second administrative recovery retires the record on different evidence:
+
+```sh
+taskspindle-controller recover-absent-launch taskspindle-worker-<task_id> --attest-never-ran
+taskspindle-controller reconcile
+taskspindle-controller status
+```
+
+`--attest-never-ran` is your statement that you cancelled the task and that, as far as you can
+tell, its worker never ran; without it the command refuses with `UNIT_RECOVERY_UNATTESTED`.
+Prefer `recover-failed-create` whenever a destroy event still exists: it is stronger evidence.
+
+The controller closes admission first and keeps it closed, then, under the same operations lock
+that serializes launches, requires every one of these:
+
+- the record is a worker launch still in `creating`, with no destroy evidence recorded;
+- it was reserved at least one hour ago, judged by the later of its `reserved_at_ns` and the
+  record file's modification time, so no create sent for it can still land;
+- the task is `CANCELLING`, its `started_at`, `heartbeat_at` and `worker_pid` are all empty, and
+  none of its turns has ever ended;
+- the Engine answers, and no container in any state (`docker ps --all`) has the record's
+  deterministic name or this installation's owner label together with the record's generation or
+  unit label. This check runs last, immediately before the record is saved.
+
+Then the record becomes `failed` with a `recovery` object of `kind: "absent"` holding the checked
+facts and `checked_at_ns`. The ordinary `reconcile` settles the task to `CANCELLED`, releases its
+lease, and keeps its worktree. Anything else is refused and changes nothing but the fence:
+
+| Code | Meaning |
+| --- | --- |
+| `UNIT_RECOVERY_INVALID` | no record, a record past `creating`, an accept launch, or a task that no longer exists |
+| `UNIT_RECOVERY_TOO_RECENT` | the reservation is less than an hour old; wait and retry |
+| `UNIT_RECOVERY_NOT_CANCELLED` | cancel the task first |
+| `UNIT_RECOVERY_TASK_STARTED` | the task database shows a worker started, heartbeated, or finished a turn |
+| `UNIT_RECOVERY_UNPROVEN` | a container for this launch exists; let reconciliation observe it |
+| `UNIT_QUERY_FAILED` | the Engine or the task database could not be read; repair it first |
+
+### Reopening admission
+
+Both recoveries, `fence`, and `interrupt-workers` leave admission closed on success and failure
+alike; nothing reopens it automatically. Once `status` shows no unexpected `unknown` jobs and
+`doctor` no longer reports `stuck_launches` or `orphan_leases`, inspect the queue and reopen:
+
+```sh
+taskspindle-controller open
+```
+
+Queued tasks then start unattended as slots free. If a maintenance operation owns the fence,
+`open` refuses with `UNIT_MAINTENANCE_ACTIVE`; its owner reopens it with
+`taskspindle-controller maintenance-release --token <token> --reopen`.
+
+### Engine storage errors
 
 Docker's overlay mount error `no space left on device` can also mean an exhausted
 Linux mount namespace. Check free bytes, free inodes, the Engine's mount count,
@@ -71,7 +176,8 @@ in the same worktree and the other risks discarding a live turn.
 why, and `manual_action`, the sentence telling you what to do. Do that:
 
 ```sh
-systemctl --user status taskspindle-worker-<task_id>
+systemctl --user status taskspindle-worker-<task_id>   # systemd backend
+taskspindle-controller status                          # Docker backend: look for the unit in jobs
 ```
 
 - **Nothing there.** The worker is gone. `continue_task` reconciles once more and, if the task has
@@ -112,7 +218,8 @@ Three refinements matter:
   once as a `RECOVERY` event — a sweep that keeps finding the same stuck task stays quiet.
 - **A `CANCELLING` task whose unit is gone is `CANCELLED`.** The cancel got what it asked for. A
   `CANCELLING` task whose unit is *still running* thirty seconds after the cancel was asked for is
-  stopped (`systemctl --user stop`), logged once as `cancel_escalated`, and left for the next sweep
+  stopped (`systemctl --user stop`, or a container stop through the Docker controller), logged
+  once as `cancel_escalated`, and left for the next sweep
   to settle from the unit's own post-mortem.
 - **An `ACCEPTING` task consults its journal**, unless the unit itself is ambiguous — then the
   accept may still be in flight, and asking the journal would undo an apply that is still running.

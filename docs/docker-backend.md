@@ -79,8 +79,10 @@ persist intent -> create -> persist Docker ID -> start -> observe terminal state
 ```
 
 `UNIT_START_FAILED` means no process was launched. `UNIT_START_UNCERTAIN` means a
-launch may exist and reservations must remain intact. Engine outages never report
-`not_found`. Created-but-unconfirmed containers remain uncertain. Terminal OOM,
+launch may exist and reservations must remain intact. Their messages keep only safe
+detail: an Engine API error's HTTP status and known failure phrases, or a transport
+failure's exception class (for example `ReadTimeout`), never the Engine's own text.
+Engine outages never report `not_found`. Created-but-unconfirmed containers remain uncertain. Terminal OOM,
 exit, and signal evidence is persisted before Docker cleanup and survives it.
 A later turn uses a new generation; prior evidence is archived. A prior turn still
 running produces `UNIT_PREVIOUS_TURN_ACTIVE`, so the new turn remains queued. No prompt or
@@ -90,8 +92,22 @@ integration action is replayed autonomously.
 
 `taskspindle-controller serve` reads `TASKSPINDLE_CONFIG` and serves both sockets.
 `--jobs-socket` and `--diagnostics-socket` override their configured paths. The
-same executable offers `status`, `fence`, `open`, `reconcile`, and `interrupt-workers` clients.
+same executable offers `status`, `fence`, `open`, `reconcile`, `interrupt-workers`,
+`recover-failed-create <unit>`, and `recover-absent-launch <unit> --attest-never-ran` clients.
 Success is JSON and exit 0; failures are bounded JSON errors and exit 1.
+
+The two recovery commands retire one execution record stuck in `creating` after a
+failed create, so ordinary reconciliation can settle its already-cancelling task and
+release its lease. Both close admission first, keep it closed, and hold the controller's
+mutation lock and the cross-process operations lock that serializes launches.
+`recover-failed-create` needs a Docker `destroy` event for exactly that launch.
+`recover-absent-launch` is the fallback once that event has left the Engine's history:
+it requires the operator's attestation flag, a record at least one hour old, a
+`CANCELLING` task whose worker never started, heartbeated, or ended a turn, and a
+reachable Engine with no container in any state carrying the record's name or this
+owner's generation or unit label. On success the record is `failed` with a `recovery`
+object (`kind` `destroy` or `absent`) holding the evidence. Every other case is refused
+with a specific code; [Recovery](recovery.md#the-docker-backend) lists them.
 
 Status reports `backend`, `admission_open`, `engine_reachable`, active or uncertain
 `jobs` (`unit`, `kind`, `task_id`, `state`), `unsettled_integrations`,
@@ -117,6 +133,21 @@ provider probe uses the worker image, security settings, selected auth mounts,
 readonly config, and a private tmpfs in place of live state. Probes have bounded
 runtime/output, do not participate in leases, and remove their finished diagnostic
 containers. The jobs socket does not expose arbitrary commands or diagnostics.
+A failed probe reports a controller error's stable code and fixed message, or only
+the exception class for anything else; provider output never crosses the socket.
+
+After the probes, the controller adds its own execution-state checks from its records
+and a readonly view of the task database. None is advisory:
+
+| Check | Fails when |
+| --- | --- |
+| `worker_admission` | admission is closed; the detail gives `taskspindle-controller open`, or the maintenance release command when maintenance owns the fence |
+| `stuck_launches` | a record not yet `finished`, `retired`, or `failed` is over ten minutes old and its container is absent, uninspectable, or never confirmed running; the units are named |
+| `orphan_leases` | a lease's task is gone, its launch is one of the stuck records, or neither the lease nor the task has heartbeated for ten minutes |
+| `execution_state` | the records or fence cannot be read at all |
+
+`taskspindle doctor` on the host adds the advisory capacity checks; a
+`capacity_<provider>` detail counts orphaned leases apart from active work.
 
 The [official Docker SDK container reference](https://docker-py.readthedocs.io/en/stable/containers.html)
 defines memory-plus-swap as the "Maximum amount of memory + swap a container is
