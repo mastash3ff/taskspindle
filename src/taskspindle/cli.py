@@ -124,6 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reprice.add_argument("--json", action="store_true", help="print the report as JSON")
 
+    sub.add_parser(
+        "metrics", help="print Prometheus text metrics read from the task database (read-only)"
+    )
+
     policy = sub.add_parser("policy", help="inspect and edit the dispatch policy")
     policy_sub = policy.add_subparsers(dest="policy_command", metavar="POLICY_COMMAND")
 
@@ -263,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
             args.since, args.provider,
             dry_run=args.dry_run, use_selected_model=args.use_selected_model, as_json=args.json,
         )
+    if args.command == "metrics":
+        return _metrics()
     if args.command == "policy":
         return _policy(parser, args)
     if args.command == "dispatch":
@@ -550,6 +556,7 @@ def _print_usage(report: dict[str, Any]) -> None:
     present_keys.discard("turns")
     present_keys.discard("input_tokens")
     present_keys.discard("output_tokens")
+    present_keys.discard("reasoning_tokens")
     present_keys.discard("cache_read_tokens")
     present_keys.discard("cache_write_tokens")
     present_keys.discard("cost_estimate_usd")
@@ -582,17 +589,110 @@ def _print_usage(report: dict[str, Any]) -> None:
         [[r["provider"], r["mode"], r["state"], str(r["count"])] for r in report["outcomes"]],
     )
     print()
+    print("failures")
+    _table(
+        ["provider", "mode", "code", "count"],
+        [[r["provider"], r["mode"], r["code"], str(r["count"])] for r in report.get("failures", [])],
+    )
+    print()
     turns = report["turns"]
     print(
-        f"turns: {turns['count']} (mean {turns['mean_ms']} ms, p50 {turns['p50_ms']} ms); "
+        f"turns: {turns['count']} (mean {turns['mean_ms']} ms, p50 {turns['p50_ms']} ms, "
+        f"p95 {turns.get('p95_ms')} ms); "
         f"checks: {report['checks']['passed']}/{report['checks']['count']} passed"
     )
-    for entry in report["windows"]:
-        marks = ", ".join(
-            f"{w['window']} {w['status'] or '?'} {w['used_percent'] or '?'}%" for w in entry["windows"]
+    print(_metering_line(report.get("metering", [])))
+    daily = report.get("daily", [])[-_DAILY_TREND_DAYS:]
+    if daily:
+        print()
+        print(f"daily (last {len(daily)} days, UTC)")
+        _table(
+            ["day", "tasks", "failed", "turns", "in+out", "est_usd", "checks"],
+            [
+                [
+                    row["day"], str(row["tasks_created"]), str(row["failures"]), str(row["turns"]),
+                    _compact(row["input_tokens"] + row["output_tokens"]),
+                    f"{row['cost_estimate_usd']:.2f}",
+                    f"{row['checks_passed']}/{row['checks_run']}" if row["checks_run"] else "-",
+                ]
+                for row in daily
+            ],
         )
+        print()
+    for entry in report["windows"]:
+        marks = ", ".join(_window_mark(w, report["generated_at"]) for w in entry["windows"])
         print(f"{entry['provider']}: {entry['state']}" + (f"; windows: {marks}" if marks else ""))
     print(report["cost_note"])
+
+
+#: How many of the report's days ``taskspindle usage`` prints; ``--json`` carries them all.
+_DAILY_TREND_DAYS = 14
+
+
+def _compact(value: int) -> str:
+    for size, suffix in ((1_000_000_000, "G"), (1_000_000, "M"), (1_000, "k")):
+        if abs(value) >= size:
+            return f"{value / size:.1f}{suffix}"
+    return str(value)
+
+
+def _metering_line(rows: list[dict[str, Any]]) -> str:
+    """How much of the recorded work carries token usage, and so how complete the totals are."""
+    total = sum(int(row["turns"]) for row in rows)
+    if not total:
+        return "metering: no turns recorded"
+    metered = sum(int(row["turns_with_usage"]) for row in rows)
+    unmetered = sum(int(row["unmetered_turns"]) for row in rows)
+    successful = sum(int(row["unmetered_successful_turns"]) for row in rows)
+    unpriced = sum(int(row["unpriced_turns"]) for row in rows)
+    line = f"metering: {metered}/{total} turns carry token usage"
+    if unmetered:
+        line += f"; {unmetered} unmetered ({successful} of them ended normally)"
+    if unpriced:
+        line += f"; {unpriced} metered but unpriced"
+    if unmetered or unpriced:
+        line += "; token and cost totals are partial"
+    by_provider = ", ".join(f"{row['provider']} {row['turns_with_usage']}/{row['turns']}" for row in rows)
+    return f"{line} [{by_provider}]"
+
+
+def _window_mark(window: dict[str, Any], generated_at: str) -> str:
+    """``five_hour allowed 45% (as of ...)``: the percentage only when one was observed."""
+    text = f"{window['window']} {window.get('status') or '?'}"
+    if window.get("used_percent") is not None:
+        text += f" {float(window['used_percent']):g}%"
+        seen = window.get("used_percent_observed_at")
+        if seen and seen != window.get("observed_at"):
+            text += f" (as of {str(seen)[:16]}Z)"
+    resets = window.get("resets_at")
+    if resets and str(resets) <= generated_at:
+        text += f" (reset {resets} passed)"
+    return text
+
+
+def _metrics() -> int:
+    import sqlite3
+    from datetime import UTC, datetime
+
+    from . import metrics, providers
+    from . import policy as policy_module
+    from .web.db import ReadOnlyStore
+
+    paths = resolve_paths()
+    try:
+        profiles = _profiles(paths)
+        with ReadOnlyStore(paths.state_dir / "taskspindle.sqlite3") as store:
+            text = metrics.render(
+                store,
+                profiles=profiles,
+                limits=policy_module.slot_limits_for(store, paths.config_file, profiles),
+                now=datetime.now(UTC),
+            )
+    except (ConfigError, providers.ProfileError, OSError, ValueError, sqlite3.Error) as exc:
+        print(f"taskspindle metrics: {exc}", file=sys.stderr)
+        return 1
+    sys.stdout.write(text)
+    return 0
 
 
 def _reprice(

@@ -191,6 +191,48 @@ def test_usage_prints_the_report_as_json_or_as_tables(
     assert "since must be" in capsys.readouterr().err
 
 
+def test_usage_prints_failures_p95_the_daily_trend_metering_and_current_windows(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from taskspindle.models import Mode, TaskState
+    from taskspindle.store import Store
+    from tests.test_usage import _seed
+
+    with Store.open(cli.resolve_paths().state_dir / "taskspindle.sqlite3") as store:
+        task_id = _seed(store, "grok", Mode.CONSULT, state=TaskState.FAILED, ms=3000, tokens=100)
+        store.update_task(task_id, None, error={"code": "TURN_TIMEOUT", "message": "private /path"})
+        store.insert_turn(task_id, 2, "continue", stop_reason="end_turn")
+        for status, percent, at in (("allowed_warning", 81.0, "2099-01-01T01:00:00.000000Z"),
+                                    ("allowed", None, "2099-01-01T02:00:00.000000Z")):
+            store.insert_provider_window(
+                "claude", "five_hour", source="rate_limit_event", status=status, used_percent=percent,
+                resets_at="2099-01-01T05:00:00Z", observed_at=at,
+            )
+
+    assert cli.main(["usage"]) == 0
+    text = capsys.readouterr().out
+    assert "failures\nprovider  mode     code" in text
+    assert "grok      consult  TURN_TIMEOUT  1" in text
+    assert "p95 3000 ms" in text
+    assert "metering: 1/2 turns carry token usage; 1 unmetered (1 of them ended normally)" in text
+    assert "[grok 1/2]" in text
+    assert "daily (last 14 days, UTC)" in text
+    assert "private" not in text
+    assert "windows: five_hour allowed 81% (as of 2099-01-01T01:00Z)" in text
+    assert text.count("five_hour") == 1
+
+
+def test_metrics_prints_the_exposition_without_creating_a_database(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["metrics"]) == 0
+    text = capsys.readouterr().out
+    assert text.startswith("# HELP taskspindle_build_info ")
+    assert f'version="{taskspindle.__version__}"' in text
+    assert 'taskspindle_provider_state{provider="claude",state="ok"} 1' in text
+    assert not (cli.resolve_paths().state_dir / "taskspindle.sqlite3").exists()
+
+
 def test_reprice_with_no_database_yet_examines_nothing(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
