@@ -155,3 +155,73 @@ def test_failed_create_recovery_cli_calls_the_exact_unit(monkeypatch, tmp_path, 
     assert result == 0
     assert seen == ["taskspindle-worker-ts_one"]
     assert json.loads(capsys.readouterr().out)["load_state"] == "not-found"
+
+
+def test_absent_launch_recovery_requires_attestation_and_the_mutation_lock(controller):
+    calls = []
+
+    def recover(unit):
+        # Another thread cannot take the mutation lock while recovery runs.
+        taken = []
+        lock = controller._mutation_lock
+        probe = threading.Thread(target=lambda: taken.append(lock.acquire(blocking=False)))
+        probe.start()
+        probe.join()
+        calls.append((unit, taken[0]))
+        return UnitState("not-found", "inactive", "dead", "unknown")
+
+    controller.backend.recover_absent_launch = recover
+    for arguments in ({"unit": "taskspindle-worker-ts_one"},
+                      {"unit": "taskspindle-worker-ts_one", "attested": False},
+                      {"unit": "taskspindle-worker-ts_one", "attested": "yes"},
+                      {"unit": ["taskspindle-worker-ts_one"], "attested": True},
+                      {"unit": "taskspindle-worker-ts_one", "attested": True, "force": True}):
+        with pytest.raises((RemoteError, UnitError)) as refused:
+            controller.dispatch("recover_absent_launch", arguments)
+        assert refused.value.code in {"CONTROL_INVALID_ARGUMENT", "UNIT_RECOVERY_UNATTESTED"}
+    with pytest.raises(RemoteError):
+        controller.dispatch("recover_absent_launch",
+                            {"unit": "taskspindle-worker-ts_one", "attested": True}, diagnostics=True)
+    assert calls == []
+
+    result = controller.dispatch(
+        "recover_absent_launch", {"unit": "taskspindle-worker-ts_one", "attested": True},
+    )
+
+    assert result["load_state"] == "not-found"
+    assert calls == [("taskspindle-worker-ts_one", False)]
+
+
+def _cli(monkeypatch, tmp_path, client):
+    resolved = SimpleNamespace(config_file=tmp_path / "config.toml")
+    monkeypatch.delenv("TASKSPINDLE_CONFIG", raising=False)
+    monkeypatch.setattr(controller_module, "paths", lambda: resolved)
+    monkeypatch.setattr(
+        controller_module, "load_config",
+        lambda _path: {"execution": {"jobs_socket": "/private/jobs.sock"}},
+    )
+    monkeypatch.setattr(controller_module, "ControllerClient", lambda _path: client)
+
+
+def test_absent_launch_recovery_cli_requires_the_attestation_flag(monkeypatch, tmp_path, capsys):
+    seen = []
+    client = SimpleNamespace(recover_absent_launch=lambda unit, *, attested: seen.append(
+        (unit, attested),
+    ) or UnitState("not-found", "inactive", "dead", "unknown"))
+    _cli(monkeypatch, tmp_path, client)
+
+    refused = controller_module.main(["recover-absent-launch", "taskspindle-worker-ts_one"])
+    assert refused == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "UNIT_RECOVERY_UNATTESTED"
+    missing = controller_module.main(["recover-absent-launch", "--attest-never-ran"])
+    assert missing == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "CONFIG_INVALID"
+    assert seen == []
+
+    result = controller_module.main([
+        "recover-absent-launch", "taskspindle-worker-ts_one", "--attest-never-ran",
+    ])
+
+    assert result == 0
+    assert seen == [("taskspindle-worker-ts_one", True)]
+    assert json.loads(capsys.readouterr().out)["load_state"] == "not-found"

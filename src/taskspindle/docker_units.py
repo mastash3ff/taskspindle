@@ -31,6 +31,12 @@ _SAFE_DAEMON_FAILURES = {
     "no space left on device": "no space left on device",
 }
 _RECOVERY_EVENTS_TIMEOUT_S = 30.0
+_SETTLED_PHASES = {"finished", "retired", "failed"}
+#: A launch record without progress for this long is reported by doctor as stuck.
+_UNSETTLED_AFTER_S = 600
+#: An absent launch is retired without destroy evidence only after this long. Docker's own
+#: request timeouts are far shorter, so no create sent before it can still land.
+_ABSENT_LAUNCH_MIN_AGE_S = 3600
 
 
 def _api_diagnostic(exc: APIError) -> str:
@@ -49,6 +55,17 @@ def _api_diagnostic(exc: APIError) -> str:
         if needle in lowered:
             facts.append(diagnostic)
     return f" ({'; '.join(facts)})" if facts else ""
+
+
+def _failure_diagnostic(exc: BaseException) -> str:
+    """Safe detail for a failed Engine call: bounded API facts, otherwise only the class name.
+
+    A transport exception's message can carry the Engine URL or request arguments; its class
+    (``ReadTimeout``, ``ConnectionError``) is fixed code and tells the operator what failed.
+    """
+    if isinstance(exc, APIError):
+        return _api_diagnostic(exc)
+    return f" ({type(exc).__name__})"
 
 
 def _atomic(path: Path, value: Any) -> None:
@@ -431,7 +448,9 @@ class DockerBackend:
             try:
                 self.client.images.get(self.image)  # local only; never pull or authenticate
             except Exception as exc:
-                raise UnitError("UNIT_START_FAILED", "Worker image is not locally available") from exc
+                raise UnitError(
+                    "UNIT_START_FAILED", f"Worker image is not locally available{_failure_diagnostic(exc)}",
+                ) from exc
             generation = uuid.uuid4().hex
             record = {"unit": unit, "kind": kind, "task_id": task_id, "identity": identity,
                       "generation": generation, "name": f"taskspindle-{self.owner}-{generation}",
@@ -448,7 +467,7 @@ class DockerBackend:
                                  "XDG_DATA_HOME": "/opt/taskspindle/data"}, **options,
                 )
             except Exception as exc:
-                diagnostic = _api_diagnostic(exc) if isinstance(exc, APIError) else ""
+                diagnostic = _failure_diagnostic(exc)
                 try:
                     container = self._container(record)
                 except UnitError:
@@ -469,15 +488,20 @@ class DockerBackend:
             try:
                 container.start()
             except Exception as exc:
+                diagnostic = _failure_diagnostic(exc)
                 try:
                     current = self._container(record)
                 except UnitError as query_error:
-                    raise UnitError("UNIT_START_UNCERTAIN", "Docker start is unsettled") from query_error
+                    raise UnitError(
+                        "UNIT_START_UNCERTAIN", f"Docker start is unsettled{diagnostic}",
+                    ) from query_error
                 if current is not None and self._observe(record, current).kind in {
                     "active", "success", "exit", "signal", "oom",
                 }:
                     return
-                raise UnitError("UNIT_START_UNCERTAIN", "Docker start outcome is unsettled") from exc
+                raise UnitError(
+                    "UNIT_START_UNCERTAIN", f"Docker start outcome is unsettled{diagnostic}",
+                ) from exc
             record["phase"] = "started"
             self._save(record)
 
@@ -600,6 +624,158 @@ class DockerBackend:
             record["recovery"] = {"kind": "destroy", **destroyed}
             self._save(record)
             return UnitState("not-found", "inactive", "dead", "unknown")
+
+    @staticmethod
+    def _reserved_ns(record: Mapping[str, Any], path: Path) -> int:
+        """The latest time the reservation can have been written.
+
+        ``reserved_at_ns`` precedes the first save and every later save only moves the file's
+        mtime forward, so the larger of the two never makes a reservation look older than it is.
+        Legacy records without ``reserved_at_ns`` fall back to the mtime alone.
+        """
+        return max(record.get("reserved_at_ns") or 0, path.stat().st_mtime_ns)
+
+    def _task_never_started(self, task_id: str) -> dict[str, Any]:
+        """Read the task database facts an absent-launch recovery requires, or refuse."""
+        with self._database() as connection:
+            task = connection.execute(
+                "SELECT state, started_at, heartbeat_at, worker_pid FROM tasks WHERE id=?", (task_id,),
+            ).fetchone()
+            ended = connection.execute(
+                "SELECT COUNT(*) FROM turns WHERE task_id=? AND ended_at IS NOT NULL", (task_id,),
+            ).fetchone()[0]
+        if task is None:
+            raise UnitError("UNIT_RECOVERY_INVALID", "Launch task does not exist")
+        if task["state"] != "CANCELLING":
+            raise UnitError(
+                "UNIT_RECOVERY_NOT_CANCELLED", "Cancel the task before recovering its absent launch",
+            )
+        if any(task[key] is not None for key in ("started_at", "heartbeat_at", "worker_pid")):
+            raise UnitError("UNIT_RECOVERY_TASK_STARTED", "The task database shows that a worker started")
+        if ended:
+            raise UnitError("UNIT_RECOVERY_TASK_STARTED", "The task database shows a turn that ended")
+        return {"task_state": task["state"], "started_at": None, "heartbeat_at": None,
+                "worker_pid": None, "ended_turns": 0}
+
+    def _require_no_owned_container(self, record: Mapping[str, Any]) -> None:
+        """Refuse unless a reachable Engine has no container, in any state, for this launch."""
+        try:
+            self.client.ping()
+        except Exception as exc:
+            raise UnitError(
+                "UNIT_QUERY_FAILED", f"Docker Engine is unreachable{_failure_diagnostic(exc)}",
+            ) from exc
+        try:
+            if self._container(record) is not None:
+                raise UnitError("UNIT_RECOVERY_UNPROVEN", "The recorded Docker generation exists")
+        except UnitError as exc:
+            if exc.code != "UNIT_RECORD_INVALID":
+                raise
+            raise UnitError(
+                "UNIT_RECOVERY_UNPROVEN", "A container with the recorded name exists",
+            ) from exc
+        owner = f"taskspindle.owner={self.owner}"
+        for label in (f"taskspindle.generation={record['generation']}", f"taskspindle.unit={record['unit']}"):
+            try:
+                found = self.client.containers.list(all=True, filters={"label": [owner, label]})
+            except Exception as exc:
+                raise UnitError(
+                    "UNIT_QUERY_FAILED", f"Docker container listing is unavailable{_failure_diagnostic(exc)}",
+                ) from exc
+            if found:
+                raise UnitError(
+                    "UNIT_RECOVERY_UNPROVEN", "A container with this launch's owner labels exists",
+                )
+
+    def recover_absent_launch(self, unit: str) -> UnitState:
+        """Retire a create that provably never ran when Docker's destroy evidence is gone.
+
+        ``recover_failed_create`` needs a destroy event, which the Engine keeps only briefly.
+        This is the operator's fallback for a task they already cancelled: every fact is read
+        under the operations lock with admission closed first and kept closed. The Engine must
+        answer and hold no container, in any state, with the record's name or this owner's
+        generation or unit labels; the reservation must be at least an hour old, so no create
+        sent for it can still land; and the task database must show a cancelling task whose
+        worker never started, never heartbeated, and never ended a turn. The container check
+        runs last, immediately before the record is saved as ``failed``.
+        """
+        path = self._record_path(unit)
+        with self._locked():
+            _atomic(self.directory / "admission.json", {"open": False})
+            record = self._record(unit)
+            if record is None or record["phase"] != "creating" or record["kind"] != "worker":
+                raise UnitError(
+                    "UNIT_RECOVERY_INVALID", "Only an unsettled Docker worker create can be recovered",
+                )
+            now_ns = time.time_ns()
+            reserved_ns = self._reserved_ns(record, path)
+            if now_ns - reserved_ns < _ABSENT_LAUNCH_MIN_AGE_S * 1_000_000_000:
+                raise UnitError(
+                    "UNIT_RECOVERY_TOO_RECENT", "The launch was reserved less than one hour ago",
+                )
+            task = self._task_never_started(record["task_id"])
+            self._require_no_owned_container(record)
+            record["phase"] = "failed"
+            record["recovery"] = {
+                "kind": "absent", "checked_at_ns": now_ns, "reserved_at_ns": reserved_ns,
+                "engine_reachable": True, "containers": 0,
+                "container_checks": ["name", "generation", "unit"], "attested": True, **task,
+            }
+            self._save(record)
+            return UnitState("not-found", "inactive", "dead", "unknown")
+
+    def execution_diagnostics(self) -> dict[str, Any]:
+        """Facts doctor turns into checks: the fence, stuck launches, and the leases held.
+
+        Read-only apart from what ``_record`` already validates; no container is observed into
+        its record here, and nothing is settled.
+        """
+        with self._locked():
+            maintenance = self._maintenance()
+            admission = self._admission()
+            now_ns = time.time_ns()
+            unsettled: list[dict[str, Any]] = []
+            for path in sorted(self.directory.glob("taskspindle-*.json")):
+                try:
+                    record = self._record(path.stem)
+                except UnitError:
+                    unsettled.append({"unit": path.stem, "task_id": None, "phase": "unreadable",
+                                      "age_s": None, "container": "unknown"})
+                    continue
+                if record is None or record["phase"] in _SETTLED_PHASES:
+                    continue
+                age_s = max(0, (now_ns - self._reserved_ns(record, path)) // 1_000_000_000)
+                if age_s < _UNSETTLED_AFTER_S:
+                    continue
+                try:
+                    container = self._container(record)
+                except UnitError:
+                    observed = "unobservable"
+                else:
+                    status = (container.attrs.get("State", {}) or {}).get("Status") if container else None
+                    if status in {"running", "restarting", "paused", *_TERMINAL}:
+                        continue  # Observable; ordinary reconciliation settles it.
+                    observed = "absent" if container is None else str(status or "unknown")
+                unsettled.append({"unit": record["unit"], "task_id": record["task_id"],
+                                  "phase": record["phase"], "age_s": age_s, "container": observed})
+            try:
+                with self._database() as connection:
+                    leases = [dict(row) for row in connection.execute(
+                        "SELECT provider, task_id, unit_name, acquired_at, heartbeat_at FROM leases "
+                        "ORDER BY acquired_at, task_id",
+                    )]
+                    tasks = {}
+                    for lease in leases:
+                        row = connection.execute(
+                            "SELECT state, heartbeat_at FROM tasks WHERE id=?", (lease["task_id"],),
+                        ).fetchone()
+                        if row is not None:
+                            tasks[lease["task_id"]] = dict(row)
+            except UnitError:
+                leases, tasks = None, None
+            return {"admission_open": admission,
+                    "maintenance_active": bool(maintenance and maintenance["active"]),
+                    "unsettled": unsettled, "leases": leases, "tasks": tasks}
 
     def show(self, unit: str) -> UnitState:
         with self._locked():
@@ -774,7 +950,9 @@ class DockerBackend:
             stderr = container.logs(stdout=False, stderr=True, tail=1000)[-65536:].decode("utf-8", "replace")
             return {"exit_code": result["StatusCode"], "stdout": stdout, "stderr": stderr}
         except Exception as exc:
-            raise UnitError("DIAGNOSTIC_FAILED", "Isolated worker diagnostic failed") from exc
+            raise UnitError(
+                "DIAGNOSTIC_FAILED", f"Isolated worker diagnostic failed{_failure_diagnostic(exc)}",
+            ) from exc
         finally:
             if container is not None:
                 with contextlib.suppress(Exception):

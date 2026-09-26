@@ -1,6 +1,8 @@
 """Bounded worker readiness probes and explicit post-interrupt reconciliation.
 
-Doctor uses only initialize/auth metadata probes, without tasks, prompts, or the live database.
+Doctor's worker probes use only initialize/auth metadata, without tasks, prompts, or the live
+database. The controller then adds its own execution-state checks (the admission fence, stuck
+launch records, orphan leases) from its records and a read-only view of the task database.
 The separate post-interrupt callback settles live worker records without dispatching work.
 """
 
@@ -15,7 +17,8 @@ from typing import Any
 
 from . import providers
 from .config import Paths
-from .doctor import Check
+from .doctor import Check, execution_state_checks
+from .units import UnitError
 
 
 def reconcile_interrupted_workers(backend: Any, paths: Paths, settings: Mapping[str, Any]) -> None:
@@ -66,7 +69,25 @@ def doctor_report(
             checks.extend({**row, "name": f"{provider}:{row['name']}"} for row in rows)
         except Exception as exc:
             # Provider stderr can contain authentication details. Do not return it over RPC.
+            # A UnitError carries a stable code and a fixed, already-sanitized message; any
+            # other exception contributes only its class name.
             checks.append(Check(
-                f"{provider}:worker_probe", False, f"Worker diagnostics failed ({type(exc).__name__})",
+                f"{provider}:worker_probe", False, f"Worker diagnostics failed ({_failure(exc)})",
             ).as_dict())
+    collect = getattr(backend, "execution_diagnostics", None)
+    if callable(collect):
+        try:
+            facts = collect()
+        except Exception as exc:
+            checks.append(Check(
+                "execution_state", False, f"Execution state is unavailable ({_failure(exc)})",
+            ).as_dict())
+        else:
+            checks.extend(check.as_dict() for check in execution_state_checks(facts, datetime.now(UTC)))
     return {"ok": all(row["ok"] for row in checks if not row["advisory"]), "checks": checks}
+
+
+def _failure(exc: Exception) -> str:
+    if isinstance(exc, UnitError):
+        return f"{exc.code}: {exc}"
+    return type(exc).__name__

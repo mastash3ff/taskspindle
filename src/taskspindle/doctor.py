@@ -26,7 +26,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -106,8 +106,17 @@ def capacity_summary(
         per_provider_max=capacity.per_provider_max, total_max=capacity.total_max,
     )
     active: dict[str, int] = {}
-    for lease in store.list_leases():
+    leases = store.list_leases()
+    holders: dict[str, dict[str, Any]] = {}
+    for lease in leases:
         active[lease["provider"]] = active.get(lease["provider"], 0) + 1
+        task = store.get_task(lease["task_id"])
+        if task is not None:
+            holders[lease["task_id"]] = {"state": task.state.value, "heartbeat_at": task.heartbeat_at}
+    orphans = orphan_leases(leases, holders, now)
+    orphaned: dict[str, int] = {}
+    for orphan in orphans:
+        orphaned[orphan["provider"]] = orphaned.get(orphan["provider"], 0) + 1
     day = utilization.pool(
         store, now=now, limits={name: info["limit"] for name, info in limits_now["providers"].items()},
         queued_states=[TaskState.QUEUED.value, TaskState.REPAIRING.value, TaskState.RESUMING.value],
@@ -122,6 +131,7 @@ def capacity_summary(
             name: {
                 **info,
                 "active": active.get(name, 0),
+                "orphaned": orphaned.get(name, 0),
                 "queued": day.get(name, {}).get("queued", 0),
                 "slot_utilization": day.get(name, {}).get("slot_utilization"),
             }
@@ -129,6 +139,7 @@ def capacity_summary(
         },
         "total": limits_now["total"],
         "shared_seats": {family: sorted(names) for family, names in families.items() if len(names) > 1},
+        "orphan_leases": orphans,
     }
 
 
@@ -152,8 +163,14 @@ def capacity_checks(summary: Mapping[str, Any], *, memory_total: int | None = No
     for name, info in sorted(summary.get("providers", {}).items()):
         busy = info.get("slot_utilization")
         used = f"{busy:.0%}" if isinstance(busy, int | float) else "unknown"
+        orphaned = info.get("orphaned", 0)
+        held = f"{info['active']} active"
+        if orphaned:
+            # A lease nothing runs under still takes a slot, but it is not healthy work.
+            held = (f"{info['active'] - orphaned} active, {orphaned} held by "
+                    f"orphaned lease{'s' if orphaned != 1 else ''} (see orphan_leases)")
         detail = (
-            f"limit {info['limit']} from {info['source']}, {info['active']} active, "
+            f"limit {info['limit']} from {info['source']}, {held}, "
             f"{info['queued']} queued, slots {used} used over the last day"
         )
         saturated = info["queued"] > 0 and info["active"] >= info["limit"]
@@ -180,6 +197,142 @@ def capacity_checks(summary: Mapping[str, Any], *, memory_total: int | None = No
         if exposure > memory_total:
             detail += "; set [capacity] total_max to bound it"
         checks.append(Check("capacity_memory", exposure <= memory_total, detail, advisory=True))
+    return checks
+
+
+# -- stuck execution state ------------------------------------------------------------------------
+
+#: How long a launch or a lease may go without progress before doctor reports it as stuck. A
+#: running worker refreshes its task and lease heartbeats every few seconds.
+STUCK_AFTER_S = 600
+
+
+def _stamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def orphan_leases(
+    leases: Sequence[Mapping[str, Any]],
+    tasks: Mapping[str, Mapping[str, Any]],
+    now: datetime,
+    *,
+    unsettled_units: frozenset[str] | set[str] = frozenset(),
+) -> list[dict[str, str]]:
+    """Leases that hold a provider slot while no worker runs under them.
+
+    ``tasks`` maps each lease's task ID to its ``state`` and ``heartbeat_at``; a missing entry
+    means the task is gone. A lease is orphaned when its task is gone, when its unit is one the
+    backend reports as unsettled, or when neither the lease nor the task has heartbeated for
+    :data:`STUCK_AFTER_S`. The same rules apply to every backend; only the Docker controller
+    knows which launch records are unsettled.
+    """
+    from .models import ACTIVE_STATES
+
+    active = {state.value for state in ACTIVE_STATES}
+    moment = now if now.tzinfo else now.replace(tzinfo=UTC)
+    cutoff = moment - timedelta(seconds=STUCK_AFTER_S)
+    found: list[dict[str, str]] = []
+    for lease in leases:
+        task_id = str(lease["task_id"])
+        unit = str(lease.get("unit_name") or f"taskspindle-worker-{task_id}")
+        task = tasks.get(task_id)
+        if task is None:
+            reason = "its task no longer exists"
+        elif unit in unsettled_units:
+            reason = f"task is {task['state']} and its launch is unsettled"
+        else:
+            beats = [_stamp(lease.get("heartbeat_at")), _stamp(task.get("heartbeat_at"))]
+            latest = max((beat for beat in beats if beat is not None), default=None)
+            if latest is not None and latest >= cutoff:
+                continue
+            reason = (
+                f"task is {task['state']} with no worker heartbeat for over {STUCK_AFTER_S // 60} minutes"
+                if task["state"] in active else f"task is {task['state']}"
+            )
+        found.append({"provider": str(lease["provider"]), "task_id": task_id, "unit": unit,
+                      "reason": reason})
+    return found
+
+
+def _listed(items: Sequence[str], limit: int = 5) -> str:
+    shown = "; ".join(items[:limit])
+    return shown + (f"; and {len(items) - limit} more" if len(items) > limit else "")
+
+
+def orphan_lease_check(orphans: Sequence[Mapping[str, str]], *, held: int | None = None) -> Check:
+    """Fail while any lease holds a slot that no running worker uses."""
+    if not orphans:
+        if held == 0:
+            return Check("orphan_leases", True, "no provider leases are held")
+        return Check("orphan_leases", True, "every provider lease belongs to a live worker")
+    rows = [f"{row['provider']} lease held by {row['task_id']}: {row['reason']}" for row in orphans]
+    return Check("orphan_leases", False, (
+        f"{len(orphans)} lease{'s' if len(orphans) != 1 else ''} hold a slot with no running worker "
+        f"({_listed(rows)}). Reconciliation releases a lease once its task's unit settles; "
+        "see docs/recovery.md"
+    ))
+
+
+def _age(seconds: Any) -> str:
+    if not isinstance(seconds, int):
+        return "an unknown time"
+    if seconds >= 7200:
+        return f"{seconds // 3600} hours"
+    return f"{seconds // 60} minutes"
+
+
+def stuck_launch_check(unsettled: Sequence[Mapping[str, Any]]) -> Check:
+    """Fail while a Docker launch record has stayed unsettled past :data:`STUCK_AFTER_S`."""
+    if not unsettled:
+        return Check("stuck_launches", True, "no launch record is unsettled")
+    rows = [
+        f"{row['unit']} in {row['phase']} for {_age(row.get('age_s'))} (container {row.get('container')})"
+        for row in unsettled
+    ]
+    return Check("stuck_launches", False, (
+        f"{len(unsettled)} launch record{'s' if len(unsettled) != 1 else ''} unsettled for over "
+        f"{STUCK_AFTER_S // 60} minutes: {_listed(rows)}. Reconciliation retains their tasks and "
+        "leases until the outcome is proven; see docs/recovery.md for recover-failed-create and "
+        "recover-absent-launch"
+    ))
+
+
+def admission_check(admission_open: bool, *, maintenance_active: bool = False) -> Check:
+    """Fail while the controller's admission fence is closed: queued work cannot start."""
+    if admission_open:
+        return Check("worker_admission", True, "worker admission is open")
+    if maintenance_active:
+        return Check("worker_admission", False, (
+            "worker admission is closed by an active maintenance operation; queued work waits "
+            "until its owner runs `taskspindle-controller maintenance-release --token <token> --reopen`"
+        ))
+    return Check("worker_admission", False, (
+        "worker admission is closed; queued work waits. Inspect `taskspindle-controller status`, "
+        "then reopen with `taskspindle-controller open`"
+    ))
+
+
+def execution_state_checks(facts: Mapping[str, Any], now: datetime) -> list[Check]:
+    """The controller's view of stuck state: the fence, unsettled launches, and orphan leases."""
+    checks = [admission_check(
+        facts.get("admission_open") is True, maintenance_active=facts.get("maintenance_active") is True,
+    )]
+    unsettled = list(facts.get("unsettled") or [])
+    checks.append(stuck_launch_check(unsettled))
+    leases, tasks = facts.get("leases"), facts.get("tasks")
+    if leases is None or tasks is None:
+        checks.append(Check("orphan_leases", False, "the task database cannot be read safely"))
+    else:
+        units = {str(row["unit"]) for row in unsettled if row.get("unit")}
+        checks.append(orphan_lease_check(
+            orphan_leases(leases, tasks, now, unsettled_units=units), held=len(leases),
+        ))
     return checks
 
 
@@ -781,7 +934,16 @@ async def run_doctor_async(
     if capacity is not None and parent_env.get("TASKSPINDLE_WORKER_CONTAINER") != "1":
         # Slots are scheduled here, not in a worker, so these are answered on this side even
         # when every other question was put to the worker image.
-        report["checks"] = [*report["checks"], *(check.as_dict() for check in capacity_checks(capacity))]
+        extra = capacity_checks(capacity)
+        if "orphan_leases" in capacity and not any(
+            row.get("name") == "orphan_leases" for row in report["checks"]
+        ):
+            # The Docker controller answers this itself, with its launch records; otherwise the
+            # task database alone decides, which is all the systemd backend has.
+            leases = orphan_lease_check(capacity["orphan_leases"])
+            extra.append(leases)
+            report["ok"] = bool(report["ok"]) and leases.ok
+        report["checks"] = [*report["checks"], *(check.as_dict() for check in extra)]
     return report
 
 

@@ -104,3 +104,71 @@ def test_worker_probe_failure_is_failure_even_when_controller_is_available(paths
     assert report["ok"] is False
     assert report["checks"][0]["name"] == "a:worker_probe"
     assert "private auth contents" not in json.dumps(report)
+
+
+def test_worker_probe_failure_keeps_a_unit_error_code_but_only_other_class_names(paths, monkeypatch):
+    from taskspindle.units import UnitError
+
+    profiles = {name: Profile(id=name, auth="oauth", command=("/bin/true",)) for name in ("a", "b")}
+    monkeypatch.setattr(worker_diagnostics.providers, "load_profiles", lambda *args, **kwargs: profiles)
+
+    class Backend:
+        def run_probe(self, provider, *args, **kwargs):
+            if provider == "a":
+                raise UnitError("DIAGNOSTIC_FAILED", "Isolated worker diagnostic failed (ReadTimeout)")
+            raise RuntimeError("private stderr TOKEN=never-public")
+
+    report = worker_diagnostics.doctor_report(Backend(), paths, {})
+
+    details = {row["name"]: row["detail"] for row in report["checks"]}
+    assert details == {
+        "a:worker_probe": "Worker diagnostics failed "
+                          "(DIAGNOSTIC_FAILED: Isolated worker diagnostic failed (ReadTimeout))",
+        "b:worker_probe": "Worker diagnostics failed (RuntimeError)",
+    }
+    assert "never-public" not in json.dumps(report)
+
+
+def test_controller_report_adds_execution_state_checks(paths, monkeypatch):
+    from taskspindle.units import UnitError
+
+    monkeypatch.setattr(worker_diagnostics.providers, "load_profiles", lambda *args, **kwargs: {})
+
+    class Ghost:
+        def execution_diagnostics(self):
+            return {
+                "admission_open": False, "maintenance_active": False,
+                "unsettled": [{"unit": "taskspindle-worker-ts_g", "task_id": "ts_g", "phase": "creating",
+                               "age_s": 90000, "container": "absent"}],
+                "leases": [{"provider": "grok", "task_id": "ts_g", "unit_name": "taskspindle-worker-ts_g",
+                            "acquired_at": None, "heartbeat_at": None}],
+                "tasks": {"ts_g": {"state": "CANCELLING", "heartbeat_at": None}},
+            }
+
+    report = worker_diagnostics.doctor_report(Ghost(), paths, {})
+
+    rows = {row["name"]: row for row in report["checks"]}
+    assert report["ok"] is False
+    assert set(rows) == {"worker_admission", "stuck_launches", "orphan_leases"}
+    assert "taskspindle-controller open" in rows["worker_admission"]["detail"]
+    assert "taskspindle-worker-ts_g in creating for 25 hours" in rows["stuck_launches"]["detail"]
+    assert "grok lease held by ts_g: task is CANCELLING and its launch is unsettled" in (
+        rows["orphan_leases"]["detail"]
+    )
+
+    class Healthy:
+        def execution_diagnostics(self):
+            return {"admission_open": True, "maintenance_active": False, "unsettled": [],
+                    "leases": [], "tasks": {}}
+
+    assert worker_diagnostics.doctor_report(Healthy(), paths, {})["ok"] is True
+
+    class Broken:
+        def execution_diagnostics(self):
+            raise UnitError("UNIT_RECORD_INVALID", "Admission record is invalid")
+
+    broken = worker_diagnostics.doctor_report(Broken(), paths, {})
+    assert broken["checks"] == [{
+        "name": "execution_state", "ok": False, "advisory": False,
+        "detail": "Execution state is unavailable (UNIT_RECORD_INVALID: Admission record is invalid)",
+    }]

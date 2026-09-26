@@ -56,14 +56,23 @@ class ControllerClient:
     def reset_failed(self, unit: str) -> None:
         self._call("reset_failed", {"unit": unit})
 
-    def recover_failed_create(self, unit: str) -> UnitState:
-        result = self._call("recover_failed_create", {"unit": unit})
+    @staticmethod
+    def _recovery_state(result: Any) -> UnitState:
         try:
             if not isinstance(result, dict) or set(result) != set(asdict(UnitState("", "", "", ""))):
                 raise ValueError
             return UnitState(**result)
         except (TypeError, ValueError) as exc:
             raise UnitError("UNIT_QUERY_FAILED", "Invalid controller recovery result") from exc
+
+    def recover_failed_create(self, unit: str) -> UnitState:
+        return self._recovery_state(self._call("recover_failed_create", {"unit": unit}))
+
+    def recover_absent_launch(self, unit: str, *, attested: bool) -> UnitState:
+        """Retire a never-run launch; ``attested`` is the operator's explicit confirmation."""
+        return self._recovery_state(
+            self._call("recover_absent_launch", {"unit": unit, "attested": attested}),
+        )
 
     def admission_open(self) -> bool:
         return self._call("admission") is True

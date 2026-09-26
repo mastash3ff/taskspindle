@@ -39,7 +39,7 @@ class Controller:
         if not diagnostics and operation in {"start", "set_admission", "interrupt_workers", "reconcile",
                                                "maintenance_acquire", "maintenance_release",
                                                "submission_begin", "submission_end",
-                                               "recover_failed_create"}:
+                                               "recover_failed_create", "recover_absent_launch"}:
             with self._mutation_lock:
                 return self._dispatch(operation, arguments, diagnostics=diagnostics)
         return self._dispatch(operation, arguments, diagnostics=diagnostics)
@@ -93,6 +93,15 @@ class Controller:
             if type(args["open"]) is not bool:
                 raise RemoteError("CONTROL_INVALID_ARGUMENT", "Admission flag must be boolean")
             return self.backend.set_admission(args["open"])
+        if operation == "recover_absent_launch":
+            args = _arguments(arguments, {"unit", "attested"})
+            if not isinstance(args["unit"], str) or len(args["unit"]) > 200:
+                raise RemoteError("CONTROL_INVALID_ARGUMENT", "Invalid logical job name")
+            if args["attested"] is not True:
+                raise UnitError(
+                    "UNIT_RECOVERY_UNATTESTED", "Absent-launch recovery requires operator attestation",
+                )
+            return asdict(self.backend.recover_absent_launch(args["unit"]))
         if operation in {"show", "stop", "reset_failed", "kill", "start", "recover_failed_create"}:
             fields = {"unit"}
             if operation == "kill":
@@ -247,11 +256,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="taskspindle-controller")
     parser.add_argument(
         "command", choices=["serve", "status", "fence", "open", "interrupt-workers", "reconcile",
-                            "maintenance-acquire", "maintenance-release", "recover-failed-create"],
+                            "maintenance-acquire", "maintenance-release", "recover-failed-create",
+                            "recover-absent-launch"],
     )
     parser.add_argument("unit", nargs="?")
     parser.add_argument("--token")
     parser.add_argument("--reopen", action="store_true")
+    parser.add_argument(
+        "--attest-never-ran", action="store_true",
+        help="recover-absent-launch: attest that you cancelled the task and checked that its "
+             "worker never ran",
+    )
     parser.add_argument("--jobs-socket", type=Path)
     parser.add_argument("--diagnostics-socket", type=Path)
     args = parser.parse_args(argv)
@@ -282,6 +297,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.unit is None:
                 raise ConfigError("recover-failed-create requires a logical unit name")
             result = asdict(client.recover_failed_create(args.unit))
+        elif args.command == "recover-absent-launch":
+            if args.unit is None:
+                raise ConfigError("recover-absent-launch requires a logical unit name")
+            if not args.attest_never_ran:
+                raise UnitError(
+                    "UNIT_RECOVERY_UNATTESTED",
+                    "recover-absent-launch requires --attest-never-ran; see docs/recovery.md",
+                )
+            result = asdict(client.recover_absent_launch(args.unit, attested=True))
         elif args.command in {"fence", "reconcile"}:
             result = client.reconcile()
         else:

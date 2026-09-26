@@ -95,3 +95,26 @@ def test_worker_reservation_is_inside_submission_guard():
     orchestrator._start_worker_admitted = lambda *args: events.append('claim/start') or True
     assert orchestrator._start_worker(None)
     assert events == ['begin', 'claim/start', 'end']
+
+
+def test_absent_launch_recovery_round_trip_carries_the_attestation(monkeypatch):
+    calls = []
+
+    def request(_socket, operation, arguments, **_):
+        calls.append((operation, arguments))
+        return {
+            "load_state": "not-found", "active_state": "inactive", "sub_state": "dead",
+            "result": "unknown", "exec_main_status": None, "main_pid": None,
+        }
+
+    monkeypatch.setattr(execution, "request", request)
+    client = execution.ControllerClient("/private/jobs.sock")
+
+    state = client.recover_absent_launch("worker", attested=True)
+
+    assert state.kind == "not_found"
+    assert calls == [("recover_absent_launch", {"unit": "worker", "attested": True})]
+    monkeypatch.setattr(execution, "request", lambda *_args, **_kwargs: {"load_state": "gone"})
+    with pytest.raises(UnitError) as malformed:
+        client.recover_absent_launch("worker", attested=True)
+    assert malformed.value.code == "UNIT_QUERY_FAILED"

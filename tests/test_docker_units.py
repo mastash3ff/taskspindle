@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
 from docker.errors import APIError, NotFound
 
+from taskspindle import doctor
 from taskspindle.config import ConfigError, Paths
 from taskspindle.docker_units import DockerBackend
 from taskspindle.units import UnitError
@@ -53,6 +56,11 @@ class Container:
         return b"probe output" if stdout else b""
 
 
+def all_labels(container, wanted):
+    labels = container.attrs["Config"]["Labels"]
+    return all(labels.get(key) == value for key, value in wanted.items())
+
+
 class Containers:
     def __init__(self):
         self.values = {}
@@ -62,6 +70,7 @@ class Containers:
         self.query_failure = False
         self.entered = None
         self.proceed = None
+        self.list_calls = []
 
     def get(self, identity):
         if self.query_failure:
@@ -70,6 +79,15 @@ class Containers:
             if identity in {name, container.id}:
                 return container
         raise NotFound("not found")
+
+    def list(self, all=False, filters=None):
+        self.list_calls.append((all, filters))
+        if self.query_failure:
+            raise OSError("secret engine URL")
+        wanted = dict(item.split("=", 1) for item in (filters or {}).get("label", []))
+        return [container for container in self.values.values()
+                if (all or container.attrs["State"]["Status"] == "running")
+                and all_labels(container, wanted)]
 
     def create(self, image, command, **options):
         if self.entered:
@@ -723,3 +741,341 @@ def test_maintenance_acquire_crash_before_legacy_write_is_still_closed(setup, mo
     assert restarted.admission_open() is False
     with pytest.raises(UnitError):
         restarted.submission_begin('b' * 64)
+
+
+# -- safe detail for non-API Engine failures -----------------------------------------------------
+
+
+def test_create_transport_failure_names_only_the_exception_class(setup):
+    backend, client = setup
+    client.containers.create_failure = "before"
+
+    with pytest.raises(UnitError) as caught:
+        launch(backend)
+
+    assert caught.value.code == "UNIT_START_UNCERTAIN"
+    assert str(caught.value) == "Docker create outcome is unsettled (OSError)"
+
+
+def test_start_transport_failure_names_only_the_exception_class(setup):
+    backend, client = setup
+    client.containers.start_failure = "before"
+
+    with pytest.raises(UnitError) as caught:
+        launch(backend)
+
+    assert caught.value.code == "UNIT_START_UNCERTAIN"
+    assert str(caught.value) == "Docker start outcome is unsettled (OSError)"
+    assert "secret" not in str(caught.value)
+
+
+def test_image_and_probe_failures_keep_only_safe_detail(setup):
+    backend, client = setup
+    client.images = SimpleNamespace(get=lambda image: (_ for _ in ()).throw(
+        APIError("private registry TOKEN=never-public", response=SimpleNamespace(status_code=404)),
+    ))
+    with pytest.raises(UnitError) as missing:
+        launch(backend)
+    assert str(missing.value) == "Worker image is not locally available (HTTP 404)"
+
+    client.images = SimpleNamespace(get=lambda image: (_ for _ in ()).throw(TimeoutError("private URL")))
+    with pytest.raises(UnitError) as probe:
+        backend.run_probe("claude", ["taskspindle", "doctor", "--json", "--no-live"])
+    assert probe.value.code == "DIAGNOSTIC_FAILED"
+    assert str(probe.value) == "Isolated worker diagnostic failed (TimeoutError)"
+
+
+# -- recovery of a launch that provably never ran ------------------------------------------------
+
+
+def full_schema(backend):
+    """Add the production columns absent-launch recovery and doctor read to the small fixture."""
+    with sqlite3.connect(backend.paths.state_dir / "taskspindle.sqlite3") as db:
+        for table, column in (
+            ("tasks", "started_at"), ("tasks", "heartbeat_at"), ("tasks", "worker_pid"),
+            ("turns", "ended_at"), ("leases", "provider"), ("leases", "unit_name"),
+            ("leases", "acquired_at"), ("leases", "heartbeat_at"),
+        ):
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+
+
+def age_record(backend, unit="taskspindle-worker-ts_one", seconds=7200, *, mtime=True):
+    path = backend.directory / f"{unit}.json"
+    record = json.loads(path.read_text())
+    past = time.time_ns() - seconds * 1_000_000_000
+    record["reserved_at_ns"] = past
+    path.write_text(json.dumps(record))
+    if mtime:
+        os.utime(path, ns=(past, past))
+    return path, record
+
+
+def execute(backend, statement):
+    with sqlite3.connect(backend.paths.state_dir / "taskspindle.sqlite3") as db:
+        db.execute(statement)
+
+
+def absent_launch(backend, client, *, seconds=7200):
+    """A create that failed before Docker made anything, for a task the operator cancelled."""
+    full_schema(backend)
+    client.containers.create_failure = "before"
+    with pytest.raises(UnitError):
+        launch(backend)
+    client.containers.create_failure = None
+    execute(backend, "UPDATE tasks SET state='CANCELLING' WHERE id='ts_one'")
+    return age_record(backend, seconds=seconds)
+
+
+def test_absent_launch_recovery_retires_a_cancelled_create_that_never_ran(setup):
+    backend, client = setup
+    path, record = absent_launch(backend, client)
+
+    recovered = backend.recover_absent_launch(record["unit"])
+
+    assert recovered.kind == "not_found"
+    assert backend.admission_open() is False
+    persisted = json.loads(path.read_text())
+    assert persisted["phase"] == "failed"
+    evidence = persisted["recovery"]
+    assert evidence["kind"] == "absent" and evidence["attested"] is True
+    assert evidence["reserved_at_ns"] == record["reserved_at_ns"]
+    assert evidence["checked_at_ns"] >= record["reserved_at_ns"] + 3600 * 1_000_000_000
+    assert evidence["engine_reachable"] is True and evidence["containers"] == 0
+    assert evidence["container_checks"] == ["name", "generation", "unit"]
+    assert {key: evidence[key] for key in (
+        "task_state", "started_at", "heartbeat_at", "worker_pid", "ended_turns",
+    )} == {"task_state": "CANCELLING", "started_at": None, "heartbeat_at": None,
+           "worker_pid": None, "ended_turns": 0}
+    assert backend.show(record["unit"]).kind == "not_found"
+    owner = f"taskspindle.owner={backend.owner}"
+    assert client.containers.list_calls == [
+        (True, {"label": [owner, f"taskspindle.generation={record['generation']}"]}),
+        (True, {"label": [owner, f"taskspindle.unit={record['unit']}"]}),
+    ]
+
+    with pytest.raises(UnitError) as again:
+        backend.recover_absent_launch(record["unit"])
+    assert again.value.code == "UNIT_RECOVERY_INVALID"
+
+
+def test_absent_launch_recovery_accepts_a_legacy_record_by_its_mtime(setup):
+    backend, client = setup
+    path, record = absent_launch(backend, client)
+    del record["reserved_at_ns"]
+    path.write_text(json.dumps(record))
+    past = time.time_ns() - 7200 * 1_000_000_000
+    os.utime(path, ns=(past, past))
+
+    assert backend.recover_absent_launch(record["unit"]).kind == "not_found"
+    assert json.loads(path.read_text())["recovery"]["reserved_at_ns"] == past
+
+
+@pytest.mark.parametrize(("change", "code"), [
+    ("UPDATE tasks SET state='RUNNING'", "UNIT_RECOVERY_NOT_CANCELLED"),
+    ("UPDATE tasks SET state='CANCELLED'", "UNIT_RECOVERY_NOT_CANCELLED"),
+    ("UPDATE tasks SET started_at='2030-01-01T00:00:00Z'", "UNIT_RECOVERY_TASK_STARTED"),
+    ("UPDATE tasks SET heartbeat_at='2030-01-01T00:00:00Z'", "UNIT_RECOVERY_TASK_STARTED"),
+    ("UPDATE tasks SET worker_pid=42", "UNIT_RECOVERY_TASK_STARTED"),
+    ("UPDATE turns SET ended_at='2030-01-01T00:00:00Z'", "UNIT_RECOVERY_TASK_STARTED"),
+    ("DELETE FROM tasks", "UNIT_RECOVERY_INVALID"),
+])
+def test_absent_launch_recovery_refuses_any_sign_the_task_ran(setup, change, code):
+    backend, client = setup
+    path, record = absent_launch(backend, client)
+    execute(backend, change)
+
+    with pytest.raises(UnitError) as refused:
+        backend.recover_absent_launch(record["unit"])
+
+    assert refused.value.code == code
+    assert backend.admission_open() is False
+    assert json.loads(path.read_text())["phase"] == "creating"
+    assert client.containers.list_calls == []
+
+
+@pytest.mark.parametrize("present", ["name", "foreign_name", "generation", "unit"])
+def test_absent_launch_recovery_refuses_any_owned_container_in_any_state(setup, present):
+    backend, client = setup
+    path, record = absent_launch(backend, client)
+    owner = {"taskspindle.owner": backend.owner}
+    name, labels = {
+        "name": (record["name"], {**owner, "taskspindle.generation": record["generation"]}),
+        "foreign_name": (record["name"], {"taskspindle.owner": "someone-else"}),
+        "generation": ("renamed", {**owner, "taskspindle.generation": record["generation"]}),
+        "unit": ("older", {**owner, "taskspindle.generation": "b" * 32, "taskspindle.unit": record["unit"]}),
+    }[present]
+    container = Container(client.containers, name, {"labels": labels})
+    container.attrs["State"]["Status"] = "exited"
+    client.containers.values[name] = container
+
+    with pytest.raises(UnitError) as refused:
+        backend.recover_absent_launch(record["unit"])
+
+    assert refused.value.code == "UNIT_RECOVERY_UNPROVEN"
+    assert json.loads(path.read_text())["phase"] == "creating"
+
+
+def test_absent_launch_recovery_requires_a_reachable_engine_and_listing(setup):
+    backend, client = setup
+    path, record = absent_launch(backend, client)
+    client.ping = lambda: (_ for _ in ()).throw(OSError("private engine endpoint"))
+
+    with pytest.raises(UnitError) as unreachable:
+        backend.recover_absent_launch(record["unit"])
+    assert unreachable.value.code == "UNIT_QUERY_FAILED"
+    assert str(unreachable.value) == "Docker Engine is unreachable (OSError)"
+
+    client.ping = lambda: True
+    client.containers.query_failure = True
+    with pytest.raises(UnitError) as unobservable:
+        backend.recover_absent_launch(record["unit"])
+    assert unobservable.value.code == "UNIT_QUERY_FAILED"
+    assert "secret" not in str(unobservable.value)
+    assert json.loads(path.read_text())["phase"] == "creating"
+
+
+def test_absent_launch_recovery_requires_an_hour_old_creating_worker_record(setup):
+    backend, client = setup
+    path, record = absent_launch(backend, client, seconds=3500)
+    with pytest.raises(UnitError) as recent:
+        backend.recover_absent_launch(record["unit"])
+    assert recent.value.code == "UNIT_RECOVERY_TOO_RECENT"
+
+    # An old reservation time never outweighs a newer file: the later of the two decides.
+    path, record = age_record(backend, seconds=7200, mtime=False)
+    with pytest.raises(UnitError) as rewritten:
+        backend.recover_absent_launch(record["unit"])
+    assert rewritten.value.code == "UNIT_RECOVERY_TOO_RECENT"
+
+    for phase in ("starting", "started", "finished"):
+        path.write_text(json.dumps({**record, "phase": phase, "evidence": {
+            "load_state": "loaded", "active_state": "inactive", "sub_state": "exited",
+            "result": "success", "exec_main_status": 0, "main_pid": None,
+        }}))
+        with pytest.raises(UnitError) as settled:
+            backend.recover_absent_launch(record["unit"])
+        assert settled.value.code == "UNIT_RECOVERY_INVALID"
+
+    with pytest.raises(UnitError) as missing:
+        backend.recover_absent_launch("taskspindle-worker-ts_none")
+    assert missing.value.code == "UNIT_RECOVERY_INVALID"
+    with pytest.raises(UnitError) as invalid:
+        backend.recover_absent_launch("../escape")
+    assert invalid.value.code == "UNIT_INVALID"
+    assert client.containers.list_calls == []
+
+
+def test_absent_launch_recovery_never_applies_to_an_accept_launch(setup):
+    backend, _client = setup
+    full_schema(backend)
+    execute(backend, "UPDATE tasks SET state='CANCELLING'")
+    generation = "c" * 32
+    path = backend.directory / "taskspindle-accept-ts_one.json"
+    path.write_text(json.dumps({
+        "unit": "taskspindle-accept-ts_one", "kind": "accept", "task_id": "ts_one", "identity": "[]",
+        "generation": generation, "name": f"taskspindle-{backend.owner}-{generation}",
+        "phase": "creating", "reserved_at_ns": 1,
+    }))
+    os.utime(path, ns=(1, 1))
+
+    with pytest.raises(UnitError) as refused:
+        backend.recover_absent_launch("taskspindle-accept-ts_one")
+
+    assert refused.value.code == "UNIT_RECOVERY_INVALID"
+    assert json.loads(path.read_text())["phase"] == "creating"
+
+
+def test_absent_launch_recovery_serializes_with_a_launch(setup):
+    backend, client = setup
+    _path, record = absent_launch(backend, client)
+    execute(backend, "INSERT INTO tasks (id, provider, provider_family, state) "
+                     "VALUES ('ts_two', 'claude', 'claude', 'RUNNING')")
+    execute(backend, "INSERT INTO turns (id, task_id) VALUES (3, 'ts_two')")
+    client.containers.entered, client.containers.proceed = threading.Event(), threading.Event()
+    launching = threading.Thread(target=lambda: backend.start(
+        "taskspindle-worker-ts_two", ["/host/python", "-m", "taskspindle.runner", "--task", "ts_two"],
+        working_dir=backend.paths.state_dir, env={}, properties={},
+    ))
+    launching.start()
+    assert client.containers.entered.wait(3)
+    results = []
+    recovering = threading.Thread(target=lambda: results.append(
+        backend.recover_absent_launch(record["unit"]).kind,
+    ))
+    recovering.start()
+    recovering.join(0.2)
+    assert recovering.is_alive() and results == []
+    client.containers.proceed.set()
+    launching.join(3)
+    recovering.join(3)
+    assert results == ["not_found"]
+    assert backend.admission_open() is False
+
+
+# -- doctor facts ---------------------------------------------------------------------------------
+
+
+def test_execution_diagnostics_report_fence_stuck_launch_and_its_lease(setup):
+    backend, client = setup
+    path, record = absent_launch(backend, client, seconds=1800)
+    execute(backend, "INSERT INTO leases (task_id, provider, unit_name, acquired_at, heartbeat_at) "
+                     "VALUES ('ts_one', 'claude', 'taskspindle-worker-ts_one', "
+                     "'2030-01-01T00:00:00Z', '2030-01-01T00:00:00Z')")
+    backend.set_admission(False)
+
+    facts = backend.execution_diagnostics()
+
+    assert facts["admission_open"] is False and facts["maintenance_active"] is False
+    [stuck] = facts["unsettled"]
+    assert {key: stuck[key] for key in ("unit", "task_id", "phase", "container")} == {
+        "unit": record["unit"], "task_id": "ts_one", "phase": "creating", "container": "absent",
+    }
+    assert 1790 <= stuck["age_s"] <= 1900
+    assert facts["leases"] == [{"provider": "claude", "task_id": "ts_one",
+                                "unit_name": "taskspindle-worker-ts_one",
+                                "acquired_at": "2030-01-01T00:00:00Z",
+                                "heartbeat_at": "2030-01-01T00:00:00Z"}]
+    assert facts["tasks"] == {"ts_one": {"state": "CANCELLING", "heartbeat_at": None}}
+
+    # The lease is fresh by the clock it was written with, yet its unit is unsettled.
+    checks = {check.name: check for check in doctor.execution_state_checks(
+        facts, datetime(2030, 1, 1, 0, 1, tzinfo=UTC),
+    )}
+    assert checks["worker_admission"].ok is False
+    assert "taskspindle-controller open" in checks["worker_admission"].detail
+    assert checks["stuck_launches"].ok is False
+    stuck_detail = checks["stuck_launches"].detail
+    assert f"{record['unit']} in creating for 30 minutes (container absent)" in stuck_detail
+    assert checks["orphan_leases"].ok is False
+    assert "claude lease held by ts_one: task is CANCELLING and its launch is unsettled" in (
+        checks["orphan_leases"].detail
+    )
+    assert json.loads(path.read_text())["phase"] == "creating"
+
+
+def test_execution_diagnostics_ignore_running_and_recent_launches(setup):
+    backend, client = setup
+    launch(backend)
+    age_record(backend, seconds=7200)
+    (backend.directory / "taskspindle-worker-ts_bad.json").write_text("[")
+
+    facts = backend.execution_diagnostics()
+
+    assert facts["admission_open"] is True
+    assert facts["unsettled"] == [{"unit": "taskspindle-worker-ts_bad", "task_id": None,
+                                   "phase": "unreadable", "age_s": None, "container": "unknown"}]
+    # The fixture's lease table lacks production columns: reported as unreadable, not empty.
+    assert facts["leases"] is None and facts["tasks"] is None
+
+    # A started launch whose container vanished without exit evidence is unsettled too.
+    (backend.directory / "taskspindle-worker-ts_bad.json").unlink()
+    client.containers.values.clear()
+    [vanished] = backend.execution_diagnostics()["unsettled"]
+    assert (vanished["phase"], vanished["container"]) == ("started", "absent")
+
+    # A failed create younger than the threshold is still within ordinary retry territory.
+    (backend.directory / "taskspindle-worker-ts_one.json").unlink()
+    client.containers.create_failure = "before"
+    with pytest.raises(UnitError):
+        launch(backend)
+    assert backend.execution_diagnostics()["unsettled"] == []

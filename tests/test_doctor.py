@@ -759,7 +759,169 @@ def test_capacity_summary_reads_limits_use_and_queue_from_the_store(tmp_path) ->
             datetime.now(UTC),
         )
     assert summary["providers"]["claude"] | {"slot_utilization": None} == {
-        "limit": 4, "source": "config", "ceiling": 8, "active": 0, "queued": 0, "slot_utilization": None,
+        "limit": 4, "source": "config", "ceiling": 8, "active": 0, "orphaned": 0, "queued": 0,
+        "slot_utilization": None,
     }
+    assert summary["orphan_leases"] == []
     assert summary["providers"]["grok"]["limit"] == 8 and summary["providers"]["grok"]["source"] == "policy"
     assert summary["total"]["limit"] == 9 and summary["shared_seats"] == {}
+
+
+# -- stuck execution state -----------------------------------------------------------------------
+
+
+def test_orphan_leases_flag_missing_unsettled_and_silent_holders() -> None:
+    from datetime import UTC, datetime
+
+    now = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+    fresh, stale = "2030-01-01T11:59:00Z", "2030-01-01T11:00:00Z"
+    leases = [
+        {"provider": "claude", "task_id": "ts_run", "unit_name": None, "heartbeat_at": stale},
+        {"provider": "claude", "task_id": "ts_gone", "unit_name": None, "heartbeat_at": fresh},
+        {"provider": "grok", "task_id": "ts_ghost", "unit_name": "taskspindle-worker-ts_ghost",
+         "heartbeat_at": stale},
+        {"provider": "grok", "task_id": "ts_done", "unit_name": None, "heartbeat_at": stale},
+        {"provider": "agy", "task_id": "ts_new", "unit_name": None, "heartbeat_at": fresh},
+        {"provider": "agy", "task_id": "ts_stuck", "unit_name": None, "heartbeat_at": fresh},
+    ]
+    tasks = {
+        # The task heartbeat alone keeps a lease live: the worker refreshes both.
+        "ts_run": {"state": "RUNNING", "heartbeat_at": fresh},
+        "ts_ghost": {"state": "CANCELLING", "heartbeat_at": None},
+        "ts_done": {"state": "FAILED", "heartbeat_at": stale},
+        "ts_new": {"state": "QUEUED", "heartbeat_at": None},
+        "ts_stuck": {"state": "CANCELLING", "heartbeat_at": None},
+    }
+
+    found = doctor.orphan_leases(leases, tasks, now, unsettled_units={"taskspindle-worker-ts_stuck"})
+
+    assert [(row["provider"], row["task_id"], row["reason"]) for row in found] == [
+        ("claude", "ts_gone", "its task no longer exists"),
+        ("grok", "ts_ghost", "task is CANCELLING with no worker heartbeat for over 10 minutes"),
+        ("grok", "ts_done", "task is FAILED"),
+        ("agy", "ts_stuck", "task is CANCELLING and its launch is unsettled"),
+    ]
+    check = doctor.orphan_lease_check(found)
+    assert check.ok is False and check.advisory is False
+    assert "4 leases hold a slot with no running worker" in check.detail
+    assert "grok lease held by ts_ghost: task is CANCELLING" in check.detail
+    assert "docs/recovery.md" in check.detail
+    assert doctor.orphan_lease_check([]).ok is True
+    assert doctor.orphan_lease_check([], held=0).detail == "no provider leases are held"
+
+
+def test_capacity_detail_does_not_present_an_orphan_lease_as_active_work() -> None:
+    checks = {c.name: c for c in doctor.capacity_checks(
+        _capacity(active=1, orphaned=1), memory_total=64 * 1024**3,
+    )}
+
+    assert "limit 2 from policy, 0 active, 1 held by orphaned lease (see orphan_leases), 0 queued" in (
+        checks["capacity_claude"].detail
+    )
+
+
+def test_capacity_summary_finds_an_orphan_lease_in_the_store(tmp_path) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from taskspindle import providers, service
+    from taskspindle.models import AuthMode, Mode, StartTaskRequest, TaskState
+    from taskspindle.store import Store
+
+    profiles = providers.load_profiles(
+        {}, runtime_dir=tmp_path / "rt", home=tmp_path, state_dir=tmp_path / "state",
+    )
+    with Store.open(tmp_path / "state" / "taskspindle.sqlite3") as store:
+        request = StartTaskRequest(provider="claude", mode=Mode.CONSULT, prompt="never launched")
+        task = service.create_task(store, request, repository_id=None, auth_mode=AuthMode.OAUTH)
+        store.update_task(task.id, None, state=TaskState.CANCELLING)
+        assert store.acquire_lease("claude", task.id, f"taskspindle-worker-{task.id}", None, "boot")
+        current = doctor.capacity_summary(store, profiles, {}, datetime.now(UTC))
+        later = doctor.capacity_summary(store, profiles, {}, datetime.now(UTC) + timedelta(hours=1))
+
+    assert current["orphan_leases"] == [] and current["providers"]["claude"]["orphaned"] == 0
+    assert later["providers"]["claude"] | {"slot_utilization": None} == {
+        "limit": later["providers"]["claude"]["limit"], "source": later["providers"]["claude"]["source"],
+        "ceiling": later["providers"]["claude"]["ceiling"], "active": 1, "orphaned": 1, "queued": 0,
+        "slot_utilization": None,
+    }
+    assert later["orphan_leases"] == [{
+        "provider": "claude", "task_id": task.id, "unit": f"taskspindle-worker-{task.id}",
+        "reason": "task is CANCELLING with no worker heartbeat for over 10 minutes",
+    }]
+
+
+def _paths(tmp_path: Path) -> Paths:
+    return Paths(tmp_path / "config.toml", tmp_path / "state", tmp_path / "data", tmp_path / "runtime")
+
+
+_ORPHAN = {"provider": "claude", "task_id": "ts_x", "unit": "taskspindle-worker-ts_x",
+           "reason": "task is FAILED"}
+
+
+def test_doctor_adds_the_database_orphan_lease_check_as_a_failure(tmp_path, monkeypatch) -> None:
+    async def collect(self):
+        self.checks.append(doctor.Check("git", True, "git version 2.43.0"))
+
+    monkeypatch.setattr(doctor._Doctor, "collect", collect)
+
+    report = run_doctor(
+        profiles={}, paths=_paths(tmp_path), parent_env={}, live_probes=False, settings={},
+        capacity=_capacity() | {"orphan_leases": [_ORPHAN]},
+    )
+
+    rows = {row["name"]: row for row in report["checks"]}
+    assert rows["orphan_leases"]["ok"] is False and rows["orphan_leases"]["advisory"] is False
+    assert "claude lease held by ts_x: task is FAILED" in rows["orphan_leases"]["detail"]
+    assert report["ok"] is False
+
+    healthy = run_doctor(
+        profiles={}, paths=_paths(tmp_path), parent_env={}, live_probes=False, settings={},
+        capacity=_capacity() | {"orphan_leases": []},
+    )
+    assert healthy["ok"] is True
+    assert {row["name"]: row["ok"] for row in healthy["checks"]}["orphan_leases"] is True
+
+
+def test_doctor_keeps_the_controllers_own_orphan_lease_answer(tmp_path, monkeypatch) -> None:
+    from taskspindle import rpc
+
+    controller_row = {"name": "orphan_leases", "ok": True, "detail": "controller", "advisory": False}
+    monkeypatch.setattr(rpc, "request", lambda *args, **kwargs: {"ok": True, "checks": [controller_row]})
+
+    report = run_doctor(
+        profiles={}, paths=_paths(tmp_path), parent_env={},
+        settings={"execution": {"backend": "docker", "diagnostics_socket": "/run/probes.sock"}},
+        capacity=_capacity() | {"orphan_leases": [_ORPHAN]},
+    )
+
+    assert [row for row in report["checks"] if row["name"] == "orphan_leases"] == [controller_row]
+    assert report["ok"] is True
+
+
+def test_execution_state_checks_explain_admission_and_stuck_launches() -> None:
+    from datetime import UTC, datetime
+
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+    healthy = doctor.execution_state_checks(
+        {"admission_open": True, "maintenance_active": False, "unsettled": [], "leases": [],
+         "tasks": {}},
+        now,
+    )
+    assert [(check.name, check.ok) for check in healthy] == [
+        ("worker_admission", True), ("stuck_launches", True), ("orphan_leases", True),
+    ]
+    assert healthy[2].detail == "no provider leases are held"
+
+    maintenance = doctor.execution_state_checks(
+        {"admission_open": False, "maintenance_active": True, "unsettled": [
+            {"unit": "taskspindle-worker-ts_a", "phase": "creating", "age_s": 700, "container": "absent"},
+            {"unit": "taskspindle-worker-ts_b", "phase": "unreadable", "age_s": None, "container": "unknown"},
+        ], "leases": None, "tasks": None}, now,
+    )
+    admission, stuck, leases = maintenance
+    assert admission.ok is False and "maintenance-release --token <token> --reopen" in admission.detail
+    assert stuck.ok is False and stuck.advisory is False
+    assert "taskspindle-worker-ts_a in creating for 11 minutes (container absent)" in stuck.detail
+    assert "taskspindle-worker-ts_b in unreadable for an unknown time" in stuck.detail
+    assert "recover-absent-launch" in stuck.detail
+    assert leases.ok is False and leases.detail == "the task database cannot be read safely"
