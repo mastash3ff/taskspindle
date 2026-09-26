@@ -144,8 +144,10 @@ above.
 - **Overview** — global task counts, work currently active, work needing attention, and candidates
   awaiting review. The bounded lists add a short, redacted task summary and expose only the
   registered repository ID and display path. Full prompts are not included in these lists.
-  Attention means `RESULT_READY`, `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, or a failed task whose
-  cleanup is incomplete.
+  Attention means `RESULT_READY`, `INTERRUPTED`, `RECOVERY_AMBIGUOUS`, a failed task whose
+  cleanup is incomplete, or an active task that carries an error — for example a `CANCELLING`
+  task whose Docker launch is `UNIT_START_UNCERTAIN`. Such a task stays in the active list too,
+  and its attention row names the error code; [Recovery](recovery.md) explains how to settle it.
 - **Tasks** — a filterable list (state, provider, mode) of every task, and a detail page per task:
   its header (state, versions, repository, worktree, session, model, timestamps, error), the
   event timeline, every turn (timings, stop reason, usage, response text, tool calls, violations,

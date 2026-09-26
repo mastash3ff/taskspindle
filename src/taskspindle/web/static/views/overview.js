@@ -4,9 +4,11 @@ import { routeHref } from "../router.js";
 
 function taskItem(task, kind) {
   const repo = task.repository?.path || task.repository?.display_path || task.repository_path || task.repository_id || "No repository";
+  // An active task in the attention list is there because it carries an error; name it.
+  const error = kind === "attention" && task.error?.code ? ` · ${task.error.code}` : "";
   return h("a", { class: "activity-item", href: routeHref("tasks", task.id) },
     h("span", { class: `activity-mark activity-${kind}`, "aria-hidden": "true" }),
-    h("span", { class: "activity-main" }, h("strong", { text: task.summary || "Untitled task" }), h("small", { text: `${task.id} · ${repo}` })),
+    h("span", { class: "activity-main" }, h("strong", { text: task.summary || "Untitled task" }), h("small", { text: `${task.id} · ${repo}${error}` })),
     badge(task.state),
     h("time", { datetime: task.updated_at, title: formatDate(task.updated_at), text: relativeTime(task.updated_at) }),
   );

@@ -105,3 +105,24 @@ def test_overview_rejects_invalid_limits(tmp_path: Path, value: str) -> None:
 
 def test_overview_is_get_only(tmp_path: Path) -> None:
     assert _client(_paths(tmp_path)).post("/api/overview").status_code == 405
+
+
+def test_overview_brings_an_active_task_with_an_error_to_attention(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    with Store.open(paths.state_dir / "taskspindle.sqlite3") as store:
+        stuck_id = _task(store, TaskState.CANCELLING)
+        store.update_task(stuck_id, None, bump_version=False, error={
+            "code": "UNIT_START_UNCERTAIN", "message": "Docker create outcome is unsettled",
+            "retryable": False, "details": {},
+        })
+        running_id = _task(store, TaskState.RUNNING)
+        _task(store, TaskState.CANCELLING)
+
+    body = _client(paths).get("/api/overview").json()
+
+    assert body["counts"] == {"total": 3, "active": 3, "attention": 1, "awaiting_review": 0}
+    assert running_id in {row["id"] for row in body["active_tasks"]}
+    assert stuck_id in {row["id"] for row in body["active_tasks"]}
+    assert [row["id"] for row in body["attention_tasks"]] == [stuck_id]
+    assert body["attention_tasks"][0]["error"]["code"] == "UNIT_START_UNCERTAIN"
+    assert body["truncated"] == {"active": False, "attention": False}

@@ -154,9 +154,12 @@ class ReadOnlyStore:
         )
         active_marks = ", ".join("?" for _ in active_states)
         attention_marks = ", ".join("?" for _ in attention_states)
+        # An active task that carries an error -- a CANCELLING task whose launch outcome is
+        # unsettled, say -- is stuck until someone acts, so it is listed under both headings.
         attention_where = (
             f"(t.state IN ({attention_marks}) OR "
-            "(t.state = ? AND t.cleanup_state IS NOT ?))"
+            "(t.state = ? AND t.cleanup_state IS NOT ?) OR "
+            f"(t.state IN ({active_marks}) AND t.error IS NOT NULL))"
         )
 
         total = int(self._conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
@@ -165,7 +168,9 @@ class ReadOnlyStore:
                 f"SELECT COUNT(*) FROM tasks WHERE state IN ({active_marks})", active_states
             ).fetchone()[0]
         )
-        attention_params = (*attention_states, TaskState.FAILED.value, CleanupState.COMPLETE.value)
+        attention_params = (
+            *attention_states, TaskState.FAILED.value, CleanupState.COMPLETE.value, *active_states,
+        )
         attention = int(
             self._conn.execute(
                 f"SELECT COUNT(*) FROM tasks t WHERE {attention_where}", attention_params
